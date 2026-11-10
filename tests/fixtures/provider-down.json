@@ -1,0 +1,18 @@
+{
+  "good": {
+    "ac": [
+      {
+        "hex": "eee555",
+        "flight": "KEEP1",
+        "lat": 0,
+        "lon": -29.98,
+        "alt_baro": 18000,
+        "gs": 300,
+        "track": 40,
+        "seen_pos": 0
+      }
+    ],
+    "msg": "No error",
+    "now": 1700000000000
+  }
+}

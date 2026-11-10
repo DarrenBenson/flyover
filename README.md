@@ -31,6 +31,27 @@ The owner has accepted the stack, the units, the audience, the map host, and a m
 
 The position feed to enable is adsb.lol. OpenSky is not eligible for this live display without a written licence. The ADS-B Exchange community and RapidAPI plans are not eligible for an always-on screen. Do not treat a commercial fork as covered by those findings.
 
+## Run
+
+```bash
+npm test
+npm start
+```
+
+The process reads the house from the environment. None of these values belong in git:
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `FLYOVER_POSTCODE` | The UK postcode | unset, and the screen says the house is not configured |
+| `FLYOVER_LAT`, `FLYOVER_LON` | A centre already resolved for this host | unset, and the postcode is looked up once |
+| `FLYOVER_RADIUS_MILES` | Statute miles | 15 |
+| `STALE_AFTER_SECONDS` | Age before the picture is marked stale | 60 |
+| `POSITION_PROVIDER` | Must be `adsb.lol` before any position call | unset, and nothing is called |
+| `MAPTILER_API_KEY` | Map tiles, when the map is drawn | unset |
+| `FLYOVER_DB` | This host's SQLite file | `data/flyover.sqlite` |
+
+`npm start` listens on port 8080. Put the reverse proxy in front of it. The live view answers a home-LAN client and refuses a public one.
+
 ## Licence
 
 [MIT](LICENSE). Copyright (c) 2026 Darren Benson.

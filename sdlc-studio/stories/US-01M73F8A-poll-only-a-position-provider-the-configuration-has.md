@@ -1,13 +1,13 @@
 # US-01M73F8A: Poll only a position provider the configuration has enabled
 
-> **Status:** Ready
+> **Status:** Done
 > **Created:** 2026-11-10
 > **Created-by:** sdlc-studio new
 > **Raised-by:** sdlc-studio; agent; v1
 > **Epic:** EP-01M73FH0
 > **Points:** 5
 > **Persona:** Alex Brennan
-> **Affects:** sdlc-studio/trd.md, tests/fixtures/provider-gate.json
+> **Affects:** sdlc-studio/trd.md, tests/fixtures/provider-gate.json, src/app.ts, src/page.ts, src/poll.ts, src/config.ts, src/lan.ts, src/geo.ts, src/credits.ts, src/store.ts, src/types.ts, src/index.ts, tests/walking-skeleton.test.ts, package.json, package-lock.json, tsconfig.json, vitest.config.ts, .github/workflows/test.yml, .gitignore
 
 ## User Story
 
@@ -19,12 +19,16 @@
 
 - **AC1:** Given no position provider enabled, when a poll runs, then the transport is not called and the screen shows the not-configured or empty state.
   - **Verify:** vitest "F8A-AC1"
+  - **Verified:** yes (2026-11-10)
 - **AC2:** Given adsb.lol enabled, when a poll runs, then only the adsb.lol transport is called.
   - **Verify:** vitest "F8A-AC2"
+  - **Verified:** yes (2026-11-10)
 - **AC3:** Given configuration that names OpenSky or ADS-B Exchange, when the server starts, then it refuses that provider and makes no call.
   - **Verify:** vitest "F8A-AC3"
+  - **Verified:** yes (2026-11-10)
 - **AC4:** Given a provider credential, when the kiosk bundle is inspected, then the credential is not in it.
   - **Verify:** vitest "F8A-AC4"
+  - **Verified:** yes (2026-11-10)
 
 The default this deployment names is adsb.lol ([D0009](../decisions.md)). A checkout with no config still calls nobody ([D0003](../decisions.md)).
 

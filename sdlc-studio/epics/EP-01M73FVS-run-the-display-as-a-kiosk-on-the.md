@@ -12,8 +12,8 @@ The live view is something one household can leave full screen. One build is wha
 
 ## Story Breakdown
 
-- [ ] [US-01M73FSE: Leave the live view running full screen](../stories/US-01M73FSE-leave-the-live-view-running-full-screen.md)
-- [ ] [US-01M73F39: Keep the last good picture when the provider fails](../stories/US-01M73F39-keep-the-last-good-picture-when-the-provider.md)
+- [x] [US-01M73FSE: Leave the live view running full screen](../stories/US-01M73FSE-leave-the-live-view-running-full-screen.md)
+- [x] [US-01M73F39: Keep the last good picture when the provider fails](../stories/US-01M73F39-keep-the-last-good-picture-when-the-provider.md)
 - [ ] [US-01M73F7A: Promote one build across the owner's servers](../stories/US-01M73F7A-promote-one-build-across-the-owner-s-servers.md)
 
 ## Acceptance Criteria

@@ -1,0 +1,36 @@
+{
+  "ac": [
+    {
+      "hex": "aaa111",
+      "flight": "INSIDEA",
+      "lat": 0,
+      "lon": -29.971,
+      "alt_baro": 32000,
+      "gs": 450,
+      "track": 90,
+      "seen_pos": 1
+    },
+    {
+      "hex": "bbb222",
+      "flight": "INSIDEB",
+      "lat": 0,
+      "lon": -29.855,
+      "alt_baro": 41000,
+      "gs": 480,
+      "track": 90,
+      "seen_pos": 1
+    },
+    {
+      "hex": "ccc333",
+      "flight": "OUTSIDE",
+      "lat": 0,
+      "lon": -28,
+      "alt_baro": 28000,
+      "gs": 400,
+      "track": 270,
+      "seen_pos": 1
+    }
+  ],
+  "msg": "No error",
+  "now": 1700000000000
+}

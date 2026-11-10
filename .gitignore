@@ -6,3 +6,9 @@
 # Script caches from the vendored SDLC Studio tools.
 __pycache__/
 *.pyc
+
+# The process and its per-host database.
+node_modules/
+data/
+*.sqlite
+*.sqlite3

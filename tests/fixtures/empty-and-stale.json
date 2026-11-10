@@ -1,0 +1,24 @@
+{
+  "staleSeconds": 60,
+  "empty": {
+    "ac": [],
+    "msg": "No error",
+    "now": 1700000000000
+  },
+  "one": {
+    "ac": [
+      {
+        "hex": "ddd444",
+        "flight": "AGED1",
+        "lat": 0,
+        "lon": -29.98,
+        "alt_baro": 15000,
+        "gs": 220,
+        "track": 10,
+        "seen_pos": 0
+      }
+    ],
+    "msg": "No error",
+    "now": 1700000000000
+  }
+}

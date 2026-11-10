@@ -1,13 +1,13 @@
 # US-01M73FSE: Leave the live view running full screen
 
-> **Status:** Ready
+> **Status:** Done
 > **Created:** 2026-11-10
 > **Created-by:** sdlc-studio new
 > **Raised-by:** sdlc-studio; agent; v1
 > **Epic:** EP-01M73FVS
 > **Points:** 3
 > **Persona:** Ruth Okonkwo
-> **Affects:** sdlc-studio/prd.md
+> **Affects:** sdlc-studio/prd.md, src/app.ts, src/page.ts, src/poll.ts, src/config.ts, src/lan.ts, src/geo.ts, src/credits.ts, src/store.ts, src/types.ts, src/index.ts, tests/walking-skeleton.test.ts, package.json, package-lock.json, tsconfig.json, vitest.config.ts, .github/workflows/test.yml, .gitignore
 
 ## User Story
 
@@ -19,12 +19,16 @@
 
 - **AC1:** Given the environment is configured, when the live view is shown, then no control depends on hover.
   - **Verify:** vitest "FSE-AC1"
+  - **Verified:** yes (2026-11-10)
 - **AC2:** Given the environment is configured, when the live view is shown, then a keyboard is not required to keep it updating.
   - **Verify:** vitest "FSE-AC2"
+  - **Verified:** yes (2026-11-10)
 - **AC3:** Given the view in current Chromium, when an aircraft is overhead, then the nearest identity is set in type of at least 32px so it can be read without approaching the screen.
   - **Verify:** vitest "FSE-AC3"
+  - **Verified:** yes (2026-11-10)
 - **AC4:** Given a client that is not on the home LAN, when it requests the live view, then the server refuses it. A loopback or private-LAN client is admitted.
   - **Verify:** vitest "FSE-AC4"
+  - **Verified:** yes (2026-11-10)
 
 Version 1 is Chromium only ([D0017](../decisions.md)). The live view is home-LAN only ([D0018](../decisions.md)). The 32px check is the executable stand-in for reading it from the seat. The owner still looks at the real screen.
 
