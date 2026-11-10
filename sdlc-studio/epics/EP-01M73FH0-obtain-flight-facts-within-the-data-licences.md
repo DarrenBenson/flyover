@@ -1,6 +1,6 @@
 # EP-01M73FH0: Obtain flight facts within the data licences
 
-> **Status:** Draft
+> **Status:** Done
 > **Created:** 2026-11-10
 > **Created-by:** sdlc-studio new
 > **Raised-by:** sdlc-studio; agent; v1

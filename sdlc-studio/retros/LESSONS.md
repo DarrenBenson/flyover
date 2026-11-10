@@ -4,6 +4,15 @@
 
 <!-- Append new entries at the top. Keep each entry under 10 lines. -->
 
+## L-0003: Try generating the QR from the same library and the same options in the test, so a page that only prints the URL as text fails the…
+
+- **Added:** 2026-11-10
+- **Review-by:** 2027-02-08
+
+Try generating the QR from the same library and the same options in the test, so a page that only prints the URL as text fails the comparison.
+
+Recorded from retro RETRO0003.
+
 ## L-0002: Try one fixture aircraft at a known offset from the test centre so the next distance assertion can be checked with an independent…
 
 - **Added:** 2026-11-10

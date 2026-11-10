@@ -1,0 +1,149 @@
+{
+  "schema": 1,
+  "run_id": "RUN-01M73QDR",
+  "started_at": "2026-11-10T21:51:02Z",
+  "ended_at": "2026-11-10T22:01:49Z",
+  "outcome": "goal-reached",
+  "goal": "done",
+  "batch": [
+    "US01M73FFM"
+  ],
+  "plan": "sdlc-studio/.local/sprint-plan.json",
+  "handoff": null,
+  "session_token_baseline": null,
+  "session_token_stamps": [],
+  "delegated_tokens": [],
+  "reopened": [],
+  "batch_changes": [],
+  "rulings": [],
+  "base_ref": "e31817e37a12f20db545dcafa955fbb13fbe4aab",
+  "preplan_reconcile": {
+    "drift": 0,
+    "kinds": [],
+    "at": "2026-11-10T21:51:02Z"
+  },
+  "appetite": {
+    "units": 8,
+    "minutes": 240.0,
+    "standing_units": 8,
+    "standing_minutes": 240.0,
+    "over_appetite": false
+  },
+  "sprint_goal": "A credited photo is shown, or no photo, and never a copied logo",
+  "sprint_goal_review": {
+    "reviewed": false,
+    "status": "not read",
+    "skipped": null,
+    "seats": [],
+    "goal": "A credited photo is shown, or no photo, and never a copied logo",
+    "shipped_seats": false,
+    "available_seats": [
+      "engineering",
+      "product",
+      "qa",
+      "security"
+    ],
+    "rounds": 0,
+    "objected": false,
+    "objections": [],
+    "reason": "no seat verdict is recorded for any goal - its seats are engineering, product, qa, security (`sprint.py goal-review record`)"
+  },
+  "reachable_end_state": {
+    "state": "Done",
+    "types": [
+      "story"
+    ],
+    "basis": "the `done` rung's own terminal for each type present is: Done"
+  },
+  "plan_snapshot": {
+    "units": {
+      "US01M73FFM": {
+        "planned_points": 3,
+        "forecast_tokens": 75000,
+        "forecast_minutes": null,
+        "added": false
+      }
+    },
+    "rates": {
+      "tokens_per_point": {
+        "value": 25000,
+        "source": "seed"
+      },
+      "minutes_per_point": {
+        "value": null,
+        "source": "not measured"
+      }
+    }
+  },
+  "token_forecast": 75000,
+  "goal_content_review": [
+    {
+      "phase": "plan",
+      "goal": "A credited photo is shown, or no photo, and never a copied logo",
+      "answer": "yes",
+      "missing": "",
+      "shortfall": {},
+      "recorded_at": "2026-11-10T21:51:02Z"
+    },
+    {
+      "phase": "close",
+      "goal": "A credited photo is shown, or no photo, and never a copied logo",
+      "answer": "yes",
+      "missing": "",
+      "shortfall": {
+        "undelivered": [],
+        "defects": []
+      },
+      "recorded_at": "2026-11-10T22:01:48Z"
+    }
+  ],
+  "review_base": {
+    "US01M73FFM": 0
+  },
+  "scaffolded_retro": "RETRO0003",
+  "sprint_goal_verdict": {
+    "verdict": "achieved",
+    "note": "A credited photo renders with a link and a QR code, and an empty list renders neither."
+  },
+  "close_attempts": [
+    {
+      "at": "2026-11-10T22:01:47Z",
+      "outstanding": 0,
+      "stages": []
+    }
+  ],
+  "close_known_issues": [],
+  "close_not_measured": [
+    {
+      "id": "cost",
+      "title": "Cost, velocity and estimate accuracy",
+      "detail": "no per-unit telemetry, no measured run total and no supplied sprint total, so what this sprint cost is not attributable - which is not zero"
+    }
+  ],
+  "close_tree": "3d951aec2ca73ff78b431a412dd6b29df381e319",
+  "report_gate_clear": [
+    "US01M73FFM"
+  ],
+  "verified_sha": "b94bca835700a5d5fed8bd22ad4d1ad44c20677a",
+  "ci_runs": {
+    "source": "gh run list",
+    "runs": []
+  },
+  "review_rows": {
+    "US01M73FFM": [
+      "5a660c6c2775730d"
+    ]
+  },
+  "report_discharged": [],
+  "report": "RPT0003",
+  "report_fingerprint": "ec2381fa655205d7",
+  "report_window_end": "2026-11-10T22:01:49Z",
+  "unanswered": [],
+  "unanswered_rulings_from": "RETRO0003",
+  "signature": {
+    "principal": "Darren Benson (delegated to Juno)",
+    "signed_at": "2026-11-10T22:01:49Z",
+    "report": "RPT0003",
+    "fingerprint": "ec2381fa655205d7"
+  }
+}
