@@ -34,6 +34,8 @@ export function readAircraft(body: unknown, homeLat: number, homeLon: number, ra
     const aircraft: Aircraft = {
       id,
       callsign,
+      lat,
+      lon,
       distanceMiles,
       bearingDeg: bearingDegrees(homeLat, homeLon, lat, lon),
       altitudeFeet: onGround ? null : numberOrNull(record.alt_baro),

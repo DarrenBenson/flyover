@@ -1,6 +1,8 @@
 export type Aircraft = {
   id: string;
   callsign: string | null;
+  lat: number;
+  lon: number;
   distanceMiles: number;
   bearingDeg: number;
   altitudeFeet: number | null;
@@ -54,4 +56,16 @@ export type PublicSnapshot = {
   source: string | null;
   detail: Detail | null;
   selection: "shown" | "gone" | "none";
+  map: MapView | null;
+};
+
+export type MapView = {
+  width: number;
+  height: number;
+  homeX: number;
+  homeY: number;
+  radiusPx: number;
+  tilesConfigured: boolean;
+  marks: { id: string; x: number; y: number }[];
+  tiles: { z: number; x: number; y: number; left: number; top: number }[];
 };

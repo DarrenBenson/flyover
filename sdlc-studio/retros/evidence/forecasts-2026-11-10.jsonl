@@ -7,3 +7,5 @@
 {"id": "US01M73FSQ", "tokens": 125000, "points": 5, "estimator": "unattributed", "size_gate": "compulsory", "constants": {"TOKENS_PER_POINT": 25000}, "planned_at": "2026-11-10T21:36:00Z", "project": "flyover"}
 {"id": "US01M73FJV", "tokens": 125000, "points": 5, "estimator": "unattributed", "size_gate": "compulsory", "constants": {"TOKENS_PER_POINT": 25000}, "planned_at": "2026-11-10T21:36:00Z", "project": "flyover"}
 {"id": "US01M73FFM", "tokens": 75000, "points": 3, "estimator": "unattributed", "size_gate": "compulsory", "constants": {"TOKENS_PER_POINT": 25000}, "planned_at": "2026-11-10T21:51:02Z", "project": "flyover"}
+{"id": "US01M73F1W", "tokens": 125000, "points": 5, "estimator": "unattributed", "size_gate": "compulsory", "constants": {"TOKENS_PER_POINT": 25000}, "planned_at": "2026-11-10T22:05:24Z", "project": "flyover"}
+{"id": "US01M73F6W", "tokens": 75000, "points": 3, "estimator": "unattributed", "size_gate": "compulsory", "constants": {"TOKENS_PER_POINT": 25000}, "planned_at": "2026-11-10T22:05:24Z", "project": "flyover"}

@@ -3,6 +3,7 @@ import { getConnInfo } from "@hono/node-server/conninfo";
 import { ADSB_CREDIT, NAVIGATION, POSTCODE_CREDITS, ROUTE_CREDIT } from "./credits.ts";
 import { providerKind, readConfig, type AppConfig } from "./config.ts";
 import { clientAllowed } from "./lan.ts";
+import { buildMap, maptilerTileUrl, pausedTileSvg } from "./map.ts";
 import { adsbUrl, postcodeUrl, readAircraft } from "./poll.ts";
 import { photoUrl, qrSvg, readPhoto } from "./photo.ts";
 import { readRoute, routeUrl } from "./route.ts";
@@ -70,6 +71,17 @@ export function createApp(deps: AppDeps): FlyoverApp {
       source: providerKind(config.positionProvider) === "adsb.lol" ? "adsb.lol" : null,
       detail: null,
       selection: "none",
+      map: centre
+        ? buildMap(
+            centre.lat,
+            centre.lon,
+            config.radiusMiles,
+            state === "unconfigured" || state === "lookup-failed" || state === "provider-off" || state === "refused"
+              ? []
+              : aircraft,
+            config.maptilerKey != null,
+          )
+        : null,
     };
   }
 
@@ -262,6 +274,29 @@ export function createApp(deps: AppDeps): FlyoverApp {
       return c.text("This display is only available on the home network.", 403);
     }
     await next();
+  });
+  app.get("/tiles/:z/:x/:file", async (c) => {
+    if (!config.maptilerKey) return c.text("Map tiles are not configured.", 404);
+    const z = Number(c.req.param("z"));
+    const x = Number(c.req.param("x"));
+    const y = Number(c.req.param("file").replace(/\.png$/, ""));
+    if (!Number.isInteger(z) || !Number.isInteger(x) || !Number.isInteger(y) || z < 0 || x < 0 || y < 0) {
+      return c.text("Bad tile.", 400);
+    }
+    const url = maptilerTileUrl(z, x, y, config.maptilerKey);
+    if (!url.startsWith("https://api.maptiler.com/")) return c.text("Refused tile host.", 502);
+    try {
+      const response = await deps.fetch(url, { headers: { accept: "image/png", "user-agent": USER_AGENT } });
+      if (!response.ok) {
+        return c.body(pausedTileSvg(), 200, { "content-type": "image/svg+xml; charset=utf-8" });
+      }
+      return c.body(await response.arrayBuffer(), 200, {
+        "content-type": response.headers.get("content-type") ?? "image/png",
+        "cache-control": "public, max-age=86400",
+      });
+    } catch {
+      return c.body(pausedTileSvg(), 200, { "content-type": "image/svg+xml; charset=utf-8" });
+    }
   });
   app.get("/api/snapshot", async (c) => c.json(await present(c.req.query("selected") ?? null)));
   app.get("/", async (c) =>

@@ -12,8 +12,8 @@ A map of the same set the list shows: home, the radius, and the aircraft. Select
 
 ## Story Breakdown
 
-- [ ] [US-01M73F1W: Show home, the radius, and the aircraft on a map](../stories/US-01M73F1W-show-home-the-radius-and-the-aircraft-on.md)
-- [ ] [US-01M73F6W: Keep the map and the list on the same aircraft](../stories/US-01M73F6W-keep-the-map-and-the-list-on-the.md)
+- [x] [US-01M73F1W: Show home, the radius, and the aircraft on a map](../stories/US-01M73F1W-show-home-the-radius-and-the-aircraft-on.md)
+- [x] [US-01M73F6W: Keep the map and the list on the same aircraft](../stories/US-01M73F6W-keep-the-map-and-the-list-on-the.md)
 
 ## Acceptance Criteria
 

@@ -71,9 +71,7 @@ describe("credited photos", () => {
     const expected = (await QRCode.toString(LINK, { type: "svg", margin: 0, errorCorrectionLevel: "M" }))
       .replace(/^<\?xml[^>]*>\s*/, "");
     expect(page).toContain(expected);
-    expect(page).toContain("<svg");
-    const withoutQr = page.replace(/<div class="qr">[\s\S]*<\/div>/, "");
-    expect(withoutQr).not.toContain("<svg");
+    expect(page).toMatch(/<div class="qr">\s*<svg/);
   });
 
   it("FFM-AC3 an empty photo list shows no image and no logo", async () => {
