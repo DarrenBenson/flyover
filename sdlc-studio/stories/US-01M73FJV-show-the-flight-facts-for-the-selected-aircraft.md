@@ -7,6 +7,8 @@
 > **Epic:** EP-01M73F6G
 > **Points:** 5
 > **Persona:** Samir Rahman
+> **Affects:** sdlc-studio/prd.md, tests/fixtures/flight-facts.json
+> **Depends on:** US-01M73FSQ
 
 ## User Story
 
@@ -16,15 +18,23 @@
 
 ## Acceptance Criteria
 
-- **AC1:** Given a selected aircraft whose enrichment is complete, when the detail is shown, then each of those fields is visible.
-  - **Verify:** manual Select a fully enriched fixture aircraft and read every required field.
+- **AC1:** Given a selected aircraft whose route lookup hit and whose position feed includes a type, when the detail is shown, then each required field is visible.
+  - **Verify:** manual Select a fully populated fixture aircraft and read every required field.
 - **AC2:** Given a selected aircraft whose route lookup missed, when the detail is shown, then origin and destination say unknown and no city is invented.
   - **Verify:** manual Select a fixture with no route and confirm origin and destination are unknown.
-- **AC3:** Given a home and an aircraft position, when distance and direction are shown, then they are computed from those two points rather than copied from an unrelated field.
+- **AC3:** Given a home centre and an aircraft position, when distance and direction are shown, then they are computed from those two points.
   - **Verify:** manual Compare the shown distance and bearing with a hand calculation from the fixture coordinates.
+- **AC4:** Given a position feed with no aircraft type, when the detail is shown, then type says unknown and Planebase is not called.
+  - **Verify:** manual Confirm the type line is unknown and the Planebase transport count stays zero.
+
+## Still needs
+
+- [PRD-OQ3](../prd.md#14-open-questions): the on-screen units for altitude, speed, and distance, and the default radius. The fields cannot be specified until that set is chosen.
+- Sequence after [US-01M73FSQ](US-01M73FSQ-show-route-and-airline-facts-without-storing-a.md), which is the route lookup.
 
 ## Revision History
 
 | Date | Author | Change |
 | --- | --- | --- |
 | 2026-11-10 | sdlc-studio | Created via `new` (deterministic) |
+| 2026-11-10 | sdlc-studio | Type comes from the position feed. Stays Draft on the unit question. |

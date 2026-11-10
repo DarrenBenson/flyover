@@ -8,7 +8,7 @@
 
 ## Summary
 
-The live view is something a household can leave full screen. One build is what devserver1, stagingserver, webserver1, and webserver2 run. A failed provider does not blank the screen. How traffic fails over is still an open question.
+The live view is something one household can leave full screen. One build is what devserver1, stagingserver, webserver1, and webserver2 run. webserver2 also needs the postcode in its own host config. A failed provider does not blank the screen. How traffic fails over is still an open question.
 
 ## Story Breakdown
 
@@ -27,3 +27,4 @@ The live view is something a household can leave full screen. One build is what 
 | Date | Author | Change |
 | --- | --- | --- |
 | 2026-11-10 | sdlc-studio | Created via `new` (deterministic) |
+| 2026-11-10 | sdlc-studio | webserver2 carries the postcode in host config. Cutover still open. |

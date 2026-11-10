@@ -1,0 +1,8 @@
+# House profile and secrets. Never the UK postcode, the resolved centre, or a provider key.
+.env
+.env.*
+*.local
+
+# Script caches from the vendored SDLC Studio tools.
+__pycache__/
+*.pyc

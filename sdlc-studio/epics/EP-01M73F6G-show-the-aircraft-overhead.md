@@ -8,7 +8,7 @@
 
 ## Summary
 
-The live list for one configured home: which aircraft are inside the radius, what is known about the selected one, and an honest empty or stale screen. Serves Ruth Okonkwo's glance and Samir Rahman's demand that unknown stays unknown.
+The live list for one house: which aircraft are inside the radius of the postcode centre, what is known about the selected one, and an honest empty or stale screen. Serves Ruth Okonkwo's glance and Samir Rahman's demand that unknown stays unknown.
 
 ## Story Breakdown
 
@@ -28,3 +28,4 @@ The live list for one configured home: which aircraft are inside the radius, wha
 | Date | Author | Change |
 | --- | --- | --- |
 | 2026-11-10 | sdlc-studio | Created via `new` (deterministic) |
+| 2026-11-10 | sdlc-studio | One house, postcode centre. |

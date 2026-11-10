@@ -20,7 +20,7 @@ Jordan wants a picture complete enough to act on: alerts when a flight is late, 
 
 ## Why we are not designing for them
 
-Serving those goals would require history, alerting, and a warranty about the feed. The position sources evaluated for v1 are hobby or research networks, or commercial contracts Flyover does not hold. A feature that looks operational will be used operationally. The Primary's screen stays a household glance.
+Serving those goals would require history, alerting, and a warranty about the feed. The owner's deployment is a personal non-commercial glance at one house. The position source for that glance is adsb.lol, not an operational contract. A feature that looks operational will be used operationally. The Primary's screen stays a household glance.
 
 ## Behaviours & Context
 

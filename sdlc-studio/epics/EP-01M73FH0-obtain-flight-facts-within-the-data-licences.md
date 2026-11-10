@@ -8,7 +8,7 @@
 
 ## Summary
 
-Position, route, and photo data come from providers the owner has explicitly enabled. A disabled provider is not called. Route rows are not published as a database. Photo bytes are not stored.
+Position data for this deployment comes from adsb.lol, and only when configuration names it. Route facts come from a live adsbdb lookup that is not stored. Photos come from Planespotters when configuration names them, with the credit and the path back. A disabled provider is not called.
 
 ## Story Breakdown
 
@@ -27,3 +27,4 @@ Position, route, and photo data come from providers the owner has explicitly ena
 | Date | Author | Change |
 | --- | --- | --- |
 | 2026-11-10 | sdlc-studio | Created via `new` (deterministic) |
+| 2026-11-10 | sdlc-studio | adsb.lol, live routes, credited photos. |

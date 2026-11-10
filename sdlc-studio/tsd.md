@@ -1,7 +1,7 @@
 # Test Strategy Document
 
 > **Project:** Flyover
-> **Version:** 0.1
+> **Version:** 0.2
 > **Last Updated:** 2026-11-10
 > **Owner:** QA seat. The named seat is provisional until the owner accepts the team (see the persona index).
 
@@ -9,25 +9,26 @@
 
 Flyover has no code and no tests. This document is the strategy a later build has to satisfy. It is not a report of a run.
 
-The product is a kiosk that must not lie about what is overhead, and a server that must not call a flight-data provider the configuration has not enabled. Those two failures are the ones the strategy is built around. A green unit suite that mocks the provider and never asserts the licence gate would be a false pass. A mocked provider test proves the code on Flyover's side of the socket. It does not prove the provider, the terms, or the live sky.
+The product is a kiosk for one house. It must not lie about what is overhead, it must not call a flight-data provider the configuration has not enabled, and it must not commit the UK postcode or the resolved centre. Those failures are the ones the strategy is built around. A green unit suite that mocks the provider and never asserts the licence gate, or never looks at the git tree, would be a false pass. A mocked provider test proves the code on Flyover's side of the socket. It does not prove the provider, the terms, or the live sky.
 
 Numbers below are the SDLC Studio defaults (unit 90, integration 85, end-to-end feature coverage 100). They are targets. Nothing has been measured.
 
 ## Test Objectives
 
-- The list and the map show the same aircraft, and only aircraft inside the configured radius.
-- Unknown flight facts stay unknown.
+- The list and the map show the same aircraft, and only aircraft inside the configured radius of the one house.
+- Unknown flight facts stay unknown. A route lookup miss stays unknown, and the route response is not written to disk.
 - Empty, stale, and provider-down are distinguishable on the screen.
-- A provider that is not enabled is not called.
-- Credentials and the home location do not appear in the client bundle, the repository, or the poll log.
-- Credits render for every enabled source.
+- A provider that is not enabled is not called. The enabled position provider in the owner's configuration is adsb.lol. A test that enables OpenSky or ADS-B Exchange fails, because those sources are ineligible for this deployment.
+- Credentials, the UK postcode, and the resolved coordinates do not appear in the client bundle, the git index, or the poll log.
+- Credits render for every enabled source, including the postcodes.io attribution when a centre is in use.
 - The screen states that the data is not for navigation.
 
 ## Scope
 
 ### In Scope
 
-- Display profile, radius filter, distance and direction.
+- Display profile: one UK postcode, one resolved centre, one radius.
+- Radius filter, distance and direction.
 - Snapshot list, selection, map agreement.
 - Enrichment and photo behaviour when the fixture says present, absent, or refused.
 - Stale and failure presentation.
@@ -36,6 +37,7 @@ Numbers below are the SDLC Studio defaults (unit 90, integration 85, end-to-end 
 
 ### Out of Scope
 
+- A second household, a second postcode, or a profile picker.
 - Certifying the upstream data. Flyover does not claim the feed is complete or correct.
 - Performance of adsb.lol, OpenSky, or anyone else. Their limits are constraints, not numbers Flyover's tests invent.
 - Radio reception, `dump1090`, and `readsb`.
@@ -87,6 +89,7 @@ No spec files exist. The matrix is the obligation, not a result.
 | Feature Area | Spec File | Test Count | Status |
 |--------------|-----------|------------|--------|
 | Home and radius | Not created | 0 | Not Started |
+| Postcode absent from git | Not created | 0 | Not Started |
 | Overhead list | Not created | 0 | Not Started |
 | Flight facts | Not created | 0 | Not Started |
 | Livery and photo credit | Not created | 0 | Not Started |
@@ -116,7 +119,7 @@ Do not load-test an upstream API.
 
 | Attribute | Value |
 |-----------|-------|
-| Scope | Secrets and the home location stay out of the client and the repo. Setup is not a world-writable route if PRD-OQ7 says it must be closed. Dependencies are reviewed when they exist |
+| Scope | Secrets, the UK postcode, and the resolved centre stay out of the client and the git index. The live view's exposure is not asserted until PRD-OQ7 says who may open it. Dependencies are reviewed when they exist |
 | Tools | Repository search in CI or in the pre-commit gate for known key patterns. A test that builds the client and fails if a configured secret string appears in the output. No secret value is stored in the test |
 
 ---
@@ -128,7 +131,7 @@ Do not load-test an upstream API.
 | Local | The author's machine | Not specified | Fixtures only |
 | Development | `devserver1` | Not specified by the owner | Fixtures, or a provider key the owner has chosen to use there |
 | Staging | `stagingserver` | Not specified by the owner | Same build as production. A real provider only if the terms allow a rehearsal |
-| Production | `webserver1`, with `webserver2` as failover | Not specified by the owner | The household profile, on the host, not in git |
+| Production | `webserver1`, with `webserver2` as failover | Not specified by the owner | The one household profile, in host config on that machine, not in git. `webserver2` carries the same class of config |
 
 No URL is invented here. When the owner names one, it is recorded in the decisions log, not guessed.
 
@@ -136,14 +139,25 @@ No URL is invented here. When the owner names one, it is recorded in the decisio
 
 ### Approach
 
-- Synthetic aircraft in fixtures: positions relative to a fictional home that is not anyone's house. A fixed point in the ocean is a reasonable fixture origin. Do not use the owner's home.
+- Synthetic aircraft in fixtures: positions relative to a fictional centre that is not anyone's house. A fixed point in the ocean is the fixture origin. The fixture postcode is the token `TEST-POSTCODE`, which is not a real UK postcode, and the stubbed lookup returns that ocean point. Do not use the owner's postcode, a real residential postcode, or the owner's coordinates.
 - One fixture with an aircraft inside the radius, one outside, one with no route, one with a photo credit, one with a provider error.
 - Clocks are injected. A stale test does not sleep for 60 seconds.
+- The route-lookup fixture returns a body and the test asserts no route file or route table was written.
 - Live smoke, if the owner runs it, uses the real profile on a server and is not committed as a cassette that contains that profile.
+
+### The postcode and the centre are not in git
+
+This is a required test, not a review note. [D0007](decisions.md).
+
+- `git ls-files` must not list `.env`, `.env.*`, or a tracked file whose path is host config for the house.
+- The repository `.gitignore` ignores `.env` and `.env.*`. The test fails if a later change stops ignoring them.
+- The test does not embed the owner's postcode or coordinates in source so that it knows what to search for. It fails if `git ls-files` lists `.env`, `.env.*`, or any tracked file under a host-config path. Documentation may discuss postcodes. The synthetic token `TEST-POSTCODE` may appear in a tracked fixture, because it is not a real postcode.
+- When the owner's real postcode and centre are present in the environment of a local run, the test also asserts those exact strings are absent from every tracked file. When they are absent, that extra assertion is skipped. A missing owner value does not fail the suite, and it is not replaced with a value written into the repo.
+- A poll-log test asserts the postcode and the centre are not on the info line. The log may carry a count and an age.
 
 ### Sensitive Data
 
-The home location is personal data. Tests use the fictional origin. Logs from a failed test must not dump the real profile. Provider keys are read from the environment on the owner's machine and are absent in CI until [TRD-OQ10](trd.md#12-open-technical-questions) says there is CI and how it gets a secret. A missing key skips the live smoke. It does not fail the fixture suite, and it does not get replaced with a key checked into the repo.
+The home postcode and the resolved centre are personal data. Tests use `TEST-POSTCODE` and the ocean fixture. Logs from a failed test must not dump the real profile. Provider keys are read from the environment on the owner's machine and are absent in CI until [TRD-OQ10](trd.md#12-open-technical-questions) says there is CI and how it gets a secret. A missing key skips the live smoke. It does not fail the fixture suite, and it does not get replaced with a key checked into the repo.
 
 ---
 
@@ -151,7 +165,8 @@ The home location is personal data. Tests use the fictional origin. Logs from a 
 
 ### Automation Candidates
 
-- Radius inclusion and ordering.
+- Radius inclusion and ordering, measured from the stubbed centre.
+- "The git index contains no `.env` and no host-config profile."
 - Distance and bearing against known points.
 - Stale threshold.
 - "Provider disabled means zero outbound calls" using a stub transport.
@@ -209,7 +224,7 @@ No pipeline is installed. The intended order, when the owner has a place to run 
 
 | Severity | Definition | SLA |
 | ---------- | ------------ | ----- |
-| Critical | The screen shows invented flight facts, hides a dead feed, or leaks a credential or the home location | Stop the production display until fixed. No numeric response time is promised |
+| Critical | The screen shows invented flight facts, hides a dead feed, calls OpenSky or ADS-B Exchange, stores a route row or a photo file, or leaks a credential, the postcode, or the centre | Stop the production display until fixed. No numeric response time is promised |
 | High | A must-have feature is wrong and there is no obvious way for the household to see that it is wrong | Next fix on `main` before the next production deploy |
 | Medium | A feature is impaired and the screen makes the impairment obvious | Backlog, ordered with the other stories |
 | Low | Copy, spacing, a credit wrapped awkwardly | Backlog |
@@ -241,7 +256,7 @@ tests/
   e2e/
 ```
 
-Fixtures contain no secrets and no real home. End-to-end tests start the server with the fixture transport. They do not read `webserver1`.
+Fixtures contain no secrets and no real postcode. End-to-end tests start the server with the fixture transport and the stubbed postcode lookup. They do not read `webserver1`.
 
 ---
 
@@ -256,3 +271,4 @@ Fixtures contain no secrets and no real home. End-to-end tests start the server 
 | Date | Author | Change |
 |------|--------|--------|
 | 2026-11-10 | Discovery draft | Initial strategy. No tests exist, so every count is zero. |
+| 2026-11-10 | Discovery draft | Added the git test for the UK postcode and the resolved centre. Named adsb.lol as the only position provider a fixture may enable for this deployment. |

@@ -6,22 +6,22 @@
 | --- | --- |
 | **Cast role** | Secondary |
 | **Role** | The person who installs the display and keeps it running |
-| **Context** | Puts the URL on a screen, sets the location, and does not want the house address or a provider key in git |
+| **Context** | Puts the URL on a screen in the one house, sets the UK postcode and the radius in the server environment, and does not want that postcode or a provider key in git |
 
 ## Who They Are
 
-Alex is who Flyover is handed to on the day it is installed. Alex may also be Ruth, but the job is different: choose a location, pick a radius, point a browser at the URL, and leave it. Alex cares that the credits are on the screen, that the software's MIT licence is not mistaken for a licence to the flight data, and that a failed server does not require a redesign. Alex is not asking for a control panel.
+Alex is who Flyover is handed to on the day it is installed, for this one house. Alex may also be Ruth, but the job is different: put the UK postcode and a radius in the server environment, point a browser at the URL, and leave it. Alex cares that the credits are on the screen, that the software's MIT licence is not mistaken for a licence to the flight data, and that a failed server does not require a redesign. Alex is not asking for a control panel, and not for a second house.
 
 ## End Goals
 
-1. Configure the location and the radius once, and have the live view keep using them.
-2. Run the display without putting a secret or the home location in the repository, and without hiding where the data came from.
+1. Configure the one UK postcode and the radius once, in host config, and have the live view keep using the resolved centre.
+2. Run the display without putting a secret, the postcode, or the centre in the repository, and without hiding where the data came from.
 3. Know which browser is the supported kiosk, and know the screen is not offering itself as a navigation tool.
 
 ## Experience Goals
 
 - Finished. Setup ends.
-- Not exposed. The location is not the first line of a log.
+- Not exposed. The postcode is not the first line of a log, and it is not in git.
 - Legitimate. The credits match the sources that are actually enabled.
 
 ## Behaviours & Context
@@ -32,10 +32,10 @@ Alex is who Flyover is handed to on the day it is installed. Alex may also be Ru
 
 ## Frustrations
 
-- A sample configuration that contains someone's real home, or a real key.
-- A dependency that seemed free and forbids a live display.
-- A failover plan that exists only as a hostname with no shared profile.
+- A sample configuration that contains a real postcode, a real centre, or a real key.
+- A dependency that seemed free and still forbids this live display. OpenSky is that case even though the project is non-commercial.
+- A failover plan that moves traffic and forgets to put the same postcode on `webserver2`.
 
 ## Scenario
 
-Alex sets the home coordinates and a radius, enables the one position provider the owner has accepted, and opens the URL in Chromium's kiosk mode. The credits name that provider. The navigation line is on the screen. The key is on the server, not in the page source. Alex stops. The screen keeps running.
+Alex sets the UK postcode and a radius in the server environment, enables adsb.lol, and opens the URL in Chromium's kiosk mode. The screen resolves the postcode through postcodes.io and shows that attribution. The credits name adsb.lol. The navigation line is on the screen. The postcode is on the server, not in the page source and not in git. Alex stops. The screen keeps running.

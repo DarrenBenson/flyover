@@ -66,13 +66,13 @@ section of `<skill>/reference-doctrine.md`.
 
 ## Project specifics
 
-- **Stack:** Not chosen. No application code yet. The TRD proposes one TypeScript process that serves the kiosk and calls flight-data APIs. That proposal is an open question for the owner (`sdlc-studio/trd.md`).
-- **Run / build / test:** None. Do not invent a toolchain or add application code until a story leaves Draft and its plan is approved. Targets live in `sdlc-studio/tsd.md`.
-- **Deploy & CI:** Requirements only. Development on `devserver1`, staging on `stagingserver`, production on `webserver1`, failover on `webserver2`. No CI provider, URL, IP, or cutover mechanism is specified. `release_strategy` is `trunk` (`sdlc-studio/.config.yaml`).
-- **Config & secrets:** Do not commit provider credentials, the home location, or host addresses. Operator config stays on the server. The MIT licence does not license upstream flight data.
+- **Stack:** Not chosen. No application code yet ([D0013](sdlc-studio/decisions.md)). The TRD proposes one TypeScript process. That proposal is [TRD-OQ1](sdlc-studio/trd.md).
+- **Run / build / test:** None. Do not invent a toolchain or add application code while TRD-OQ1 is open. Targets live in `sdlc-studio/tsd.md`. A later suite must prove the UK postcode and the resolved centre are not in git.
+- **Deploy & CI:** Requirements only. Development on `devserver1`, staging on `stagingserver`, production on `webserver1`, failover on `webserver2`. The postcode lives in host config on each serving machine, including `webserver2`. How traffic moves is still open. No CI provider, URL, IP, or cutover mechanism is specified. `release_strategy` is `trunk` (`sdlc-studio/.config.yaml`).
+- **Config & secrets:** Do not commit provider credentials, the UK postcode, the resolved centre, or host addresses. `.env` is gitignored. The MIT licence does not license upstream flight data, and this deployment's non-commercial eligibility does not travel to a commercial fork.
 - **Code style:** Discovery documents use British spelling, matching the SDLC Studio templates. No application style guide until there is code.
-- **Architecture & services:** See `sdlc-studio/trd.md`. One web app. A local ADS-B receiver is out of scope for v1.
-- **Gotchas:** OpenSky's terms block operational use of the REST API in a live product without a written licence. ADS-B Exchange's community API is non-commercial. adsbdb route data may not be copied into another database without permission. Do not copy another product's name, branding, or copy. The screen must not present the feed as suitable for navigation.
+- **Architecture & services:** See `sdlc-studio/trd.md`. One web app, one house. A local ADS-B receiver is out of scope for v1.
+- **Gotchas:** The default position provider is adsb.lol, and only when config names it. OpenSky's terms still block a live poll without a written licence, even for this non-commercial display. The ADS-B Exchange community and RapidAPI grant does not cover an always-on screen. adsbdb route data may be shown from a live lookup and must not be cached. Planespotters photos need a visible photographer credit and an obvious path back to the photo page, and the image bytes are not stored. Do not copy another product's name, branding, or copy. The screen must not present the feed as suitable for navigation.
 
 ## Don't
 

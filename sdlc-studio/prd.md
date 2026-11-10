@@ -1,7 +1,7 @@
 # Product Requirements Document
 
 **Project:** Flyover
-**Version:** 0.1
+**Version:** 0.2
 **Last Updated:** 2026-11-10
 **Status:** Draft
 
@@ -15,7 +15,7 @@ Flyover
 
 ### Purpose
 
-Flyover is a live display of aircraft currently flying over or near a configured home location. A person glances at a screen they already own and can tell which aircraft is there, where it is going, and how far away it is. The screen is a kiosk-mode browser. Version 1 gets its data from online flight-data APIs. It does not include a radio, a custom frame, or any other hardware.
+Flyover is a live display of aircraft currently flying over or near one house. A person glances at a screen they already own and can tell which aircraft is there, where it is going, and how far away it is. The house is configured by a UK postcode and a radius. The screen is a kiosk-mode browser. Version 1 gets its data from online flight-data APIs. It does not include a radio, a custom frame, or any other hardware. The owner's deployment is a personal, non-commercial hobby ([D0005](decisions.md)).
 
 The idea is in the same family as a framed Wi-Fi flight display that looks up traffic from a street address. Flyover is an independent MIT-licensed project. It does not use that product's name, branding, copy, or assets, and it is not affiliated with it. [HIGH]
 
@@ -37,11 +37,11 @@ People who live under a flight path can hear or see an aircraft and have no calm
 
 ### Target Users
 
-The design target is the person who lives with the screen (see [Ruth Okonkwo](personas/ruth-okonkwo.md)). Two other people shape v1 without getting their own interface: the household member who wants the identity of the aircraft to be right ([Samir Rahman](personas/samir-rahman.md)), and the person who sets the location and keeps the screen running ([Alex Brennan](personas/alex-brennan.md)). Flyover is explicitly not a tool for airline operations or navigation ([Jordan Hale](personas/jordan-hale.md)). [HIGH]
+The design target is the person who lives with the screen in that one house (see [Ruth Okonkwo](personas/ruth-okonkwo.md)). Two other people shape v1 without getting their own interface: the household member who wants the identity of the aircraft to be right ([Samir Rahman](personas/samir-rahman.md)), and the person who sets the postcode and keeps the screen running ([Alex Brennan](personas/alex-brennan.md)). Flyover is explicitly not a tool for airline operations or navigation ([Jordan Hale](personas/jordan-hale.md)). [HIGH]
 
 ### Context
 
-The owner will build and run Flyover on their own servers: `devserver1` for development, `stagingserver` for staging, `webserver1` for production, and `webserver2` as production failover. The display itself is a browser on whatever screen the household points at the URL. Version 1 is the API-backed web app only. [HIGH]
+The owner will build and run Flyover for one household on their own servers: `devserver1` for development, `stagingserver` for staging, `webserver1` for production, and `webserver2` as production failover. The display itself is a browser on whatever screen in that house points at the URL. Version 1 is the API-backed web app only. [HIGH]
 
 ---
 
@@ -58,7 +58,7 @@ The owner will build and run Flyover on their own servers: `devserver1` for deve
 
 | Feature | Description | Status | Priority | Location |
 |---------|-------------|--------|----------|----------|
-| Home and radius | One configured location and a radius around it | Not Started | Must | Setup |
+| Home and radius | One UK postcode, resolved to a centre, and a radius around it | Not Started | Must | Runtime config |
 | Overhead list | Aircraft inside the radius, nearest first | Not Started | Must | Display |
 | Flight facts | Airline, flight number, origin, destination, type, altitude, speed, distance, direction | Not Started | Must | Display |
 | Livery, narrowly | Airline name, and an optional attributed photo of the airframe. Not a copied logo | Not Started | Must | Display |
@@ -72,19 +72,20 @@ The owner will build and run Flyover on their own servers: `devserver1` for deve
 
 #### Home and radius
 
-**User Story:** As Alex, I want to set the home location and a radius once so that the screen watches the right patch of sky.
+**User Story:** As Alex, I want to set one UK postcode and a radius in the server environment so that the screen watches this house.
 
 **Serves:** Alex Brennan, Ruth Okonkwo
 
 **Acceptance Criteria:**
 
-- [ ] A display profile stores a latitude, a longitude, and a radius, and the live view uses that profile.
-- [ ] Changing the profile changes which aircraft qualify, without a code change.
-- [ ] The stored location is not written into the git repository.
+- [ ] The runtime config holds one UK postcode and a radius. The server resolves the postcode to a centre through postcodes.io and the live view uses that centre.
+- [ ] Changing the postcode or the radius changes which aircraft qualify, without a code change and without a second profile.
+- [ ] The postcode and the coordinates are not written into the git repository.
+- [ ] A failed lookup does not invent a centre. The required postcode attribution is on the screen.
 
-**Dependencies:** How the operator enters the location (coordinates, a one-shot address lookup, or both) is [PRD-OQ2](#14-open-questions).
+**Dependencies:** Decided. [D0006](decisions.md), [D0007](decisions.md), [D0008](decisions.md). The on-screen unit of the radius is still [PRD-OQ3](#14-open-questions). The filter itself does not wait on that choice.
 **Status:** Not Started
-**Confidence:** [HIGH] that a location and a radius are required. [LOW] on the entry method.
+**Confidence:** [HIGH]
 
 #### Overhead list
 
@@ -98,7 +99,7 @@ The owner will build and run Flyover on their own servers: `devserver1` for deve
 - [ ] The list is ordered by distance from home, nearest first.
 - [ ] The list updates from a successful position response without a manual refresh, and shows how old the data is.
 
-**Dependencies:** A position provider the owner has accepted. See the TRD.
+**Dependencies:** The default position provider for this deployment is adsb.lol ([D0009](decisions.md)). The list is still correct when that call is stubbed.
 **Status:** Not Started
 **Confidence:** [HIGH]
 
@@ -113,11 +114,11 @@ The owner will build and run Flyover on their own servers: `devserver1` for deve
 - [ ] The selected aircraft shows each of those fields when the data exists.
 - [ ] A field the providers do not know is shown as unknown. The app does not guess a route, a type, or an airline.
 - [ ] Distance and direction are computed from the home location and the aircraft position.
-- [ ] Altitude and speed use the units the profile selects. The default unit set is an open question ([PRD-OQ3](#14-open-questions)).
+- [ ] Altitude, speed, and distance use the units the profile selects. Which set is the default is still [PRD-OQ3](#14-open-questions), so this feature is not ready to build.
 
-**Dependencies:** Position feed plus a route and aircraft lookup whose terms allow this use.
+**Dependencies:** Position feed, plus the live adsbdb route lookup in [D0010](decisions.md). Aircraft type comes from the position feed when it has one. Planebase is not a source.
 **Status:** Not Started
-**Confidence:** [HIGH] on the field list. [MEDIUM] on which provider can legally supply each field.
+**Confidence:** [HIGH] on the field list. [MEDIUM] until the unit set is chosen.
 
 #### Livery, narrowly
 
@@ -128,12 +129,12 @@ The owner will build and run Flyover on their own servers: `devserver1` for deve
 **Acceptance Criteria:**
 
 - [ ] The airline is shown as a name.
-- [ ] If a photo is shown, the photographer is credited and the thumbnail links to the source page, and the image bytes are not copied onto Flyover's servers.
+- [ ] If a photo is shown, the photographer is named beside it and the way back to the Planespotters photo page is obvious. The image bytes are not copied onto Flyover's servers.
 - [ ] Airline logos and livery artwork are not copied into the product. A decorative colour that is not a trademarked mark is allowed only if the owner accepts that treatment ([PRD-OQ4](#14-open-questions)).
 
-**Dependencies:** A photo source with terms that allow this display. Logos are out of scope until a licence exists.
+**Dependencies:** [D0011](decisions.md). Photos stay off until configuration enables them. Logos stay out.
 **Status:** Not Started
-**Confidence:** [HIGH] that unlicensed logos are out. [MEDIUM] on the photo source.
+**Confidence:** [HIGH]
 
 #### Map
 
@@ -178,7 +179,7 @@ The owner will build and run Flyover on their own servers: `devserver1` for deve
 - [ ] The position provider, the route source, the photo credit, and the map credit are visible without reading the source code.
 - [ ] Credits follow the wording the source requires when that wording is known.
 
-**Dependencies:** The provider decision in the TRD.
+**Dependencies:** [D0008](decisions.md), [D0009](decisions.md), [D0010](decisions.md), and [D0011](decisions.md) name the credits. Map-tile credit waits on [TRD-OQ6](trd.md#12-open-technical-questions).
 **Status:** Not Started
 **Confidence:** [HIGH]
 
@@ -219,8 +220,8 @@ The owner will build and run Flyover on their own servers: `devserver1` for deve
 
 ### Core Behaviours
 
-1. One display profile: a location, a radius, and a unit preference. Version 1 does not require accounts. Whether one deployment holds one profile or several is [PRD-OQ1](#14-open-questions).
-2. On a timer, the server asks a position provider for aircraft in a box around the home and keeps those inside the radius.
+1. One display profile for one house: a UK postcode, the centre resolved from it, a radius, and a unit preference. Version 1 does not require accounts and does not hold a second household. [D0006](decisions.md).
+2. On a timer, the server asks the enabled position provider for aircraft in a box around that centre and keeps those inside the radius. The default provider to enable is adsb.lol ([D0009](decisions.md)). The call still does not happen until configuration names it ([D0003](decisions.md)).
 3. The screen lists them nearest-first and shows the flight facts for the selected one.
 4. The map shows the same set. Selection is shared.
 5. Enrichment (airline, flight number, origin, destination, type, photo) is best-effort and nullable. Failure of enrichment does not remove the aircraft from the list.
@@ -253,14 +254,14 @@ Proposed, and open under [PRD-OQ5](#14-open-questions): after a successful posit
 ### Security
 
 - Provider credentials never ship to the browser and never enter git.
-- The home location is personal data. It is operator configuration, not a sample file.
+- The UK postcode and the resolved coordinates are personal data. They live in runtime config or environment variables on the servers, including `webserver2`. They are not a sample file and they are not committed. [D0007](decisions.md), [D0012](decisions.md).
 - The browser talks to Flyover's server. It does not call upstream flight APIs with a key.
 - No analytics and no third-party tracker in v1.
 - Production transport security (TLS terminated on the owner's servers) is expected and the mechanism is an open question in the TRD.
 
 ### Scalability
 
-Version 1 is a small deployment the owner runs, not a multi-tenant public service. The design must not assume a fleet of servers beyond `webserver1` and `webserver2`. Load is one or a few kiosk browsers polling a cached snapshot, not one request per visitor to the upstream API. [HIGH] on the constraint. Whether "a few" means one household or several displays is [PRD-OQ1](#14-open-questions).
+Version 1 is one household the owner runs, not a multi-tenant public service and not several houses. The design must not assume a fleet of servers beyond `webserver1` and `webserver2`. Load is one or a few kiosk browsers in that house polling a cached snapshot, not one request per visitor to the upstream API. [HIGH]
 
 ### Availability
 
@@ -278,7 +279,7 @@ Not applicable. Flyover does not classify images, predict tracks, or call a mode
 
 ### Data Models
 
-- **Display profile.** Label, latitude, longitude, radius, unit set. One in v1 unless [PRD-OQ1](#14-open-questions) says otherwise.
+- **Display profile.** One UK postcode, the resolved latitude and longitude, a radius, and a unit set. One profile. [D0006](decisions.md). The unit set is still [PRD-OQ3](#14-open-questions).
 - **Aircraft snapshot.** Identifier, callsign, latitude, longitude, altitude, speed, heading, observed-at, source name. Ephemeral.
 - **Enrichment.** Airline name, flight number, origin, destination, aircraft type, registration. Each field independently present or unknown, with the source named.
 - **Photo reference.** Remote thumbnail URL, photographer, link to the source page, fetched-at. Not the image bytes.
@@ -297,21 +298,21 @@ Proposed in the TRD: the profile and a short-lived enrichment cache on the serve
 
 ### External Services
 
-Evaluated in the TRD, not selected here:
+Settled for this personal non-commercial deployment, with the licence detail in the TRD:
 
-- A live position feed (candidates include adsb.lol, OpenSky Network, ADS-B Exchange).
-- A route and aircraft lookup (candidate: adsbdb), if the terms allow display without building a second route database.
-- An aircraft photo source (candidate: Planespotters thumbnails), if the conditions can be met.
-- Map tiles from a provider that allows a kiosk, not the public OpenStreetMap tile servers.
-- An optional one-shot geocoder if address entry is in scope ([PRD-OQ2](#14-open-questions)).
+- Positions: adsb.lol is the default to enable ([D0009](decisions.md)). OpenSky and the ADS-B Exchange community and RapidAPI plans are ineligible for this display.
+- Routes: a live adsbdb lookup, shown and discarded ([D0010](decisions.md)). No route database.
+- Photos: Planespotters, only when configuration enables them and the API terms are met ([D0011](decisions.md)).
+- Map tiles from a provider that allows a kiosk, not the public OpenStreetMap tile servers. The host is still open.
+- Postcode centre: postcodes.io, once per loaded postcode ([D0008](decisions.md)).
 
 ### Authentication Methods
 
-No end-user accounts in the proposal. Whether the setup page is open on the network or gated by something the owner already runs is [PRD-OQ7](#14-open-questions). Upstream APIs use whatever that provider requires (anonymous, API key, or a written licence). Keys stay on the server.
+No end-user accounts. The postcode is not entered on a page that could be saved into git. It is host configuration. Who may open the live view is still [PRD-OQ7](#14-open-questions). Upstream calls use what that provider requires. Keys stay on the server. adsb.lol needs no key to start. OpenSky is not used.
 
 ### Third-Party Dependencies
 
-None are locked. The TRD lists the licence, rate-limit, attribution, and commercial-use risks for each candidate. Those risks are product risks: a provider that forbids a live product cannot be the default, however convenient the API is.
+The eligible set for this deployment is recorded in [D0008](decisions.md) through [D0011](decisions.md). A provider the terms do not allow for a personal non-commercial live display is not the default. A commercial fork does not inherit that set.
 
 ---
 
@@ -323,17 +324,20 @@ Names are illustrative. Nothing here is implemented, and no secret value belongs
 
 | Variable | Description | Required | Default |
 |----------|-------------|----------|---------|
-| Home latitude and longitude | The point the radius is measured from | Yes | None |
-| Radius | How far "near home" reaches | Yes | Unset until [PRD-OQ3](#14-open-questions) |
-| Position provider | Which feed is enabled | Yes | None enabled until the owner chooses |
-| Provider credential | Key or token, when the chosen provider needs one | When the provider requires it | None |
-| Photo and route toggles | Whether enrichment is attempted | No | Off until the terms are accepted |
+| UK postcode | The house. Resolved to a centre. Never committed | Yes | None |
+| Resolved centre | Latitude and longitude from postcodes.io, held with the postcode in host config | After a successful lookup | None. A failure does not invent one |
+| Radius | How far "near home" reaches | Yes | Unset until [PRD-OQ3](#14-open-questions) names a default. The value is required either way |
+| Position provider | Which feed is enabled | Yes | The deployment default to name is adsb.lol ([D0009](decisions.md)). A checkout with no config calls nobody |
+| Provider credential | Key or token, when the chosen provider needs one | When the provider requires it | None. adsb.lol does not need one to start |
+| Route lookup | Whether a live adsbdb lookup is attempted | No | Off until named. Results are not stored ([D0010](decisions.md)) |
+| Photos | Whether a Planespotters lookup is attempted | No | Off until named ([D0011](decisions.md)) |
 
 ### Feature Flags
 
-- Route enrichment: off until the route source's terms are accepted.
-- Photos: off until the photo source's terms are accepted.
+- Route enrichment: off until the host config names it. When on, the lookup is live and is not stored.
+- Photos: off until the host config names them.
 - Local ADS-B receiver: absent in v1. Not a flag yet.
+- A second household: absent. Not a flag.
 
 ---
 
@@ -349,13 +353,13 @@ The entire product.
 
 ### Technical Debt
 
-None yet. The debt to avoid is shipping a provider the terms do not allow, and storing a route database the route source forbids.
+None yet. The debt to avoid is calling OpenSky or ADS-B Exchange without a grant this deployment does not have, and storing a route row the route notice forbids.
 
 ---
 
 ## 11. Technical Debt Register
 
-No code, so no debt. The debt to avoid, recorded here so it is not only a test note: enabling a provider whose terms do not allow a live display, and storing route rows the route source forbids copying into another database.
+No code, so no debt. The debt to avoid, recorded here so it is not only a test note: calling OpenSky or the ADS-B Exchange community API for this kiosk, storing an adsbdb route row, writing a Planespotters image to disk, or committing the postcode.
 
 ---
 
@@ -370,23 +374,19 @@ No code, so no debt. The debt to avoid, recorded here so it is not only a test n
 ## 13. Recommendations
 
 1. Build the glanceable display for Ruth first. Samir's extra detail is one selection away, not a second product. Alex's installer needs are setup and credits, not a separate interface.
-2. Do not enable a position provider until the owner answers [PRD-OQ8](#14-open-questions) and the matching TRD question. OpenSky's published terms do not allow this live display without a written licence.
-3. Keep v1 to the API web app. Do not start a receiver, a frame, or a hardware BOM.
-4. Leave the stories in Draft until the provider and the stack questions are answered. They are a backlog, not a sprint commitment.
+2. Enable adsb.lol for positions when the host config is written. Do not enable OpenSky or the ADS-B Exchange community or RapidAPI plans for this display. [D0009](decisions.md).
+3. Keep v1 to the API web app for one house. Do not start a receiver, a frame, a hardware BOM, or a second household.
+4. Stories whose behaviour is now specified may be Ready. Stories that still need the unit set, the map host, or the failover mechanism stay Draft. Do not write application code while the stack question is open ([D0013](decisions.md)).
 
 ---
 
 ## 14. Open Questions
 
-These are for the owner. Recommendations sit in the TRD. Nothing in this list is decided. A resolution is promoted into the decisions log with `decisions.py promote --from PRD-OQn`. The question stays here.
+Resolved questions stay here with the decision that closed them. Open ones are still for the owner. A resolution is promoted into the decisions log with `decisions.py promote --from PRD-OQn`.
 
-- **PRD-OQ1:** Is one deployment one household (one profile), or several displays with their own locations on the same servers?
-  **Context:** It changes storage, setup, and whether failover must share a database.
-  **Options:** One profile per deployment. Several profiles, still private to the owner. A public signup service (this PRD assumes that is out of v1).
+- **PRD-OQ1:** Resolved by [D0006](decisions.md). One household, one house, one profile.
 
-- **PRD-OQ2:** How does the operator enter the location?
-  **Context:** Coordinates are precise and need no extra provider. A street address is what a household expects and needs a geocoder with its own terms.
-  **Options:** Coordinates only. Address lookup once at setup, result stored as coordinates. Both.
+- **PRD-OQ2:** Resolved by [D0007](decisions.md) and [D0008](decisions.md). One UK postcode in host config, converted by postcodes.io, plus a radius. Never committed.
 
 - **PRD-OQ3:** What is the default radius, and are the on-screen units aviation (feet, knots, nautical miles) or household (metres, kilometres per hour)?
   **Context:** The feeds speak in aviation units. The person glancing from the kitchen may not.
@@ -404,13 +404,11 @@ These are for the owner. Recommendations sit in the TRD. Nothing in this list is
   **Context:** The requirement is specified against current Chromium. Smart-TV browsers vary.
   **Options:** Chromium on the display device. A named TV browser. More than one, in which case each needs a check.
 
-- **PRD-OQ7:** Who can open the setup page and the live view?
-  **Context:** A kiosk URL on a home LAN is a different exposure from a URL on the public internet that reveals a home location.
+- **PRD-OQ7:** Who can open the live view?
+  **Context:** The postcode is host config, not a page. A kiosk URL on a home LAN is still a different exposure from a URL on the public internet, because the map shows where the house is.
   **Options:** Reachable only on the owner's network. A secret the owner provisions outside git. Something else the owner already uses. No sign-in, and the owner accepts the exposure.
 
-- **PRD-OQ8:** Will anyone besides the owner run this, including commercially?
-  **Context:** The code is MIT. Several candidate data sources forbid commercial use or any live product without a separate licence. The answer changes which provider is even eligible. Detail is in the TRD.
-  **Options:** Owner-operated, non-commercial. Anyone may run it, including commercially, so only sources that allow that are eligible. Decide per deployment.
+- **PRD-OQ8:** Resolved by [D0005](decisions.md). The owner's deployment is personal and non-commercial. A commercial fork is the forker's responsibility.
 
 ---
 
@@ -419,6 +417,7 @@ These are for the owner. Recommendations sit in the TRD. Nothing in this list is
 | Date | Version | Changes |
 |------|---------|---------|
 | 2026-11-10 | 0.1 | Initial draft from the product brief. No code to extract. |
+| 2026-11-10 | 0.2 | Owner answers: one house, UK postcode, personal non-commercial use. Multi-household scope removed. |
 
 ---
 

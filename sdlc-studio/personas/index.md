@@ -33,9 +33,9 @@ Discoveries, each marked with how it was settled:
 
 | Signal | Value | How settled |
 | --- | --- | --- |
-| Domain | Household live display of nearby aircraft | Inferred from the PRD |
+| Domain | One household, one UK postcode, a live display of nearby aircraft | Owner answer, D0006 and D0007 |
 | Stack | TypeScript monolith proposed, not accepted | Defaulted. TRD-OQ1 is open |
-| Risk class | Home location is personal data. Not money, not health, not a contractual uptime SLA | Defaulted. The question was not asked. Mapped to the privacy side of the PII class, with no health regime |
+| Risk class | The UK postcode and the resolved centre are personal data. Not money, not health, not a contractual uptime SLA | Owner answer, D0007. Mapped to the privacy side of the PII class, with no health regime |
 | Compliance | No sector regime declared. Minimise the location anyway | Defaulted. TRD-OQ8 is open |
 | Extra seats | Security added. A UX seat was folded into Product rather than added | Defaulted. Security is the strong signal (coordinates and provider keys). A fifth UX seat was not added |
 | Quality bar | Unit 90, integration 85, feature coverage 100 | Defaulted from the skill defaults |

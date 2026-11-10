@@ -1,7 +1,7 @@
 # Technical Requirements Document
 
 **Project:** Flyover
-**Version:** 0.1
+**Version:** 0.2
 **Status:** Draft
 **Last Updated:** 2026-11-10
 **PRD Reference:** [PRD](prd.md)
@@ -14,21 +14,23 @@ Terms below were read on 2026-11-10. They are not a legal opinion. The owner con
 
 ### Purpose
 
-Describe a v1 Flyover that a kiosk browser can run against the owner's servers, fed by online flight data, without pretending a provider has been chosen or a stack has been accepted.
+Describe a v1 Flyover that one household runs as a personal, non-commercial kiosk, fed by the providers the decisions log now allows, without pretending the stack or the failover mechanism has been accepted.
 
 ### Scope
 
-In scope: the shape of the web app, the provider options and the licence risks, the data the server may keep, and the environment and failover requirements for `devserver1`, `stagingserver`, `webserver1`, and `webserver2`.
+In scope: the shape of the web app, which providers this personal non-commercial deployment may use, the data the server may keep, the UK postcode profile, and the environment and failover requirements for `devserver1`, `stagingserver`, `webserver1`, and `webserver2`.
 
-Out of scope: application code, host addresses beyond those four names, credentials, a radio receiver, and any cutover mechanism the owner has not described.
+Out of scope: application code, a second household, host addresses beyond those four names, credentials, a radio receiver, and the traffic cutover the owner has not described.
 
 ### Key Decisions
 
-Only the decisions in [decisions.md](decisions.md) are accepted. Everything in the ADR section of this document is **Proposed**.
+Only the decisions in [decisions.md](decisions.md) are accepted. An ADR below is accepted only when a decision id says so.
 
-- v1 is the API web app. No extra hardware. (Accepted. See the decisions log.)
-- The software licence is MIT. Upstream data terms are not. (Accepted.)
-- One deployable web application, TypeScript, SQLite, and adsb.lol as the position source are **proposals**, gated on the open questions below.
+- v1 is the API web app for one house. No extra hardware. ([D0001](decisions.md), [D0006](decisions.md).)
+- The owner's use is personal and non-commercial. The software licence is MIT. Upstream data terms are not. A commercial fork re-clears every provider. ([D0003](decisions.md), [D0005](decisions.md).)
+- The default position provider for this deployment is adsb.lol. OpenSky and the ADS-B Exchange community and RapidAPI plans are ineligible. ([D0009](decisions.md).)
+- The profile is a UK postcode and a radius in host config on every serving machine, resolved through postcodes.io, never committed. ([D0007](decisions.md), [D0008](decisions.md), [D0012](decisions.md).)
+- One deployable web application and TypeScript remain **proposals**. [TRD-OQ1](#12-open-technical-questions). SQLite is not the profile store.
 
 ---
 
@@ -84,7 +86,7 @@ No paths exist yet. The names are the modules a later story would create.
 | Position adapter | One interface, one enabled implementation | Proposed | Record the source name on every snapshot. Do not call a second provider to fill gaps unless that provider is also explicitly enabled. |
 | Enrichment adapter | Airline, flight number, origin, destination, type | Proposed | A cache is not a republished route database. Unknown stays unknown. |
 | Photo adapter | Thumbnail URL, credit, link | Proposed | Do not store image bytes. Do not show a photo without the credit and the link. |
-| Operator config | Location, radius, secrets | On the host, outside git | No secret and no home coordinate in the repository. |
+| Operator config | UK postcode, resolved centre, radius, secrets | Runtime config or environment on each serving host, outside git | No secret, no postcode, and no home coordinate in the repository. |
 
 ---
 
@@ -96,7 +98,7 @@ No paths exist yet. The names are the modules a later story would create.
 | ---------- | ----------- | --------- | ----------- |
 | Language | TypeScript | Not pinned | The UI is the product, and the server must share types with it for the snapshot and the profile. Proposed, not accepted. [TRD-OQ1](#12-open-technical-questions). |
 | Framework | Not chosen | — | A Vite-built UI served by one small HTTP server (Hono or Fastify are the candidates) keeps a kiosk from taking on a document-site framework. Next.js is the other web-app default in the architecture guide and remains an option. |
-| Database | SQLite | Not pinned | The profile is small and the deployment is a single host. PostgreSQL is the usual production default and is not justified until more than one host must read the same profiles. Failover may change this. [TRD-OQ2](#12-open-technical-questions). |
+| Database | None for the profile | — | The profile is host config on each server ([D0012](decisions.md)). Route rows are not stored ([D0010](decisions.md)). A database, if a later story needs one, waits on the stack question. |
 
 Python with FastAPI is the other recommended web-app server. It was not proposed as the default because the kiosk UI would then be a second language and a second build. That trade is the owner's if they prefer Python. Familiarity alone is not the reason for TypeScript. The reason is one language across the only two parts v1 has.
 
@@ -163,11 +165,10 @@ Provider failures are not this error. A dead upstream is a successful snapshot r
 
 | Field | Type | Constraints | Description |
 |-------|------|-------------|-------------|
-| id | text | Primary key | One row until PRD-OQ1 says otherwise |
-| label | text | Optional | What the household calls this screen |
-| latitude | number | -90 to 90 | Home |
-| longitude | number | -180 to 180 | Home |
-| radius_m | number | Greater than 0 | Great-circle radius |
+| postcode | text | One UK postcode | The house. Personal data. Host config only |
+| latitude | number | -90 to 90 | Centre from postcodes.io. Not invented if the lookup fails |
+| longitude | number | -180 to 180 | Centre from postcodes.io |
+| radius_m | number | Greater than 0 | Great-circle radius. The on-screen unit is PRD-OQ3. The filter can compare metres without that label |
 | units | text | An allowed set | Open which set. PRD-OQ3 |
 
 #### Aircraft snapshot
@@ -194,16 +195,17 @@ Not stored as history. The server keeps the latest poll.
 | fetched_at | timestamp | Required | So a stale row can be dropped |
 | source | text | Required | Which lookup |
 
-This cache exists to avoid repeat lookups. It is not a database of routes offered to anyone else. If the source forbids incorporation into another database, the cache is either not written or is written only for the duration the source allows, and it is never exported. That condition is [TRD-OQ5](#12-open-technical-questions).
+Route rows are not this cache. [D0010](decisions.md) discards the adsbdb response after the screen has used it. A Planespotters JSON body may be kept in memory for at most 24 hours ([D0011](decisions.md)) and is not a photo file. Planebase aircraft rows are not cached because those terms were not read.
 
 ### Storage Strategy
 
 | Data Type | Storage | Rationale |
 |-----------|---------|-----------|
-| Profile | SQLite on the host, proposed | Small, one writer, no extra service |
+| Profile | Runtime config or environment on each serving host | [D0012](decisions.md). `webserver2` has its own copy. Not in git |
 | Latest poll | Process memory | A history is a different product and a different licence question |
-| Enrichment | SQLite with a TTL, proposed | Cuts repeat calls. Must not become a published route dump |
-| Photo bytes | Not stored | The thumbnail is loaded from the source URL |
+| Route lookup | Not stored | [D0010](decisions.md). Shown, then discarded |
+| Photo JSON | Memory, at most 24 hours | [D0011](decisions.md). Not the image bytes |
+| Photo bytes | Not stored | The display loads the thumbnail URL itself |
 | Secrets | Host environment or a file outside the repo | Never in git |
 
 ### Migrations
@@ -216,20 +218,20 @@ None until there is a schema. When there is one, migrations ship with the same b
 
 ### External Services
 
-Read on 2026-11-10. "Eligible" means the published terms do not obviously forbid a live display. It is not permission. The owner still accepts the source.
+Re-read on 2026-11-10 against a personal, non-commercial, one-house deployment ([D0005](decisions.md)). "Eligible" means the published terms allow that use. It is not a grant to a commercial fork. A fork used commercially re-clears every row itself.
 
-| Service | Purpose | Protocol | Auth | Licence and limits, as read | Commercial / live use | Attribution |
-|---------|---------|----------|------|-----------------------------|------------------------|-------------|
-| [adsb.lol API](https://www.adsb.lol/docs/open-data/api) | Live positions | HTTPS JSON, base `https://api.adsb.lol` | Optional key. The API repository says a key may later be required and is obtained by feeding | Data and API under the Open Database Licence 1.0, stated on the docs page and in the API service description. ODbL allows commercial use. Share-alike applies to a publicly used derivative database, not to merely showing a produced work. Rate limits are dynamic with load. No fixed number is published. The API description asks production users to make contact so a change does not break the application | Best fit of the sources read, for an MIT app someone besides the owner might run. Still a risk: the project can change the API, and production use is "please contact", not a contract | ODbL attribution. Credit adsb.lol and keep the licence notice |
-| [OpenSky Network](https://opensky-network.org/about/terms-of-use) | Live positions | REST, documented at the [REST API manual](https://openskynetwork.github.io/opensky-api/rest.html) | Anonymous by IP, or an account. Anonymous is current data only, 10-second resolution | Anonymous quota 400 credits per day for each of `/states`, `/tracks`, and `/flights`. A `/states/all` box of at most 25 square degrees costs 1 credit. Global costs 4. Exhaustion is HTTP 429 with `X-Rate-Limit-Retry-After-Seconds`. Standard account 4,000 credits per day. Active feeder 8,000. The terms grant use for non-profit research and education | **Not eligible for this product without a written licence.** The terms require a written licence for any commercial or for-profit use, and for operational REST API use in any live product, service, or automated system, including by a non-profit. A kiosk that polls OpenSky is that operational use | If a licence is obtained, publications cite Schäfer et al., IPSN 2014, and opensky-network.org, as the terms specify |
-| [ADS-B Exchange](https://www.adsbexchange.com/community/developer-hub/) community / RapidAPI | Live positions | REST via RapidAPI | API key | The RapidAPI listing's licence, as retrieved 2026-11-10, allows personal non-commercial research, non-profit education, or non-production internal testing. Redistribution, resale, and sublicensing are prohibited. The developer hub describes a personal-use plan and enterprise products. Enterprise pricing is not published. Re-check any price before relying on it | Community and personal-use plans are **not eligible** for a customer-facing or commercial deployment. Enterprise is a commercial contract the owner would have to request | As the contract requires. Not assumed |
-| [adsbdb](https://www.adsbdb.com/) | Airline, route, aircraft type | HTTPS JSON `https://api.adsbdb.com/v0/` | None for reads | The site says the flight-route data is the work of David Taylor and Jim Mason and **may not be copied, published, or incorporated into other databases** without David J Taylor's permission. Rate limit, from the same page: in a rolling 60 seconds, 512 or more requests are blocked for 60 seconds, and 1,024 or more for 300 seconds. Aircraft photos on that API are credited to airport-data, whose terms were **not** read. Do not use those photo URLs until they are | Display of a looked-up route may be allowed and a stored route database may not. Treat a durable cache as the risky case. [TRD-OQ5](#12-open-technical-questions) | Credit the route authors and adsbdb if the owner is allowed to use the data |
-| [Planespotters](https://www.planespotters.net/legal/termsofuse) | Airframe photo | The public photo API page (`/photo/api`) returned an error on 2026-11-10 and was **not** read | Unknown until that page is read | The terms of use forbid copying or publishing photos without the author's permission, and they say thumbnails supplied to partner sites carry the author credit and a link back to the photo. Integrator write-ups describe a keyless thumbnail API, a ban on re-hosting, and a 24-hour cap on caching the JSON. Those write-ups are not the terms. [TRD-OQ7](#12-open-technical-questions) | Do not enable photos until the API conditions are read from Planespotters. A photo behind a paywall would violate the "freely accessible" condition integrators report, so v1 must not put photos behind a login even if the rest of the app gains one | Photographer name and a link, if photos are enabled |
-| Map tiles | Basemap | HTTPS tiles or a vector style | Depends on the host | The OpenStreetMap Foundation's public tile servers are operated for light, human use of the project, not for a kiosk that loads tiles all day. Flyover must not point a kiosk at `tile.openstreetmap.org` | Use a provider or a self-hosted style the owner is allowed to hammer. [TRD-OQ6](#12-open-technical-questions) | Whatever that host requires. OpenStreetMap data itself is ODbL |
-| Geocoder | One-shot address to coordinates, only if PRD-OQ2 asks for it | HTTPS | None assumed | Not selected. A public Nominatim instance has a usage policy of its own. One lookup at setup is a different load from the position poll | Out of the live loop | As that service requires |
-| Local `dump1090` / `readsb` | Positions from a receiver in the house | Not in v1 | — | Future adapter only. Named so the position interface does not assume a single HTTP vendor forever | The owner's own receiver is their data. Out of scope for this version | Not applicable in v1 |
+| Service | Purpose | Protocol | Auth | What the terms say for this use | Verdict for the owner's deployment | Attribution |
+|---------|---------|----------|------|--------------------------------|------------------------------------|-------------|
+| [adsb.lol API](https://www.adsb.lol/docs/open-data/api) | Live positions | HTTPS JSON, base `https://api.adsb.lol` | Optional key. A key may later be required and is obtained by feeding | ODbL 1.0, stated on the docs page. ODbL allows the screen to show a produced work. Share-alike applies to a publicly used derivative database, not to the kiosk picture. Rate limits are dynamic. No fixed number is published. Production users are asked to make contact | **Eligible. This is the default position provider** ([D0009](decisions.md)). Configuration must still name it before a call. It is a volunteer service and can change or go away | ODbL attribution. Credit adsb.lol and keep the licence notice |
+| [OpenSky Network](https://opensky-network.org/about/terms-of-use) | Live positions | REST, documented at the [REST API manual](https://openskynetwork.github.io/opensky-api/rest.html) | Anonymous by IP, or an account. Anonymous is current data only, 10-second resolution | The terms grant non-profit research and non-profit education only. They require a previous written licence for operational REST API use in any live product, service, or automated system, even for a non-profit. Anonymous quota remains 400 credits per day for `/states`. A small box costs 1 credit | **Ineligible, including for this non-commercial live display.** A kiosk that polls OpenSky is the operational use the terms name. Non-commercial does not remove the written-licence requirement. Do not enable it | Not used. If a written licence is later obtained, cite Schäfer et al., IPSN 2014, and opensky-network.org |
+| [ADS-B Exchange](https://www.adsbexchange.com/community/developer-hub/) community / RapidAPI | Live positions | REST via RapidAPI | API key. The developer hub describes a personal-use plan at a price that was not re-copied here | The RapidAPI licence grant, retrieved 2026-11-10, is personal non-commercial research, non-profit education, or commercial internal testing that is non-production, time-limited, and not customer-facing. Redistribution, resale, and sublicensing are prohibited. Marketing on the developer hub calls the same API suitable for hobby projects. That sentence is not the grant | **Ineligible for an always-on display.** A household kiosk is not research, not education, and not time-limited non-production testing. The marketing line does not widen the grant. Enterprise would be a separate contract this project does not hold | Not used |
+| [adsbdb](https://www.adsbdb.com/) | Airline, flight number, origin, destination | HTTPS JSON `https://api.adsbdb.com/v0/` | None for reads | Route data is the work of David Taylor and Jim Mason and may not be copied, published, or incorporated into other databases without David J Taylor's permission. Non-commercial use does not lift that notice. In a rolling 60 seconds, 512 or more requests are blocked for 60 seconds, and 1,024 or more for 300 seconds. Aircraft data on the same site is credited to Planebase. Those terms were not read. airport-data photos were not read | **Eligible only as a live lookup that is shown and discarded** ([D0010](decisions.md)). **Ineligible as a cache or a route database.** Planebase and airport-data are not sources | Credit David Taylor, Jim Mason, and adsbdb on the screen when a route is shown |
+| [Planespotters photo API](https://www.planespotters.net/photo/api) | Airframe photo | HTTPS JSON `https://api.planespotters.net/pub/photos/hex/{hex}` or `/reg/{registration}` | None. Free and keyless | The API page loaded on the second read, 2026-11-10. Visible photographer credit. An obvious path to the returned `link` URL: a plain anchor without `rel="nofollow"` on a clickable browser, or a QR code or NFC tag on a display that cannot be clicked. The URL as text does not qualify. The display fetches thumbnail URLs unchanged. No storing, re-hosting, or proxying of image bytes. JSON cache at most 24 hours. Server-side calls need a descriptive User-Agent with a contact URL or email. Not for training models. Not for resale as an API | **Eligible when those conditions are met, and off until configuration enables it** ([D0011](decisions.md)). Personal non-commercial use adds no extra right. A commercial fork must meet the same page itself | Photographer name beside the image, and the path back to the photo page |
+| [postcodes.io](https://postcodes.io/docs/licences/) | UK postcode to a centre, once when the postcode is loaded | HTTPS JSON | None | Software is MIT. Great Britain postcode data is OS OpenData. The licences page requires the Ordnance Survey, Royal Mail, National Statistics, and NRS attribution statements (copyright year 2025 on the page read). Northern Ireland postcodes beginning BT are free for non-commercial use under the ONSPD terms. Commercial use of BT data needs a licence from NI Land & Property Services | **Eligible for this deployment**, including a BT postcode, because the owner's use is non-commercial ([D0008](decisions.md)). Do not download the postcode directory into the repo. A commercial fork that resolves BT postcodes needs the LPS licence. One lookup, not a poll | The four attribution lines from the licences page, on the screen |
+| Map tiles | Basemap | HTTPS tiles or a vector style | Depends on the host | The OpenStreetMap Foundation's public tile servers are for light, human use of the project, not for a kiosk that loads tiles all day. Flyover must not point a kiosk at `tile.openstreetmap.org` | **No host selected.** [TRD-OQ6](#12-open-technical-questions) | Whatever that host requires. OpenStreetMap data itself is ODbL |
+| Local `dump1090` / `readsb` | Positions from a receiver in the house | Not in v1 | — | Future adapter only | Out of scope for this version | Not applicable in v1 |
 
-Other commercial flight APIs exist. Prices were not copied from third-party roundups. If the owner wants a contracted feed, that is a procurement choice, not a default.
+No other flight API is a candidate. A contracted feed would be a new decision.
 
 ### Event Architecture
 
@@ -237,14 +239,16 @@ None. The server polls. The kiosk polls the server, or the server pushes over on
 
 ### Risks, called out together
 
-1. **OpenSky looks free and is the wrong default.** Operational use of the REST API in a live product needs a written licence even for a non-profit. Using it in Flyover without that licence is a licence breach, not a technical shortcut.
-2. **ADS-B Exchange community data is non-commercial.** An MIT repository that anyone can run is an awkward fit for a personal-use-only feed.
-3. **adsb.lol is the least-restricted position source read so far, and it is still a single volunteer service** with dynamic limits and a request that production users make contact. It can go away or start requiring a feed.
-4. **ODbL share-alike is about databases, not about the screen.** Publishing a derived position or route database would obligate that database's licence. v1 does not publish one. A later "export tracks" feature would reopen this.
-5. **adsbdb routes cannot be poured into another database** without permission. A convenient SQLite of every callsign seen is the thing the notice forbids.
-6. **Photos are other people's copyright.** Re-hosting them, dropping the credit, or putting them behind a paywall are the failures.
-7. **The home location leaks by the query.** A tight bounding box sent to a third party is close to the address. The server should query a box no tighter than it needs, and it should not log the profile at info level on every poll.
-8. **MIT does not flow upstream.** README and the about-credits on the screen have to say so.
+1. **OpenSky stays ineligible.** Operational use of the REST API in a live product needs a written licence even when the operator is non-commercial. Using it here is a licence breach.
+2. **ADS-B Exchange's community grant is research, education, or time-limited testing.** An always-on hobby screen does not fit that grant, however non-commercial it is. The developer-hub hobby sentence is not the licence.
+3. **adsb.lol is the default and it is still one volunteer service** with dynamic limits. The owner should tell the project before a production kiosk depends on it. It can go away.
+4. **ODbL share-alike is about a database, not about the screen.** Publishing derived positions would obligate that database's licence. v1 does not publish one.
+5. **adsbdb routes cannot be cached.** Personal use does not create permission to copy them into another database. The allowed shape is show, then discard.
+6. **Photos are other people's copyright.** The API page allows a credited thumbnail with an obvious path back. Re-hosting, dropping the credit, or hiding the link fails the terms.
+7. **The postcode is the household.** It and the centre stay in host config. A tight bounding box sent upstream is close to the house. Do not log the postcode or the centre on the poll path. Do not commit either.
+8. **MIT does not flow upstream, and this eligibility set does not flow to a fork.** README and the credits on the screen have to say so. A commercial fork is the forker's responsibility ([D0005](decisions.md)).
+9. **postcodes.io is a lookup, not a directory we own.** Vendor the centre for this one house in host config after a successful lookup. Do not vendor the national file.
+
 
 ---
 
@@ -274,7 +278,7 @@ Requirements, not a design:
 - `webserver2` can serve the same Flyover build `webserver1` serves.
 - When `webserver1` is unavailable, the display is reachable via `webserver2` without a code change.
 - Failover does not require a position archive. Losing the in-memory poll means the next poll refills the screen.
-- The profile must exist on the host that serves traffic. If the profile lives only on `webserver1`'s disk, `webserver2` cannot fail over. That is why [TRD-OQ2](#12-open-technical-questions) is open.
+- The profile is runtime config on the host that serves traffic ([D0012](decisions.md)). `webserver2` has the postcode, the centre, and the radius in its own environment. It does not read a database on `webserver1`.
 - How traffic moves (DNS, a proxy the owner already has, or a manual change) is [TRD-OQ3](#12-open-technical-questions). This document does not pick one.
 
 ### Scaling Strategy
@@ -290,10 +294,10 @@ Vertical, in the trivial sense: one process on one host is enough for a handful 
 | Threat | Likelihood | Impact | Mitigation |
 |--------|-----------|--------|------------|
 | Provider key committed or sent to the browser | Medium if someone is careless | High. The key is the quota, and sometimes the licence | Keys only in host config. Browser talks to Flyover. Review any client bundle for the key |
-| Home location in logs, backups, or a too-tight upstream box | Medium | High. It is the household's address | Do not log the profile on the poll path. Query a box, not a street. No location in git |
-| Unauthenticated setup on the public internet | Unknown until PRD-OQ7 | High. Anyone could retarget the display or read the location | Setup write is not exposed until the owner says who may call it |
+| Home postcode or centre in git, logs, or a too-tight upstream box | Medium | High. It is the household | Do not log the postcode or the centre on the poll path. Query a box, not the postcode. No postcode and no coordinate in git |
+| Unauthenticated live view on the public internet | Unknown until PRD-OQ7 | High. The map shows where the house is | The postcode is not a web form. Who may open the live view is still open |
 | Stale or empty feed shown as live | High, because feeds fail | Medium. The household trusts a lie | Age on screen. Distinct empty, stale, and down states. PRD feature "Honest emptiness" |
-| Photo or route used outside its terms | Medium | High, legally | Providers off until enabled. Photo bytes not stored. Route cache policy follows TRD-OQ5 |
+| Photo or route used outside its terms | Medium | High, legally | Routes are not stored ([D0010](decisions.md)). Photo bytes are not stored ([D0011](decisions.md)). OpenSky and ADS-B Exchange are not enabled |
 | Treating the screen as navigation | Low technically, high if the copy is casual | High | The not-for-navigation statement is a requirement, not a footer afterthought |
 
 ### Security Controls
@@ -301,7 +305,7 @@ Vertical, in the trivial sense: one process on one host is enough for a handful 
 | Control | Implementation |
 | --------- | ---------------- |
 | Authentication | No end-user account proposed. Upstream auth stays on the server. Setup exposure is an open question |
-| Authorisation | One operator. No roles until there is more than one profile with different people |
+| Authorisation | One operator, one house. No roles and no second profile |
 | Encryption at rest | Not specified. The profile is a location. Disk encryption of the host, if any, is the owner's existing practice and is not invented here |
 | Encryption in transit | The kiosk should reach Flyover over HTTPS in production. Where TLS terminates is [TRD-OQ9](#12-open-technical-questions). Upstream calls are HTTPS |
 
@@ -341,26 +345,26 @@ Proposed. Not accepted. Accepting one is an owner decision, recorded with `decis
 - Positive: Failover copies one build. One test suite. Credentials stay in one place.
 - Negative: The UI and the poller ship together even when only one changed.
 
-### ADR-002: No position provider is enabled by default
+### ADR-002: adsb.lol is the position provider, and nothing calls until config names it
 
-**Status:** Proposed
+**Status:** Accepted ([D0009](decisions.md), [D0003](decisions.md))
 
-**Context:** The eligible sources do not agree. OpenSky's terms forbid this use without a written licence. ADS-B Exchange's community terms are non-commercial. adsb.lol is ODbL and asks production users to make contact.
+**Context:** Re-assessed for personal non-commercial use. OpenSky still needs a written licence for a live poll. The ADS-B Exchange community grant does not cover an always-on display. adsb.lol is ODbL.
 
-**Decision:** The adapter interface exists. The configuration must name the provider before any call is made. The recommendation, if the owner wants a source that permits a live open-source display, is adsb.lol, after the owner contacts the project. It is not a silent default.
+**Decision:** The owner's deployment enables adsb.lol. The configuration must name it before any call. OpenSky and the ADS-B Exchange community and RapidAPI plans are not enabled. A fresh checkout with no config calls nobody.
 
 **Consequences:**
 
-- Positive: The app cannot boot into a licence breach.
-- Negative: A fresh checkout shows no aircraft until the owner chooses.
+- Positive: The default is a source the terms allow for this use. The app cannot boot into OpenSky.
+- Negative: adsb.lol is a volunteer service. A commercial fork must make its own choice.
 
 ### ADR-003: Do not store a position history in v1
 
 **Status:** Proposed
 
-**Context:** A trail is attractive and turns the server into a database of movements. ODbL share-alike and retention both get sharper once that database is kept or published.
+**Context:** A trail is attractive and turns the server into a database of movements. ODbL share-alike and retention both get sharper once that database is kept or published. Route rows are already forbidden as a store by [D0010](decisions.md).
 
-**Decision:** Keep the latest poll in memory. Enrichment cache is keyed and expired, and is not an export.
+**Decision:** Keep the latest poll in memory. Do not write route rows at all. A Planespotters JSON body may sit in memory for at most 24 hours and is not an export.
 
 **Consequences:**
 
@@ -380,50 +384,49 @@ Proposed. Not accepted. Accepting one is an owner decision, recorded with `decis
 - Positive: Keys and the tightest query stay on the server.
 - Negative: The server must be up for the screen to be up. That is already true of the hosting plan.
 
-### ADR-005: SQLite until failover needs a shared profile
+### ADR-005: The profile is host config, not a database
 
-**Status:** Proposed
+**Status:** Accepted ([D0012](decisions.md)). Supersedes the SQLite-profile proposal.
 
-**Context:** One host, one profile, no transactions across services. PostgreSQL would be another thing `webserver2` must reach.
+**Context:** One house, one postcode. `webserver2` must serve that same house when `webserver1` cannot. A SQLite file on one disk does not do that. The owner required the postcode and the coordinates to live in runtime config.
 
-**Decision:** SQLite for the profile and the enrichment TTL, on the host that serves. If failover requires the profile to exist on both hosts, either the profile is deployed with the config (not in git) or the owner names a store both hosts can read. Do not introduce PostgreSQL speculatively.
+**Decision:** The postcode, the resolved centre, and the radius are environment or runtime config on every serving host. They are not in git and not in SQLite. Do not add PostgreSQL for the profile.
 
 **Consequences:**
 
-- Positive: No database service to operate.
-- Negative: Two disks do not share a SQLite file. [TRD-OQ2](#12-open-technical-questions) remains open.
+- Positive: Failover of the profile is "the same env exists on `webserver2`". No database service.
+- Negative: Someone must place that env on each host. How the browser's traffic moves is still [TRD-OQ3](#12-open-technical-questions).
 
 ---
 
 ## 12. Open Technical Questions
 
 - [ ] **TRD-OQ1:** Accept TypeScript as one process (UI plus server), or name another stack?
-  **Context:** The proposal is one language because the UI and the poller share a snapshot type. Python plus a separate UI is the main alternative. No application code should be written until this is answered.
+  **Context:** The proposal is one language because the UI and the poller share a snapshot type. Python plus a separate UI is the main alternative. No application code is written until this is answered ([D0013](decisions.md)).
 
-- [ ] **TRD-OQ2:** Where does the display profile live so that `webserver2` can serve it when `webserver1` cannot?
-  **Context:** SQLite on one disk does not fail over. A profile shipped as host config (still outside git) might. A shared database might. This document does not invent the mechanism.
+- [x] **TRD-OQ2:** Where does the display profile live so that `webserver2` can serve it when `webserver1` cannot?
+  **Resolved by [D0012](decisions.md).** Runtime config or environment variables on each serving host, including `webserver2`. Not in git. Not only on `webserver1`.
 
 - [ ] **TRD-OQ3:** How does traffic move from `webserver1` to `webserver2`?
-  **Context:** DNS, an existing proxy, or a manual step are all possible. None is documented by the owner. No IP or hostname beyond the four server names is known.
+  **Context:** DNS, an existing proxy, or a manual step are all possible. None is documented by the owner. No IP or hostname beyond the four server names is known. The profile location is decided. The cutover is not.
 
-- [ ] **TRD-OQ4:** Which position provider, if any, will the owner enable?
-  **Context:** Recommendation is adsb.lol after contact, and only if [PRD-OQ8](prd.md#14-open-questions) allows that licence. OpenSky requires a written licence for this use. ADS-B Exchange community data does not cover a commercial or customer-facing deployment.
-  **Options:** adsb.lol. OpenSky with a written licence. ADS-B Exchange enterprise. Another contracted feed. None until later.
+- [x] **TRD-OQ4:** Which position provider will this deployment enable?
+  **Resolved by [D0009](decisions.md).** adsb.lol. OpenSky remains ineligible without a written licence, including for a non-commercial live display. The ADS-B Exchange community and RapidAPI plans remain ineligible for an always-on display.
 
-- [ ] **TRD-OQ5:** May Flyover cache adsbdb route rows long enough to display them, or is permission from David J Taylor required first?
-  **Context:** The site forbids copying the routes into another database without permission. A TTL cache for display is the grey edge. Do not enable route enrichment until the owner decides.
+- [x] **TRD-OQ5:** May Flyover cache adsbdb route rows?
+  **Resolved by [D0010](decisions.md).** No. A live lookup may be shown and then discarded. A cache needs David J Taylor's permission first. Personal non-commercial use does not grant it.
 
 - [ ] **TRD-OQ6:** Which map tile or style host may a kiosk load all day?
   **Context:** The public OpenStreetMap tile servers are not that host.
 
-- [ ] **TRD-OQ7:** What does the Planespotters photo API require?
-  **Context:** The terms of use were read. The API page was not, on 2026-11-10. Photos stay off until it is read. airport-data, credited by adsbdb for photos, was not read either and is not a candidate until it is.
+- [x] **TRD-OQ7:** What does the Planespotters photo API require?
+  **Resolved by [D0011](decisions.md).** The API page was read on 2026-11-10. Credit, an obvious path to the photo page, no stored or proxied images, JSON cached at most 24 hours, descriptive User-Agent on server-side calls. airport-data, credited by adsbdb for photos, was not read and is not a candidate.
 
-- [ ] **TRD-OQ8:** Does a home location stored on the owner's server bring a privacy regime (for example UK GDPR) into scope?
-  **Context:** No regime was declared. The data minimisation in the security section stands either way.
+- [ ] **TRD-OQ8:** Does a home postcode stored on the owner's server bring a privacy regime (for example UK GDPR) into scope?
+  **Context:** No regime was declared. The postcode and the centre are personal data either way. Minimisation in the security section stands.
 
 - [ ] **TRD-OQ9:** Where does TLS for the kiosk terminate, and how are provider secrets provided on each server?
-  **Context:** Required behaviour is HTTPS in production and secrets outside git. The mechanism is the owner's. Do not invent a secret manager.
+  **Context:** Required behaviour is HTTPS in production and secrets outside git. The mechanism is the owner's. Do not invent a secret manager. The profile itself is already host config ([D0012](decisions.md)).
 
 - [ ] **TRD-OQ10:** Is there a CI system that should run the future test gate, or does the owner run it on `devserver1`?
   **Context:** The test strategy describes the stages. It does not add a workflow file.
@@ -434,16 +437,18 @@ Proposed. Not accepted. Accepting one is an owner decision, recorded with `decis
 
 ### Must Have
 
-- No application code in the discovery revision.
-- No provider calls until that provider is explicitly enabled.
-- No credentials, home coordinates, or extra hostnames in the repository.
-- Credits on the screen for every source that is enabled.
+- No application code while the stack question is open ([D0013](decisions.md)).
+- No provider calls until that provider is explicitly enabled. The one this deployment should enable for positions is adsb.lol.
+- No credentials, UK postcode, home coordinates, or extra hostnames in the repository.
+- Credits on the screen for every source that is enabled, including the postcode attribution when a centre is shown.
 - A local ADS-B receiver is not required and is not implemented in v1.
 
 ### Won't Have (This Version)
 
 - Radio hardware, `dump1090`, `readsb`, or a custom frame.
-- A position archive, alerts, dispatch, or anything a crew would use operationally.
+- A second household or a second profile.
+- A position archive, a route database, alerts, dispatch, or anything a crew would use operationally.
+- OpenSky, and the ADS-B Exchange community and RapidAPI plans, as position sources for this deployment.
 - Copied airline logos.
 - User accounts, unless PRD-OQ7 is answered by adding one.
 - A second deployed service.
@@ -455,3 +460,4 @@ Proposed. Not accepted. Accepting one is an owner decision, recorded with `decis
 | Date | Version | Changes |
 |------|---------|---------|
 | 2026-11-10 | 0.1 | Initial draft. Provider terms cited from pages retrieved that day. Stack and provider are proposed, not accepted. |
+| 2026-11-10 | 0.2 | Re-assessed providers for personal non-commercial use. Default position provider is adsb.lol. Profile is a UK postcode in host config. |

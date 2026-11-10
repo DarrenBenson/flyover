@@ -12,13 +12,13 @@
 
 ## Who They Are
 
-Ruth hears aircraft from the house and wants the answer without picking up a phone. She set the display up once, or someone in the house did, and she does not want to operate it again. She reads type from across the room. She trusts the screen only while it is willing to say that it does not know, or that it has stopped.
+Ruth hears aircraft from this one house and wants the answer without picking up a phone. She does not type the postcode. Someone in the house put it in the server environment once, and she does not want to operate the screen again. She reads type from across the room. She trusts the screen only while it is willing to say that it does not know, or that it has stopped.
 
 ## End Goals
 
 1. Glance at the screen and tell what is flying over, without opening another app.
 2. Trust the picture: current data looks current, and a dead feed does not look live.
-3. Leave the display running after a single setup.
+3. Leave the display running after the postcode has been set once, for this house only.
 
 ## Experience Goals
 

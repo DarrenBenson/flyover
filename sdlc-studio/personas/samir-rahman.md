@@ -37,4 +37,4 @@ Samir is the person in the house who already knows a Boeing from an Airbus at a 
 
 ## Scenario
 
-Samir taps the aircraft Ruth noticed. The detail shows the callsign, the airline name, the type, the altitude and speed, and the origin and destination from the lookup. One field the lookup missed says unknown. The photo, if present, names the photographer and links back. He can see it is the same aircraft the map has selected.
+Samir taps the aircraft Ruth noticed. The detail shows the callsign, the airline name, the type when the position feed has one, the altitude and speed, and the origin and destination from a live lookup that is not saved. One field the lookup missed says unknown. The photo, if present, names the photographer and makes the way back to the photo page obvious. He can see it is the same aircraft the map has selected.

@@ -7,6 +7,8 @@
 > **Epic:** EP-01M73FGP
 > **Points:** 3
 > **Persona:** Samir Rahman
+> **Affects:** sdlc-studio/prd.md
+> **Depends on:** US-01M73F1W
 
 ## User Story
 
@@ -23,8 +25,13 @@
 - **AC3:** Given a selection, when the next poll no longer contains that aircraft, then the selection clears and the screen does not keep facts for an aircraft that has gone.
   - **Verify:** manual Drop the selected aircraft from the next fixture poll and confirm the detail clears.
 
+## Still needs
+
+- [US-01M73F1W](US-01M73F1W-show-home-the-radius-and-the-aircraft-on.md), which stays Draft until [TRD-OQ6](../trd.md#12-open-technical-questions) names a tile host. This story selects on that map, so it stays Draft with it.
+
 ## Revision History
 
 | Date | Author | Change |
 | --- | --- | --- |
 | 2026-11-10 | sdlc-studio | Created via `new` (deterministic) |
+| 2026-11-10 | sdlc-studio | Stays Draft with the map story. |
