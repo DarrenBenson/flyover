@@ -26,7 +26,7 @@
 
 ## Notes
 
-Traffic moves by the manual DNS runbook in the TRD ([D0020](../decisions.md)). The rehearsal on the owner's servers is this story's remaining work. It is not part of the walking skeleton, and the repository does not deploy.
+Traffic moves by the manual DNS runbook in the TRD ([D0020](../decisions.md)). The rehearsal on the owner's servers is this story's remaining work ([TRD-OQ11](../trd.md)). It is not part of the walking skeleton, and the repository does not deploy. A session that must not touch those servers cannot mark this Done.
 
 ## Revision History
 
@@ -34,3 +34,4 @@ Traffic moves by the manual DNS runbook in the TRD ([D0020](../decisions.md)). T
 | --- | --- | --- |
 | 2026-11-10 | sdlc-studio | Created via `new` (deterministic) |
 | 2026-11-10 | sdlc-studio | Profile on webserver2 is host config. Stays Draft on the cutover. |
+| 2026-11-10 | cursor-agent | Stays Ready. The rehearsal is TRD-OQ11, for the owner. |

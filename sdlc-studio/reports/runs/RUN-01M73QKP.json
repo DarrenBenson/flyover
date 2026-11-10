@@ -1,0 +1,161 @@
+{
+  "schema": 1,
+  "run_id": "RUN-01M73QKP",
+  "started_at": "2026-11-10T22:05:24Z",
+  "ended_at": "2026-11-10T22:22:08Z",
+  "outcome": "goal-reached",
+  "goal": "done",
+  "batch": [
+    "US01M73F1W",
+    "US01M73F6W"
+  ],
+  "plan": "sdlc-studio/.local/sprint-plan.json",
+  "handoff": null,
+  "session_token_baseline": null,
+  "session_token_stamps": [],
+  "delegated_tokens": [],
+  "reopened": [],
+  "batch_changes": [],
+  "rulings": [],
+  "base_ref": "e874213da6514df18c42cccb70ad50fea0a2a216",
+  "preplan_reconcile": {
+    "drift": 0,
+    "kinds": [],
+    "at": "2026-11-10T22:05:24Z"
+  },
+  "appetite": {
+    "units": 8,
+    "minutes": 240.0,
+    "standing_units": 8,
+    "standing_minutes": 240.0,
+    "over_appetite": false
+  },
+  "sprint_goal": "The map marks home and the aircraft, and the list selects the same one",
+  "sprint_goal_review": {
+    "reviewed": false,
+    "status": "not read",
+    "skipped": null,
+    "seats": [],
+    "goal": "The map marks home and the aircraft, and the list selects the same one",
+    "shipped_seats": false,
+    "available_seats": [
+      "engineering",
+      "product",
+      "qa",
+      "security"
+    ],
+    "rounds": 0,
+    "objected": false,
+    "objections": [],
+    "reason": "no seat verdict is recorded for any goal - its seats are engineering, product, qa, security (`sprint.py goal-review record`)"
+  },
+  "reachable_end_state": {
+    "state": "Done",
+    "types": [
+      "story"
+    ],
+    "basis": "the `done` rung's own terminal for each type present is: Done"
+  },
+  "plan_snapshot": {
+    "units": {
+      "US01M73F1W": {
+        "planned_points": 5,
+        "forecast_tokens": 125000,
+        "forecast_minutes": null,
+        "added": false
+      },
+      "US01M73F6W": {
+        "planned_points": 3,
+        "forecast_tokens": 75000,
+        "forecast_minutes": null,
+        "added": false
+      }
+    },
+    "rates": {
+      "tokens_per_point": {
+        "value": 25000,
+        "source": "seed"
+      },
+      "minutes_per_point": {
+        "value": null,
+        "source": "not measured"
+      }
+    }
+  },
+  "token_forecast": 200000,
+  "goal_content_review": [
+    {
+      "phase": "plan",
+      "goal": "The map marks home and the aircraft, and the list selects the same one",
+      "answer": "yes",
+      "missing": "",
+      "shortfall": {},
+      "recorded_at": "2026-11-10T22:05:24Z"
+    },
+    {
+      "phase": "close",
+      "goal": "The map marks home and the aircraft, and the list selects the same one",
+      "answer": "yes",
+      "missing": "",
+      "shortfall": {
+        "undelivered": [],
+        "defects": []
+      },
+      "recorded_at": "2026-11-10T22:22:07Z"
+    }
+  ],
+  "review_base": {
+    "US01M73F1W": 0,
+    "US01M73F6W": 0
+  },
+  "scaffolded_retro": "RETRO0004",
+  "sprint_goal_verdict": {
+    "verdict": "achieved",
+    "note": "The map marks home and the aircraft, and the list selects the same one."
+  },
+  "close_attempts": [
+    {
+      "at": "2026-11-10T22:22:07Z",
+      "outstanding": 0,
+      "stages": []
+    }
+  ],
+  "close_known_issues": [],
+  "close_not_measured": [
+    {
+      "id": "cost",
+      "title": "Cost, velocity and estimate accuracy",
+      "detail": "no per-unit telemetry, no measured run total and no supplied sprint total, so what this sprint cost is not attributable - which is not zero"
+    }
+  ],
+  "close_tree": "51d1eb921ad703318f97a15194505c01a70e80e4",
+  "report_gate_clear": [
+    "US01M73F1W",
+    "US01M73F6W"
+  ],
+  "verified_sha": "93582f7623352d00be12cbfd04b2d02be7ded693",
+  "ci_runs": {
+    "source": "gh run list",
+    "runs": []
+  },
+  "review_rows": {
+    "US01M73F1W": [
+      "d449173264b4f81c"
+    ],
+    "US01M73F6W": [
+      "13c8082f63e884be"
+    ]
+  },
+  "report_discharged": [],
+  "report": "RPT0004",
+  "report_fingerprint": "df8bab22e1f2aa51",
+  "report_window_end": "2026-11-10T22:22:08Z",
+  "unanswered": [],
+  "unanswered_rulings_from": "RETRO0004",
+  "signature": {
+    "principal": "Darren Benson (delegated to Juno)",
+    "signed_at": "2026-11-10T22:22:08Z",
+    "report": "RPT0004",
+    "fingerprint": "df8bab22e1f2aa51"
+  }
+}

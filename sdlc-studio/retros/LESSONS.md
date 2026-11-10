@@ -4,6 +4,15 @@
 
 <!-- Append new entries at the top. Keep each entry under 10 lines. -->
 
+## L-0004: Try a tile request in the test that returns 429, so a fallback host would show up as a second call rather than as a comment
+
+- **Added:** 2026-11-10
+- **Review-by:** 2027-02-08
+
+Try a tile request in the test that returns 429, so a fallback host would show up as a second call rather than as a comment.
+
+Recorded from retro RETRO0004.
+
 ## L-0003: Try generating the QR from the same library and the same options in the test, so a page that only prints the URL as text fails the…
 
 - **Added:** 2026-11-10

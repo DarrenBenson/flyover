@@ -1,0 +1,1213 @@
+{
+  "schema": 2,
+  "report_id": "RPT0004",
+  "run_id": "RUN-01M73QKP",
+  "retro_id": "RETRO0004",
+  "generated_at": "2026-11-10T22:22:08Z",
+  "window_end": "2026-11-10T22:22:08Z",
+  "signature": {
+    "principal": "Darren Benson (delegated to Juno)",
+    "signed_at": "2026-11-10T22:22:08Z",
+    "report": "RPT0004",
+    "fingerprint": "df8bab22e1f2aa51"
+  },
+  "sections": [
+    {
+      "key": "goal",
+      "title": "Goal",
+      "figures": {
+        "sprint_goal": {
+          "key": "sprint_goal",
+          "value": "The map marks home and the aircraft, and the list selects the same one",
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "goal_verdict": {
+          "key": "goal_verdict",
+          "value": "Judged achieved",
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "goal_verdict_note": {
+          "key": "goal_verdict_note",
+          "value": "The map marks home and the aircraft, and the list selects the same one.",
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "run_id": {
+          "key": "run_id",
+          "value": "RUN-01M73QKP",
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "started_at": {
+          "key": "started_at",
+          "value": "2026-11-10T22:05:24Z",
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "ended_at": {
+          "key": "ended_at",
+          "value": "2026-11-10T22:22:08Z",
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "duration_hours": {
+          "key": "duration_hours",
+          "value": "0.3h",
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "verified_sha": {
+          "key": "verified_sha",
+          "value": "93582f7623352d00be12cbfd04b2d02be7ded693",
+          "source": "sdlc-studio/.local/run-state.json"
+        }
+      },
+      "rows": [],
+      "not_measured": null
+    },
+    {
+      "key": "estimates",
+      "title": "Estimates",
+      "figures": {},
+      "rows": [
+        {
+          "est_measure": {
+            "key": "est_measure",
+            "value": "Points",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_forecast": {
+            "key": "est_forecast",
+            "value": 8,
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_actual": {
+            "key": "est_actual",
+            "value": 8,
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_ratio": {
+            "key": "est_ratio",
+            "value": "1.0x",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_basis": {
+            "key": "est_basis",
+            "value": "2 of 2 delivered unit(s)",
+            "source": "sdlc-studio/.local/run-state.json"
+          }
+        },
+        {
+          "est_measure": {
+            "key": "est_measure",
+            "value": "Minutes",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_forecast": {
+            "key": "est_forecast",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "the plan recorded no minute forecast for any unit"
+          },
+          "est_actual": {
+            "key": "est_actual",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "no unit carries a measured time (an In Progress span or agent minutes)"
+          },
+          "est_ratio": {
+            "key": "est_ratio",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "needs both a forecast and an actual"
+          },
+          "est_basis": {
+            "key": "est_basis",
+            "value": "the whole run: forecast over 0 of 2 unit(s) planned or added and not dropped; no unit carries both a forecast and a measured time",
+            "source": "sdlc-studio/.local/run-state.json"
+          }
+        },
+        {
+          "est_measure": {
+            "key": "est_measure",
+            "value": "Wall-clock span",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_forecast": {
+            "key": "est_forecast",
+            "value": "not forecast",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_actual": {
+            "key": "est_actual",
+            "value": 16.7,
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_ratio": {
+            "key": "est_ratio",
+            "value": "no ratio",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_basis": {
+            "key": "est_basis",
+            "value": "the run's minutes, start to end, so waiting counts; the forecast is active work, so the two are not compared",
+            "source": "sdlc-studio/.local/run-state.json"
+          }
+        },
+        {
+          "est_measure": {
+            "key": "est_measure",
+            "value": "Priced cost",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_forecast": {
+            "key": "est_forecast",
+            "value": "not forecast",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_actual": {
+            "key": "est_actual",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "the run carries no meter stamp and no session token baseline"
+          },
+          "est_ratio": {
+            "key": "est_ratio",
+            "value": "no ratio",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_basis": {
+            "key": "est_basis",
+            "value": "priced input-equivalent tokens, the run's headline cost",
+            "source": "sdlc-studio/.local/run-state.json"
+          }
+        },
+        {
+          "est_measure": {
+            "key": "est_measure",
+            "value": "Tokens",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_forecast": {
+            "key": "est_forecast",
+            "value": 200000,
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_actual": {
+            "key": "est_actual",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "the run carries no meter stamp and no session token baseline"
+          },
+          "est_ratio": {
+            "key": "est_ratio",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "withheld - no delegated spend was supplied, so the actual is the main-thread meter alone, which cannot see a delegated agent's spend; each lane records its builder's total with `sprint lane return --tokens N`"
+          },
+          "est_basis": {
+            "key": "est_basis",
+            "value": "the whole run: forecast over 2 of 2 unit(s) planned or added and not dropped; actual is the run meter, a lower bound",
+            "source": "sdlc-studio/.local/run-state.json"
+          }
+        },
+        {
+          "est_measure": {
+            "key": "est_measure",
+            "value": "Priced per point",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_forecast": {
+            "key": "est_forecast",
+            "value": "not forecast",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_actual": {
+            "key": "est_actual",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "the run carries no meter stamp and no session token baseline"
+          },
+          "est_ratio": {
+            "key": "est_ratio",
+            "value": "no ratio",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_basis": {
+            "key": "est_basis",
+            "value": "the Priced cost row over the 8 point(s) of the 2 delivered unit(s), in priced input-equivalent tokens per point",
+            "source": "sdlc-studio/.local/run-state.json"
+          }
+        },
+        {
+          "est_measure": {
+            "key": "est_measure",
+            "value": "Dollar cost",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_forecast": {
+            "key": "est_forecast",
+            "value": "not forecast",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_actual": {
+            "key": "est_actual",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "the reading carries no per-model split of its components"
+          },
+          "est_ratio": {
+            "key": "est_ratio",
+            "value": "no ratio",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_basis": {
+            "key": "est_basis",
+            "value": "estimated US dollars: each model's own components in the Priced cost row times that model's list prices; price table effective 2026-11-06",
+            "source": "sdlc-studio/.local/run-state.json"
+          }
+        },
+        {
+          "est_measure": {
+            "key": "est_measure",
+            "value": "Dollars per point",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_forecast": {
+            "key": "est_forecast",
+            "value": "not forecast",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_actual": {
+            "key": "est_actual",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "the reading carries no per-model split of its components"
+          },
+          "est_ratio": {
+            "key": "est_ratio",
+            "value": "no ratio",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "est_basis": {
+            "key": "est_basis",
+            "value": "the Dollar cost row over the 8 point(s) of the 2 delivered unit(s); price table effective 2026-11-06",
+            "source": "sdlc-studio/.local/run-state.json"
+          }
+        }
+      ],
+      "not_measured": null,
+      "unit_rows": [
+        {
+          "unit_id": {
+            "key": "unit_id",
+            "value": "US01M73F1W",
+            "source": "sdlc-studio/stories/US-01M73F1W-show-home-the-radius-and-the-aircraft-on.md"
+          },
+          "eu_forecast_minutes": {
+            "key": "eu_forecast_minutes",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "not in the plan"
+          },
+          "eu_minutes": {
+            "key": "eu_minutes",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "no In Progress span and no agent total tagged to it - record one with `retro.py accuracy --delegated-tokens N --delegated-unit US01M73F1W --delegated-minutes M`"
+          },
+          "eu_forecast_tokens": {
+            "key": "eu_forecast_tokens",
+            "value": 125000,
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "eu_tokens": {
+            "key": "eu_tokens",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "no In Progress span and no agent total tagged to it - record one with `retro.py accuracy --delegated-tokens N --delegated-unit US01M73F1W --delegated-minutes M`"
+          },
+          "eu_priced": {
+            "key": "eu_priced",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "no agent returned for it was priced from its own transcript - price one with `sprint.py lane return --units US01M73F1W --agent A`"
+          },
+          "eu_usd": {
+            "key": "eu_usd",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/stories/US-01M73F1W-show-home-the-radius-and-the-aircraft-on.md",
+            "reason": "no agent returned for it was priced from its own transcript"
+          }
+        },
+        {
+          "unit_id": {
+            "key": "unit_id",
+            "value": "US01M73F6W",
+            "source": "sdlc-studio/stories/US-01M73F6W-keep-the-map-and-the-list-on-the.md"
+          },
+          "eu_forecast_minutes": {
+            "key": "eu_forecast_minutes",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "not in the plan"
+          },
+          "eu_minutes": {
+            "key": "eu_minutes",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "no In Progress span and no agent total tagged to it - record one with `retro.py accuracy --delegated-tokens N --delegated-unit US01M73F6W --delegated-minutes M`"
+          },
+          "eu_forecast_tokens": {
+            "key": "eu_forecast_tokens",
+            "value": 75000,
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "eu_tokens": {
+            "key": "eu_tokens",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "no In Progress span and no agent total tagged to it - record one with `retro.py accuracy --delegated-tokens N --delegated-unit US01M73F6W --delegated-minutes M`"
+          },
+          "eu_priced": {
+            "key": "eu_priced",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/.local/run-state.json",
+            "reason": "no agent returned for it was priced from its own transcript - price one with `sprint.py lane return --units US01M73F6W --agent A`"
+          },
+          "eu_usd": {
+            "key": "eu_usd",
+            "value": "NOT MEASURED",
+            "source": "sdlc-studio/stories/US-01M73F6W-keep-the-map-and-the-list-on-the.md",
+            "reason": "no agent returned for it was priced from its own transcript"
+          }
+        }
+      ]
+    },
+    {
+      "key": "delivered",
+      "title": "Delivered to plan",
+      "figures": {
+        "planned_units": {
+          "key": "planned_units",
+          "value": 2,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "planned_points": {
+          "key": "planned_points",
+          "value": 8,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "plan_delivered_units": {
+          "key": "plan_delivered_units",
+          "value": 2,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "plan_delivered_points": {
+          "key": "plan_delivered_points",
+          "value": 8,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "added_delivered_units": {
+          "key": "added_delivered_units",
+          "value": 0,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "added_points": {
+          "key": "added_points",
+          "value": 0,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "dropped_units": {
+          "key": "dropped_units",
+          "value": 0,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "dropped_points": {
+          "key": "dropped_points",
+          "value": 0,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "carried_units": {
+          "key": "carried_units",
+          "value": 0,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "carried_points": {
+          "key": "carried_points",
+          "value": 0,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "added_units": {
+          "key": "added_units",
+          "value": 0,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "points_delivered": {
+          "key": "points_delivered",
+          "value": 8,
+          "source": "sdlc-studio/stories/US-01M73F1W-show-home-the-radius-and-the-aircraft-on.md, sdlc-studio/stories/US-01M73F6W-keep-the-map-and-the-list-on-the.md"
+        }
+      },
+      "rows": [
+        {
+          "unit_id": {
+            "key": "unit_id",
+            "value": "US01M73F1W",
+            "source": "sdlc-studio/stories/US-01M73F1W-show-home-the-radius-and-the-aircraft-on.md"
+          },
+          "unit_planned_points": {
+            "key": "unit_planned_points",
+            "value": 5,
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "unit_points": {
+            "key": "unit_points",
+            "value": 5,
+            "source": "sdlc-studio/stories/US-01M73F1W-show-home-the-radius-and-the-aircraft-on.md"
+          },
+          "unit_outcome": {
+            "key": "unit_outcome",
+            "value": "delivered",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "unit_rounds": {
+            "key": "unit_rounds",
+            "value": 1,
+            "source": "sdlc-studio/reviews/critic-verdicts.md"
+          }
+        },
+        {
+          "unit_id": {
+            "key": "unit_id",
+            "value": "US01M73F6W",
+            "source": "sdlc-studio/stories/US-01M73F6W-keep-the-map-and-the-list-on-the.md"
+          },
+          "unit_planned_points": {
+            "key": "unit_planned_points",
+            "value": 3,
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "unit_points": {
+            "key": "unit_points",
+            "value": 3,
+            "source": "sdlc-studio/stories/US-01M73F6W-keep-the-map-and-the-list-on-the.md"
+          },
+          "unit_outcome": {
+            "key": "unit_outcome",
+            "value": "delivered",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "unit_rounds": {
+            "key": "unit_rounds",
+            "value": 1,
+            "source": "sdlc-studio/reviews/critic-verdicts.md"
+          }
+        }
+      ],
+      "not_measured": null
+    },
+    {
+      "key": "known_issues",
+      "title": "Known issues handed over",
+      "figures": {
+        "findings_scan": {
+          "key": "findings_scan",
+          "value": "0 open finding(s) raised in the run, 0 close gap(s), 0 carried unit(s)",
+          "source": "sdlc-studio/.local/run-state.json"
+        }
+      },
+      "rows": [],
+      "not_measured": null
+    },
+    {
+      "key": "signoff",
+      "title": "Sign-off",
+      "figures": {
+        "principal": {
+          "key": "principal",
+          "value": "not yet signed",
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "signed_at": {
+          "key": "signed_at",
+          "value": "not yet signed",
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "signed_fingerprint": {
+          "key": "signed_fingerprint",
+          "value": "not yet signed",
+          "source": "sdlc-studio/.local/run-state.json"
+        }
+      },
+      "rows": [],
+      "not_measured": null
+    },
+    {
+      "key": "cost",
+      "title": "Tokens by model",
+      "figures": {
+        "tokens_delegated": {
+          "key": "tokens_delegated",
+          "value": "NOT MEASURED",
+          "source": "sdlc-studio/.local/run-state.json",
+          "reason": "no delegated agent supplied a total, which is not the same fact as no work having been delegated"
+        }
+      },
+      "rows": [],
+      "not_measured": {
+        "key": "cost",
+        "value": "NOT MEASURED",
+        "source": "sdlc-studio/.local/run-state.json",
+        "reason": "the run carries no meter stamp and no session token baseline"
+      }
+    },
+    {
+      "key": "cost_roles",
+      "title": "Cost by role",
+      "figures": {},
+      "rows": [],
+      "not_measured": {
+        "key": "cost_roles",
+        "value": "NOT MEASURED",
+        "source": "sdlc-studio/.local/run-state.json",
+        "reason": "no closing reading in the run's window recorded the spend by role"
+      }
+    },
+    {
+      "key": "dora",
+      "title": "DORA",
+      "figures": {},
+      "rows": [
+        {
+          "dora_key": {
+            "key": "dora_key",
+            "value": "Deployment frequency",
+            "source": "git log"
+          },
+          "dora_value": {
+            "key": "dora_value",
+            "value": 1,
+            "source": "git log"
+          },
+          "dora_mapping": {
+            "key": "dora_mapping",
+            "value": "a push to main IS the deployment in this trunk-based repository: there is no separate deploy step, and CI on that commit is what decides whether the change stood up; with no forge run data a deployment is counted as a commit on main inside the run window",
+            "source": "git log"
+          },
+          "dora_band": {
+            "key": "dora_band",
+            "value": "on demand",
+            "source": "git log"
+          },
+          "dora_source": {
+            "key": "dora_source",
+            "value": "git history - 1 commit(s) on main inside the run window",
+            "source": "git log"
+          }
+        },
+        {
+          "dora_key": {
+            "key": "dora_key",
+            "value": "Lead time for changes",
+            "source": "gh run list"
+          },
+          "dora_value": {
+            "key": "dora_value",
+            "value": "NOT MEASURED",
+            "source": "gh run list",
+            "reason": "no forge run data"
+          },
+          "dora_mapping": {
+            "key": "dora_mapping",
+            "value": "the span from the run's first commit on main to its last - per-commit lead time is not derived, because the work is committed locally and pushed in batches",
+            "source": "gh run list"
+          },
+          "dora_band": {
+            "key": "dora_band",
+            "value": "under a day",
+            "source": "gh run list"
+          },
+          "dora_source": {
+            "key": "dora_source",
+            "value": "no commit and no push-triggered run inside the run window",
+            "source": "gh run list"
+          }
+        },
+        {
+          "dora_key": {
+            "key": "dora_key",
+            "value": "Change failure rate",
+            "source": "gh run list"
+          },
+          "dora_value": {
+            "key": "dora_value",
+            "value": "NOT MEASURED",
+            "source": "gh run list",
+            "reason": "no forge run data"
+          },
+          "dora_mapping": {
+            "key": "dora_mapping",
+            "value": "a push to main IS the deployment in this trunk-based repository: there is no separate deploy step, and CI on that commit is what decides whether the change stood up; the rate is the share of push-triggered CI runs on main that concluded failure or timed out - a cancelled or skipped run is not a failed deployment",
+            "source": "gh run list"
+          },
+          "dora_band": {
+            "key": "dora_band",
+            "value": "0-15%",
+            "source": "gh run list"
+          },
+          "dora_source": {
+            "key": "dora_source",
+            "value": "no push-triggered CI run is readable for this run window",
+            "source": "gh run list"
+          }
+        },
+        {
+          "dora_key": {
+            "key": "dora_key",
+            "value": "Time to restore",
+            "source": "gh run list"
+          },
+          "dora_value": {
+            "key": "dora_value",
+            "value": "NOT MEASURED",
+            "source": "gh run list",
+            "reason": "no forge run data"
+          },
+          "dora_mapping": {
+            "key": "dora_mapping",
+            "value": "per red streak on main, in creation order, the span from its first failure's conclusion to the conclusion of the first push-triggered run created after it that concluded success, floored at zero; the median over the window's restored streaks, or not restored while the window's last streak is still red",
+            "source": "gh run list"
+          },
+          "dora_band": {
+            "key": "dora_band",
+            "value": "under an hour",
+            "source": "gh run list"
+          },
+          "dora_source": {
+            "key": "dora_source",
+            "value": "no push-triggered CI run is readable for this run window",
+            "source": "gh run list"
+          }
+        }
+      ],
+      "not_measured": null
+    },
+    {
+      "key": "calibration",
+      "title": "Calibration",
+      "figures": {
+        "cal_tokens_per_point": {
+          "key": "cal_tokens_per_point",
+          "value": 25000,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "cal_tokens_source": {
+          "key": "cal_tokens_source",
+          "value": "seed",
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "cal_minutes_per_point": {
+          "key": "cal_minutes_per_point",
+          "value": "NOT MEASURED",
+          "source": "sdlc-studio/.local/run-state.json",
+          "reason": "the plan snapshot records no rate"
+        },
+        "cal_minutes_source": {
+          "key": "cal_minutes_source",
+          "value": "not measured",
+          "source": "sdlc-studio/.local/run-state.json"
+        }
+      },
+      "rows": [],
+      "not_measured": null
+    },
+    {
+      "key": "rulings",
+      "title": "Rulings",
+      "figures": {
+        "persona_rulings": {
+          "key": "persona_rulings",
+          "value": 0,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "cited_rulings": {
+          "key": "cited_rulings",
+          "value": 0,
+          "source": "sdlc-studio/.local/run-state.json"
+        },
+        "operator_rulings": {
+          "key": "operator_rulings",
+          "value": 0,
+          "source": "sdlc-studio/.local/run-state.json"
+        }
+      },
+      "rows": [],
+      "not_measured": null
+    },
+    {
+      "key": "waivers",
+      "title": "Waivers in force",
+      "figures": {
+        "waivers_note": {
+          "key": "waivers_note",
+          "value": "no gate stood down for this seal - the log was read and carries no accepted waiver dated inside this report's window",
+          "source": "sdlc-studio/decisions.md"
+        },
+        "waivers_count": {
+          "key": "waivers_count",
+          "value": 0,
+          "source": "sdlc-studio/decisions.md"
+        }
+      },
+      "rows": [],
+      "not_measured": null
+    },
+    {
+      "key": "lessons",
+      "title": "Lessons",
+      "figures": {
+        "lessons_note": {
+          "key": "lessons_note",
+          "value": "8 lesson class(es) in force at this close.",
+          "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+        }
+      },
+      "rows": [
+        {
+          "lesson_id": {
+            "key": "lesson_id",
+            "value": "LC-001",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_class": {
+            "key": "lesson_class",
+            "value": "mutant never applied",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_state": {
+            "key": "lesson_state",
+            "value": "active",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_run": {
+            "key": "lesson_hits_run",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_total": {
+            "key": "lesson_hits_total",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          }
+        },
+        {
+          "lesson_id": {
+            "key": "lesson_id",
+            "value": "LC-002",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_class": {
+            "key": "lesson_class",
+            "value": "criterion words outrun the fixture",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_state": {
+            "key": "lesson_state",
+            "value": "active",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_run": {
+            "key": "lesson_hits_run",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_total": {
+            "key": "lesson_hits_total",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          }
+        },
+        {
+          "lesson_id": {
+            "key": "lesson_id",
+            "value": "LC-003",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_class": {
+            "key": "lesson_class",
+            "value": "mechanism reaches no caller",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_state": {
+            "key": "lesson_state",
+            "value": "active",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_run": {
+            "key": "lesson_hits_run",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_total": {
+            "key": "lesson_hits_total",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          }
+        },
+        {
+          "lesson_id": {
+            "key": "lesson_id",
+            "value": "LC-004",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_class": {
+            "key": "lesson_class",
+            "value": "premise not executed",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_state": {
+            "key": "lesson_state",
+            "value": "active",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_run": {
+            "key": "lesson_hits_run",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_total": {
+            "key": "lesson_hits_total",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          }
+        },
+        {
+          "lesson_id": {
+            "key": "lesson_id",
+            "value": "LC-005",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_class": {
+            "key": "lesson_class",
+            "value": "repair breaks its neighbour",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_state": {
+            "key": "lesson_state",
+            "value": "active",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_run": {
+            "key": "lesson_hits_run",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_total": {
+            "key": "lesson_hits_total",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          }
+        },
+        {
+          "lesson_id": {
+            "key": "lesson_id",
+            "value": "LC-006",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_class": {
+            "key": "lesson_class",
+            "value": "absence read as an answer",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_state": {
+            "key": "lesson_state",
+            "value": "active",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_run": {
+            "key": "lesson_hits_run",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_total": {
+            "key": "lesson_hits_total",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          }
+        },
+        {
+          "lesson_id": {
+            "key": "lesson_id",
+            "value": "LC-007",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_class": {
+            "key": "lesson_class",
+            "value": "shared machine resources exhausted",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_state": {
+            "key": "lesson_state",
+            "value": "active",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_run": {
+            "key": "lesson_hits_run",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_total": {
+            "key": "lesson_hits_total",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          }
+        },
+        {
+          "lesson_id": {
+            "key": "lesson_id",
+            "value": "LC-008",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_class": {
+            "key": "lesson_class",
+            "value": "constraint added without retirement",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_state": {
+            "key": "lesson_state",
+            "value": "active",
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_run": {
+            "key": "lesson_hits_run",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          },
+          "lesson_hits_total": {
+            "key": "lesson_hits_total",
+            "value": 0,
+            "source": "the skill's bundled seed, templates/lessons-seed.jsonl"
+          }
+        }
+      ],
+      "not_measured": null
+    },
+    {
+      "key": "unmeasured",
+      "title": "Not measured",
+      "figures": {},
+      "rows": [
+        {
+          "unmeasured_item": {
+            "key": "unmeasured_item",
+            "value": "cost: Cost, velocity and estimate accuracy",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "unmeasured_state": {
+            "key": "unmeasured_state",
+            "value": "not measured",
+            "source": "sdlc-studio/.local/run-state.json"
+          },
+          "unmeasured_reason": {
+            "key": "unmeasured_reason",
+            "value": "no per-unit telemetry, no measured run total and no supplied sprint total, so what this sprint cost is not attributable - which is not zero",
+            "source": "sdlc-studio/.local/run-state.json"
+          }
+        }
+      ],
+      "not_measured": null
+    }
+  ],
+  "record_paths": "portable",
+  "token_ratio": "every-delivered-unit-delegated",
+  "restore_pairing": "next-success-after-failure",
+  "discharged_carry": "delivered",
+  "findings_scan": "delivered-batch-units-excluded",
+  "minutes_ratio": "measured-unit-minutes",
+  "delegated_tokens": "counted-over-a-zero-meter",
+  "agent_minutes": "any-agent-supplied",
+  "dora_failures": "failure-or-timed-out-only",
+  "token_headline": "priced-input-equivalent",
+  "priced_units": "unit-priced-and-per-point",
+  "usd_cost": "per-model-dollars-and-roles",
+  "price_table": {
+    "stale_after_days": 90,
+    "models": {
+      "claude-fable-5": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 1.0,
+        "cache_write_5m": 12.5,
+        "cache_write_1h": 20.0,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "claude-fable-5-1": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 0.25,
+        "cache_write_5m": 12.5,
+        "cache_write_1h": 20.0,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "claude-haiku-4-5": {
+        "input": 1.0,
+        "output": 5.0,
+        "cache_read": 0.1,
+        "cache_write_5m": 1.25,
+        "cache_write_1h": 2.0,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "claude-haiku-5-5": {
+        "input": 0.1,
+        "output": 0.5,
+        "cache_read": 0.01,
+        "cache_write_5m": 0.125,
+        "cache_write_1h": 0.2,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "claude-mythos-5-1": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 0.25,
+        "cache_write_5m": 12.5,
+        "cache_write_1h": 20.0,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "claude-opus-4-6": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write_5m": 6.25,
+        "cache_write_1h": 10.0,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "claude-opus-4-7": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write_5m": 6.25,
+        "cache_write_1h": 10.0,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "claude-opus-4-8": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write_5m": 6.25,
+        "cache_write_1h": 10.0,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "claude-opus-5": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write_5m": 6.25,
+        "cache_write_1h": 10.0,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "claude-opus-5-5": {
+        "input": 4.0,
+        "output": 20.0,
+        "cache_read": 0.2,
+        "cache_write_5m": 5.0,
+        "cache_write_1h": 8.0,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "claude-sonnet-4-6": {
+        "input": 3.0,
+        "output": 15.0,
+        "cache_read": 0.3,
+        "cache_write_5m": 3.75,
+        "cache_write_1h": 6.0,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "claude-sonnet-5": {
+        "input": 2.0,
+        "output": 10.0,
+        "cache_read": 0.2,
+        "cache_write_5m": 2.5,
+        "cache_write_1h": 4.0,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "claude-sonnet-5-5": {
+        "input": 2.0,
+        "output": 10.0,
+        "cache_read": 0.1,
+        "cache_write_5m": 2.5,
+        "cache_write_1h": 4.0,
+        "effective": "2026-11-06",
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing (Model pricing table, read 2026-11-06)"
+      },
+      "gpt-5.3-codex": {
+        "input": 1.75,
+        "output": 14.0,
+        "cache_read": 0.175,
+        "cache_write_5m": 1.75,
+        "cache_write_1h": 1.75,
+        "effective": "2026-11-06",
+        "source": "https://developers.openai.com/api/docs/pricing (Specialized models, Codex, Standard, read 2026-11-06)"
+      },
+      "gpt-6-astra": {
+        "input": 10.0,
+        "output": 50.0,
+        "cache_read": 1.0,
+        "cache_write_5m": 12.5,
+        "cache_write_1h": 25.0,
+        "effective": "2026-11-06",
+        "source": "https://developers.openai.com/api/docs/pricing (Flagship models, Standard, Short context length, read 2026-11-06)"
+      },
+      "gpt-6-luna": {
+        "input": 0.1,
+        "output": 0.5,
+        "cache_read": 0.01,
+        "cache_write_5m": 0.125,
+        "cache_write_1h": 0.25,
+        "effective": "2026-11-06",
+        "source": "https://developers.openai.com/api/docs/pricing (Flagship models, Standard, Short context length, read 2026-11-06)"
+      },
+      "gpt-6.1-sol": {
+        "input": 2.0,
+        "output": 10.0,
+        "cache_read": 0.1,
+        "cache_write_5m": 2.5,
+        "cache_write_1h": 5.0,
+        "effective": "2026-11-06",
+        "source": "https://developers.openai.com/api/docs/pricing (Flagship models, Standard, Short context length, read 2026-11-06)"
+      },
+      "gpt-6.1-terra": {
+        "input": 1.0,
+        "output": 5.0,
+        "cache_read": 0.05,
+        "cache_write_5m": 1.25,
+        "cache_write_1h": 2.5,
+        "effective": "2026-11-06",
+        "source": "https://developers.openai.com/api/docs/pricing (Flagship models, Standard, Short context length, read 2026-11-06)"
+      },
+      "opencode/deepseek-v4.1-flash-free": {
+        "input": 0.0,
+        "output": 0.0,
+        "cache_read": 0.0,
+        "cache_write_5m": 0.0,
+        "cache_write_1h": 0.0,
+        "effective": "2026-11-06",
+        "source": "https://opencode.ai/docs/console/models/ (Pricing table, where https://opencode.ai/docs/zen/ redirects, read 2026-11-06)"
+      }
+    },
+    "premium_request": {
+      "usd": 0.04,
+      "effective": "2026-11-06",
+      "source": "https://docs.github.com/en/copilot/reference/copilot-billing/request-based-billing-legacy/copilot-requests (Copilot requests (legacy): additional premium requests at $0.04/request, read 2026-11-06)"
+    }
+  },
+  "price_table_rule": "replayed-and-digested",
+  "premium_usd": "per-request-dollars",
+  "fingerprint": "df8bab22e1f2aa51"
+}

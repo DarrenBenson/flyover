@@ -434,6 +434,9 @@ Accepted where the decisions log says so.
 - [x] **TRD-OQ10:** Is there a CI system that should run the future test gate, or does the owner run it on `devserver1`?
   **Resolved by [D0024](decisions.md), as a default the owner can revisit.** GitHub Actions runs the test suite on a push to `main`. It does not deploy.
 
+- [ ] **TRD-OQ11:** Has the owner rehearsed one build on `devserver1`, `stagingserver`, `webserver1`, and `webserver2`?
+  **Open.** [US-01M73F7A](stories/US-01M73F7A-promote-one-build-across-the-owner-s-servers.md) stays Ready. The failover method is already decided ([D0020](decisions.md)). What remains is the owner's comparison of the build identity on those four hosts. This session does not deploy, does not create accounts or keys, and does not write down a build identity it has not seen.
+
 ---
 
 ## 13. Implementation Constraints
