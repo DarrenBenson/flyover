@@ -1,6 +1,6 @@
 # EP-01M73F6G: Show the aircraft overhead
 
-> **Status:** Draft
+> **Status:** Done
 > **Created:** 2026-11-10
 > **Created-by:** sdlc-studio new
 > **Raised-by:** sdlc-studio; agent; v1

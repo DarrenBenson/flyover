@@ -11,3 +11,4 @@ than edited when a figure moves.
 | ID | Run | Generated | Fingerprint | Signed |
 | --- | --- | --- | --- | --- |
 | [RPT0001](RPT0001-sprint-report-run-01m73kn7.md) | RUN-01M73KN7 | 2026-11-10T21:28:39Z | 03c24828f37b3083 | Darren Benson (delegated to Juno) |
+| [RPT0002](RPT0002-sprint-report-run-01m73pr6.md) | RUN-01M73PR6 | 2026-11-10T21:49:25Z | 4b016cd1a1c1aaf3 | Darren Benson (delegated to Juno) |
