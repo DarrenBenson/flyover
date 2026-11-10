@@ -18,13 +18,15 @@
 ## Acceptance Criteria
 
 - **AC1:** Given the environment is configured, when the live view is shown, then no control depends on hover.
-  - **Verify:** manual Walk the live view with a pointer and confirm no hover-only control.
+  - **Verify:** vitest "FSE-AC1"
 - **AC2:** Given the environment is configured, when the live view is shown, then a keyboard is not required to keep it updating.
-  - **Verify:** manual Hide the keyboard and confirm the view keeps updating.
-- **AC3:** Given the view is in a full-screen Chromium window, when an aircraft is overhead, then the nearest identity is readable without approaching the screen.
-  - **Verify:** manual Read the nearest aircraft from the intended seating distance in Chromium kiosk mode.
+  - **Verify:** vitest "FSE-AC2"
+- **AC3:** Given the view in current Chromium, when an aircraft is overhead, then the nearest identity is set in type of at least 32px so it can be read without approaching the screen.
+  - **Verify:** vitest "FSE-AC3"
+- **AC4:** Given a client that is not on the home LAN, when it requests the live view, then the server refuses it. A loopback or private-LAN client is admitted.
+  - **Verify:** vitest "FSE-AC4"
 
-Other browsers remain [PRD-OQ6](../prd.md#14-open-questions). This story is the Chromium kiosk.
+Version 1 is Chromium only ([D0017](../decisions.md)). The live view is home-LAN only ([D0018](../decisions.md)). The 32px check is the executable stand-in for reading it from the seat. The owner still looks at the real screen.
 
 ## Revision History
 

@@ -1,13 +1,13 @@
 # Test Strategy Document
 
 > **Project:** Flyover
-> **Version:** 0.2
+> **Version:** 0.3
 > **Last Updated:** 2026-11-10
 > **Owner:** QA seat. The named seat is provisional until the owner accepts the team (see the persona index).
 
 ## Overview
 
-Flyover has no code and no tests. This document is the strategy a later build has to satisfy. It is not a report of a run.
+The strategy below is what the build has to satisfy. A green suite that never asserts the provider gate, or never looks at the git tree, would be a false pass. A stubbed provider proves Flyover's side of the socket. It does not prove the live sky.
 
 The product is a kiosk for one house. It must not lie about what is overhead, it must not call a flight-data provider the configuration has not enabled, and it must not commit the UK postcode or the resolved centre. Those failures are the ones the strategy is built around. A green unit suite that mocks the provider and never asserts the licence gate, or never looks at the git tree, would be a false pass. A mocked provider test proves the code on Flyover's side of the socket. It does not prove the provider, the terms, or the live sky.
 
@@ -33,7 +33,7 @@ Numbers below are the SDLC Studio defaults (unit 90, integration 85, end-to-end 
 - Enrichment and photo behaviour when the fixture says present, absent, or refused.
 - Stale and failure presentation.
 - The enabled-provider gate.
-- Kiosk layout checks that a person can do in a browser, recorded as manual verifiers until a browser harness exists.
+- Kiosk checks that the page carries no hover-only control, no required keyboard input, and type of at least 32px on the nearest aircraft. The physical "across the room" look stays the owner's.
 
 ### Out of Scope
 
@@ -42,7 +42,7 @@ Numbers below are the SDLC Studio defaults (unit 90, integration 85, end-to-end 
 - Performance of adsb.lol, OpenSky, or anyone else. Their limits are constraints, not numbers Flyover's tests invent.
 - Radio reception, `dump1090`, and `readsb`.
 - A load test of a public service. Do not point a stress tool at a flight-data API.
-- Failover of `webserver1` to `webserver2` as an automated test, until [TRD-OQ3](trd.md#12-open-technical-questions) says how traffic moves. Until then it is a manual rehearsal on staging.
+- A live rehearsal of the manual DNS switch ([D0020](decisions.md)). The runbook is reviewed as a document. This suite does not touch a server.
 
 ---
 
@@ -63,7 +63,7 @@ Numbers below are the SDLC Studio defaults (unit 90, integration 85, end-to-end 
 | Attribute | Value |
 |-----------|-------|
 | Coverage Target | 90% |
-| Framework | Not chosen. Follows TRD-OQ1. If the stack is TypeScript, the runner is the one that stack already uses. Do not add a second |
+| Framework | Vitest, the runner for the TypeScript process ([D0019](decisions.md), [D0024](decisions.md)) |
 | Execution | On every change, locally, before a commit that claims the story |
 
 ### Integration Testing
@@ -79,7 +79,7 @@ Numbers below are the SDLC Studio defaults (unit 90, integration 85, end-to-end 
 | Attribute | Value |
 |-----------|-------|
 | Scope | The kiosk against a Flyover server whose providers are fixtures: aircraft inside and outside the radius, selection shared with the map, empty sky, stale banner |
-| Framework | Not chosen. A browser driver is justified once the UI exists. Until then the story verifiers are `manual` |
+| Framework | Vitest against the HTML the process returns. Chromium is the only browser version 1 claims ([D0017](decisions.md)). A full browser driver is not required for the walking skeleton |
 | Execution | Against the fixture server, not against adsb.lol |
 
 ### E2E Feature Coverage Matrix
@@ -119,7 +119,7 @@ Do not load-test an upstream API.
 
 | Attribute | Value |
 |-----------|-------|
-| Scope | Secrets, the UK postcode, and the resolved centre stay out of the client and the git index. The live view's exposure is not asserted until PRD-OQ7 says who may open it. Dependencies are reviewed when they exist |
+| Scope | Secrets, the UK postcode, and the resolved centre stay out of the client and the git index. A public client is refused ([D0018](decisions.md)). Dependencies are reviewed when they exist |
 | Tools | Repository search in CI or in the pre-commit gate for known key patterns. A test that builds the client and fails if a configured secret string appears in the output. No secret value is stored in the test |
 
 ---
@@ -141,7 +141,8 @@ No URL is invented here. When the owner names one, it is recorded in the decisio
 
 - Synthetic aircraft in fixtures: positions relative to a fictional centre that is not anyone's house. A fixed point in the ocean is the fixture origin. The fixture postcode is the token `TEST-POSTCODE`, which is not a real UK postcode, and the stubbed lookup returns that ocean point. Do not use the owner's postcode, a real residential postcode, or the owner's coordinates.
 - One fixture with an aircraft inside the radius, one outside, one with no route, one with a photo credit, one with a provider error.
-- Clocks are injected. A stale test does not sleep for 60 seconds.
+- Clocks are injected. The default stale threshold is 60 seconds ([D0016](decisions.md)). A stale test does not sleep for it.
+- Distance assertions use statute miles. The default radius in a fixture that does not override it is 15 ([D0014](decisions.md)).
 - The route-lookup fixture returns a body and the test asserts no route file or route table was written.
 - Live smoke, if the owner runs it, uses the real profile on a server and is not committed as a cassette that contains that profile.
 
@@ -157,7 +158,7 @@ This is a required test, not a review note. [D0007](decisions.md).
 
 ### Sensitive Data
 
-The home postcode and the resolved centre are personal data. Tests use `TEST-POSTCODE` and the ocean fixture. Logs from a failed test must not dump the real profile. Provider keys are read from the environment on the owner's machine and are absent in CI until [TRD-OQ10](trd.md#12-open-technical-questions) says there is CI and how it gets a secret. A missing key skips the live smoke. It does not fail the fixture suite, and it does not get replaced with a key checked into the repo.
+The home postcode and the resolved centre are personal data. Tests use `TEST-POSTCODE` and the ocean fixture. Logs from a failed test must not dump the real profile. GitHub Actions runs the fixture suite and receives no postcode, centre, or provider key ([D0024](decisions.md)). A missing key skips a live smoke. It does not fail the fixture suite, and it does not get replaced with a key checked into the repo.
 
 ---
 
@@ -176,9 +177,9 @@ The home postcode and the resolved centre are personal data. Tests use `TEST-POS
 ### Manual Testing
 
 - Readability from across a room on the owner's actual screen.
-- Chromium kiosk mode, and any other browser named in PRD-OQ6.
+- Current Chromium, the only browser version 1 claims ([D0017](decisions.md)).
 - A real poll on staging, watched by a person, after a provider is enabled.
-- Failover rehearsal: stop the app on `webserver1` and confirm the display comes back on `webserver2`, once TRD-OQ3 has a mechanism.
+- The owner's rehearsal of the manual DNS runbook. The suite does not perform it.
 - The navigation disclaimer is visible without scrolling on the kiosk viewport.
 
 ### Automation Framework Stack
@@ -186,8 +187,8 @@ The home postcode and the resolved centre are personal data. Tests use `TEST-POS
 | Layer | Tool | Language |
 | ------- | ------ | ---------- |
 | E2E/UI | Not chosen | Follows the UI language |
-| API | The server's test runner against fixtures | Follows TRD-OQ1 |
-| Unit | The same runner | Follows TRD-OQ1 |
+| API | Vitest against the Hono app | `npx vitest run` |
+| Unit | Vitest | `npx vitest run` |
 
 ---
 
@@ -204,7 +205,7 @@ No pipeline is installed. The intended order, when the owner has a place to run 
 3. **Nightly, optional:** The live smoke, only for a provider the owner has enabled and only within its rate limit. One call, not a loop.
 4. **Before a production deploy:** The fixture suite green, plus the owner's look at staging. Deploy stays manual.
 
-[TRD-OQ10](trd.md#12-open-technical-questions) asks whether this runs on a CI service or on `devserver1`. This strategy does not add a workflow file.
+GitHub Actions runs stages 1 to 3 on a push to `main` ([D0024](decisions.md)). The workflow does not deploy and does not receive a secret.
 
 ### Quality Gates
 
@@ -238,7 +239,7 @@ There is no on-call rota and no contractual SLA. "Stop the production display" m
 | Purpose | Tool |
 | --------- | ------ |
 | Test Management | Story `Verify:` lines and, later, test specs under `sdlc-studio/test-specs/` |
-| CI/CD | Not chosen. TRD-OQ10 |
+| CI/CD | GitHub Actions ([D0024](decisions.md)) |
 | Browser Automation | Not chosen |
 | Coverage | The runner's coverage tool, when the language is chosen |
 

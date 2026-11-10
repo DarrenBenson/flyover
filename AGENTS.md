@@ -66,9 +66,9 @@ section of `<skill>/reference-doctrine.md`.
 
 ## Project specifics
 
-- **Stack:** Not chosen. No application code yet ([D0013](sdlc-studio/decisions.md)). The TRD proposes one TypeScript process. That proposal is [TRD-OQ1](sdlc-studio/trd.md).
-- **Run / build / test:** None. Do not invent a toolchain or add application code while TRD-OQ1 is open. Targets live in `sdlc-studio/tsd.md`. A later suite must prove the UK postcode and the resolved centre are not in git.
-- **Deploy & CI:** Requirements only. Development on `devserver1`, staging on `stagingserver`, production on `webserver1`, failover on `webserver2`. The postcode lives in host config on each serving machine, including `webserver2`. How traffic moves is still open. No CI provider, URL, IP, or cutover mechanism is specified. `release_strategy` is `trunk` (`sdlc-studio/.config.yaml`).
+- **Stack:** One TypeScript process on Node 22, Hono, SQLite via `node:sqlite` ([D0019](sdlc-studio/decisions.md)). [D0013](sdlc-studio/decisions.md) is superseded. The postcode still enters through the host environment.
+- **Run / build / test:** `npm test` runs Vitest. Tests stub the network. They use `TEST-POSTCODE` and an ocean centre, never a real postcode. GitHub Actions runs the same suite.
+- **Deploy & CI:** Do not deploy. Development on `devserver1`, staging on `stagingserver`, production on `webserver1`, failover on `webserver2` by the manual DNS runbook in the TRD. CI is GitHub Actions and does not deploy. `release_strategy` is `trunk` (`sdlc-studio/.config.yaml`).
 - **Config & secrets:** Do not commit provider credentials, the UK postcode, the resolved centre, or host addresses. `.env` is gitignored. The MIT licence does not license upstream flight data, and this deployment's non-commercial eligibility does not travel to a commercial fork.
 - **Code style:** Discovery documents use British spelling, matching the SDLC Studio templates. No application style guide until there is code.
 - **Architecture & services:** See `sdlc-studio/trd.md`. One web app, one house. A local ADS-B receiver is out of scope for v1.

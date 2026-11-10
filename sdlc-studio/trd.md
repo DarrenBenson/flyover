@@ -1,7 +1,7 @@
 # Technical Requirements Document
 
 **Project:** Flyover
-**Version:** 0.2
+**Version:** 0.3
 **Status:** Draft
 **Last Updated:** 2026-11-10
 **PRD Reference:** [PRD](prd.md)
@@ -14,7 +14,7 @@ Terms below were read on 2026-11-10. They are not a legal opinion. The owner con
 
 ### Purpose
 
-Describe a v1 Flyover that one household runs as a personal, non-commercial kiosk, fed by the providers the decisions log now allows, without pretending the stack or the failover mechanism has been accepted.
+Describe a v1 Flyover that one household runs as a personal, non-commercial kiosk: one TypeScript process, a gitignored per-host SQLite file, and a manual DNS failover from `webserver1` to `webserver2`.
 
 ### Scope
 
@@ -30,7 +30,7 @@ Only the decisions in [decisions.md](decisions.md) are accepted. An ADR below is
 - The owner's use is personal and non-commercial. The software licence is MIT. Upstream data terms are not. A commercial fork re-clears every provider. ([D0003](decisions.md), [D0005](decisions.md).)
 - The default position provider for this deployment is adsb.lol. OpenSky and the ADS-B Exchange community and RapidAPI plans are ineligible. ([D0009](decisions.md).)
 - The profile is a UK postcode and a radius in host config on every serving machine, resolved through postcodes.io, never committed. ([D0007](decisions.md), [D0008](decisions.md), [D0012](decisions.md).)
-- One deployable web application and TypeScript remain **proposals**. [TRD-OQ1](#12-open-technical-questions). SQLite is not the profile store.
+- One TypeScript process and a per-host SQLite file are accepted ([D0019](decisions.md)). The profile still enters through the host environment ([D0012](decisions.md)). SQLite is gitignored and is not the copy `webserver2` reads.
 
 ---
 
@@ -67,7 +67,7 @@ flowchart LR
   kiosk --> tiles
 ```
 
-The kiosk never holds an upstream flight-data credential. Map tiles are requested by the browser from a tile host whose terms allow it. Which host is [TRD-OQ6](#12-open-technical-questions).
+The kiosk never holds an upstream flight-data credential. When the map is drawn, tiles come from MapTiler Cloud ([D0021](decisions.md)). The browser does not call `tile.openstreetmap.org`. The walking skeleton does not draw the map.
 
 ### Architecture Pattern
 
@@ -96,17 +96,19 @@ No paths exist yet. The names are the modules a later story would create.
 
 | Category | Technology | Version | Rationale |
 | ---------- | ----------- | --------- | ----------- |
-| Language | TypeScript | Not pinned | The UI is the product, and the server must share types with it for the snapshot and the profile. Proposed, not accepted. [TRD-OQ1](#12-open-technical-questions). |
-| Framework | Not chosen | — | A Vite-built UI served by one small HTTP server (Hono or Fastify are the candidates) keeps a kiosk from taking on a document-site framework. Next.js is the other web-app default in the architecture guide and remains an option. |
-| Database | None for the profile | — | The profile is host config on each server ([D0012](decisions.md)). Route rows are not stored ([D0010](decisions.md)). A database, if a later story needs one, waits on the stack question. |
+| Language | TypeScript on Node.js 22 | Node 22 | One language for the page and the poller. Accepted ([D0019](decisions.md)). |
+| Framework | Hono | Current 4.x | One small HTTP server in the same process as the poller. The kiosk is a page that process serves. |
+| Database | SQLite via `node:sqlite` | Node 22 built-in | Per-host runtime state. Gitignored. Seeded from the host environment. Not a route store and not the profile `webserver2` copies ([D0012](decisions.md), [D0019](decisions.md)). |
 
-Python with FastAPI is the other recommended web-app server. It was not proposed as the default because the kiosk UI would then be a second language and a second build. That trade is the owner's if they prefer Python. Familiarity alone is not the reason for TypeScript. The reason is one language across the only two parts v1 has.
+Python with FastAPI was the other server. It was declined because the kiosk and the poller would then be two languages. The owner accepted TypeScript ([D0019](decisions.md)).
 
 ### Build & Development
 
 | Tool | Purpose |
 |------|---------|
-| Not chosen | No toolchain is selected while the stack question is open. The test strategy names the kinds of check, not the commands. |
+| npm | Installs the process dependencies. The lockfile is committed. Secrets are not. |
+| Vitest | Runs the acceptance tests. Upstream calls are stubbed. |
+| GitHub Actions | Runs that suite on a push to `main` ([D0024](decisions.md)). It does not deploy. |
 
 ### Infrastructure Services
 
@@ -117,7 +119,7 @@ Python with FastAPI is the other recommended web-app server. It was not proposed
 | Production | `webserver1` | The live display |
 | Production failover | `webserver2` | The same release, used when `webserver1` is unavailable |
 
-No other provider is assumed. No container platform, no DNS host, and no secret store is named, because the owner has not named one.
+No container platform and no secret store is named. The owner changes DNS by hand when failing over ([D0020](decisions.md)). Secrets stay in the host environment ([D0023](decisions.md)).
 
 ---
 
@@ -129,7 +131,7 @@ REST with JSON, between the kiosk and the Flyover server only. Upstream provider
 
 ### Authentication
 
-No end-user account in the proposal. The kiosk calls same-origin routes. Upstream credentials are server configuration. Whether setup itself is protected is [PRD-OQ7](prd.md#14-open-questions).
+No end-user account. The kiosk calls same-origin routes. The live view answers only a client on the home LAN ([D0018](decisions.md)). Upstream credentials are server configuration.
 
 ### Endpoints Overview
 
@@ -137,9 +139,8 @@ Illustrative. Not a commitment to paths.
 
 | Method | Path | Description | Auth |
 |--------|------|-------------|------|
-| GET | `/api/snapshot` | Last accepted poll for the active profile: aircraft, ages, source names, credits | Unspecified. See PRD-OQ7 |
-| GET | `/api/profile` | The non-secret profile the screen needs | Unspecified |
-| PUT | `/api/profile` | Set location, radius, units | Unspecified. Must not be an open write on the public internet by accident |
+| GET | `/` | The kiosk page | Home LAN only ([D0018](decisions.md)) |
+| GET | `/api/snapshot` | Last accepted poll: aircraft, age, source name, credits, empty or stale or degraded | Home LAN only |
 
 ### Error Response Format
 
@@ -168,8 +169,7 @@ Provider failures are not this error. A dead upstream is a successful snapshot r
 | postcode | text | One UK postcode | The house. Personal data. Host config only |
 | latitude | number | -90 to 90 | Centre from postcodes.io. Not invented if the lookup fails |
 | longitude | number | -180 to 180 | Centre from postcodes.io |
-| radius_m | number | Greater than 0 | Great-circle radius. The on-screen unit is PRD-OQ3. The filter can compare metres without that label |
-| units | text | An allowed set | Open which set. PRD-OQ3 |
+| radius_miles | number | Greater than 0. Default 15 | Great-circle statute miles ([D0014](decisions.md)) |
 
 #### Aircraft snapshot
 
@@ -178,8 +178,8 @@ Provider failures are not this error. A dead upstream is a successful snapshot r
 | icao24 | text | From the feed | Stable aircraft id when present |
 | callsign | text | Nullable | As broadcast |
 | latitude, longitude | number | Required to be listed | Last accepted position |
-| altitude | number | Nullable | As the feed defines it. Unit recorded |
-| ground_speed | number | Nullable | As the feed defines it. Unit recorded |
+| altitude_ft | number | Nullable. The feed value `ground` stays ground, not a guessed 0 | Feet ([D0014](decisions.md)) |
+| ground_speed_kt | number | Nullable | Knots ([D0014](decisions.md)) |
 | heading | number | Nullable | Track, if the feed has it |
 | observed_at | timestamp | Required | When the source observed it |
 | source | text | Required | Which provider |
@@ -201,8 +201,8 @@ Route rows are not this cache. [D0010](decisions.md) discards the adsbdb respons
 
 | Data Type | Storage | Rationale |
 |-----------|---------|-----------|
-| Profile | Runtime config or environment on each serving host | [D0012](decisions.md). `webserver2` has its own copy. Not in git |
-| Latest poll | Process memory | A history is a different product and a different licence question |
+| Profile | Host environment on each serving host, then this host's gitignored SQLite | [D0012](decisions.md), [D0019](decisions.md). `webserver2` has its own environment and its own database file. Neither is committed |
+| Latest poll | This host's SQLite, one row | A history is a different product. A restart can still show the last picture and its age |
 | Route lookup | Not stored | [D0010](decisions.md). Shown, then discarded |
 | Photo JSON | Memory, at most 24 hours | [D0011](decisions.md). Not the image bytes |
 | Photo bytes | Not stored | The display loads the thumbnail URL itself |
@@ -210,7 +210,7 @@ Route rows are not this cache. [D0010](decisions.md) discards the adsbdb respons
 
 ### Migrations
 
-None until there is a schema. When there is one, migrations ship with the same build that reads them, and a migration runs before the process serves traffic. No migration tool is chosen.
+The schema is created by the process on startup. There is one profile row and one snapshot row. A later change ships with the build that reads it. No migration framework.
 
 ---
 
@@ -228,7 +228,7 @@ Re-read on 2026-11-10 against a personal, non-commercial, one-house deployment (
 | [adsbdb](https://www.adsbdb.com/) | Airline, flight number, origin, destination | HTTPS JSON `https://api.adsbdb.com/v0/` | None for reads | Route data is the work of David Taylor and Jim Mason and may not be copied, published, or incorporated into other databases without David J Taylor's permission. Non-commercial use does not lift that notice. In a rolling 60 seconds, 512 or more requests are blocked for 60 seconds, and 1,024 or more for 300 seconds. Aircraft data on the same site is credited to Planebase. Those terms were not read. airport-data photos were not read | **Eligible only as a live lookup that is shown and discarded** ([D0010](decisions.md)). **Ineligible as a cache or a route database.** Planebase and airport-data are not sources | Credit David Taylor, Jim Mason, and adsbdb on the screen when a route is shown |
 | [Planespotters photo API](https://www.planespotters.net/photo/api) | Airframe photo | HTTPS JSON `https://api.planespotters.net/pub/photos/hex/{hex}` or `/reg/{registration}` | None. Free and keyless | The API page loaded on the second read, 2026-11-10. Visible photographer credit. An obvious path to the returned `link` URL: a plain anchor without `rel="nofollow"` on a clickable browser, or a QR code or NFC tag on a display that cannot be clicked. The URL as text does not qualify. The display fetches thumbnail URLs unchanged. No storing, re-hosting, or proxying of image bytes. JSON cache at most 24 hours. Server-side calls need a descriptive User-Agent with a contact URL or email. Not for training models. Not for resale as an API | **Eligible when those conditions are met, and off until configuration enables it** ([D0011](decisions.md)). Personal non-commercial use adds no extra right. A commercial fork must meet the same page itself | Photographer name beside the image, and the path back to the photo page |
 | [postcodes.io](https://postcodes.io/docs/licences/) | UK postcode to a centre, once when the postcode is loaded | HTTPS JSON | None | Software is MIT. Great Britain postcode data is OS OpenData. The licences page requires the Ordnance Survey, Royal Mail, National Statistics, and NRS attribution statements (copyright year 2025 on the page read). Northern Ireland postcodes beginning BT are free for non-commercial use under the ONSPD terms. Commercial use of BT data needs a licence from NI Land & Property Services | **Eligible for this deployment**, including a BT postcode, because the owner's use is non-commercial ([D0008](decisions.md)). Do not download the postcode directory into the repo. A commercial fork that resolves BT postcodes needs the LPS licence. One lookup, not a poll | The four attribution lines from the licences page, on the screen |
-| Map tiles | Basemap | HTTPS tiles or a vector style | Depends on the host | The OpenStreetMap Foundation's public tile servers are for light, human use of the project, not for a kiosk that loads tiles all day. Flyover must not point a kiosk at `tile.openstreetmap.org` | **No host selected.** [TRD-OQ6](#12-open-technical-questions) | Whatever that host requires. OpenStreetMap data itself is ODbL |
+| [MapTiler Cloud](https://www.maptiler.com/cloud/pricing/) | Basemap, when the map story is built | HTTPS, MapTiler SDK session or tile API | `MAPTILER_API_KEY` in the host environment, never in git | Free plan read 2026-11-10: personal and non-commercial use and proof of concept, not commercial use. 5,000 map sessions a month. A session is one page load with unlimited interaction after that. A third-party SDK counts tile requests, capped at 100,000 a month. The free quota pauses until the next month rather than billing. Free use must show the MapTiler logo linking to maptiler.com and the text attribution. Terms: https://www.maptiler.com/terms/cloud/ | **Eligible for this personal kiosk** ([D0021](decisions.md)). A paused quota degrades the map. No fallback to `tile.openstreetmap.org`. The key is not committed. The map is not part of the walking skeleton | MapTiler logo and text attribution on the map |
 | Local `dump1090` / `readsb` | Positions from a receiver in the house | Not in v1 | — | Future adapter only | Out of scope for this version | Not applicable in v1 |
 
 No other flight API is a candidate. A contracted feed would be a new decision.
@@ -273,13 +273,16 @@ Promotion is dev, then staging, then the production pair. The owner triggers pro
 
 ### Failover
 
-Requirements, not a design:
+Version 1 failover is a manual DNS change ([D0020](decisions.md)). There is no automatic cutover. This runbook is the procedure. It does not name an IP, a DNS vendor, a port, or a credential, and following it is the owner's job. This repository does not deploy.
 
-- `webserver2` can serve the same Flyover build `webserver1` serves.
-- When `webserver1` is unavailable, the display is reachable via `webserver2` without a code change.
-- Failover does not require a position archive. Losing the in-memory poll means the next poll refills the screen.
-- The profile is runtime config on the host that serves traffic ([D0012](decisions.md)). `webserver2` has the postcode, the centre, and the radius in its own environment. It does not read a database on `webserver1`.
-- How traffic moves (DNS, a proxy the owner already has, or a manual change) is [TRD-OQ3](#12-open-technical-questions). This document does not pick one.
+1. `webserver1` and `webserver2` run the same Flyover build.
+2. `webserver2` has the same host environment as `webserver1`: the UK postcode, the radius, the position-provider name, and any key. It has its own SQLite file, created on that host and not copied from `webserver1`.
+3. The owner checks the display by opening Flyover on `webserver2` from a device on the home LAN. A public client is refused ([D0018](decisions.md)).
+4. The owner changes the household DNS name so it points at `webserver2` instead of `webserver1`. The kiosk keeps using that name.
+5. To return, the owner points the same DNS name back at `webserver1`.
+6. The postcode, the centre, and any key stay in the host environment. They are not pasted into git, into this runbook, or into a ticket while the switch is made.
+
+A failed upstream still does not need this procedure. The screen shows empty, stale, or degraded on whichever host is serving.
 
 ### Scaling Strategy
 
@@ -295,7 +298,7 @@ Vertical, in the trivial sense: one process on one host is enough for a handful 
 |--------|-----------|--------|------------|
 | Provider key committed or sent to the browser | Medium if someone is careless | High. The key is the quota, and sometimes the licence | Keys only in host config. Browser talks to Flyover. Review any client bundle for the key |
 | Home postcode or centre in git, logs, or a too-tight upstream box | Medium | High. It is the household | Do not log the postcode or the centre on the poll path. Query a box, not the postcode. No postcode and no coordinate in git |
-| Unauthenticated live view on the public internet | Unknown until PRD-OQ7 | High. The map shows where the house is | The postcode is not a web form. Who may open the live view is still open |
+| Live view opened from the public internet | Medium if the proxy is published | High. The map shows where the house is | The process admits only loopback, private LAN addresses, and a loopback reverse proxy whose forwarded client is also on the LAN ([D0018](decisions.md)) |
 | Stale or empty feed shown as live | High, because feeds fail | Medium. The household trusts a lie | Age on screen. Distinct empty, stale, and down states. PRD feature "Honest emptiness" |
 | Photo or route used outside its terms | Medium | High, legally | Routes are not stored ([D0010](decisions.md)). Photo bytes are not stored ([D0011](decisions.md)). OpenSky and ADS-B Exchange are not enabled |
 | Treating the screen as navigation | Low technically, high if the copy is casual | High | The not-for-navigation statement is a requirement, not a footer afterthought |
@@ -304,12 +307,12 @@ Vertical, in the trivial sense: one process on one host is enough for a handful 
 
 | Control | Implementation |
 | --------- | ---------------- |
-| Authentication | No end-user account proposed. Upstream auth stays on the server. Setup exposure is an open question |
+| Authentication | No end-user account. Upstream auth stays on the server. The live view is LAN-only ([D0018](decisions.md)) |
 | Authorisation | One operator, one house. No roles and no second profile |
-| Encryption at rest | Not specified. The profile is a location. Disk encryption of the host, if any, is the owner's existing practice and is not invented here |
-| Encryption in transit | The kiosk should reach Flyover over HTTPS in production. Where TLS terminates is [TRD-OQ9](#12-open-technical-questions). Upstream calls are HTTPS |
+| Encryption at rest | The profile is a location in the host environment and in a gitignored SQLite file. Disk encryption of the host, if any, is the owner's existing practice and is not invented here |
+| Encryption in transit | TLS terminates at the reverse proxy on the serving host ([D0023](decisions.md)). Flyover listens for HTTP behind that proxy. Upstream calls are HTTPS |
 
-No sector compliance regime is declared. Home location is personal data. Whether UK GDPR or another regime applies is [TRD-OQ8](#12-open-technical-questions). The engineering consequence that does not wait for that answer: collect only the location the display needs, do not send it to a provider as a street address, and do not keep a history of who looked at the screen. There is no "who looked" record in v1.
+The working assumption is the UK GDPR household exemption ([D0022](decisions.md)). It is a default the owner can revisit, not a legal opinion. Publishing the display, adding a household, or making it commercial reopens it. The engineering consequence stands either way: collect only the location the display needs, do not send the postcode upstream, and do not keep a history of who looked at the screen.
 
 ---
 
@@ -317,7 +320,7 @@ No sector compliance regime is declared. Home location is personal data. Whether
 
 ### Targets
 
-Proposed. The owner can replace the numbers via PRD-OQ5. They are not a benchmark result.
+Accepted defaults ([D0016](decisions.md)). The stale threshold is configurable. They are not a benchmark result.
 
 | Metric | Target | Measurement |
 | -------- | -------- | ------------- |
@@ -330,11 +333,11 @@ Proposed. The owner can replace the numbers via PRD-OQ5. They are not a benchmar
 
 ## 11. Architecture Decision Records
 
-Proposed. Not accepted. Accepting one is an owner decision, recorded with `decisions.py add`, not by editing the status word here and nowhere else.
+Accepted where the decisions log says so.
 
 ### ADR-001: One deployable web application
 
-**Status:** Proposed
+**Status:** Accepted ([D0019](decisions.md))
 
 **Context:** The architecture guide's default for a web application on a small team is a monolith. Flyover has one UI, one poller, and two hosts that must run the same thing.
 
@@ -386,29 +389,29 @@ Proposed. Not accepted. Accepting one is an owner decision, recorded with `decis
 
 ### ADR-005: The profile is host config, not a database
 
-**Status:** Accepted ([D0012](decisions.md)). Supersedes the SQLite-profile proposal.
+**Status:** Accepted ([D0012](decisions.md)), clarified by [D0019](decisions.md).
 
-**Context:** One house, one postcode. `webserver2` must serve that same house when `webserver1` cannot. A SQLite file on one disk does not do that. The owner required the postcode and the coordinates to live in runtime config.
+**Context:** One house, one postcode. `webserver2` must serve that same house when `webserver1` cannot. A SQLite file that exists only on `webserver1` does not do that. The owner required the postcode and the coordinates to enter through runtime config, and later accepted a per-host SQLite file for runtime state.
 
-**Decision:** The postcode, the resolved centre, and the radius are environment or runtime config on every serving host. They are not in git and not in SQLite. Do not add PostgreSQL for the profile.
+**Decision:** The postcode, the radius, and any key enter through the environment on every serving host. They are not in git. After startup, that host may keep the resolved centre and the latest poll in its own SQLite file. `webserver2` does not read `webserver1`'s file. Do not add PostgreSQL.
 
 **Consequences:**
 
 - Positive: Failover of the profile is "the same env exists on `webserver2`". No database service.
-- Negative: Someone must place that env on each host. How the browser's traffic moves is still [TRD-OQ3](#12-open-technical-questions).
+- Negative: Someone must place that env on each host. Traffic moves by the manual DNS runbook ([D0020](decisions.md)).
 
 ---
 
 ## 12. Open Technical Questions
 
-- [ ] **TRD-OQ1:** Accept TypeScript as one process (UI plus server), or name another stack?
-  **Context:** The proposal is one language because the UI and the poller share a snapshot type. Python plus a separate UI is the main alternative. No application code is written until this is answered ([D0013](decisions.md)).
+- [x] **TRD-OQ1:** Accept TypeScript as one process (UI plus server), or name another stack?
+  **Resolved by [D0019](decisions.md).** One TypeScript process on Node 22, with a gitignored per-host SQLite file. The profile still enters through the host environment. [D0013](decisions.md) is superseded.
 
 - [x] **TRD-OQ2:** Where does the display profile live so that `webserver2` can serve it when `webserver1` cannot?
   **Resolved by [D0012](decisions.md).** Runtime config or environment variables on each serving host, including `webserver2`. Not in git. Not only on `webserver1`.
 
-- [ ] **TRD-OQ3:** How does traffic move from `webserver1` to `webserver2`?
-  **Context:** DNS, an existing proxy, or a manual step are all possible. None is documented by the owner. No IP or hostname beyond the four server names is known. The profile location is decided. The cutover is not.
+- [x] **TRD-OQ3:** How does traffic move from `webserver1` to `webserver2`?
+  **Resolved by [D0020](decisions.md).** The owner changes DNS by hand. The runbook is in section 8. It has not been rehearsed, and this repository does not deploy.
 
 - [x] **TRD-OQ4:** Which position provider will this deployment enable?
   **Resolved by [D0009](decisions.md).** adsb.lol. OpenSky remains ineligible without a written licence, including for a non-commercial live display. The ADS-B Exchange community and RapidAPI plans remain ineligible for an always-on display.
@@ -416,20 +419,20 @@ Proposed. Not accepted. Accepting one is an owner decision, recorded with `decis
 - [x] **TRD-OQ5:** May Flyover cache adsbdb route rows?
   **Resolved by [D0010](decisions.md).** No. A live lookup may be shown and then discarded. A cache needs David J Taylor's permission first. Personal non-commercial use does not grant it.
 
-- [ ] **TRD-OQ6:** Which map tile or style host may a kiosk load all day?
-  **Context:** The public OpenStreetMap tile servers are not that host.
+- [x] **TRD-OQ6:** Which map tile or style host may a kiosk load all day?
+  **Resolved by [D0021](decisions.md).** MapTiler Cloud free plan. The key is `MAPTILER_API_KEY` in the host environment. Attribution is required. A paused quota degrades the map. `tile.openstreetmap.org` is not a fallback.
 
 - [x] **TRD-OQ7:** What does the Planespotters photo API require?
   **Resolved by [D0011](decisions.md).** The API page was read on 2026-11-10. Credit, an obvious path to the photo page, no stored or proxied images, JSON cached at most 24 hours, descriptive User-Agent on server-side calls. airport-data, credited by adsbdb for photos, was not read and is not a candidate.
 
-- [ ] **TRD-OQ8:** Does a home postcode stored on the owner's server bring a privacy regime (for example UK GDPR) into scope?
-  **Context:** No regime was declared. The postcode and the centre are personal data either way. Minimisation in the security section stands.
+- [x] **TRD-OQ8:** Does a home postcode stored on the owner's server bring a privacy regime (for example UK GDPR) into scope?
+  **Resolved by [D0022](decisions.md), as a default the owner can revisit.** The working assumption is the UK GDPR household exemption. It is not a legal opinion. Minimisation still stands.
 
-- [ ] **TRD-OQ9:** Where does TLS for the kiosk terminate, and how are provider secrets provided on each server?
-  **Context:** Required behaviour is HTTPS in production and secrets outside git. The mechanism is the owner's. Do not invent a secret manager. The profile itself is already host config ([D0012](decisions.md)).
+- [x] **TRD-OQ9:** Where does TLS for the kiosk terminate, and how are provider secrets provided on each server?
+  **Resolved by [D0023](decisions.md), as a default the owner can revisit.** TLS terminates at the serving host's reverse proxy. Secrets stay in the host environment. No secret manager is added.
 
-- [ ] **TRD-OQ10:** Is there a CI system that should run the future test gate, or does the owner run it on `devserver1`?
-  **Context:** The test strategy describes the stages. It does not add a workflow file.
+- [x] **TRD-OQ10:** Is there a CI system that should run the future test gate, or does the owner run it on `devserver1`?
+  **Resolved by [D0024](decisions.md), as a default the owner can revisit.** GitHub Actions runs the test suite on a push to `main`. It does not deploy.
 
 ---
 
@@ -437,7 +440,7 @@ Proposed. Not accepted. Accepting one is an owner decision, recorded with `decis
 
 ### Must Have
 
-- No application code while the stack question is open ([D0013](decisions.md)).
+- Application code is allowed. The stack is accepted ([D0019](decisions.md)). [D0013](decisions.md) is superseded.
 - No provider calls until that provider is explicitly enabled. The one this deployment should enable for positions is adsb.lol.
 - No credentials, UK postcode, home coordinates, or extra hostnames in the repository.
 - Credits on the screen for every source that is enabled, including the postcode attribution when a centre is shown.
@@ -450,7 +453,7 @@ Proposed. Not accepted. Accepting one is an owner decision, recorded with `decis
 - A position archive, a route database, alerts, dispatch, or anything a crew would use operationally.
 - OpenSky, and the ADS-B Exchange community and RapidAPI plans, as position sources for this deployment.
 - Copied airline logos.
-- User accounts, unless PRD-OQ7 is answered by adding one.
+- User accounts. The live view is limited by the home LAN, not by a login ([D0018](decisions.md)).
 - A second deployed service.
 
 ---
@@ -461,3 +464,4 @@ Proposed. Not accepted. Accepting one is an owner decision, recorded with `decis
 |------|---------|---------|
 | 2026-11-10 | 0.1 | Initial draft. Provider terms cited from pages retrieved that day. Stack and provider are proposed, not accepted. |
 | 2026-11-10 | 0.2 | Re-assessed providers for personal non-commercial use. Default position provider is adsb.lol. Profile is a UK postcode in host config. |
+| 2026-11-10 | 0.3 | Stack accepted. MapTiler chosen. Manual DNS runbook. LAN-only live view. Household-exemption, TLS, and GitHub Actions recorded as revisitable defaults. |

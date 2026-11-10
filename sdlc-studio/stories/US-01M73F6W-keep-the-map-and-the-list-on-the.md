@@ -1,6 +1,6 @@
 # US-01M73F6W: Keep the map and the list on the same aircraft
 
-> **Status:** Draft
+> **Status:** Ready
 > **Created:** 2026-11-10
 > **Created-by:** sdlc-studio new
 > **Raised-by:** sdlc-studio; agent; v1
@@ -25,9 +25,9 @@
 - **AC3:** Given a selection, when the next poll no longer contains that aircraft, then the selection clears and the screen does not keep facts for an aircraft that has gone.
   - **Verify:** manual Drop the selected aircraft from the next fixture poll and confirm the detail clears.
 
-## Still needs
+## Notes
 
-- [US-01M73F1W](US-01M73F1W-show-home-the-radius-and-the-aircraft-on.md), which stays Draft until [TRD-OQ6](../trd.md#12-open-technical-questions) names a tile host. This story selects on that map, so it stays Draft with it.
+The map host is decided ([D0021](../decisions.md)). This story still depends on [US-01M73F1W](US-01M73F1W-show-home-the-radius-and-the-aircraft-on.md) and is not part of the walking skeleton.
 
 ## Revision History
 

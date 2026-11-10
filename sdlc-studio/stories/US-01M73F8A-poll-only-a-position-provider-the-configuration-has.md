@@ -18,13 +18,13 @@
 ## Acceptance Criteria
 
 - **AC1:** Given no position provider enabled, when a poll runs, then the transport is not called and the screen shows the not-configured or empty state.
-  - **Verify:** manual Run a poll with every provider off and confirm the stub transport count stays zero.
+  - **Verify:** vitest "F8A-AC1"
 - **AC2:** Given adsb.lol enabled, when a poll runs, then only the adsb.lol transport is called.
-  - **Verify:** manual Enable the adsb.lol stub and confirm the OpenSky and ADS-B Exchange stubs are not called.
+  - **Verify:** vitest "F8A-AC2"
 - **AC3:** Given configuration that names OpenSky or ADS-B Exchange, when the server starts, then it refuses that provider and makes no call.
-  - **Verify:** manual Name each ineligible provider and confirm the call count stays zero and the refusal is visible.
+  - **Verify:** vitest "F8A-AC3"
 - **AC4:** Given a provider credential, when the kiosk bundle is inspected, then the credential is not in it.
-  - **Verify:** manual Build the client and confirm a sentinel credential string is absent from the output.
+  - **Verify:** vitest "F8A-AC4"
 
 The default this deployment names is adsb.lol ([D0009](../decisions.md)). A checkout with no config still calls nobody ([D0003](../decisions.md)).
 

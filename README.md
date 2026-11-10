@@ -10,7 +10,7 @@ The owner's deployment is a personal, non-commercial hobby. Flyover is independe
 
 For this deployment the default position feed is [adsb.lol](https://www.adsb.lol/docs/open-data/api). OpenSky still needs a written licence before a live display may poll it, commercial or not. The ADS-B Exchange community and RapidAPI plans do not cover an always-on screen. See the technical requirements before enabling anything.
 
-There is no application code in the repository yet. This revision is the discovery set: what the product is, how it should be built and tested, and who it is for.
+Version 1 is one TypeScript process. On-screen units are feet, knots, and statute miles. The default radius is 15 miles. A feed is stale after 60 seconds without fresh data. The live view answers only on the home LAN, in Chromium. Map tiles, when the map is drawn, come from MapTiler. The key stays on the server.
 
 ## Documents
 
@@ -27,7 +27,7 @@ SDLC Studio 6.3.0 owns the lifecycle. The skill is vendored for this repository 
 
 ## Status
 
-Discovery, with the household and the data sources decided for this deployment. There is still no application code. The stack, the on-screen units, who may open the live view, the map tile host, and how traffic moves from `webserver1` to `webserver2` are open. They are listed in the PRD and the TRD.
+The owner has accepted the stack, the units, the audience, the map host, and a manual DNS failover from `webserver1` to `webserver2`. The runbook is in the technical requirements. Nothing in this repository deploys to a server. The UK postcode, the centre, and any key stay out of git.
 
 The position feed to enable is adsb.lol. OpenSky is not eligible for this live display without a written licence. The ADS-B Exchange community and RapidAPI plans are not eligible for an always-on screen. Do not treat a commercial fork as covered by those findings.
 

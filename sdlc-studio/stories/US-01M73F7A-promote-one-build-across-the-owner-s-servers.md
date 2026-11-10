@@ -1,6 +1,6 @@
 # US-01M73F7A: Promote one build across the owner's servers
 
-> **Status:** Draft
+> **Status:** Ready
 > **Created:** 2026-11-10
 > **Created-by:** sdlc-studio new
 > **Raised-by:** sdlc-studio; agent; v1
@@ -24,9 +24,9 @@
 - **AC3:** Given the repository and the host notes, when they are read, then they contain no IP address, extra hostname, credential, postcode, or centre.
   - **Verify:** manual Search the repo and the committed docs for credentials, postcodes, and hostnames other than the four named servers.
 
-## Still needs
+## Notes
 
-- [TRD-OQ3](../trd.md#12-open-technical-questions): how traffic moves from webserver1 to webserver2. Where the profile lives is decided ([D0012](../decisions.md)). The cutover is not, so this story cannot say how the display arrives at webserver2.
+Traffic moves by the manual DNS runbook in the TRD ([D0020](../decisions.md)). The rehearsal on the owner's servers is this story's remaining work. It is not part of the walking skeleton, and the repository does not deploy.
 
 ## Revision History
 
