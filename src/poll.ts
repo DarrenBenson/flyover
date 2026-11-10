@@ -40,6 +40,7 @@ export function readAircraft(body: unknown, homeLat: number, homeLon: number, ra
       onGround,
       speedKnots: numberOrNull(record.gs),
       trackDeg: numberOrNull(record.track),
+      typeCode: typeof record.t === "string" && record.t.trim() ? record.t.trim() : null,
     };
     const existing = byId.get(id);
     if (!existing || aircraft.distanceMiles < existing.distanceMiles) byId.set(id, aircraft);

@@ -1,0 +1,35 @@
+{
+  "full": {
+    "ac": [
+      {
+        "hex": "abc123",
+        "flight": "FACT1",
+        "lat": 0,
+        "lon": -29.971,
+        "alt_baro": 32000,
+        "gs": 450.2,
+        "track": 90,
+        "t": "A20N",
+        "seen_pos": 0
+      }
+    ],
+    "msg": "No error",
+    "now": 1700000000000
+  },
+  "noType": {
+    "ac": [
+      {
+        "hex": "def456",
+        "flight": "NOTYPE",
+        "lat": 0,
+        "lon": -29.98,
+        "alt_baro": 10000,
+        "gs": 200,
+        "track": 10,
+        "seen_pos": 0
+      }
+    ],
+    "msg": "No error",
+    "now": 1700000000000
+  }
+}

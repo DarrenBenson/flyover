@@ -13,7 +13,7 @@ Position data for this deployment comes from adsb.lol, and only when configurati
 ## Story Breakdown
 
 - [x] [US-01M73F8A: Poll only a position provider the configuration has enabled](../stories/US-01M73F8A-poll-only-a-position-provider-the-configuration-has.md)
-- [ ] [US-01M73FSQ: Show route and airline facts without storing a route database](../stories/US-01M73FSQ-show-route-and-airline-facts-without-storing-a.md)
+- [x] [US-01M73FSQ: Show route and airline facts without storing a route database](../stories/US-01M73FSQ-show-route-and-airline-facts-without-storing-a.md)
 - [ ] [US-01M73FFM: Show a credited photo or no photo](../stories/US-01M73FFM-show-a-credited-photo-or-no-photo.md)
 
 ## Acceptance Criteria

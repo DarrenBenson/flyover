@@ -1,0 +1,14 @@
+{
+  "hit": {
+    "response": {
+      "flightroute": {
+        "callsign": "FACT1",
+        "callsign_iata": "EX123",
+        "airline": { "name": "Example Air" },
+        "origin": { "name": "Example Origin", "iata_code": "EXO" },
+        "destination": { "name": "Example Destination", "iata_code": "EXD" }
+      }
+    }
+  },
+  "miss": { "response": {} }
+}

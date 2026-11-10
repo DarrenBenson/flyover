@@ -1,13 +1,13 @@
 # US-01M73FJV: Show the flight facts for the selected aircraft
 
-> **Status:** Ready
+> **Status:** Done
 > **Created:** 2026-11-10
 > **Created-by:** sdlc-studio new
 > **Raised-by:** sdlc-studio; agent; v1
 > **Epic:** EP-01M73F6G
 > **Points:** 5
 > **Persona:** Samir Rahman
-> **Affects:** sdlc-studio/prd.md, tests/fixtures/flight-facts.json
+> **Affects:** sdlc-studio/prd.md, tests/fixtures/flight-facts.json, src/route.ts, src/app.ts, src/page.ts, src/poll.ts, tests/facts.test.ts
 > **Depends on:** US-01M73FSQ
 
 ## User Story
@@ -19,13 +19,17 @@
 ## Acceptance Criteria
 
 - **AC1:** Given a selected aircraft whose route lookup hit and whose position feed includes a type, when the detail is shown, then each required field is visible, with altitude in feet, speed in knots, and distance in statute miles.
-  - **Verify:** manual Select a fully populated fixture aircraft and read every required field.
+  - **Verify:** vitest "FJV-AC1"
+  - **Verified:** yes (2026-11-10)
 - **AC2:** Given a selected aircraft whose route lookup missed, when the detail is shown, then origin and destination say unknown and no city is invented.
-  - **Verify:** manual Select a fixture with no route and confirm origin and destination are unknown.
+  - **Verify:** vitest "FJV-AC2"
+  - **Verified:** yes (2026-11-10)
 - **AC3:** Given a home centre and an aircraft position, when distance and direction are shown, then they are computed from those two points.
-  - **Verify:** manual Compare the shown distance and bearing with a hand calculation from the fixture coordinates.
+  - **Verify:** vitest "FJV-AC3"
+  - **Verified:** yes (2026-11-10)
 - **AC4:** Given a position feed with no aircraft type, when the detail is shown, then type says unknown and Planebase is not called.
-  - **Verify:** manual Confirm the type line is unknown and the Planebase transport count stays zero.
+  - **Verify:** vitest "FJV-AC4"
+  - **Verified:** yes (2026-11-10)
 
 ## Notes
 

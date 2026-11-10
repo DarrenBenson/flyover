@@ -1,4 +1,4 @@
-import type { Aircraft, PublicSnapshot } from "./types.ts";
+import type { Aircraft, Detail, PublicSnapshot } from "./types.ts";
 
 function escapeHtml(value: string): string {
   return value
@@ -28,6 +28,7 @@ export function renderPage(snapshot: PublicSnapshot): string {
     .join("");
   const list = snapshot.aircraft.length ? `<ol>${items}</ol>` : "";
   const age = snapshot.ageSeconds == null ? "" : `<p class="age">Age ${snapshot.ageSeconds} seconds</p>`;
+  const detail = renderDetail(snapshot);
   const credits = snapshot.credits.map((line) => `<li>${escapeHtml(line)}</li>`).join("");
   return `<!DOCTYPE html>
 <html lang="en-GB">
@@ -48,9 +49,33 @@ export function renderPage(snapshot: PublicSnapshot): string {
   <p class="message">${escapeHtml(snapshot.message)}</p>
   ${age}
   ${list}
+  ${detail}
   <p class="navigation">${escapeHtml(snapshot.navigation)}</p>
   <ul class="credits">${credits}</ul>
 </main>
-</body>
+  </body>
 </html>`;
+}
+
+function field(name: string, value: string): string {
+  return `<dt>${escapeHtml(name)}</dt><dd data-field="${escapeHtml(name)}">${escapeHtml(value)}</dd>`;
+}
+
+function renderDetail(snapshot: PublicSnapshot): string {
+  if (snapshot.selection === "gone") {
+    return `<p class="detail" data-selection="gone">That aircraft has left the picture.</p>`;
+  }
+  const detail: Detail | null = snapshot.detail;
+  if (!detail) return "";
+  return `<dl class="detail" data-selection="shown" data-id="${escapeHtml(detail.id)}">
+    ${field("airline", detail.airline)}
+    ${field("flight", detail.flightNumber)}
+    ${field("origin", detail.origin)}
+    ${field("destination", detail.destination)}
+    ${field("type", detail.typeCode)}
+    ${field("altitude", detail.altitude)}
+    ${field("speed", detail.speed)}
+    ${field("distance", detail.distance)}
+    ${field("direction", detail.direction)}
+  </dl>`;
 }

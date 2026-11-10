@@ -7,6 +7,21 @@ export type Aircraft = {
   onGround: boolean;
   speedKnots: number | null;
   trackDeg: number | null;
+  typeCode: string | null;
+};
+
+export type Detail = {
+  id: string;
+  airline: string;
+  flightNumber: string;
+  origin: string;
+  destination: string;
+  typeCode: string;
+  altitude: string;
+  speed: string;
+  distance: string;
+  direction: string;
+  routeShown: boolean;
 };
 
 export type FeedState =
@@ -29,4 +44,6 @@ export type PublicSnapshot = {
   credits: string[];
   navigation: string;
   source: string | null;
+  detail: Detail | null;
+  selection: "shown" | "gone" | "none";
 };

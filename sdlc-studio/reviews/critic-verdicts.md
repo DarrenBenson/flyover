@@ -12,3 +12,5 @@
 | US01M73FRX | APPROVE | qa | cursor-agent | 2026-11-10 | - | - | none |
 | US01M73F39 | APPROVE | qa | cursor-agent | 2026-11-10 | - | - | none |
 | US01M73FSE | APPROVE | qa | cursor-agent | 2026-11-10 | - | - | none |
+| US01M73FSQ | APPROVE | qa | cursor-agent | 2026-11-10 | - | - | none |
+| US01M73FJV | APPROVE | qa | cursor-agent | 2026-11-10 | - | - | none |

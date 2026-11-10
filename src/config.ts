@@ -6,6 +6,7 @@ export type AppConfig = {
   staleAfterSeconds: number;
   positionProvider: string | null;
   maptilerKey: string | null;
+  routeLookup: boolean;
   databasePath: string;
 };
 
@@ -27,6 +28,7 @@ export function readConfig(env: Record<string, string | undefined>): AppConfig {
     staleAfterSeconds: stale != null && stale > 0 ? stale : 60,
     positionProvider: provider || null,
     maptilerKey: (env.MAPTILER_API_KEY ?? "").trim() || null,
+    routeLookup: (env.ROUTE_LOOKUP ?? "").trim().toLowerCase() === "adsbdb",
     databasePath: (env.FLYOVER_DB ?? "").trim() || "data/flyover.sqlite",
   };
 }

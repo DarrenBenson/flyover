@@ -10,3 +10,5 @@ export const POSTCODE_CREDITS = [
 
 export const ADSB_CREDIT =
   "Positions from adsb.lol, licensed under the Open Database Licence (ODbL) 1.0.";
+
+export const ROUTE_CREDIT = "Route data by David Taylor and Jim Mason, via adsbdb.";

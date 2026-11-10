@@ -14,7 +14,7 @@ The live list for one house: which aircraft are inside the radius of the postcod
 
 - [x] [US-01M73FFG: Set the home location and radius](../stories/US-01M73FFG-set-the-home-location-and-radius.md)
 - [x] [US-01M73FBE: List aircraft inside the radius](../stories/US-01M73FBE-list-aircraft-inside-the-radius.md)
-- [ ] [US-01M73FJV: Show the flight facts for the selected aircraft](../stories/US-01M73FJV-show-the-flight-facts-for-the-selected-aircraft.md)
+- [x] [US-01M73FJV: Show the flight facts for the selected aircraft](../stories/US-01M73FJV-show-the-flight-facts-for-the-selected-aircraft.md)
 - [x] [US-01M73FRX: Tell an empty sky from a stale feed](../stories/US-01M73FRX-tell-an-empty-sky-from-a-stale-feed.md)
 
 ## Acceptance Criteria

@@ -47,6 +47,7 @@ The process reads the house from the environment. None of these values belong in
 | `FLYOVER_RADIUS_MILES` | Statute miles | 15 |
 | `STALE_AFTER_SECONDS` | Age before the picture is marked stale | 60 |
 | `POSITION_PROVIDER` | Must be `adsb.lol` before any position call | unset, and nothing is called |
+| `ROUTE_LOOKUP` | Must be `adsbdb` before a live route lookup | unset, and no route call is made |
 | `MAPTILER_API_KEY` | Map tiles, when the map is drawn | unset |
 | `FLYOVER_DB` | This host's SQLite file | `data/flyover.sqlite` |
 

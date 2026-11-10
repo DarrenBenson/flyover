@@ -1,12 +1,13 @@
 import { Hono } from "hono";
 import { getConnInfo } from "@hono/node-server/conninfo";
-import { ADSB_CREDIT, NAVIGATION, POSTCODE_CREDITS } from "./credits.ts";
+import { ADSB_CREDIT, NAVIGATION, POSTCODE_CREDITS, ROUTE_CREDIT } from "./credits.ts";
 import { providerKind, readConfig, type AppConfig } from "./config.ts";
 import { clientAllowed } from "./lan.ts";
 import { adsbUrl, postcodeUrl, readAircraft } from "./poll.ts";
+import { readRoute, routeUrl } from "./route.ts";
 import { renderPage } from "./page.ts";
 import { Store } from "./store.ts";
-import type { Aircraft, FeedState, PublicSnapshot } from "./types.ts";
+import type { Aircraft, Detail, FeedState, PublicSnapshot } from "./types.ts";
 
 const USER_AGENT = "flyover/0.1 (personal non-commercial kiosk)";
 
@@ -66,6 +67,56 @@ export function createApp(deps: AppDeps): FlyoverApp {
       credits,
       navigation: NAVIGATION,
       source: providerKind(config.positionProvider) === "adsb.lol" ? "adsb.lol" : null,
+      detail: null,
+      selection: "none",
+    };
+  }
+
+  async function factsFor(chosen: Aircraft): Promise<Detail> {
+    const unknown: Detail = {
+      id: chosen.id,
+      airline: "unknown",
+      flightNumber: "unknown",
+      origin: "unknown",
+      destination: "unknown",
+      typeCode: chosen.typeCode ?? "unknown",
+      altitude: chosen.onGround
+        ? "on ground"
+        : chosen.altitudeFeet == null
+          ? "unknown"
+          : `${Math.round(chosen.altitudeFeet)} ft`,
+      speed: chosen.speedKnots == null ? "unknown" : `${Math.round(chosen.speedKnots)} kt`,
+      distance: `${chosen.distanceMiles.toFixed(1)} mi`,
+      direction: `${Math.round(chosen.bearingDeg)}°`,
+      routeShown: false,
+    };
+    if (!config.routeLookup || !chosen.callsign) return unknown;
+    try {
+      const response = await deps.fetch(routeUrl(chosen.callsign), {
+        headers: { accept: "application/json", "user-agent": USER_AGENT },
+      });
+      if (!response.ok) return unknown;
+      const route = readRoute(await response.json());
+      if (!route) return unknown;
+      return { ...unknown, ...route, routeShown: true };
+    } catch {
+      return unknown;
+    }
+  }
+
+  async function present(selectedId: string | null): Promise<PublicSnapshot> {
+    const view = snapshot();
+    if (selectedId && !view.aircraft.some((item) => item.id === selectedId)) {
+      return { ...view, selection: "gone" };
+    }
+    const chosen = view.aircraft.find((item) => item.id === selectedId) ?? view.aircraft[0];
+    if (!chosen) return view;
+    const detail = await factsFor(chosen);
+    return {
+      ...view,
+      detail,
+      selection: "shown",
+      credits: detail.routeShown ? [...view.credits, ROUTE_CREDIT] : view.credits,
     };
   }
 
@@ -193,9 +244,11 @@ export function createApp(deps: AppDeps): FlyoverApp {
     }
     await next();
   });
-  app.get("/api/snapshot", (c) => c.json(snapshot()));
-  app.get("/", (c) =>
-    c.body(renderPage(snapshot()), 200, { "content-type": "text/html; charset=utf-8" }),
+  app.get("/api/snapshot", async (c) => c.json(await present(c.req.query("selected") ?? null)));
+  app.get("/", async (c) =>
+    c.body(renderPage(await present(c.req.query("selected") ?? null)), 200, {
+      "content-type": "text/html; charset=utf-8",
+    }),
   );
 
   return {
