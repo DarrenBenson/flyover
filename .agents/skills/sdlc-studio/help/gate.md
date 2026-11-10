@@ -1,0 +1,361 @@
+# Help: gate
+
+<!-- Load when: /sdlc-studio gate - running the ecosystem-neutral quality gate -->
+
+## You can just ask
+
+SDLC Studio is model-invoked - say it in plain language:
+
+| Just say... | Runs |
+| --- | --- |
+| "Are we clear to commit this?" | `/sdlc-studio gate` |
+| "Run the quality checks before I push" | `/sdlc-studio gate` |
+| "Are we clear to tag?" | `/sdlc-studio gate --release` |
+| "Can we close this sprint?" | `/sdlc-studio gate --require-retro RETRO0021` |
+| "Is a sprint close still owed?" | `/sdlc-studio status` (the close-owed advisory) |
+| "Just check the index and drift, nothing else" | `/sdlc-studio gate --only reconcile,duplicate-id` |
+| "Skip the principles check this time" | `/sdlc-studio gate --skip constitution` |
+| "Give me the gate result as JSON for the pipeline" | `/sdlc-studio gate --format json` |
+
+A single, **ecosystem-neutral** quality gate over the deterministic checks. Run it in
+any CI (or a pre-commit hook) to enforce the discipline on a consuming project's changes.
+
+## Command
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --root .          # run all checks, exit 1 on a blocking failure
+python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --root . --release  # pre-tag: the same gate + an executing AC verify pass
+python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --only conformance,reconcile
+python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --skip constitution --format json
+```
+
+Prints a consolidated report and exits non-zero only when a **blocking** check fails; a non-blocking
+failure is reported (`warn`) but does not fail the gate. No network, no CI/cloud assumption.
+
+## The commit is judged on what it changed
+
+The `conformance` and `validate` lanes run **diff-scoped** in the plain gate: they judge the
+artefacts this working tree touched (staged, unstaged or untracked), so a commit that changes
+nothing about a workspace's pre-existing backlog debt is not held hostage by it. A guard whose
+cost is paid on every commit gets switched off, and `--no-verify` disarms every lane rather than
+the noisy two.
+
+Three rules keep the narrowing honest, and each is worth more than the time it saves:
+
+- **It states its own scope.** Every scoped run prints the units it judged, the untouched ones
+  it reported as advisory, by id, and the stages it therefore did not judge. A verdict is only
+  readable next to what it did not examine.
+- **Nothing is dropped from the report.** An untouched error is still printed, marked
+  `ADVISORY`; only the count that decides the exit code narrows.
+- **A repo-wide failure still blocks.** The census, the index, the doc-coverage stage, the
+  DoR/DoD check tags and the id-named-file sweep all still run over everything. Narrowing the
+  per-unit ledger is not a way to hide a repository-wide fault.
+
+**A probe that cannot answer judges everything.** With no git, no commit to diff against, or a
+`--root` that is not the repository top level, the lane falls back to the **whole workspace**,
+says so in its detail, and takes the full cost. Unknown never means "nothing changed" - a scope
+built on an unanswered probe would be an empty scope wearing a green tick, which is worse than
+the slow check.
+
+`--release` restores both lanes to the whole workspace (see below): a commit is judged on what it
+changed, a tag on everything. The same function runs in both modes, so the two verdicts cannot
+drift into disagreeing about what conformance or validity means.
+
+The two scripts carry the same `--changed` flag for a run by hand:
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/conformance.py" check --changed
+python3 "$CLAUDE_SKILL_DIR/scripts/validate.py" check --changed
+```
+
+## When the whole suite runs, and when a selection does
+
+The unit suites are the expensive half of the gate, and the price and the risk are not the
+same at every moment. A wrong answer inside a working tree costs one more commit; a wrong
+answer past a push or a tag is out of your hands and somebody else's to unwind. So the full
+suite is confined to a **boundary**, and everywhere else the gate runs what the change can
+reach.
+
+| Moment | What runs | Why |
+| --- | --- | --- |
+| A commit | the tests the changed files reach | the answer is cheap to correct, and a five-minute wait per commit is what trains people to batch commits or reach for `--no-verify` |
+| A **push** | the full suite, once, plus the standard lanes | the change is leaving your tree |
+| A **release** | the full suite plus the two lanes below | a tag is a claim other people rely on |
+| A sprint **close** | everything | the close is the moment the batch is declared done |
+
+At a push and a tag, `full-suite` runs every test module of both suites once, as `--run-tests`
+runs a selection: in parallel under pytest-xdist, the `serial_only` tests after, and the
+`boundary_only` tests a commit leaves out included. It blocks, names each failing test, and keeps
+the whole output in `sdlc-studio/.local/boundary-suite-last.log`.
+
+Two lanes bind at the release boundary and nowhere else, because each costs minutes a push
+should not pay: `release-rehearsal` drives a greenfield init and a v4 upgrade end to end;
+`module-alone` runs every skill test module alone under `unittest` in a fresh interpreter from
+the repository root, in parallel, with the `serial_only` partition after - the run that sees a
+module passing only because a sibling imported a name first. A hung module is named after
+`SDLC_MODULE_ALONE_TIMEOUT` seconds (1800 by default).
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --suite-decision                  # what a commit owes
+python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --suite-decision --staged         # staged paths only
+python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --suite-decision --changed a.py   # what named paths select
+python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --suite-decision --boundary push  # what a push owes
+python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --run-tests tests/test_a.py       # run a selection
+```
+
+`--suite-decision` prints a `suite-decision: run|skip` sentinel, the `suite-mode:` it chose
+(`none`, `reuse`, `selected` or `full`), and one `suite-selector:` line per test module a
+selective run needs. It exits 0 when a run is owed. Set the boundary with `--boundary` or with
+the `SDLC_GATE_BOUNDARY` environment variable, for a push step that runs the gate through a
+wrapper. An unrecognised boundary is **refused**, never downgraded to the cheap path: a caller
+who asked for everything and silently got a selection would be wrong about their coverage.
+
+`--run-tests` runs the named modules under pytest, across every core when pytest-xdist is
+installed, with the tests marked `serial_only` after on their own. It leaves out the tests
+marked `boundary_only` - those that run the real gate, or a boundary lane, for 17-36s each - and the push's full suite runs them. The commit hook runs its selection through it and
+reports the commit's elapsed time against a 90-second budget - a
+report, never a refusal. Given a boundary (`--boundary push`), it runs the `boundary_only` tests
+too, as the push's `full-suite` lane does, so a CI step can run the push's own plan and the two
+give one verdict.
+
+How a commit's selection is made, and why it is safe to keep it narrow:
+
+- **Routes, read from the test sources.** A changed test module selects itself; `x.py` (or
+  `x.sh`) selects `test_x.py`; a module that imports `x` or loads it by name (`load_script("x")`
+  included) is selected for it, and so is a module that imports a fixture test module which does
+  (one level, no further; the fixture's imports and loads are inherited, not its name or census
+  subject); and a module whose `test-census-subject` header names a changed path is selected for
+  it. A change to a widely imported helper selects its importers, not the whole suite. A change
+  none of these reach runs **no** unit suite per commit, and says so: a library no test module
+  imports, loads, is named for or declares, which tests drive only through another script, and a
+  file that is not `.py` or `.sh` (a doc, template, artefact, hook or `pytest.ini`) that no
+  module declares as its census subject.
+- **The push is the backstop.** Whatever the selection misses, the full suite at the push
+  boundary catches. A boundary never selects and never reuses a verdict.
+- **An unchanged tree reuses the last green verdict.** Every tracked file is hashed by content,
+  so a retry over the same tree costs nothing. Record a verdict with `--record-suite-verdict
+  RUN-xxxx` (`--status red` for a failure, which is never reused). Every unknown - an absent,
+  unreadable or malformed record, a red one, a tree that cannot be hashed - runs the suites.
+
+## `--release`: the one command before a tag
+
+The pre-tag ritual is otherwise two commands - the gate, plus a separate verify run whose exit
+code you have to remember not to discard. `--release` makes it one:
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --root . --release || exit 1   # do not tag on a red exit
+```
+
+It restores the `conformance` and `validate` lanes to the **whole workspace** - the debt a
+pre-commit run reported as advisory is judged here - and adds a blocking `verify` lane:
+
+- **It executes.** Every story's `Verify:` expression is run *now*. It does not read the stored
+  `verify-report.json`, because a merged report carries a story's last green forward until
+  something re-runs it - and a stale green is exactly how a rotted verify layer reaches a tag.
+- **It writes nothing.** No `- **Verified:**` back-annotation, no report rewrite. The gate stays
+  read-only, so it is safe from a hook and safe to run twice.
+- **It names the failures.** `2 red AC(s): US0001::AC3 (pytest tests/test_x.py::test_y), ...` -
+  and the whole thing is one exit code, so tagging over a red AC layer means *ignoring a failing
+  command* rather than misreading a passing-looking one.
+- **A red AC fails the lane when its story CLAIMS to be finished.** A failing criterion on a
+  story at `Ready`, `Superseded` or `Won't Implement` is unbuilt or abandoned work, not a
+  regression - a `design` rung authors such criteria deliberately, and they are its product. Those
+  are still executed and are reported on their own line with each story's status; what they do not
+  do is block. Anything the status vocabulary cannot resolve - absent, misspelled, off-vocabulary -
+  counts as claiming completion, so the exclusion cannot be reached by editing a status line.
+- **You cannot deselect the lane and keep the verdict.** `--release --skip verify` (or an
+  `--only` that leaves it out) is **refused**, not honoured: a release PASS printed over an
+  unexamined AC layer is the passing-looking command this mode exists to abolish. Want the AC
+  layer left alone? That is the standard gate - drop `--release`.
+
+`--release` also binds a `review-legs` lane: every required **document leg** (PRD / TRD / TSD /
+Persona) must be **present** or **explicitly waived**, or the release fails. A prose review can
+call a missing leg "optional polish"; this lane cannot be talked around. Resolve an absent leg one
+of two ways - add the artefact, or record a waiver:
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/decisions.py" waive --leg tsd \
+  --rationale "single-repo project; per-story Verify: discipline stands in for a TSD"
+```
+
+The lane then reports the leg as `waived (D00xx)`, never `optional`. The **CODE leg is out of
+scope** (it has no single artefact whose presence can be tested); every verdict states that
+exclusion, so a green lane is not misread as certifying the code. It is release-only for the same
+reason as `verify`: a leg legitimately absent mid-build is not a standard-gate failure. Deselecting
+it under `--release` is refused.
+
+### Nothing to prove is not proof
+
+The lane fails, rather than passing quietly, when it has examined nothing:
+
+| Situation | Lane says |
+| --- | --- |
+| No stories under `sdlc-studio/stories` | FAIL - wrong `--root`, or a moved directory |
+| A story with an **unspecified** AC (no `Verify:` line at all) | FAIL, and the story is named - so *deleting* a rotted `Verify:` line can never be the way to a green gate |
+| A story whose ACs are all declared `Verify: manual` | PASS - a declared human-checked judgement is honest, and is not over-fired on |
+| A verifier the trust boundary refused to run | FAIL, reported **BLOCKED**, never red (see below) |
+
+The unspecified check is **per-story**, not repo-wide: an omitted `Verify:` line (nothing was
+asserted about the AC) is distinct from a declared `Verify: manual` one (a judgement call). One
+green executable AC elsewhere does not let a verifier-less story ride along - each story is judged on
+its own ACs.
+
+### The trust boundary (`--allow-external`)
+
+A story stamped `Provenance: external` does not get to reach a shell: its `shell` / `http` / `eval`
+verifiers are **not executed** (`reference-verify.md`). The lane reports those ACs as **unproven -
+BLOCKED**, never as red, because an unrun verifier is not evidence about the code - calling it a
+failing AC sends you to debug a verifier that works. Unproven still fails the gate. Pass
+`--allow-external` to run them once you trust the content; the AC then goes green or red on its
+own merits.
+
+A green `--release` is the *mechanical* half of the pre-tag checklist. The judgement items still
+belong to the operator - see `templates/workflows/release-gate.md`.
+
+## `--require-retro`: the one command that closes a sprint
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --root . --require-retro RETRO0021 || exit 1
+```
+
+The close's learning loop is one obligation, so one flag carries all of it. Three blocking lanes:
+
+- `retro` - the named batch retro exists in `sdlc-studio/retros/`.
+- `lessons-summary` - the committed `retros/LESSONS-SUMMARY.md` is the digest of the **current**
+  lessons log. The lane recomputes that digest and compares, so a lesson **closed** since the last
+  regeneration fails it just as an added one does; there is no freshness stamp to forge, and
+  reformatting the file cannot false-fire it. Fix: `lessons summary`.
+- `lessons-validity` - no open lesson is past its `Review-by` horizon, and none lacks one
+  (unprovable is not proven). Fix: `lessons revalidate --close` / `--extend` / `--stamp`.
+
+Summarising the sprint's lessons and reading them at the next sprint's start used to be prose,
+and prose gets skipped under effort pressure. Now the close **fails loud** without it, and
+`sprint plan` prints the lessons into the plan the next sprint reads. `--require-lessons` runs the
+two lessons lanes alone (a close with no retro due). Deselecting a bound lane
+(`--skip lessons-summary`) is refused, not honoured.
+
+## Owed closes: an advisory, not a gate
+
+A delivery unit (epic / story / bug) that reached a terminal state since the close-owed baseline
+with no retro's `Batch` naming it is an **owed close**. It is reported, never refused: `status`
+and `hint` print an `advisory:` line naming the owed units, so a skipped close is seen where
+operators look rather than discovered sprints later.
+
+`--require-close` is retired. `sprint sign` seals each run, and the release tag asks only whether
+the gate was green on the tagged commit and CI passed on the forge (`release_cut.py tag-check`).
+The detector could not read a unit delivered through a carry bug or closed by a ruling, so as a
+gate it refused work that had been closed. Passing the flag exits 2 and names its retirement.
+
+**The baseline (run once, at adoption).** A project that adopts this after many sprints carries a
+tail of historically-closed units that predate story-level retro batches. Stamp a one-time baseline -
+the exact set of ids terminal at adoption - so only *later* closes can owe a retro:
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/close_owed.py" baseline    # grandfathers the existing tail
+python3 "$CLAUDE_SKILL_DIR/scripts/close_owed.py" detect      # what owes a close right now?
+```
+
+The pre-adoption tail is recorded and forgiven in `.close-owed-baseline.json`, never enforced
+retroactively. Until a baseline is stamped the detector reports every uncovered unit and asks you to
+baseline first, rather than inventing a cutoff.
+
+**The Stop hook (optional).** `scripts/hooks/close_guard.py` wires the same detector into a project's
+`.claude/settings.json` under `hooks.Stop`, so the agent is reminded of an owed close at the moment a
+turn would end - the harness enforcing the Definition of Done's close clause rather than the agent's
+recall. It is default-allow on any doubt and never hard-locks; a project that finds a per-turn
+reminder too eager simply does not wire it and reads the `status` advisory instead.
+A sprint is complete only when the close gate is green and shown, **never at "deployed"**.
+
+### The checks
+
+| Group | Checks | Blocks? |
+| --- | --- | --- |
+| **Artifact quality** | `conformance` (lifecycle stages), `validate` (structure/vocab), `integrity` (required links/refs) | yes |
+| **Engagement floor** | `engagement-floor` (a shipped multi-file unit with no AC / Verify / linked plan) | yes (advisory under `engagement_floor: judgement`) |
+| **Index consistency** | `reconcile` (file-census drift), `duplicate-id` | yes |
+| **Skill docs (skill repo only)** | `doc-coverage` (every command/script documented) | yes |
+| **Enforced by the project** | `constitution` (project principles), `provenance` (tool-created stamps) | yes, and in the plain gate, when `constitution.enforce` / `provenance.enforce` is set; otherwise on demand and advisory |
+| **On demand (`--only <lane>`)** | `doc-surface`, `disclosure` (progressive-disclosure hygiene), `doc-freshness` (LATEST.md vs reality), `hook-enabled`, `batch-size` | never |
+| **Executable ACs (`--release` only)** | `verify` (executes every story's `Verify:` expression) | yes |
+| **Required legs (`--release` only)** | `review-legs` (every required document leg present or waived; CODE out of scope) | yes |
+| **Sprint close (`--require-retro` / `--require-lessons` only)** | `retro` (the batch retro exists), `lessons-summary` (LESSONS-SUMMARY.md is current), `lessons-validity` (no expired or horizon-less open lesson) | yes |
+
+The **artifact-quality** checks are the ones that police every artifact; the rest guard the
+index and the skill's own docs. `--only` / `--skip` select a subset. A lane that can only advise
+never refuses a commit, so a plain run leaves it out and pays nothing for it: each runs when named
+with `--only`, and `doc-freshness` also runs at the sprint close (`--require-retro`), where it
+reports and never blocks. A lane the project set to block stays in the plain gate: with
+`constitution.enforce` or `provenance.enforce` set, that lane runs on every plain run and its
+finding fails the gate. The `verify`
+lane only joins the registry under `--release` (it runs test suites; the standard gate stays fast
+and read-only for a pre-commit hook).
+
+Mutation testing is not a gate lane, on demand or otherwise: run `mutation.py run` when you want to
+probe a suite (see [mutation](mutation.md)). `--only mutation` is refused as an unknown lane.
+
+## CI wiring (the gate is the mechanism; these are just examples)
+
+Each example names its script through `$CLAUDE_SKILL_DIR`, the skill's install directory, so it
+runs wherever your tool installed the skill (`install.sh --list-targets` names them). Set it
+in the job or the hook, for example `CLAUDE_SKILL_DIR=.claude/skills/sdlc-studio`.
+
+### GitHub Actions
+
+```yaml
+- name: SDLC gate
+  env:
+    CLAUDE_SKILL_DIR: .claude/skills/sdlc-studio
+  run: python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --root .
+```
+
+### GitLab CI
+
+```yaml
+sdlc-gate:
+  variables:
+    CLAUDE_SKILL_DIR: .claude/skills/sdlc-studio
+  script:
+    - python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --root .
+```
+
+### Generic shell / pre-commit hook
+
+```bash
+# .git/hooks/pre-commit  (or any Jenkins/Buildkite/CircleCI step)
+CLAUDE_SKILL_DIR="${CLAUDE_SKILL_DIR:-.claude/skills/sdlc-studio}"
+python3 "$CLAUDE_SKILL_DIR/scripts/gate.py" --root . || {
+  echo "SDLC gate failed - fix drift/conformance before committing"; exit 1; }
+```
+
+Any runner that can execute a shell command can run the gate; nothing here is
+GitHub-specific.
+
+### Opt-in commit-msg gate (engagement floor)
+
+A separate, opt-in `commit-msg` hook checks that a commit subject naming more than
+one work-item id (US/BG/CR) accounts for each one with a trailer. `Refs: <id>` says
+the id owns the commit's files and lets the engagement floor attribute them per id
+(otherwise such a commit is skipped and an understated `Affects` goes uncaught).
+`Mentions: <id>` says the subject only mentions the id: the floor never reads it, so
+in such a commit that id is attributed none of the files. Add `--strict` and it refuses the commit, printing the trailer lines to paste -
+which is how this repo's own `.githooks/commit-msg` runs it, so the warning cannot
+be read as enforcement while the commit lands anyway. Without `--strict` it warns
+and exits 0. A single-id subject passes untouched either way. Wire it into any
+project's own commit-msg hook:
+
+```bash
+# .git/hooks/commit-msg  ($1 is the message file git passes in)
+floor="${CLAUDE_SKILL_DIR:-.claude/skills/sdlc-studio}/scripts/engagement_floor.py"
+[ -f "$floor" ] || { echo "commit-msg: $floor not found - the check did not run" >&2; exit 0; }
+CLAUDE_SKILL_DIR="${CLAUDE_SKILL_DIR:-.claude/skills/sdlc-studio}"
+python3 "$CLAUDE_SKILL_DIR/scripts/engagement_floor.py" check-commit-msg --strict "$1"
+```
+
+It degrades honestly: with no git, no script, or an unparseable message it exits
+without blocking, and a missing script is named in one line. See `reference-config.md` (Engagement Floor) for the trailer
+grammar and the strict opt-in.
+
+## See also
+
+- `reference-scripts.md` - the script catalogue
+- `reference-doctrine.md` - where the gate fits the operating discipline

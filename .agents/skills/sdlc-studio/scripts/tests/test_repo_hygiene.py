@@ -1,0 +1,396 @@
+"""Test-suite hygiene guards (CR0204/US0114).
+
+A mid-file `if __name__` guard silently drops every class below it on a direct
+`python3 test_x.py` run (22 tests once vanished while reporting OK) and invites
+append-truncation. The guard must be the LAST top-level statement of every test file.
+"""
+from __future__ import annotations
+
+import ast
+import re
+import shutil
+import tempfile
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+TESTS_DIR = Path(__file__).resolve().parent
+
+
+def _guard_index(tree: ast.Module) -> int | None:
+    """Index of the `if __name__ == "__main__"` statement in the module body, or None."""
+    for i, node in enumerate(tree.body):
+        if (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name) and node.test.left.id == "__name__"):
+            return i
+    return None
+
+
+def _guard_offenders(directory) -> list[str]:
+    """Files under `directory` whose `__main__` guard is not the last statement.
+
+    Taken as a PARAMETER rather than reading TESTS_DIR directly, so the detector can be shown
+    to fire. A sweep that only ever runs over a clean tree proves nothing: green is what it
+    prints when it works and equally what it prints when it looks at nothing.
+    """
+    offenders = []
+    for p in sorted(Path(directory).glob("test_*.py")):
+        tree = ast.parse(p.read_text(encoding="utf-8"))
+        gi = _guard_index(tree)
+        if gi is not None and gi != len(tree.body) - 1:
+            after = [type(n).__name__ for n in tree.body[gi + 1:]]
+            offenders.append(f"{p.name}: guard at statement {gi}, followed by {after}")
+    return offenders
+
+
+class GuardAtEofTests(unittest.TestCase):
+    def test_every_main_guard_is_the_last_statement(self) -> None:
+        offenders = _guard_offenders(TESTS_DIR)
+        self.assertEqual(offenders, [],
+                         "mid-file __main__ guards silently drop the classes below them "
+                         "on direct runs - move the guard to true end-of-file:\n"
+                         + "\n".join(offenders))
+
+
+    def test_a_class_after_the_guard_is_reported_by_filename(self) -> None:
+        """US0114 AC3, on a selector of its own (US0635).
+
+        The regression claim - that the detector still fires - had no verifier: the class held
+        one test, which passes over a clean tree whether the sweep works or is inert. This
+        plants an offender in a temp directory and requires it back BY NAME, so the sweep is
+        shown to discriminate rather than assumed to.
+        """
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "test_offender.py").write_text(
+            "import unittest\n\n\nif __name__ == '__main__':\n    unittest.main()\n\n\n"
+            "class LostBelowTheGuard(unittest.TestCase):\n    def test_x(self):\n        pass\n",
+            encoding="utf-8")
+        (d / "test_clean.py").write_text(
+            "import unittest\n\n\nclass Fine(unittest.TestCase):\n    def test_x(self):\n"
+            "        pass\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+            encoding="utf-8")
+        offenders = _guard_offenders(d)
+        self.assertEqual(1, len(offenders), f"expected exactly the planted offender: {offenders}")
+        self.assertIn("test_offender.py", offenders[0])
+        self.assertNotIn("test_clean.py", " ".join(offenders),
+                         "a well-formed file was reported as an offender")
+
+
+class DirectRunParityTests(unittest.TestCase):
+    def test_direct_run_count_equals_discover_count(self) -> None:
+        # The historical liar: a direct run of test_validate.py once executed 49 of 71
+        # tests and reported OK. Post-normalisation the two counts must agree.
+        target = TESTS_DIR / "test_validate.py"
+
+        def ran(cmd: list[str]) -> int:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                               cwd=str(TESTS_DIR.parent.parent.parent.parent.parent))
+            m = re.search(r"Ran (\d+) tests?", r.stderr + r.stdout)
+            self.assertIsNotNone(m, (r.stderr + r.stdout)[-500:])
+            return int(m.group(1))
+
+        direct = ran([sys.executable, str(target)])
+        discover = ran([sys.executable, "-m", "unittest", "discover",
+                        "-s", ".claude/skills/sdlc-studio/scripts/tests",
+                        "-p", "test_validate.py"])
+        self.assertEqual(direct, discover)
+
+
+SCRIPTS_DIR = TESTS_DIR.parent
+
+#: Helper modules that live beside the tests rather than under `scripts/`. Importing one by
+#: its bare name only resolves when the tests directory is on `sys.path`, which
+#: `unittest discover -s tests` arranges and `unittest tests.test_x` does not.
+SIBLING_HELPERS = ("loader", "gitutil", "workspace")
+
+
+def _modules_importing_a_sibling() -> dict[str, set[str]]:
+    """`{module stem: the sibling helpers it imports}` for every test module that imports one.
+
+    BOTH import statement forms count, and at ANY nesting depth:
+
+    - `import gitutil` is an `ast.Import`;
+    - `from gitutil import git` is an `ast.ImportFrom`, and matching only the first form left
+      `test_telemetry` - which uses it, in the same directory - outside the census entirely;
+    - a helper imported inside a function or method still needs the path set up, and fails at
+      RUN time rather than import time, so `ast.walk` is used rather than reading `tree.body`.
+
+    AST-based, so a helper named in a string or a comment does not count.
+    """
+    out: dict[str, set[str]] = {}
+    for path in sorted(TESTS_DIR.glob("test_*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        used: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                used |= {a.name for a in node.names if a.name in SIBLING_HELPERS}
+            elif isinstance(node, ast.ImportFrom) and node.module in SIBLING_HELPERS:
+                used.add(node.module)
+        if used:
+            out[path.stem] = used
+    return out
+
+
+def _probe(mod: str, helpers: set[str]) -> str | None:
+    """Run `tests.<mod>` through the module-name form; return the failure line, or None.
+
+    A FRESH INTERPRETER per module, and cwd is `scripts/` - the run form that omits the tests
+    directory from `sys.path`. Importing every module in one process passes vacuously: the
+    first module to run its own `sys.path.insert` puts the directory on the path and registers
+    the helper in `sys.modules`, so everything imported after it succeeds regardless.
+
+    The module is imported AND THEN its helpers are resolved. Importing alone is not enough: a
+    helper imported inside a method does not run at import time, so the module imports cleanly
+    while the test that needs it dies at run time - which is how this sweep missed a module in
+    its own directory. Resolving the helpers reproduces what the deferred import will hit,
+    without paying to run the module's whole suite.
+    """
+    probe = (f"import importlib\nimportlib.import_module('tests.{mod}')\n"
+             + "".join(f"importlib.import_module({h!r})\n" for h in sorted(helpers)))
+    r = subprocess.run([sys.executable, "-B", "-c", probe], capture_output=True,
+                       text=True, timeout=120, cwd=str(SCRIPTS_DIR))
+    if r.returncode == 0:
+        return None
+    return (r.stderr.strip().splitlines() or ["(no output)"])[-1]
+
+
+class ProbeMechanismTests(unittest.TestCase):
+    """The probe itself, against fixtures built to fail and to pass.
+
+    Without this, the helper-RESOLUTION half of the probe - the half added to catch a module
+    whose sibling import sits inside a method - could be deleted and the whole suite would stay
+    green, silently reopening the hole. A guard whose mechanism nothing exercises is a guard
+    that can rot without anyone noticing, which is the defect class this file exists for.
+
+    Real fixture modules rather than an assertion about the probe's source text: the question
+    is whether the probe DETECTS the condition, not whether it is written a particular way.
+    """
+
+    def _fixture(self, name: str, body: str) -> str:
+        path = TESTS_DIR / f"{name}.py"
+        path.write_text(body, encoding="utf-8")
+        self.addCleanup(path.unlink)
+        # A stale .pyc from a previous fixture of the same name would be imported instead.
+        self.addCleanup(shutil.rmtree, TESTS_DIR / "__pycache__", True)
+        return name
+
+    def test_the_probe_catches_a_DEFERRED_sibling_import_with_no_path_setup(self) -> None:
+        # Imports cleanly - the offending import is inside a function, so it does not run at
+        # import time. Only resolving the helper afterwards catches it. This is exactly the
+        # shape the sweep was blind to.
+        mod = self._fixture("_probe_fixture_deferred",
+                            "def uses_it():\n    from gitutil import git\n    return git\n")
+        self.assertIsNone(_probe(mod, set()),
+                          "importing alone must succeed - that is what made this shape invisible")
+        err = _probe(mod, {"gitutil"})
+        self.assertIsNotNone(err, "resolving the helper must catch what importing could not")
+        self.assertIn("gitutil", err)
+
+    def test_the_probe_passes_a_module_that_sets_the_path_up_properly(self) -> None:
+        # The negative branch: a correct module must NOT be reported, or the sweep would
+        # fail everything and prove nothing.
+        mod = self._fixture(
+            "_probe_fixture_correct",
+            "import sys\nfrom pathlib import Path\n"
+            "sys.path.insert(0, str(Path(__file__).resolve().parent))\n"
+            "import gitutil\n")
+        self.assertIsNone(_probe(mod, {"gitutil"}))
+
+
+class SiblingImportRunnabilityTests(unittest.TestCase):
+    """A test module must import under BOTH run forms, not just under discover.
+
+    `unittest discover -s tests` puts the tests directory on `sys.path`, so a bare
+    `import loader` resolves; `unittest tests.test_x` does not, so the same line raises
+    ModuleNotFoundError naming the helper. The failure says nothing about the module the
+    operator was actually running, and it cost a diagnosis cycle during a sprint close when
+    the mutation gate was handed the module form, refused on a red baseline, and pointed at
+    a stranded mutant from a killed run - a plausible and completely wrong lead (BG0206).
+    """
+
+    def test_the_census_finds_the_modules_it_is_meant_to_guard(self) -> None:
+        # A census that silently returned nothing would make the sweep below vacuous.
+        found = _modules_importing_a_sibling()
+        self.assertGreater(len(found), 5, "the sibling-import census has stopped detecting")
+        self.assertIn("test_reconcile", found)          # plain `import loader`
+        self.assertIn("test_telemetry", found)          # `from gitutil import git`, nested
+        self.assertIn("gitutil", found["test_telemetry"])
+
+    def test_every_sibling_importing_module_resolves_its_helpers_by_module_name(self) -> None:
+        """Importing the module is not enough: the helper must RESOLVE.
+
+        Two traps, both hit for real.
+
+        ONE PROCESS PER MODULE, deliberately. Importing them all in a single process passes
+        vacuously - the first module to run its own `sys.path.insert` puts the tests directory
+        on the path and registers the helper in `sys.modules`, so every module after it
+        succeeds regardless of its own setup.
+
+        AND THE HELPER IS RESOLVED, not just the module imported. A helper imported inside a
+        method (`test_telemetry` does this) does not run at import time, so importing the
+        module succeeds while the test that needs it still dies with ModuleNotFoundError.
+        Importing the module and THEN resolving its helpers reproduces exactly what the
+        deferred import will hit, without paying to run the module's whole suite.
+
+        cwd is scripts/ - the run form that omits tests/ from `sys.path`.
+        """
+        bad = []
+        for mod, helpers in sorted(_modules_importing_a_sibling().items()):
+            err = _probe(mod, helpers)
+            if err:
+                bad.append(f"{mod} (needs {', '.join(sorted(helpers))}): {err}")
+        self.assertEqual(
+            bad, [],
+            "these test modules use a sibling helper but cannot be run as "
+            f"`python3 -m unittest tests.<name>`:\n" + "\n".join(bad) + "\n"
+            "Fix: insert the tests directory on sys.path at module level, as the others do.")
+
+# A bare read: `<expr>.read_text(...)`. `read_text_safe(` never matches - the character after
+# `read_text` is `_`, not `(`.
+BARE_READ_RE = re.compile(r"\.read_text\s*\(")
+
+# The one visible exemption channel. A bare read stays bare only when the line carries
+# `# bare-read-ok: <reason>`, so every exemption is readable at the read site itself rather
+# than hidden in a list somewhere else.
+EXEMPT_RE = re.compile(r"#\s*bare-read-ok:\s*(\S.*)$")
+
+# Modules known to stream the artefact tree today. The census is mechanical, but an
+# enumeration that silently returned nothing would pass every assertion below while checking
+# nothing. This floor is the anti-vacuity guard: the census must CONTAIN it, never be reduced
+# to it.
+KNOWN_SCANNERS = {"deploy.py", "flow.py", "status.py", "verify_ac.py"}
+
+# The marker for "this module walks the whole artefact tree". `artifact_files` is a thin
+# wrapper over `iter_artifact_files`, so a direct caller of the enumerator is the module that
+# streams the tree, and therefore the module one corrupt file can abort mid-pass.
+SCANNER_MARKER = "iter_artifact_files"
+
+
+def _scanner_modules() -> dict[str, str]:
+    """{filename: source} for every top-level script that walks the artefact tree.
+
+    Scoped to `scripts/*.py` (non-recursive): `lib/sdlc_md.py` defines both the enumerator and
+    `read_text_safe` itself, so its own bare read is the primitive, not a scanner site.
+    """
+    out = {}
+    for path in sorted(SCRIPTS_DIR.glob("*.py")):
+        src = path.read_text(encoding="utf-8")
+        if SCANNER_MARKER in src:
+            out[path.name] = src
+    return out
+
+
+class BareArtefactReadSweepTests(unittest.TestCase):
+    """Every artefact-body read in a tree-walking scanner goes through `read_text_safe`.
+
+    One corrupt or non-UTF-8 artefact from a crashed session must not abort a pass over the
+    whole workspace. Index reads are the deliberate exception and stay loud - see
+    `LoudIndexReadTests` in test_reconcile.py for the other direction.
+    """
+
+    def test_the_census_actually_enumerates_scanners(self) -> None:
+        """A census that found nothing would pass the sweep below vacuously."""
+        found = set(_scanner_modules())
+        self.assertTrue(found, "the scanner census found no modules - the enumeration is broken")
+        missing = KNOWN_SCANNERS - found
+        self.assertFalse(
+            missing,
+            f"the census no longer sees known scanners {sorted(missing)} - "
+            "the enumeration is broken, not the tree",
+        )
+
+    def test_no_bare_artefact_body_reads_in_scanners(self) -> None:
+        offenders = []
+        for name, src in _scanner_modules().items():
+            for lineno, line in enumerate(src.splitlines(), 1):
+                if BARE_READ_RE.search(line) and not EXEMPT_RE.search(line):
+                    offenders.append(f"{name}:{lineno}: {line.strip()}")
+        self.assertEqual(
+            offenders,
+            [],
+            "bare artefact-body read(s) in a tree-walking scanner - route through "
+            "`sdlc_md.read_text_safe`, or mark the line `# bare-read-ok: <reason>` when the "
+            "read must stay loud (an index, or an already-guarded config read):\n"
+            + "\n".join(offenders),
+        )
+
+    def test_every_exemption_states_a_reason(self) -> None:
+        """An exemption with no reason is an invisible exemption."""
+        bad = []
+        for name, src in _scanner_modules().items():
+            for lineno, line in enumerate(src.splitlines(), 1):
+                m = EXEMPT_RE.search(line)
+                if m and len(m.group(1).strip()) < 10:
+                    bad.append(f"{name}:{lineno}: {line.strip()}")
+        self.assertEqual(bad, [], "`# bare-read-ok:` with no usable reason:\n" + "\n".join(bad))
+
+
+class SubmoduleImportTests(unittest.TestCase):
+    """A test module that uses `unittest.mock` must BIND it where it uses it. `import unittest`
+    alone does not: the attribute exists only once something imports the submodule, and under
+    pytest something always has. Under the plain unittest runner - which `gate.py`'s
+    `module-alone` boundary lane uses, and which CI runs - the module is red with
+    `AttributeError`, every assertion in it goes unexecuted, and the discovery suite stays green
+    because a sibling imported the submodule first. A local import inside ANOTHER function does
+    not help: it binds only if that test happens to run first."""
+
+    ROOT = Path(__file__).resolve().parents[5]
+
+    @staticmethod
+    def _binds(node) -> bool:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Import) and any(a.name == "unittest.mock" for a in sub.names):
+                return True
+            if isinstance(sub, ast.ImportFrom) and (
+                    (sub.module == "unittest" and any(a.name == "mock" for a in sub.names))
+                    or sub.module == "unittest.mock"):
+                return True
+        return False
+
+    @classmethod
+    def _unbound_uses(cls, src: str, name: str) -> list:
+        """Every `unittest.mock` use in `src` that nothing binds where it is used."""
+        if "unittest.mock" not in src:
+            return []
+        tree = ast.parse(src)
+        if cls._binds(ast.Module(body=[n for n in tree.body
+                                       if isinstance(n, (ast.Import, ast.ImportFrom))],
+                                 type_ignores=[])):
+            return []
+        out = []
+        for fn in [n for n in ast.walk(tree)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            uses = [n for n in ast.walk(fn)
+                    if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                    and n.value.id == "unittest" and n.attr == "mock"]
+            if uses and not cls._binds(fn):
+                out.append(f"{name}:{uses[0].lineno} in {fn.name}()")
+        return out
+
+    def test_every_use_of_unittest_mock_is_bound_where_it_is_used(self) -> None:
+        """MUTANT: delete the module-scope `import unittest.mock` from a module whose uses sit in
+        functions that do not import it - this sweep names it, where pytest cannot, because
+        pytest imports the submodule itself."""
+        # the reader itself, on a module shaped like the failure: an import in ANOTHER function
+        # does not bind this one, and the sweep must say so rather than pass on its presence
+        shaped = ("import unittest\n\n\nclass T(unittest.TestCase):\n"
+                  "    def test_elsewhere(self):\n        import unittest.mock\n"
+                  "        return unittest.mock.patch\n\n"
+                  "    def test_here(self):\n        return unittest.mock.patch\n")
+        self.assertEqual(self._unbound_uses(shaped, "shaped.py"), ["shaped.py:10 in test_here()"])
+        self.assertEqual(self._unbound_uses("import unittest.mock\n" + shaped, "bound.py"), [],
+                         "a module-scope import binds every use in the module")
+        offenders = []
+        for d in (".claude/skills/sdlc-studio/scripts/tests", "tools/tests"):
+            for path in sorted((self.ROOT / d).glob("test_*.py")):
+                offenders.extend(self._unbound_uses(
+                    path.read_text(encoding="utf-8", errors="replace"), path.name))
+        self.assertEqual(offenders, [], "each of these uses `unittest.mock` where nothing binds the "
+                                        "submodule - red under the plain unittest runner the "
+                                        "boundary lane and CI use:\n" + "\n".join(offenders))
+
+
+if __name__ == "__main__":
+    unittest.main()

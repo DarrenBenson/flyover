@@ -1,0 +1,4233 @@
+#!/usr/bin/env python3
+"""The deterministic retro spine: parse a retro, extract its lessons, and prove every
+finding was dispositioned.
+
+The retro was the only enforced ceremony with no script behind it. `gate.py` therefore
+had nothing to interrogate but the filesystem - a glob for the filename - so an
+empty file with the right name passed it. A gate is only as good as the thing it
+can interrogate; this is that thing.
+
+Everything here is mechanical, because everything here CAN be. Parsing a `## Lessons`
+heading is parsing. Checking each finding is filed, fixed or declined is a set difference.
+Judgement is reserved for what a lesson MEANS, never for whether the plumbing ran.
+
+Subcommands:
+
+  validate  content check - required sections, at least one real lesson, and every
+            finding dispositioned. This is what the gate calls instead of a glob.
+  extract   lift the Try items (an older retro's `## Lessons`) into the lessons stores: a
+            classed item (`[LC-003]`, `[new: <class>]`) counts on `lessons.jsonl`, an
+            untagged one goes to the project lessons log (`lessons add`).
+  dispose   report every finding and its disposition; non-zero while any is undecided.
+            The read-only half of `validate`, for a human deciding what to file.
+  accuracy  estimate vs actual for the units in the retro's `Batch`: the plan's forecast
+            against what telemetry measured, per unit and per batch, IN POINTS and in tokens.
+            Flags any unit delivered above the split threshold. `--write` records it in the
+            retro and appends the sprint's row to the velocity history.
+  velocity  print the accumulated velocity history - POINTS DELIVERED PER SPRINT, and the
+            tokens-per-point rate derived from it - so the next plan can see how the estimator
+            has actually performed rather than trusting a constant.
+
+The disposition rule. A finding is dispositioned when it is filed as an artefact
+(`CR0123` / `BG0045`), recorded FIXED IN-SPRINT with the commit or unit that fixed it
+(`fixed-in: a1b2c3d`), or DECLINED WITH A REASON. All three are first-class answers and
+equally green, so honesty costs exactly what noise costs and there is nothing to game.
+The three are counted separately at close: a fix closes the finding now, a filing defers it
+to future work, a decline defers it to none - a sprint that repaired eleven findings must
+not read as having declined eleven. What does not pass is silence: a finding written down
+and left to rot.
+
+The measurement rule (the same rule, applied to numbers). A unit with no PER-UNIT telemetry
+record has its per-unit ratio reported UNMEASURED and excluded from every ratio - never skipped,
+never counted as accurate: a silent skip would let a batch of ten units with two measurements
+report as a clean forecast. Silence is not a measurement, and the report says how many of the
+batch it is actually speaking for. But UNMEASURED means NOT-YET-CAPTURED, not unmeasurable: the
+harness tracks the token count deterministically. An interactive sprint (no runner) records no
+per-unit actual, so its sprint total is supplied with `accuracy --tokens N` to yield a real,
+DESCRIPTIVE sprint tokens-per-point over the delivered points - the number the velocity loop needs.
+Never call an interactive sprint's tokens unknowable.
+
+The velocity rule. VELOCITY IS POINTS DELIVERED PER SPRINT, and the tokens-per-point rate is
+DERIVED from that history - actual tokens over points delivered, recomputed on every read.
+Nothing hardcodes it. A rate written down as a constant is an article of faith within two
+sprints, and this project has twice had to delete one; a rate that is a quotient of two things
+the history records is re-measured every sprint, by construction. A unit delivered above the
+split threshold is FLAGGED with its own tokens-per-point against the rest, so the rule that
+says to decompose it is answerable from evidence each sprint rather than believed.
+
+The forecast rule (the same rule again, on the other side of the ratio). The estimate is the
+one the PLANNER RECORDED when it planned the sprint. It is read back verbatim and is never
+re-derived from the constants in force - there is no such path, not even as a fallback. A
+number recomputed at judgement time, by the model being judged, is not a prediction: change the
+constants and every past sprint is retroactively deemed to have forecast something else, so the
+ratio drifts to 1.0x and the loop can never falsify its own estimator. A unit with no recorded
+plan-time forecast is UNFORECAST, named, and excluded from both sides - silence on the estimate
+side is not evidence either, and it is not an invitation to invent one.
+
+And the fit is not the test. A sprint whose actuals the constants were FITTED to is labelled
+IN-SAMPLE: its ratio is training error, near 1.0x by construction, and it is excluded from any
+accuracy figure shown as evidence. Only a sprint forecast by the constants in force, which they
+were not fitted to, tells you anything.
+
+What this does NOT do is recalibrate. It reports the accuracy and stops. The forecast
+constants are a hypothesis fitted to a handful of units; auto-fitting them to the next
+handful would fit noise and dress it as evidence. A human reads the history and decides.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import statistics
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import run_state, sdlc_md  # noqa: E402  (run_state: the run a close's tokens belong to)
+import lessons  # noqa: E402  (sibling - the store a retro's lessons are extracted into)
+import telemetry  # noqa: E402  (sibling - the measured actuals an estimate is judged against)
+
+RETRO_DIR = "sdlc-studio/retros"
+# The velocity history: one row per sprint, committed alongside the retros (a gitignored
+# `.local/` file would not survive a fresh clone, and history the team cannot read is not
+# history). LESSONS-SUMMARY.md is the precedent - a derived, committed sibling of the retros.
+VELOCITY_FILE = "sdlc-studio/retros/VELOCITY.md"
+
+#: The three lines a retro is written in. Each Try item becomes a lesson when the close extracts
+#: them, so Try is capped: a list that can grow is one nobody acts on.
+KEEP_STOP_TRY = ("Keep", "Stop", "Try")
+TRY_MAX = 3
+
+#: A Try item names its failure class with a leading tag, so a repeat is counted on the class
+#: in `lessons.jsonl` rather than written again as a new lesson:
+#:   `[LC-003] what happened this time`            a hit on class LC-003
+#:   `[new: <class name>] Rule. Behaviour.`         a new class, injected at plan, build, review
+#:   `[new: <class name> | build, review] ...`      a new class, injected at the named phases
+#: The first sentence after a `new` tag is the rule; the rest is what to do differently. An
+#: untagged item goes to the prose log as before.
+TRY_TAG_RE = re.compile(r"^\[\s*(?:(LC-\d{3,})|new\s*:([^\]]*))\s*\]\s*(.*)$", re.IGNORECASE)
+#: An item that reads as an attempted tag - it LEADS with a class code, bare or behind `[`, `(`
+#: or `*`, or with `new` behind one of them - but does not parse is refused, never sent to the
+#: prose log: `[LC 001]`, `[LC-01]`, `(LC-001)`, `LC-001:` or `[new scope drift]` is a repeat
+#: its author meant to count. Prose is not: a leading link or checkbox, a code named in passing,
+#: or a sentence opening on the word "New".
+TRY_TAGLIKE_RE = re.compile(r"^\s*(?:[\[(*]\W*)?LC(?:\b|\d)|^\s*[\[(*]\W*new\b", re.IGNORECASE)
+#: The unit a repeat happened on: the first story, bug or CR the Try item names, in either id
+#: era, through the shared id grammar.
+TRY_UNIT_RE = sdlc_md.cited_id_re(("US", "BG", "CR"))
+
+# The sections a retro written before Keep/Stop/Try carries. Those retros are history, and are
+# still validated against the shape they were written in.
+REQUIRED_SECTIONS = (
+    "Delivered",
+    "What went well",
+    "What was hard / what stalled",
+    "Lessons",
+    "Actions raised",
+)
+
+# The curated set the retro decides for the NEXT batch. Not in REQUIRED_SECTIONS: the
+# demand is CONDITIONAL, and a section listed there is demanded of every retro in every project.
+#
+# The condition is derived from the log rather than declared: curation is a CHOICE between lessons,
+# so it only means something when there are more lessons than the carried set can hold. A project
+# with three lessons has nothing to choose between - its whole log is the readable set - and a
+# ceremony demanded where there is no judgement to make is exactly the theatre that teaches people
+# to bypass a gate. A project with 252 has the condition the rule exists for.
+#
+# The SIZE of the set is not declared here: `lessons.carried_max` owns it, and `carried_max`
+# below delegates. Fixed by construction, not by discipline - a set that can grow is the
+# 252-entry summary again.
+CARRIED_SECTION = "Carried lessons"
+
+# The one compulsory close item that CANNOT be derived. Everything else the sprint checklist
+# asks is already in the tree; a stop-ship ruling is a judgement, so it is recorded here and
+# read back by `sprint_report.checklist`. Not in REQUIRED_SECTIONS for the same reason as
+# CARRIED_SECTION: the demand is conditional on the run having carried anything at all, and a
+# section demanded of every retro in every project is a section people learn to leave empty.
+#
+# Row grammar: `| <artefact id> | <ruling> | <who ruled> | <date> |`. Free prose is REFUSED
+# rather than half-parsed, because "carried" and "nobody looked" reading the same is the whole
+# failure this section exists to end.
+KNOWN_ISSUES_SECTION = "Known issues carried"
+#: The table's columns, in the row grammar's order: THE one statement of its header. The close's
+#: scaffold writes it (`fill_run_scaffold`) and `carried_issues` skips it by its first cell, so
+#: the header a retro is born with is the one its reader reads.
+KNOWN_ISSUES_COLUMNS = ("id", "ruling", "ruled by", "date")
+
+#: The rulings a carried issue may hold. `stop-ship` is the one that must be able to stop
+#: something: a ruling that changes nothing is a note.
+STOP_SHIP = "stop-ship"
+KNOWN_ISSUE_RULINGS = (STOP_SHIP, "not-stop-ship", "accepted-risk", "deferred")
+
+# `## Heading` -> body, to the next `##` of the same level.
+SECTION_RE = re.compile(r"^##\s+(.+?)\s*$")
+
+# A bullet that carries content. `{{placeholder}}` is a scaffold, not an answer - the
+# template ships with them and a retro that still has them was never filled in.
+BULLET_RE = re.compile(r"^\s*[-*]\s+(.*\S)\s*$")
+PLACEHOLDER_RE = re.compile(r"\{\{.*?\}\}")
+
+# A disposition is an artefact id, or an explicit decline carrying a reason.
+#
+# `LL` counts. Some findings are not tickets: the right outcome is a habit, and a habit's
+# durable form is a recorded lesson. Refusing to accept one would push those findings toward a
+# decline, which loses the lesson, or toward a make-work CR, which is the noise the decline path
+# exists to prevent. It is no cheaper to game than declining, which is already free.
+#
+# Every id the retro reads - a disposition, a carried row, a Batch unit - is read through the
+# grammar `sdlc_md` owns, in both id eras: the v2 `US0101` and the v3 ULID, bare
+# (`US-01M3CVPV`) or normalised (`US01M3CVPV`), as a run's batch carries it. The disposition and
+# carried-row reader used to be a four-digit copy, so a v3 project's ULID ids there read as
+# naming nothing. It reads only the families a finding is filed as, so a `SC2086` ShellCheck
+# code or a `TS2345` TypeScript error cited in a disposition is prose, not a filing.
+ARTEFACT_ID_RE = BATCH_ID_RE = sdlc_md.cited_id_re(("CR", "BG", "US", "RFC", "EP", "LL"))
+DECLINED_RE = re.compile(r"^\s*declined\s*:\s*(.+\S)\s*$", re.IGNORECASE)
+
+# The third disposition: a finding FIXED within the sprint, carrying the commit or unit that
+# fixed it. Filing and declining both defer the finding to future or no work; a fix closes it
+# now, and reads as neither. A sprint that repaired eleven findings and recorded them as declines
+# would read as having declined eleven - the opposite of what happened. The detail is a commit
+# sha (a 7-40 char hex) or an artefact id; a bare 'fixed' with no reference stays undecided, the
+# same silence-wearing-a-decision's-clothes rule the decline path already holds.
+FIXED_RE = re.compile(r"^\s*fixed(?:-in)?\s*:\s*(.+\S)\s*$", re.IGNORECASE)
+
+# A row in the `## Actions raised` table: | finding | disposition |
+ROW_RE = re.compile(r"^\s*\|(?!\s*[-:]+\s*\|)([^|]+)\|([^|]+)\|\s*$")
+
+
+# The leading id of a retro filename stem: `RETRO0049-slug` / `RETRO-0049-slug`.
+# Three digits are accepted as well as four: `next_id` treats a 3-digit meta id as
+# taken, so a legacy `RETRO001-x.md` holds its number and must also be findable -
+# two readers of one id space that disagree on width lose the file between them.
+# The width is a floor, not the match: the digits are still consumed greedily, so
+# `RETRO001` does not resolve a `RETRO0012` file.
+_STEM_ID_RE = re.compile(r"^([A-Za-z]+-?\d{3,})")
+
+
+def find_retro(root, retro_id: str) -> Path | None:
+    """The retro file for an id. One resolver, shared, so the gate and this script cannot
+    disagree about which file they are talking about.
+
+    Matched on the NORMALISED id, not by prefix-globbing the raw string: files are named
+    `RETRO0049-...` while indexes, run state and prose all write `RETRO-0049`, and a literal
+    glob silently found nothing for the dashed form. The close tail passed exactly that, so
+    the velocity row went unrecorded for two consecutive sprints while the close still
+    reported success.
+    """
+    d = Path(root) / RETRO_DIR
+    if not d.is_dir():
+        return None
+    want = sdlc_md.norm_id(retro_id)
+    if not want:
+        return None
+    hits = []
+    for p in sorted(d.glob("*.md")):
+        if not p.is_file():
+            continue
+        m = _STEM_ID_RE.match(p.stem)
+        if m and sdlc_md.norm_id(m.group(1)) == want:
+            hits.append(p)
+    return hits[0] if hits else None
+
+
+APPETITE_OVERAGE_HEADING = "## Appetite overage"
+
+
+def appetite_overage_note(root) -> str | None:
+    """The retro's record of an accepted over-appetite run - the over-commitment AND that it was
+    accepted - or None for an ordinary run. So a later reader asking why a run overran finds the
+    trace, rather than a retro that reads as though the batch fitted. Derived from the run
+    state's recorded standing/accepted appetite, never re-computed from a config that has moved."""
+    over = run_state.appetite_overage(root)
+    if not over:
+        return None
+    parts: list[str] = []
+    u, m = over["units"], over["minutes"]
+    if u["over"]:
+        parts.append(f"{u['accepted']} units against a standing appetite of {u['standing']}")
+    if m["over"]:
+        parts.append(f"{m['accepted']:g}min against a standing {m['standing']:g}min")
+    return (f"{APPETITE_OVERAGE_HEADING}\n\n"
+            f"This run was ACCEPTED over its standing appetite: " + "; ".join(parts) + ". The "
+            "ceiling was raised (`--appetite-units`/`--appetite-minutes`) to take the batch; the "
+            "run is reported against the standing appetite, not the raised ceiling, so the "
+            "over-commitment and the decision to accept it both stay on the record.\n")
+
+
+def record_overage_in_retro(root, retro_id_or_path) -> bool:
+    """Append the over-appetite trace to a retro document, once. Returns True iff written. A retro
+    for a run within appetite is left untouched. Idempotent: re-running a close never doubles the
+    section. Accepts a retro id or a path."""
+    note = appetite_overage_note(root)
+    if not note:
+        return False
+    p = (retro_id_or_path if isinstance(retro_id_or_path, Path)
+         else find_retro(root, str(retro_id_or_path)))
+    if not p or not Path(p).is_file():
+        return False
+    p = Path(p)
+    text = p.read_text(encoding="utf-8")
+    if APPETITE_OVERAGE_HEADING in text:
+        return False
+    # Insert before the Revision History if there is one, else append - the trace belongs in the
+    # body, not after the audit table.
+    marker = "## Revision History"
+    if marker in text:
+        text = text.replace(marker, note + "\n" + marker, 1)
+    else:
+        text = text.rstrip("\n") + "\n\n" + note
+    sdlc_md.atomic_write(p, text)
+    return True
+
+
+def sections(text: str) -> dict[str, list[str]]:
+    """Map `## Heading` -> its body lines. Headings are matched on their exact text, so a
+    renamed section reads as a MISSING section rather than silently passing - a retro
+    that quietly dropped `Lessons` is the thing this is here to catch."""
+    out: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        m = SECTION_RE.match(line)
+        if m:
+            current = m.group(1).strip()
+            out[current] = []
+            continue
+        if current is not None:
+            out[current].append(line)
+    return out
+
+
+def carried_issues(text: str, *, root=None) -> list[dict]:
+    """The retro's carried known issues, as `{id, ruling, by, date, ok, why}` rows.
+
+    With `root`, each row also carries the CURRENT status of the artefact it names, and whether
+    that status is terminal. Without it, both come back unknown - two callers pass no root and an
+    absent root must mean "not looked up", never "terminal", or a ruling would discharge itself
+    wherever nobody happened to pass a path. A row naming an id with no readable file is marked
+    `unreadable` and is NOT terminal: an id that resolves to nothing is a typo or a deletion, and
+    in neither case has anybody discharged the ruling.
+
+    Every row is returned, including the malformed ones, each carrying `ok` and the reason it
+    is not usable. Dropping a bad row would report an issue with a broken ruling as an issue
+    with NO ruling, and those are different facts: one is a typo to fix, the other is a
+    judgement nobody made. The header and separator rows are skipped; an example row the
+    template ships is skipped by its `<!-- example -->` marker, like the bullets above.
+    """
+    body = sections(text or "").get(KNOWN_ISSUES_SECTION)
+    if body is None:
+        return []
+    out: list[dict] = []
+    for line in body:
+        if "<!-- example -->" in line or PLACEHOLDER_RE.search(line):
+            continue
+        cells = sdlc_md.table_cells(line)
+        first = _known_issue_cell(cells, "id") if cells else ""
+        if not cells or first.lower() in ("issue", "id") or set(first) <= {"-", ":", " "}:
+            continue
+        hit = ARTEFACT_ID_RE.search(first)
+        uid = sdlc_md.norm_id(hit.group(1)) if hit else ""
+        # A lesson CLASS code rules the CR its graduation filed, through the store's own link:
+        # on a ULID project that CR's id is minted at filing, so no retro can name it ahead of
+        # the close, while the class code is stable. Not graduated yet, the row rules the code.
+        lesson = "" if hit else first.strip().upper()
+        if lesson and not lessons.CLASS_CODE_RE.match(lesson):
+            lesson = ""
+        if lesson:
+            uid = (graduation_crs(root).get(lesson) if root is not None else None) or lesson
+        ruling = _known_issue_cell(cells, "ruling").lower()
+        who = _known_issue_cell(cells, "ruled by")
+        date = _known_issue_cell(cells, "date")
+        status, terminal, unreadable = None, False, False
+        if root is not None and uid:
+            status, unreadable, res_type = _artefact_status(root, uid)
+            terminal = bool(status) and bool(res_type) and status in sdlc_md.terminal_statuses(
+                res_type)
+        why = ""
+        if not uid:
+            why = "names no artefact id, so the ruling cannot be joined to a finding"
+        elif ruling not in KNOWN_ISSUE_RULINGS:
+            why = (f"ruling {ruling or '(blank)'!r} is not one of "
+                   f"{', '.join(KNOWN_ISSUE_RULINGS)}")
+        elif not who:
+            # WHO ruled is not decoration: an unattributed ruling cannot be questioned, and the
+            # distinction this section exists for is between a judgement somebody made and one
+            # nobody did. An anonymous row is the second wearing the first's clothes.
+            why = "records no ruler, so nobody can be asked why"
+        out.append({"id": uid, "lesson_class": lesson, "ruling": ruling, "by": who, "date": date,
+                    "ok": not why, "why": why,
+                    "status": status, "terminal": terminal, "unreadable": unreadable})
+    return out
+
+
+def graduation_crs(root) -> dict[str, str]:
+    """`{lesson class code: the CR its graduation filed}`, from the lesson store's own link
+    (`lessons.close_pass` writes `cr` on the class's row when it files the CR). Empty when the
+    store holds no such link, or cannot be read: an unread link rules nothing, so a graduation
+    CR stays UNRULED rather than passing as ruled."""
+    try:
+        rows = lessons.load_store(root)
+    except (OSError, ValueError) as exc:
+        sdlc_md.debug("retro.graduation_crs", exc)
+        return {}
+    return {str(r["id"]).upper(): sdlc_md.norm_id(str(r["cr"])) for r in rows
+            if isinstance(r, dict) and r.get("cr")}
+
+
+def _known_issue_cell(cells: list[str], column: str) -> str:
+    """One carried row's cell, found by its column in `KNOWN_ISSUES_COLUMNS`, or "" when the
+    row is short."""
+    i = KNOWN_ISSUES_COLUMNS.index(column)
+    return cells[i].strip() if len(cells) > i else ""
+
+
+def known_issues_table() -> str:
+    """The empty `## Known issues carried` table: its header and separator, from
+    `KNOWN_ISSUES_COLUMNS`. Empty is an answer here - no carried issue was ruled on - so
+    `validate` asks nothing of it."""
+    return (f"| {' | '.join(KNOWN_ISSUES_COLUMNS)} |\n"
+            f"| {' | '.join('---' for _ in KNOWN_ISSUES_COLUMNS)} |")
+
+
+def fill_run_scaffold(text: str, run_id: str) -> str:
+    """The retro template's run slots filled: `{{run_id}}`, which is how a reader without
+    `--retro` finds the run's retro (`sprint._carried_rulings`), `-` for a retro made outside a
+    run; and `{{known_issues_table}}`, the table a stop-ship ruling is recorded in. Called by
+    `artifact._render_meta`, the one renderer of the template."""
+    return (text.replace("{{run_id}}", run_id or "-")
+            .replace("{{known_issues_table}}", known_issues_table()))
+
+
+def _artefact_status(root, uid: str) -> tuple[str | None, bool, str | None]:
+    """`(status, unreadable, type)` for the artefact a carried row names.
+
+    Resolved through `sdlc_md.find_by_id`, the shipped single lookup that `transition` and `audit`
+    already delegate to. A hand-rolled per-type walk was tried first and was wrong twice: it
+    guessed the type from the id prefix, so the four other prefixes the row grammar admits -
+    `RFC`, `US`, `EP`, `LL` - resolved nothing and were marked UNREADABLE while their files sat
+    there readable, which is the opposite of what that flag asserts; and it resolved no migration
+    alias, so a pre-migration id in an old retro answered nothing.
+
+    `(None, True, None)` when no file resolves. Unreadable is reported rather than folded into
+    "not terminal", because a ruling whose finding has vanished is a different question from one
+    whose finding is still open, and only the second has somebody to ask.
+    """
+    hit = sdlc_md.find_by_id(Path(root), uid)
+    if not hit:
+        return None, True, None
+    path, type_ = hit
+    status = (sdlc_md.extract_field(sdlc_md.read_text_safe(path), "Status") or "").strip()
+    return (status or None), False, type_
+
+
+def _fold_bullets(body: list[str]) -> list[str]:
+    """The section's bullets, each with its WRAPPED CONTINUATION LINES folded back on.
+
+    A bullet an author wrapped across three lines is ONE bullet. Read line by line it became
+    one-third of a lesson, cut wherever the author's editor happened to break the line - so the
+    store held a fragment and the headline stopped mid-clause. Where the text wraps is a
+    typographic accident, and nothing downstream may depend on it.
+
+    A blank line closes a bullet, so the paragraph after a list is not swallowed into it.
+    """
+    out: list[str] = []
+    open_bullet = False
+    for line in body:
+        m = BULLET_RE.match(line)
+        if m:
+            out.append(m.group(1).strip())
+            open_bullet = True
+            continue
+        if not line.strip():                      # a blank line ends the bullet
+            open_bullet = False
+            continue
+        if open_bullet and not line.lstrip().startswith(("#", "|", ">")):
+            out[-1] = f"{out[-1]} {line.strip()}"  # a wrapped continuation of the bullet above
+        else:
+            open_bullet = False
+    return out
+
+
+def _real_bullets(body: list[str]) -> list[str]:
+    """Bullets with content in them, unwrapped. A `{{placeholder}}` bullet is the template
+    talking, not the author, and counts as nothing."""
+    found = []
+    for text in _fold_bullets(body):
+        if not text or PLACEHOLDER_RE.search(text):
+            continue
+        # An HTML comment is template guidance, not an answer.
+        text = re.sub(r"<!--.*?-->", "", text).strip()
+        if text:
+            found.append(" ".join(text.split()))
+    return found
+
+
+# The headline a lesson is filed under - and the one line `sprint plan` prints in the lessons
+# digest at the top of every plan. That digest is the surface the whole learning loop exists to
+# serve, and the one an agent under effort pressure reads INSTEAD of opening the file. A headline
+# that stops mid-clause is a lesson that will be skimmed past.
+#
+# So the title is the lesson's first SENTENCE, taken from the wrap-normalised text. Not its first
+# line: where a line ends is where somebody's editor wrapped it.
+LESSON_TITLE_MAX = 140
+#: Abbreviations whose full stop does not end a sentence. Without this, "e.g. the seed" titles a
+#: lesson "e.g." A single-character token (an initial, or the `r` of `r = 0.42.`) is excluded by
+#: length rather than by listing every one.
+_ABBREV = frozenset({"e.g", "i.e", "cf", "vs", "etc", "fig", "approx", "no", "cr", "bg", "us"})
+_SENTENCE_END_RE = re.compile(r"[.!?]\s")
+
+
+def _first_sentence(text: str) -> str:
+    """The first complete sentence of the wrap-normalised text, or all of it."""
+    flat = " ".join(str(text or "").split())
+    for m in _SENTENCE_END_RE.finditer(flat):
+        end = m.start()
+        prev = re.split(r"[\s(\[]", flat[:end])[-1].lower()
+        if len(prev) <= 1 or prev in _ABBREV:   # an initial, a decimal, or a known abbreviation
+            continue
+        return flat[:end + 1]
+    return flat
+
+
+def lesson_title(text: str) -> str:
+    """A lesson's headline: its first complete SENTENCE, from the wrap-normalised text.
+
+    Independent of where the author broke the line, which is the whole defect. A lesson that is
+    already one short sentence is its own title (so the store's existing entries do not churn);
+    a very long first sentence is elided at a word boundary rather than cut mid-word."""
+    first = _first_sentence(text)
+    if len(first) <= LESSON_TITLE_MAX:
+        return first
+    cut = first[:LESSON_TITLE_MAX].rsplit(" ", 1)[0].rstrip(" ,;:")
+    return f"{cut}..."
+
+
+def is_three_line(text: str) -> bool:
+    """Is this a Keep/Stop/Try retro, rather than one written in the older shape?"""
+    return any(name in sections(text) for name in KEEP_STOP_TRY)
+
+
+def lessons_in(text: str) -> list[str]:
+    """The retro's lessons, as written: its Try items, or an older retro's `## Lessons`. This is
+    the input `extract` lifts into the store."""
+    return _real_bullets(sections(text).get("Try" if is_three_line(text) else "Lessons", []))
+
+
+def try_class(item: str) -> dict | None:
+    """The failure class a Try item names (see TRY_TAG_RE), or None for an untagged item.
+
+    `{kind: "hit", code, unit}` or `{kind: "new", class, inject, rule, behaviour, unit}`.
+    Raises ValueError naming what is wrong with a malformed tag."""
+    m = TRY_TAG_RE.match(item or "")
+    if not m:
+        if TRY_TAGLIKE_RE.search(item or ""):
+            raise ValueError(f"'{item[:60]}': reads as a class tag but is not one - lead the "
+                             f"item with `[LC-NNN]` (a recorded class; `lessons.py classes` "
+                             f"lists them) or `[new: <class name>] Rule. Behaviour.`")
+        return None
+    code, spec, rest = m.group(1), m.group(2), " ".join(m.group(3).split())
+    # Normalised, as the critic's hit on the same unit is (`critic.cited_lessons`): a Try item
+    # and a REJECT naming `US-01M3CVPV` are one repeat, not two, when the class counts them.
+    unit = sdlc_md.norm_id(hit.group(1)) if (hit := TRY_UNIT_RE.search(rest)) else ""
+    if code:
+        return {"kind": "hit", "code": code.upper(), "unit": unit}
+    name, _bar, phases = spec.partition("|")
+    name = " ".join(name.split())
+    if not name:
+        raise ValueError(f"'{item[:60]}': a `[new: ...]` tag must name the class")
+    inject = [p.strip().lower() for p in phases.split(",") if p.strip()] or list(lessons.PHASES)
+    bad = [p for p in inject if p not in lessons.PHASES]
+    if bad:
+        raise ValueError(f"'{item[:60]}': unknown phase {', '.join(bad)} - inject at "
+                         f"{', '.join(lessons.PHASES)}")
+    rule = _first_sentence(rest)
+    behaviour = rest[len(rule):].strip()
+    if not rule or not behaviour:
+        raise ValueError(f"'{item[:60]}': a new class needs a rule sentence and a behaviour "
+                         f"sentence after it - what the agent does differently")
+    return {"kind": "new", "class": name, "inject": inject, "rule": rule,
+            "behaviour": behaviour, "unit": unit}
+
+
+def class_errors(root, items: list[str]) -> list[str]:
+    """What is wrong with the class tags on these Try items: a malformed tag, a code the store
+    does not hold, or a store that cannot be read. Each names the item and the fix."""
+    errors, codes = [], []
+    for item in items:
+        try:
+            tag = try_class(item)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        if tag and tag["kind"] == "hit":
+            codes.append(tag["code"])
+    try:
+        rows = lessons.load_store(root)
+    except (OSError, ValueError) as exc:
+        # Flagged whether or not this retro tags a class: an unreadable store is what every
+        # brief then reports instead of its lessons, and the close is where it gets repaired.
+        return [*errors, f"{exc} - repair {lessons.STORE_FILE} before the close counts a class"]
+    return errors + [f"{c} is not a class in {lessons.STORE_FILE} - cite a recorded code "
+                     f"(`lessons.py classes` lists them), or record the class with "
+                     f"`[new: <class name>] Rule. Behaviour.`"
+                     for c in codes if lessons.find_class(rows, c) is None]
+
+
+def three_line_errors(text: str) -> list[str]:
+    """What is wrong with a Keep/Stop/Try retro: an empty line, too many tries, or placeholder
+    text the author never replaced. Nothing else is required."""
+    present = sections(text)
+    errors = [f"'## {name}' is missing or empty - write at least one line of this run's own"
+              for name in KEEP_STOP_TRY if not _real_bullets(present.get(name, []))]
+    tries = _real_bullets(present.get("Try", []))
+    if len(tries) > TRY_MAX:
+        errors.append(f"'## Try' carries {len(tries)} items, over the limit of {TRY_MAX} - keep "
+                      f"the {TRY_MAX} that matter most; each one becomes a lesson")
+    left = sorted(set(PLACEHOLDER_RE.findall(re.sub(r"<!--.*?-->", "", text, flags=re.S))))
+    if left:
+        errors.append(f"placeholder text left in the retro: {', '.join(left)} - replace each "
+                      f"with this run's own words")
+    return errors
+
+
+def carried_max(root) -> int:
+    """How many lessons the carried set holds - delegated to `lessons.carried_max`, which is the
+    ONE reader of that number. The writer that enforces the size and the check that judges it must
+    not be able to disagree, and a second copy of the default here is precisely how they would."""
+    return lessons.carried_max(root)
+
+
+def carried_in(text: str) -> list[str]:
+    """The lessons this retro curated for the next batch. A `{{placeholder}}` bullet counts as
+    nothing, exactly as it does in `## Lessons` - a scaffold is the template talking."""
+    return _real_bullets(sections(text).get(CARRIED_SECTION, []))
+
+
+def curation_applies(root) -> tuple[bool, int]:
+    """Whether this project has more still-valid lessons than the carried set can hold, and how
+    many it has. Read from the lessons store itself (`lessons.plan_digest`, the same reader the
+    sprint plan uses), never from a flag somebody has to remember to set."""
+    try:
+        count = int(lessons.plan_digest(root).get("count") or 0)
+    except Exception:  # noqa: BLE001 - an unreadable lessons store must not break the retro check
+        return False, 0
+    return count > carried_max(root), count
+
+
+def carried_errors(root, text: str) -> list[str]:
+    """What is wrong with this retro's curation: nothing when the project has fewer lessons than
+    the set can hold, otherwise a missing set or an oversized one. Each error names the section
+    and the number, so the remedy is readable without opening the source."""
+    applies, count = curation_applies(root)
+    if not applies:
+        return []
+    limit = carried_max(root)
+    carried = carried_in(text)
+    if not carried:
+        return [f"no curated set - '## {CARRIED_SECTION}' is missing, empty, or still holds its "
+                f"{{{{placeholder}}}}. This project carries {count} still-valid lesson(s), which "
+                f"is more than anyone reads: name the {limit} that matter most for the NEXT "
+                f"batch. A ranking is a fact about the past; the carried set is a decision about "
+                f"what to carry forward, and it is re-decided every retro"]
+    if len(carried) > limit:
+        return [f"'## {CARRIED_SECTION}' carries {len(carried)} lessons, over the limit of "
+                f"{limit} - refused. A set that can grow is a set nobody reads, which is the "
+                f"condition the {count}-lesson summary is already in. Drop one for each you add, "
+                f"and name what it displaced (`lessons carry --displaces`)"]
+    return []
+
+
+#: The marker the shipped template puts on every worked example it demonstrates. An HTML
+#: comment, so `_real_bullets` strips it and the demonstration COUNTS as content - which is the
+#: point: the scaffold passes its own validator instead of teaching its shapes through three
+#: rejections. The trade is that a retro nobody filled in would then pass too, so the marker is
+#: also what `demonstration_leftovers` finds.
+DEMO_MARKER = "<!-- example -->"
+
+
+def demonstration_leftovers(text: str) -> list[str]:
+    """Every line of the shipped template's worked examples still sitting in this retro.
+
+    Reported, never an error. A structurally valid retro whose content is the template's is a
+    different failure from a malformed one, and conflating them would either block a legitimate
+    close or let an unfilled retro through in silence. Naming it lets the close say which."""
+    return [" ".join(line.split())[:120] for line in text.splitlines()
+            if DEMO_MARKER in line]
+
+
+def dispositions_in(text: str) -> list[dict]:
+    """Every row of `## Actions raised`, with its disposition classified.
+
+    Returns one dict per finding: {finding, raw, state, detail}, where state is
+    'filed' (an artefact id), 'fixed' (with the commit or unit that fixed it in-sprint),
+    'declined' (with a reason) or 'undecided' (anything else - blank, a placeholder, or a
+    bare 'declined'/'fixed' with no reference).
+    """
+    rows = []
+    for line in sections(text).get("Actions raised", []):
+        m = ROW_RE.match(line)
+        if not m:
+            continue
+        finding, disp = m.group(1).strip(), m.group(2).strip()
+        # The template's own header row is not a finding.
+        if finding.lower() in {"finding", "issue"} or not finding:
+            continue
+        state, detail = "undecided", ""
+        # Order matters. An explicit `declined:` prefix WINS over an artefact id in its
+        # reason - a decline routinely cites the work it defers to ("declined: belongs to
+        # RFC0034"), and reading that id as a filing would report the finding as ticketed
+        # when it was deliberately not. A bare `declined` with no reason stays undecided:
+        # silence wearing a decision's clothes.
+        if PLACEHOLDER_RE.search(disp) or not disp:
+            state = "undecided"
+        elif (d := DECLINED_RE.match(disp)) and not PLACEHOLDER_RE.search(d.group(1)):
+            state, detail = "declined", d.group(1).strip()
+        # A `fixed-in:` prefix WINS over a bare artefact-id read, the same reason `declined:`
+        # does: a fix cites the commit or unit that closed it ("fixed-in: US0375"), and reading
+        # that id as a filing would report a closed finding as still-ticketed future work.
+        elif (fx := FIXED_RE.match(disp)) and not PLACEHOLDER_RE.search(fx.group(1)):
+            state, detail = "fixed", fx.group(1).strip()
+        elif ARTEFACT_ID_RE.search(disp):
+            state, detail = "filed", ARTEFACT_ID_RE.search(disp).group(1).upper()
+        rows.append({"finding": finding, "raw": disp, "state": state, "detail": detail})
+    return rows
+
+
+def validate(root, retro_id: str) -> dict:
+    """The content check the gate calls. Errors are blocking; each names its own remedy.
+
+    This is deliberately NOT a glob. A 0-byte file called RETRO9999.md satisfied
+    the old leg, so the one gate that made the retrospective un-skippable was the one an
+    agent could satisfy with `touch`. Existence is not evidence.
+    """
+    path = find_retro(root, retro_id)
+    if path is None:
+        return {"ok": False, "id": retro_id, "path": None, "errors": [
+            f"no retro file for {retro_id} in {RETRO_DIR}/ - write it before closing "
+            f"the sprint (artifact.py new --type retro)"]}
+
+    text = path.read_text(encoding="utf-8")
+    if is_three_line(text):
+        errors = (three_line_errors(text) + class_errors(root, lessons_in(text))
+                  + cost_cause_errors(root, retro_id, text))
+        return {"ok": not errors, "id": retro_id, "path": str(path), "errors": errors,
+                "demonstration": [], "lessons": lessons_in(text), "carried": [],
+                "findings": [], "filed": [], "fixed": [], "declined": []}
+    errors: list[str] = []
+
+    present = sections(text)
+    for want in REQUIRED_SECTIONS:
+        if want not in present:
+            errors.append(
+                f"missing section '## {want}' - a retro that skips it did not ask the "
+                f"question the section exists to ask")
+
+    if "Lessons" in present and not lessons_in(text):
+        errors.append(
+            "no lesson recorded - '## Lessons' is empty or still holds its "
+            "{{placeholder}}. A sprint that taught nothing is a claim, not a default; "
+            "if it truly taught nothing, say so in a bullet")
+
+    # The curated set for the NEXT batch, demanded only where there is a choice to make.
+    errors.extend(carried_errors(root, text))
+
+    rows = dispositions_in(text)
+    if "Actions raised" in present and not rows:
+        errors.append(
+            "'## Actions raised' has no rows - answer the question: are there any CRs or "
+            "Bugs to raise for the issues found? To say no, record a row declining it "
+            "with a reason. Silence is not an answer")
+    undecided = [r for r in rows if r["state"] == "undecided"]
+    for r in undecided:
+        errors.append(
+            f"finding not dispositioned: {r['finding'][:60]!r} - file it (BG/CR id), record it "
+            f"fixed in-sprint ('fixed-in: <sha or unit>'), or decline it with a reason "
+            f"('declined: <why>')")
+    # Demanded only of a run the close found over its cost baseline, read from the run's record.
+    errors.extend(cost_cause_errors(root, retro_id, text))
+
+    return {
+        "ok": not errors,
+        "id": retro_id,
+        "path": str(path),
+        "errors": errors,
+        # Reported alongside the verdict rather than folded into it - see
+        # `demonstration_leftovers`. A caller that ignores this key behaves exactly as before.
+        "demonstration": demonstration_leftovers(text),
+        "lessons": lessons_in(text),
+        "carried": carried_in(text),
+        "findings": rows,
+        "filed": [r["detail"] for r in rows if r["state"] == "filed"],
+        "fixed": [r["detail"] for r in rows if r["state"] == "fixed"],
+        "declined": [r["finding"] for r in rows if r["state"] == "declined"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Estimate vs actual: the plan's forecast, judged against what the sprint cost.
+# ---------------------------------------------------------------------------
+
+# `> **Batch:** BG0126, BG0127, CR0248` - the units the sprint set out to deliver.
+BATCH_RE = re.compile(r"(?m)^>?\s*\*\*Batch:\*\*\s*(.+)$")
+DATE_RE = re.compile(r"(?m)^>?\s*\*\*Date:\*\*\s*(.+?)\s*$")
+# `> **Delivered:** 5 / 5` - the retro's OWN declared unit count. The second number is the
+# total the sprint set out to deliver, which is what the Batch field enumerates.
+DELIVERED_RE = re.compile(r"(?m)^>?\s*\*\*Delivered:\*\*\s*(\d+)\s*/\s*(\d+)")
+
+
+class BatchCountMismatch(ValueError):
+    """The retro's Batch field parses to a different unit count than the retro itself declares
+    in its `Delivered: N / M` header. A range like `BG0247-BG0256` reads naturally but the
+    parser expands no ranges, so it matches only the bare endpoints and a whole-sprint token
+    numerator lands over a partial points denominator - a velocity row wrong by orders of
+    magnitude in the one file the planner re-measures its rate from. Refused BEFORE
+    `record_velocity` writes: a partial denominator must never reach the record, and CR0391's
+    fixed-term fit reads the same columns."""
+
+
+def declared_unit_count(text: str) -> int | None:
+    """The unit count the retro declares in its `Delivered: N / M` header (the total, M), or
+    None when the header is absent or still a `{{placeholder}}`. None means "nothing to
+    cross-check against" and never a mismatch: a retro predating the header is unaffected."""
+    m = DELIVERED_RE.search(PLACEHOLDER_RE.sub("", text))
+    return int(m.group(2)) if m else None
+
+
+def batch_count_check(text: str) -> dict:
+    """Cross-check the parsed Batch against the retro's own declared unit count.
+
+    `{"parsed", "declared", "parsed_ids", "ok"}`. `ok` is True when the counts agree, or when
+    the retro declares no count to check against (an older retro, or an unfilled header). A
+    disagreement is the range-in-the-Batch-field defect: the writer named its units as a range
+    the parser could not expand, so half the batch was silently dropped."""
+    parsed_ids = batch_ids(text)
+    declared = declared_unit_count(text)
+    parsed = len(parsed_ids)
+    ok = declared is None or parsed == declared
+    return {"parsed": parsed, "declared": declared, "parsed_ids": parsed_ids, "ok": ok}
+
+
+def _batch_mismatch_message(check: dict, retro_id: str) -> str:
+    """The actionable refusal: it says what to do (name the units individually), not merely
+    that a count disagreed."""
+    return (f"retro {retro_id}: the Batch field parses to {check['parsed']} unit(s) "
+            f"({', '.join(check['parsed_ids']) or 'none'}) but the retro declares "
+            f"{check['declared']} in its `Delivered: N / M` header. The parser expands no "
+            f"ranges, so a Batch written as a range (`BG0247-BG0256`) drops all but its "
+            f"endpoints, and a partial points denominator must never reach VELOCITY.md. Name "
+            f"the delivered units individually in the Batch field, then re-run.")
+
+# The generated block inside `## Estimate vs actual`. Markers, not a whole-section
+# rewrite: the section also carries the author's reading of the numbers, and a tool that
+# ate the analysis every time it refreshed the table would teach people not to run it.
+ACCURACY_BEGIN = "<!-- accuracy:begin (generated by retro.py accuracy --write) -->"
+ACCURACY_END = "<!-- accuracy:end -->"
+ACCURACY_SECTION = "Estimate vs actual"
+ACCURACY_HEADING_RE = re.compile(r"(?im)^##\s+estimate\s+vs\.?\s+actual\b.*$")
+
+VELOCITY_HEADER = """<!--
+Generated by `retro.py accuracy --write`. One row per sprint retro: how many POINTS the sprint
+delivered, what the plan forecast the batch would cost, and what it actually cost.
+
+VELOCITY IS THE POINTS COLUMN. It is the number an agile team plans with, and the reason it is
+here rather than a token total is that the tokens-per-point RATE is DERIVED from it - actual
+tokens over points delivered, re-measured every sprint from this file. A rate that is written
+down as a constant instead is an article of faith within two sprints, and this project has
+twice had to delete one. Nothing may hardcode it: read it back with `retro.py velocity`.
+
+The Points are the sizes the PLAN recorded, never the sizes on the artefacts today. A size
+revised once the outcome was known is not an estimate, and the whole point of the column is
+that it was written down before anyone knew.
+
+POINTS IS THE ACCEPTED FIGURE; WRITTEN IS WHAT THE SPRINT PRODUCED. Points counts units in a
+terminal status - the agile velocity, and the denominator the rate is derived from. Written
+adds the points of units whose code shipped and was reviewed but not accepted. Read the two
+together: a sprint that wrote 148 and had 72 rejected is a REJECTED sprint, and a row showing
+only the 76 reads as a slow one. Rows written before the Written column exists record no
+written figure - that is an absence, not a claim that nothing was rejected, and they are left
+exactly as they were rather than recomputed under the new definition.
+
+The Estimate column is the forecast AS RECORDED AT PLAN TIME, and the Constants column names
+the estimator that produced it. Neither is ever recomputed. A row re-derived from whatever the
+constants say today is not a record of a prediction, and a history of those cannot falsify the
+estimator that wrote it: recalibrate, and every past sprint is retroactively deemed to have
+forecast something else.
+
+Read the Sample column before the Ratio. IN-SAMPLE means the constants in force were fitted to
+that sprint's actuals: its ratio is training error, it lands near 1.0x by construction, and it
+is evidence of nothing. Only an OUT-OF-SAMPLE row - forecast by the constants in force, on a
+sprint they were not fitted to - tells you whether the estimator works. The planner quotes only
+those.
+
+Read the Oversized column before trusting a row's Tokens/pt. It counts the units the sprint
+delivered ABOVE the split threshold, and a point stops being a stable unit of cost up there:
+measured, the 13s ran 1.9x cheaper per point than every band below, so a row with an oversized
+unit in it has a rate dragged downward by a unit that should have been decomposed.
+
+This is a RECORD, not a calibration. Nothing here re-fits the forecast constants
+automatically - a fit to a handful of sprints would fit noise. A human reads the trend
+and decides whether the constants have earned a change.
+
+Read the coverage columns too. A ratio computed over 2 rated units of 10 is a ratio about
+2 units, and the row says so.
+
+Read the MODEL column before comparing any two rows. Cost per unit is meaningless without
+knowing which model paid it: a sprint delivered by a smaller model must not land in the same
+average as one delivered by a larger, and the mean of the two would describe neither. A sprint
+that MIXED models records `mixed` and NO ratio at all, rather than an averaged number that is
+about no run that ever happened.
+
+An EMPTY Actual (tokens) cell means the sprint's token cost was not measured, and the NOTE
+column says why. It never means the sprint cost nothing: a sprint that spent no tokens does
+not exist, so a `0` there could only ever have been a sum over an empty set of measured units
+published as though it were a measurement. Rows written before that was fixed carried exactly
+that, and the reader treats such a `0` as the absence it is - it is not a data point, and no
+rate is derived from it.
+
+Read the SOURCE column before quoting an Actual as evidence. `per-unit` is a sum of per-unit
+telemetry and `harness` is read off the harness meter; both are machine reads. `supplied` is a
+figure an operator TYPED, which is a claim about what a sprint cost, not a measurement of it.
+`harness+supplied` is the meter read PLUS the totals delegated agents reported for themselves.
+An empty Source is unrecorded - the rows written before the column existed - and unrecorded is
+what it stays, because back-filling provenance would invent the very thing the column records.
+
+A harness Source names its counting basis in parentheses once the meter counts each message
+once: `harness (main thread and subagents, once per message)`, or `(main thread, once per
+message)` for a session with no subagent transcript. A bare `harness` was counted on an earlier
+basis, per record or the main thread alone, and does not say which. A rate pooled across a bare
+and a named basis is pooled across two counts, so the planner's rate names every Source it pooled.
+
+Read the PRICED/PT column beside Tokens/pt. It is the run's priced cost per delivered point, in
+whole priced input-equivalent tokens: each component the meter read (input, output, cache write
+and cache read) times its weight from one table, over the row's Points. Only a harness capture
+whose readings carry their components writes one, and only under the Source of that capture. A
+row recorded before the column existed carries none, and none is computed for it.
+
+Read the Overhead bound column before comparing two Overhead ratios. The ratio is overhead time
+against delivery time, and delivery is DERIVED by taking the measured overhead out of the run's
+measured span - so every minute the instruments failed to attribute is credited to delivery, and
+the ratio flatters the loop exactly in proportion to how poorly the run was measured. `exact`
+means every component was measured; `lower` means the ratio is a floor and the close report for
+that sprint names the components it excludes. An empty cell is UNRECORDED - a row written before
+this column existed, which every row carrying a ratio and no bound is - and unrecorded is never
+the same as `exact`. Treat such a ratio as a floor of unknown tightness: recomputed with every
+component, the four in this file that carry one all resolve to `lower`, which is the direction
+an unmeasured component always moves it. They are left as written rather than back-filled,
+because this file publishes what was measured at the time and a figure computed today under a
+row dated two months ago is a different claim wearing that row's date.
+
+A bare `harness` figure is a LOWER BOUND, never an equality. Its meter was the session
+transcript alone, which records no subagent usage at all: measured on one live session, 6,624,813
+tokens of usage carried ZERO sidechain records. So a sprint that delegated work to agents cost
+MORE than its harness row says - one published 439,982 while its cluster agents had reported
+787,834 between them. Their totals reach a row only when somebody supplies them, which is what
+`harness+supplied` marks, and even that sum bounds the sprint from below rather than measuring
+it. Compare a fan-out sprint's rate with a single-thread sprint's only with that in mind.
+-->
+# Velocity history
+
+| Retro | Date | Units | Measured | Forecast | Points | Written | Estimate (tokens, plan-time) | Actual (tokens) | Ratio (est/actual) | Tokens/pt | Priced/pt | Oversized | Wall (s) | Overhead | Overhead bound | Constants | Sample | Model | Note | Source |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+"""
+
+# The history is parsed by COLUMN NAME, not position, so a row written before the plan-time
+# forecast was recorded (which has no Constants and no Sample) still reads - and reads as what
+# it is: a row carrying no record of any forecast, and therefore no evidence. A row written
+# before the model was recorded reads the same way: `model` is None, and None is reported as
+# unrecorded rather than assumed to be whatever is in use today. The same property is what lets
+# the Points columns be ADDED without rewriting a single historical row: an older row simply
+# records no points, which is exactly what happened.
+#
+# `Tokens/pt` is deliberately NOT parsed. It is a quotient of two columns that are, and a
+# derived number read back as though it were a measurement is how a rate escapes its evidence.
+VELOCITY_COLUMNS = (
+    ("retro", "id"), ("date", "date"), ("units", "units"), ("measured", "measured"),
+    ("forecast", "forecast"), ("points", "points"),
+    # ADDED, never back-filled: an older row records no written figure and reads as one that
+    # does not know, which is what it is.
+    ("written", "written_points"),
+    ("estimate", "estimate"),
+    ("actual", "actual_tokens"), ("ratio", "ratio"), ("oversized", "oversized"),
+    ("wall", "wall_time_s"),
+    # The overhead split, so the instrument that computes it once per sprint stops forgetting
+    # it. `overhead` is the ratio of overhead time to delivery time and `overhead bound` says
+    # whether that ratio is exact or a floor; both are absent rather than zero when the run
+    # could not attribute them, because a 0 here would read as a sprint with no overhead.
+    #
+    # The bound column replaced an `unattributed` span that was 0.0 for every row that ever
+    # carried it, and could not have been anything else: delivery is DEFINED as the measured
+    # span minus the measured overhead, so what is left over is zero by construction. A residue
+    # of two figures one of which is the difference of the other two measures nothing, and this
+    # file publishes measurements. The unattributed time is real, but it is inside the delivery
+    # figure, and the bound is the honest statement of that.
+    #
+    # `overhead bound` starts with `overhead`, so these two names OVERLAP. `_velocity_index`
+    # resolves that by taking the longest unclaimed prefix and filing exactly one key per cell,
+    # so the order they are declared in here does not matter. It used to: an earlier note claimed
+    # this list's order was the protection, and it was not - reversing it changed nothing, while
+    # the case the note warned about (a header carrying the bound and no ratio) was broken in
+    # BOTH orders.
+    ("overhead bound", "overhead_bound"), ("overhead", "overhead_ratio"),
+    ("constants", "constants"), ("sample", "sample"),
+    ("model", "model"), ("note", "note"), ("source", "source"),
+    # PARSED, unlike Tokens/pt: no priced total sits beside it to derive it from, so the cell is
+    # the record. A whole number of priced input-equivalent tokens per delivered point, `-` when
+    # absent; a row written before the column existed reads None.
+    ("priced", "priced_per_point"),
+)
+#: A sprint whose rated units were delivered by more than one model. Its ratio is not recorded.
+MODEL_MIXED = "mixed"
+#: A sprint recorded before the model was captured. Not "the model we use now".
+MODEL_UNRECORDED = "unrecorded"
+
+
+def batch_ids(text: str) -> list[str]:
+    """The unit ids named in the retro's `> **Batch:**` field, in order, de-duplicated.
+
+    An unfilled `{{batch}}` yields nothing, which reads downstream as a batch with no
+    units - correct, since a retro that never said what it delivered has nothing to measure.
+    """
+    m = BATCH_RE.search(text)
+    if not m:
+        return []
+    line = PLACEHOLDER_RE.sub("", m.group(1))
+    # The batch line names delivery units interleaved with `(...)` provenance parentheticals -
+    # `(EPxxxx-EPyyyy, from CR.../RFC...)`, `(absorbing CR0139)`, `(RFC-first)` - which epic
+    # decomposed them or which request they came from. Those ids are context, NOT delivery units,
+    # and only delivery units carry a plan-time forecast, so counting them padded the UNFORECAST
+    # list with noise. Strip each parenthetical IN PLACE (not truncate at the first `(`, which
+    # would silently drop every real unit listed AFTER an inline parenthetical); a line with none
+    # is unaffected.
+    line = re.sub(r"\([^)]*\)", "", line)
+    out: list[str] = []
+    for hit in BATCH_ID_RE.finditer(line):
+        rid = sdlc_md.norm_id(hit.group(1))
+        if rid.startswith("LL"):  # a lesson is not a unit of delivery
+            continue
+        if rid not in out:
+            out.append(rid)
+    return out
+
+
+def _sample_of(retro_id: str, constants) -> str:
+    """Where this sprint stands relative to the estimator in force (sprint.sample_class).
+
+    The import is deferred - `validate` is on the gate's path and must not pay for the
+    planner's import graph - and it reads a DECLARATION (which sprints the constants were
+    fitted to), never a formula. Nothing here recomputes an estimate."""
+    try:
+        import sprint  # noqa: PLC0415
+        return sprint.sample_class(retro_id, constants)
+    except Exception as exc:  # noqa: BLE001 - an unclassifiable row is reported, never fatal
+        sdlc_md.debug("retro._sample_of", exc)
+        return "unknown"
+
+
+#: How far a unit's tokens-per-point may sit from its sprint's own rate before the SIZE is
+#: called wrong rather than the run unusual. The band the RFC set before the data was seen
+#: (0.75x-1.25x), reused here so a sprint is judged by the same bar the model was.
+SIZE_BAND = 0.25
+
+
+def _rate(tokens: int | float, points: int | float):
+    """Tokens per point, or None when there are no points to divide by. Never 0: a unit with no
+    recorded size has no rate, and a rate of nothing is not a rate."""
+    return round(tokens / points) if points else None
+
+
+def _delivered_points(root, unit_ids) -> int:
+    """Summed `Points` of the DELIVERED units, read from their ARTEFACTS. The descriptive-velocity
+    denominator - available even when no plan-time forecast was recorded (an interactive sprint
+    reports UNFORECAST), unlike the forecast telemetry the estimate-vs-actual ratio reads. Only a
+    unit in a TERMINAL state counts: a batch may name a unit that slipped (still In Progress), and
+    counting its points as delivered would inflate the denominator and understate the real rate -
+    the exact over-claim a sprint about honest measurement must not make."""
+    total = 0
+    for uid in unit_ids:
+        hit = sdlc_md.find_by_id(root, uid)
+        if not hit:
+            continue
+        path, type_ = hit
+        text = sdlc_md.read_text_safe(path)  # a bad artefact must not crash the velocity read
+        status = sdlc_md.canonical_status(sdlc_md.extract_field(text, "Status"),
+                                          sdlc_md.status_vocab(type_, root))
+        if not sdlc_md.is_terminal_status(type_, status or ""):
+            continue   # not delivered - do not count it toward the delivered points
+        pts = sdlc_md.read_points(text)
+        if isinstance(pts, int) and pts > 0:
+            total += pts
+    return total
+
+
+def _points_split(root, unit_ids) -> dict:
+    """`{"accepted", "written", "unaccepted", "unaccepted_ids"}` - the two numerators, apart.
+
+    ACCEPTED is `_delivered_points`: points in a terminal status, which is what an agile
+    velocity means and what every existing reader of this figure expects.
+
+    WRITTEN adds the points of units whose code demonstrably shipped and was not accepted - a
+    non-terminal unit carrying a recorded delivery-phase review verdict. Somebody reviewed that
+    unit's diff, so the diff exists; a unit nobody has reviewed has nothing to show for itself
+    and is not counted, whatever its status says.
+
+    STATUS ALONE CANNOT TELL THEM APART, which is why the verdict record is the test. A story
+    the review REJECTED goes back to `Ready`, where it is indistinguishable from a story nobody
+    has started - and that is precisely the case that raised this: RETRO0089 reported 76 points
+    over 15.3 hours for a run that wrote 148, with 72 points of committed, working code sitting
+    at `Ready` because the review had rejected it. The row read as a slow run rather than a
+    rejected one, and those are different facts.
+    """
+    accepted = written = 0
+    unaccepted_ids: list[str] = []
+    try:
+        import critic  # noqa: PLC0415 - deferred; a velocity read must not pay for it upfront
+    except Exception:  # noqa: BLE001 - an unreadable critic costs the split, not the retro
+        critic = None
+    for uid in unit_ids:
+        hit = sdlc_md.find_by_id(root, uid)
+        if not hit:
+            continue
+        path, type_ = hit
+        text = sdlc_md.read_text_safe(path)
+        status = sdlc_md.canonical_status(sdlc_md.extract_field(text, "Status"),
+                                          sdlc_md.status_vocab(type_, root))
+        pts = sdlc_md.read_points(text)
+        if not (isinstance(pts, int) and pts > 0):
+            continue
+        if sdlc_md.is_terminal_status(type_, status or ""):
+            accepted += pts
+            written += pts
+            continue
+        try:
+            reviewed = bool(critic and critic.verdict_for(root, uid))
+        except Exception:  # noqa: BLE001 - a bad verdict row must not break the velocity
+            reviewed = False
+        if reviewed:
+            written += pts
+            unaccepted_ids.append(sdlc_md.norm_id(uid))
+    return {"accepted": accepted, "written": written, "unaccepted": written - accepted,
+            "unaccepted_ids": unaccepted_ids}
+
+
+def _worker_hours(root, unit_ids) -> float | None:
+    """Summed runner worker-time (`wall_time_s`) over the batch's measured units, in hours - the
+    SECONDARY velocity's denominator. None when NO unit carries a wall-time record: an interactive
+    sprint has no runner worker time, so points-per-worker-hour honestly reads UNMEASURED rather
+    than dividing by a fabricated zero. Ceremony is EXCLUDED here (this is worker time, for tuning
+    the tool), which is exactly why it is not the planning number."""
+    import telemetry
+    actuals = telemetry.latest_actuals(telemetry.read_all(root))
+    want = {sdlc_md.norm_id(u) for u in unit_ids}
+    secs, seen = 0.0, False
+    for uid, rec in actuals.items():
+        if sdlc_md.norm_id(uid) in want and isinstance(rec.get("wall_time_s"), (int, float)):
+            secs += rec["wall_time_s"]
+            seen = True
+    return round(secs / 3600, 3) if seen else None
+
+
+def _run_covers(state: dict, unit_ids) -> bool:
+    """Does this run-state's batch speak for these units?
+
+    A strict MAJORITY of the units must be in the batch, not merely one in common. Run-state
+    batches are CUMULATIVE, so a previous sprint's state can share a single carried-over
+    (failed-then-redelivered) unit with this one, and a one-unit intersection would then lend
+    that other run's whole elapsed - and its whole spend - to this sprint. The majority rule
+    still accepts a cumulative superset that covers the sprint, which is the common case: the
+    current run's own state carries earlier ids too.
+
+    ONE rule, shared by both quantities read off a run: the hours it was open and the tokens
+    it spent. Either one taken from a run that is not this sprint's is the same error.
+    """
+    run_batch = {sdlc_md.norm_id(x) for x in (state.get("batch") or [])}
+    retro_units = {sdlc_md.norm_id(u) for u in unit_ids}
+    if not retro_units:
+        return False   # a retro naming no units gives nothing for a run to cover
+    return len(run_batch & retro_units) * 2 > len(retro_units)
+
+
+def _covering_run(root, unit_ids) -> dict | None:
+    """The run record that delivered `unit_ids`: the first covering them (`_run_covers`), live
+    then archived, newest first - the rule `_run_rung` reads by. None when none does."""
+    records: list[dict] = []
+    for read in (lambda: [run_state.read(root)], lambda: list(reversed(run_state.archived(root)))):
+        try:
+            records.extend(read())
+        except Exception as exc:  # noqa: BLE001 - the velocity read must never die on a record
+            sdlc_md.debug("retro._covering_run", exc)
+    return next((r for r in records if isinstance(r, dict) and _run_covers(r, unit_ids)), None)
+
+
+def _run_active_seconds(root, unit_ids) -> int | None:
+    """The covering run's measured active time over the delivered units, in seconds: each one's
+    agents' supplied minutes, else its closed span. None unless every delivered unit carrying
+    points has one, because a partial time divided by every point understates the rate."""
+    rec = _covering_run(root, unit_ids)
+    if rec is None:
+        return None
+    agents = run_state.unit_agent_totals(rec)
+    spans = {sdlc_md.norm_id(k): v for k, v in (rec.get(run_state.UNIT_ACTUALS) or {}).items()
+             if isinstance(v, dict)}
+    total, any_unit = 0.0, False
+    for uid in unit_ids:
+        hit = sdlc_md.find_by_id(root, uid)
+        if not hit:
+            continue
+        text = sdlc_md.read_text_safe(hit[0])
+        status = sdlc_md.canonical_status(sdlc_md.extract_field(text, "Status"),
+                                          sdlc_md.status_vocab(hit[1], root))
+        pts = sdlc_md.read_points(text)
+        if not (sdlc_md.is_terminal_status(hit[1], status or "")
+                and isinstance(pts, int) and pts > 0):
+            continue   # not among the delivered points the row records
+        agent, span = agents.get(sdlc_md.norm_id(uid)) or {}, spans.get(sdlc_md.norm_id(uid)) or {}
+        minutes = (agent.get("minutes") if agent.get("timed") else
+                   None if span.get("open") else span.get("minutes"))
+        if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or minutes <= 0:
+            return None
+        total, any_unit = total + minutes, True
+    return round(total * 60) if any_unit else None
+
+
+def _discharged_carries(root, unit_ids) -> list[str]:
+    """The units the run that delivered `unit_ids` carried at the review cap and discharged
+    inside it (`sprint_report.discharged_carries`). Delivered work the retro's Batch omits: the
+    close fills that field from the batch after the carry dropped them. The run is
+    `_covering_run`'s, measured to its end, or to now while it is open. None found reads nothing
+    added."""
+    rec = _covering_run(root, unit_ids)
+    if rec is None:
+        return []
+    try:
+        import sprint_report  # noqa: PLC0415 - deferred; the page's own rule, not a copy
+        return sprint_report.discharged_carries(
+            root, rec, (rec.get("started_at"), rec.get("ended_at") or sdlc_md.now_iso8601()))
+    except Exception as exc:  # noqa: BLE001 - an unreadable ledger adds nothing, never crashes
+        sdlc_md.debug("retro._discharged_carries", exc)
+        return []
+
+
+def _run_meter_model(root, unit_ids) -> str | None:
+    """The model the meter of the run that delivered `unit_ids` names: the single model across
+    its stamps, `mixed` across several, None when none names one or no record covers the units.
+    The run is `_covering_run`'s."""
+    rec = _covering_run(root, unit_ids)
+    if rec is None:
+        return None
+    models = {str(s["model"]) for s in rec.get(run_state.TOKEN_STAMPS) or []
+              if isinstance(s, dict) and s.get("model")}
+    return models.pop() if len(models) == 1 else MODEL_MIXED if models else None
+
+
+def retro_units(root, retro_id: str) -> list[str]:
+    """The delivery units a retro records, or an empty list when there is no such retro."""
+    path = find_retro(root, retro_id)
+    return batch_ids(path.read_text(encoding="utf-8")) if path else []
+
+
+def _elapsed_hours(root, unit_ids) -> tuple[float | None, str | None, int]:
+    """Wall-clock hours the run was OPEN - the PRIMARY velocity's denominator, ceremony included -
+    read from the run-state (`started_at` -> `ended_at`, or now if still open). Returns
+    `(hours, source)`.
+
+    Trusted ONLY when the run-state's batch COVERS this sprint's units (`_run_covers`, the same
+    rule the token capture obeys). A one-unit intersection with an older cumulative batch would
+    otherwise report that run's full age (observed live: 43h) as this sprint's elapsed - the
+    exact confounding CR0273 warns about. When it does not cover, or no run was opened (an
+    interactive sprint, whose wall-clock would count operator-away gaps as sprint time), this
+    returns None and the primary reads UNMEASURED unless the operator supplies a real figure
+    with `--elapsed-hours`."""
+    try:
+        from lib import run_state
+        st = run_state.read(root)
+    except Exception:  # noqa: BLE001 - a velocity read must never break the retro
+        return None, None, 0
+    if not _run_covers(st, unit_ids):
+        return None, None, 0  # the run-state does not cover this sprint - its elapsed is not ours
+    # The idle deduction is `telemetry`'s, CALLED rather than re-derived (D0052). Two copies of
+    # a duration rule is how one sprint comes to have two elapsed figures, and the published
+    # points-per-hour is then set by whichever reader the close happens to ask. `hours` is None
+    # for an OPEN run (no `ended_at`): extending it to `now` would report the run's own age,
+    # including any operator-away gap since it opened, as sprint time - the confounder CR0273
+    # warns about. It reads UNMEASURED until the operator supplies a real figure.
+    span = telemetry.elapsed_excluding_idle(st.get("started_at"), st.get("ended_at"), st)
+    hours = span.get("hours")
+    # The GAP COUNT travels with the figure, because it is what decides whether this is working
+    # time or a calendar span. `sprint stop` reported "15.312h wall-clock less 0.0h idle INSIDE
+    # it, from 0 recorded gap(s)" for an interactive session holding six nine-minute suite runs
+    # and several long periods with nobody at the keyboard, and the row published it as though
+    # idle had been deducted. Zero gaps is not zero idle; it is no measurement of idle.
+    return (hours, "run-state", len(span.get("gaps") or [])) if hours else (None, None, 0)
+
+
+def _run_rung(root, unit_ids) -> str:
+    """The rung the run that DELIVERED these units was driven to (`goal` on that run's record),
+    or `done` when no recorded run covers them.
+
+    Read from the run the retro BELONGS to, never from whatever run is open now. Reading the
+    live state unconditionally meant re-running the accuracy report for an older retro, after a
+    new run had opened and re-stamped the goal, re-attributed that new run's rung to the old
+    sprint - so a design sprint re-read under a build run published the very tokens-per-point
+    the non-done rung exists to withhold. The provenance comes from the run record itself: the
+    live state first, then the archive, newest first, taking the first whose batch COVERS this
+    retro's units. That is the same coverage rule the elapsed and token reads obey, applied to
+    a third quantity read off a run.
+
+    A run with no recorded rung, and a retro no recorded run covers, both read `done`, so the
+    honest build case is never blanked by a lookup that simply found nothing."""
+    records: list[dict] = []
+    try:
+        records.append(run_state.read(root))
+    except Exception:  # noqa: BLE001 - the rate write must never die on a missing run state
+        pass
+    try:
+        records.extend(reversed(run_state.archived(root)))   # newest closed run first
+    except Exception:  # noqa: BLE001 - an unreadable archive is not a reason to fail the close
+        pass
+    for rec in records:
+        if isinstance(rec, dict) and _run_covers(rec, unit_ids):
+            return rec.get("goal") or "done"
+    return "done"
+
+
+#: Reported when no verdict covers a run's units, so a bare 0 cannot be read as evidence the
+#: review was free. An absence and a measured nought are different facts and want different words.
+NOT_IN_FORCE = "not-in-force"
+
+
+def review_cost_split(root, unit_ids: list) -> dict:
+    """Passes spent on CODE review for one run's units, keyed by the one verdict phase.
+
+    Read from the delivery verdict ledger, never from prose, so the figure cannot be typed in.
+    Plan review is retired: a historical `plan-review-verdicts.md` is not read, so it cannot
+    move a run's review cost. No rows at all reports `not-in-force` rather than 0.
+    """
+    import critic  # noqa: PLC0415 - deferred; the module that owns the ledger
+    wanted = {sdlc_md.norm_id(u) for u in unit_ids}
+    rows = [r for r in critic.read_verdicts(root)
+            if sdlc_md.norm_id(r.get("unit", "")) in wanted]
+    if not rows:
+        return {"delivery": {"state": NOT_IN_FORCE, "passes": None, "rejected": None,
+                             "units": None}}
+    rejected = sum(1 for r in rows if (r.get("verdict") or "").upper() == "REJECT")
+    return {"delivery": {"state": "measured", "passes": len(rows), "rejected": rejected,
+                         "units": len({sdlc_md.norm_id(r["unit"]) for r in rows})}}
+
+
+def render_review_cost(split: dict) -> list:
+    """The split as prose, with an absence stated rather than printed as a nought."""
+    s = split.get("delivery") or {}
+    if s.get("state") != "measured":
+        return ["  code review: NOT IN FORCE for this run - no verdict covers any of its units, "
+                "which is not the same as a run that held reviews and spent nothing"]
+    return [f"  code review: {s['passes']} pass(es) over {s['units']} unit(s), "
+            f"{s['rejected']} rejected"]
+
+
+def accuracy(root, retro_id: str, sprint_tokens: int | None = None,
+             elapsed_hours: float | None = None, sprint_model: str | None = None,
+             priced: dict | None = None) -> dict:
+    """Estimate vs actual for every unit in the retro's batch - IN POINTS, and in tokens.
+
+    `sprint_tokens` is the SPRINT-level actual token spend: the harness tracks the token
+    count deterministically, but the runner-only telemetry captures a per-unit `actual` only for a
+    runner-driven sprint, so an INTERACTIVE sprint's per-unit rows stay UNMEASURED. Supplying the
+    sprint total (from the harness / operator) lets the batch report a real
+    tokens-per-point - `sprint_tokens / points delivered` - instead of nothing. It does NOT invent
+    per-unit actuals (those honestly stay unmeasured); it records the batch-level figure the
+    velocity loop needs. A batch-level count, so it is not attributed to any single unit.
+    `priced` is the harness capture that total came from (`run_attributed_tokens`), whose priced
+    cost and components the batch states (`_priced_batch`).
+
+    The estimate is the forecast the planner RECORDED when it planned the sprint
+    (`telemetry.forecasts`), read back verbatim. It is never re-derived from the constants in
+    force - there is no such path, not even as a fallback. An estimate recomputed at judgement
+    time, from the model it is meant to be judging, is not a prediction: recalibrate and every
+    past sprint is retroactively deemed to have forecast something else, the ratio drifts to
+    1.0x, and the loop can never falsify its own estimator. A recorded 5.2x miss - the entire
+    evidence for one recalibration - was erased that way by the recalibration it caused.
+
+    THE POINTS ARE READ BACK THE SAME WAY, from the same record, for the same reason. A size
+    read off the artefact today may have been revised once the outcome was known, and a size
+    revised with hindsight is not an estimate. So a unit whose plan recorded no points is
+    UNSIZED: it is named, it contributes no points to the velocity, and nothing invents a
+    number for it.
+
+    Per unit: the recorded size, the recorded forecast, the measured actual, the ratio
+    (estimate / actual, so >1 means the plan over-forecast) and the tokens it cost per point -
+    which is the number that says whether the SIZE was right, not merely whether a token number
+    was. Per batch: the same, summed over the RATED units - those with BOTH a recorded forecast
+    and a measurement - plus the points delivered, the sprint's measured rate, and any unit
+    delivered above the split threshold.
+
+    Both silences are named, and both are excluded from both sides of the ratio:
+      UNMEASURED - forecast, but no telemetry record. Silence is not a measurement.
+      UNFORECAST - measured, but no plan-time forecast was recorded. Silence on the estimate
+                   side is not evidence either, and it is not an invitation to invent one.
+    """
+    path = find_retro(root, retro_id)
+    if path is None:
+        return {"ok": False, "id": retro_id, "path": None, "units": [],
+                "errors": [f"no retro file for {retro_id} in {RETRO_DIR}/"]}
+
+    text = path.read_text(encoding="utf-8")
+    measured_by_id = telemetry.actuals(root)
+    forecast_by_id = telemetry.forecasts(root)
+
+    units: list[dict] = []
+    named = batch_ids(text)
+    for uid in named + [u for u in _discharged_carries(root, named) if u not in named]:
+        fc = forecast_by_id.get(uid) or {}
+        rec = measured_by_id.get(uid, {})
+        est = fc.get("tokens")
+        # Actual tokens reconcile with the SPEND report: a per-attempt record (an escalation) may
+        # carry no flat `tokens`, only an `attempts` list. Reading flat-only would report that unit
+        # UNMEASURED here while the report priced its summed tokens - the two honest subsystems
+        # contradicting. So fall back to the summed attempts (and the delivering model = the last
+        # attempt), exactly the tokens `unit_cost` prices. A legacy record keeps its flat value.
+        _attempts = telemetry.attempts_of(rec)
+        # ATTEMPTS-FIRST, matching unit_cost and the spend report - the two must never disagree
+        #. latest_actuals aggregates a unit's records into one attempts list (rework
+        # summed), so reading the attempts here IS reading the whole cost.
+        if _attempts:
+            _token_vals = [a.get("tokens") for a in _attempts if a.get("tokens") is not None]
+            tokens = sum(_token_vals) if _token_vals else None
+        else:
+            tokens = rec.get("tokens")
+        # The unit's model SET across ALL its attempts. A unit delivered across more than one
+        # model is ITSELF mixed: its tokens cannot be booked to a single model's rate, so
+        # it marks the batch mixed and is kept out of the per-model rows. Single-model and legacy
+        # flat records read as exactly one model, unchanged.
+        _unit_models = sorted({a.get("model") for a in _attempts if a.get("model")})
+        if len(_unit_models) == 1:
+            _model = _unit_models[0]
+        elif len(_unit_models) > 1:
+            _model = MODEL_MIXED
+        else:
+            _model = rec.get("model")
+        points = fc.get("points")
+        points = points if isinstance(points, int) and points > 0 else None
+        has_est = isinstance(est, (int, float)) and est > 0
+        has_act = isinstance(tokens, (int, float)) and tokens > 0
+        u = {"id": uid, "type": rec.get("type"),
+             "complexity": fc.get("complexity", fc.get("seed")),
+             "seed": fc.get("seed"), "estimate": est if has_est else None,
+             "constants": fc.get("constants"), "planned_at": fc.get("planned_at"),
+             # WHO sized it, WHAT SIZE they called, and WHAT delivered it. All read back from
+             # the record, never inferred: an unrecorded model is `None` and reports as
+             # unrecorded, not as "presumably the one we use now".
+             "estimator": fc.get("estimator"), "points": points,
+             "model": _model, "unit_models": _unit_models,
+             "actual_tokens": tokens if has_act else None,
+             "wall_time_s": rec.get("wall_time_s"), "ratio": None,
+             "tokens_per_point": None,
+             "oversized": bool(points and points > sdlc_md.POINTS_SPLIT_ABOVE),
+             "state": "measured", "reason": ""}
+        if not has_est:
+            why = ["no plan-time forecast recorded"]
+            if not has_act:
+                why.append("no telemetry token record")
+            u["state"], u["reason"] = "unforecast", "; ".join(why)
+        elif not has_act:
+            u["state"], u["reason"] = "unmeasured", "no telemetry token record"
+        else:
+            u["ratio"] = round(est / tokens, 2)
+            u["tokens_per_point"] = _rate(tokens, points)
+        units.append(u)
+
+    rated = [u for u in units if u["state"] == "measured"]
+    # The sprint's DELIVERED points: the points of the units this batch delivered, read from their
+    # ARTEFACTS - the denominator for a sprint-level tokens-per-point when `sprint_tokens` is
+    # supplied. Deliberately NOT the forecast telemetry: an interactive sprint records no plan-time
+    # forecast (it reports UNFORECAST), but the delivered stories/bugs carry real Points. This is a
+    # DESCRIPTIVE velocity number about what shipped, distinct from the forecast-vs-actual ratio
+    # above (which must stay on the plan-time recorded points, never the artefact's revisable size).
+    delivered_points = _delivered_points(root, [u["id"] for u in units])
+    # WHETHER a sprint total was supplied is a separate fact from what it was worth, and no
+    # truthiness test can carry it: an explicit 0 is the operator retracting a wrongly recorded
+    # actual, an absent value is a plain re-run that must preserve one. Both read as falsy, so
+    # the intent travels to the writer as its own flag.
+    sprint_tokens_supplied = (isinstance(sprint_tokens, (int, float))
+                              and not isinstance(sprint_tokens, bool))
+    sprint_tokens = (int(sprint_tokens)
+                     if sprint_tokens_supplied and sprint_tokens > 0 else None)
+    est_sum = sum(u["estimate"] for u in rated)
+    act_sum = sum(u["actual_tokens"] for u in rated)
+    # THE PLAN'S FORECAST FOR THE WHOLE BATCH, over every unit that HAS one - not only the
+    # rated units. `est_sum` above is the ratio's numerator and must describe exactly the units
+    # `act_sum` does, but the published plan-time estimate is a fact about the PLAN, knowable
+    # whether or not anything was later measured. Summed over the rated units it read 0 for
+    # every sprint that measured nothing, which the history then published in a column named
+    # `Estimate (tokens, plan-time)` - a prediction of zero tokens, next to a forecast that had
+    # been recorded and simply was not read. None when no unit was forecast: that is an
+    # absence, and the writer renders it blank rather than as a prediction nobody made.
+    forecast_est = [u["estimate"] for u in units if u["estimate"]]
+    plan_est = sum(forecast_est) if forecast_est else None
+    walls = [u["wall_time_s"] for u in rated if isinstance(u["wall_time_s"], (int, float))]
+    # THE SPRINT'S VELOCITY: the points its rated units carried, as the PLAN recorded them.
+    # A rated unit with no recorded size is unsized - counted nowhere, invented nowhere.
+    sized = [u for u in rated if u["points"]]
+    pts_sum = sum(u["points"] for u in sized)
+    # A unit above the split threshold is FLAGGED, not disqualified. It counts toward the
+    # velocity (the team did deliver it), and it is named with its own tokens-per-point beside
+    # the rate of everything at or below the threshold - because that comparison is the whole
+    # evidence for the decomposition rule, and it must be re-answerable every sprint rather
+    # than taken on faith. In the blind re-estimation the 13s ran at 14,144 tokens per point
+    # against ~25,000 for every band below: systematically OVER-estimated, exactly where the
+    # literature says estimator consistency collapses.
+    within = [u for u in sized if not u["oversized"]]
+    over = [u for u in sized if u["oversized"]]
+    rate_within = _rate(sum(u["actual_tokens"] for u in within),
+                        sum(u["points"] for u in within))
+    # The estimator that produced this batch's forecasts. More than one means the batch was
+    # planned across a constants change and judges no single model - it is not evidence.
+    #
+    # Read from every FORECAST unit, not only the rated ones. Which estimator made a forecast is
+    # a property of the forecast, knowable whether or not that unit was ever measured. Sourcing
+    # it from `rated` meant a sprint with no token telemetry - every interactive sprint, until
+    # CR0278 lands - collected nothing, fell through to SAMPLE_NONE, and printed "no plan-time
+    # forecast was recorded" directly beneath its own "9 of 9 forecast at plan time". The
+    # forecasts were on disk and their estimates were printed on every line above it.
+    seen = {json.dumps(u["constants"], sort_keys=True) for u in units if u["constants"]}
+    constants = json.loads(seen.pop()) if len(seen) == 1 else ("mixed-constants" if seen else None)
+    # THE MODELS THAT DELIVERED THE RATED UNITS. A ratio pooled across two of them is a
+    # statement about neither: a sprint half-delivered by a smaller model and half by a larger
+    # would land in one mean, and the mean would describe no run that ever happened. So when the
+    # batch is mixed the pooled ratio is REFUSED and the per-model figures are given instead.
+    # Refusing to average is not refusing to report.
+    # The distinct models across ALL attempts of the rated units - NOT just each unit's last
+    # attempt. A single unit that escalated across models therefore makes the batch mixed,
+    # so the pooled ratio is refused exactly as a two-unit two-model batch is; the escalation can
+    # no longer hide as a single-model 'opus' batch.
+    models = sorted({m for u in rated for m in u.get("unit_models", []) if m})
+    mixed = len(models) > 1
+    refused = (f"REFUSED: this batch was delivered by more than one model "
+               f"({', '.join(models)}). One ratio across two models describes neither of them - "
+               f"read the per-model rows instead." if mixed else None)
+    # VELOCITY: the PRIMARY planning read is points delivered / elapsed sprint hours,
+    # CEREMONY INCLUDED - what a session actually delivers. Elapsed comes from the run-state; an
+    # interactive sprint has none (and its wall-clock counts operator-away gaps), so it reads
+    # UNMEASURED unless the operator supplies a real figure. The SECONDARY is points-per-worker-hour
+    # (runner wall-time, ceremony removed) for tuning the tool, UNMEASURED interactive. Both are
+    # DESCRIPTIVE ONLY - fed to no gate, never auto-refitted (see the module doctrine).
+    # An explicit --elapsed-hours is an operator OVERRIDE and wins outright: a matched
+    # run-state must never silently override the figure the operator supplied. Only when none is
+    # supplied does the run-state provide the elapsed.
+    if isinstance(elapsed_hours, (int, float)) and elapsed_hours > 0:
+        # An operator's figure is a claim about working time, so the idle question is theirs and
+        # is not asked here: None means "not applicable", never "no gaps recorded".
+        elapsed, elapsed_source, elapsed_gaps = round(float(elapsed_hours), 3), "supplied", None
+    else:
+        elapsed, elapsed_source, elapsed_gaps = _elapsed_hours(root, [u["id"] for u in units])
+    split = _points_split(root, [u["id"] for u in units])
+    worker_hours = _worker_hours(root, [u["id"] for u in units])
+    # The rung of the run these units were delivered by - resolved ONCE, from that run's own
+    # record, and used for both the reported rung and the rate it gates.
+    rung = _run_rung(root, [u["id"] for u in units])
+    ppeh = round(delivered_points / elapsed, 2) if elapsed and delivered_points else None
+    ppwh = round(delivered_points / worker_hours, 2) if worker_hours and delivered_points else None
+    return {
+        "ok": True,
+        "id": retro_id,
+        "path": str(path),
+        "date": (m.group(1).strip() if (m := DATE_RE.search(text)) else ""),
+        # The Batch field cross-checked against the retro's own declared unit count. A
+        # disagreement is refused at the write path (cmd_accuracy) and, belt-and-braces, by
+        # record_velocity itself, so a partially-parsed batch never reaches VELOCITY.md.
+        "batch_check": batch_count_check(text),
+        "units": units,
+        "n_units": len(units),
+        "n_measured": len(rated),
+        "n_forecast": sum(1 for u in units if u["state"] != "unforecast"),
+        "n_unmeasured": sum(1 for u in units if u["state"] == "unmeasured"),
+        "n_unforecast": sum(1 for u in units if u["state"] == "unforecast"),
+        "n_sized": len(sized),
+        "unmeasured": [u["id"] for u in units if u["state"] == "unmeasured"],
+        "unforecast": [u["id"] for u in units if u["state"] == "unforecast"],
+        "unsized": [u["id"] for u in rated if not u["points"]],
+        "constants": constants,
+        "sample": _sample_of(retro_id, constants),
+        "models": models,
+        # The model captured from the harness transcript for an INTERACTIVE close, which has no
+        # per-unit attempt telemetry to derive `models` from. The Model cell falls back to this
+        # only when the per-unit set is empty, so a runner sprint's measured per-unit models
+        # always win; a fan-out that leaves `models` populated is never overwritten by it.
+        "sprint_model": sprint_model,
+        "mixed_models": mixed,
+        "by_model": _by_model(rated),
+        "batch": {
+            "estimate": est_sum,
+            # The forecast the PLAN made for this batch, over every forecast unit. The history's
+            # Estimate column reads this one; `estimate` above stays the ratio's numerator.
+            "plan_estimate": plan_est,
+            "actual_tokens": act_sum,
+            "ratio": None if mixed else (round(est_sum / act_sum, 2) if act_sum else None),
+            "refused": refused,
+            # The runner's worker time; else, for a close with no per-unit telemetry, the run's
+            # measured active time over the delivered units (`_run_active_seconds`).
+            "wall_time_s": (sum(walls) if walls else
+                            _run_active_seconds(root, [u["id"] for u in units])),
+            # The overhead split, read from the report that computes it rather than recomputed
+            # here - two readings of one question is how they come to disagree. Absent when the
+            # run could not attribute it, never 0.
+            **_overhead_terms(root, batch_ids(text)),
+            # The velocity, and the rate it implies. Both derived here from what was recorded;
+            # neither is a constant anybody wrote down.
+            "points": pts_sum,
+            "tokens_per_point": None if mixed else _rate(act_sum, pts_sum),
+            "tokens_per_point_within": None if mixed else rate_within,
+            # CR0278: the sprint-level actual (harness-tracked) and the tokens-per-point it implies
+            # over the DELIVERED points - the honest figure for an interactive sprint that has no
+            # per-unit actuals. None until the sprint total is supplied (not unmeasurable, just
+            # not-yet-captured).
+            "sprint_actual_tokens": sprint_tokens,
+            # Was a sprint total supplied at all? The writer needs the distinction between
+            # "no --tokens" (preserve what is recorded) and "--tokens 0" (clear it).
+            "sprint_tokens_supplied": sprint_tokens_supplied,
+            # THE TWO NUMERATORS, APART. `accepted_points` is the planning velocity (terminal
+            # work); `written_points` adds the code that shipped and was rejected. The gap is
+            # the most interesting number on the row, and reporting only the first read as a
+            # slow sprint rather than a rejected one. `delivered_points` is retained with its
+            # existing meaning - the accepted figure - because every reader of this block and
+            # every historical VELOCITY.md row already means that by it; changing what a
+            # published key means underneath its readers is how one number becomes two.
+            "accepted_points": split["accepted"],
+            "written_points": split["written"],
+            "unaccepted_points": split["unaccepted"],
+            "unaccepted_ids": split["unaccepted_ids"],
+            "delivered_points": delivered_points,
+            "review_cost": review_cost_split(root, [u["id"] for u in units]),
+            "sprint_elapsed_idle_gaps": elapsed_gaps,
+            # US0401 / CR0407: a run driven to a rung OTHER than `done` (a design/plan run)
+            # records its token actual but leaves the tokens-per-point BLANK - a non-build rung
+            # terminates few units, so tokens/terminal-points is the 834,008/pt garbage the
+            # design rung once published into the file the planner re-measures from. The rate is
+            # a build-rung measurement; only the `done` rung earns one.
+            "rung": rung,
+            "sprint_tokens_per_point": (_rate(sprint_tokens, delivered_points)
+                                        if sprint_tokens and rung == "done" else None),
+            # The run's priced cost and its components, per point by the same rule.
+            "priced": _priced_batch(priced, delivered_points, rung, root,
+                                    ended=_run_end(root, [u["id"] for u in units])),
+            # Velocity: PRIMARY = points/elapsed-hour (ceremony included, the planning
+            # number); SECONDARY = points/worker-hour (runner time, tool-tuning). Both descriptive,
+            # never a target, fed to no gate. None reads as UNMEASURED (interactive sprint).
+            "sprint_elapsed_hours": elapsed,
+            "elapsed_source": elapsed_source,
+            "points_per_elapsed_hour": ppeh,
+            "worker_hours": worker_hours,
+            "points_per_worker_hour": ppwh,
+            "split_above": sdlc_md.POINTS_SPLIT_ABOVE,
+            "oversized": [{"id": u["id"], "points": u["points"],
+                           "tokens_per_point": u["tokens_per_point"],
+                           "actual_tokens": u["actual_tokens"]} for u in over],
+            "basis": "units with BOTH a recorded plan-time forecast and a measurement; an "
+                     "unmeasured or unforecast unit is excluded from both sides. A batch "
+                     "delivered by more than one model reports NO pooled ratio - it is "
+                     "segmented per model. Points are the sizes the PLAN recorded; a rated "
+                     "unit the plan did not size contributes none, and none is invented",
+        },
+        "errors": [],
+    }
+
+
+def _run_end(root, unit_ids):
+    """The day the run that delivered `unit_ids` ended (`_covering_run`'s `ended_at`, in UTC),
+    or None while it is open, when the window ends today. The page's rule, which judges
+    staleness on its window's end (`build_report`), read off the run record."""
+    rec = _covering_run(root, unit_ids) if root is not None else None
+    ended = sdlc_md.parse_iso8601(rec.get("ended_at")) if rec and rec.get("ended_at") else None
+    return ended.date() if ended else None
+
+
+def _priced_batch(cap: dict | None, points: int, rung: str, root=None,
+                  ended=None) -> dict | None:
+    """The priced cost a harness capture `cap` states, per delivered point when the run was a
+    build run with points, or None when no capture was made. `reason` says why a capture states
+    no priced figure. `usd` is the same window in estimated US dollars (`_usd_batch`)."""
+    if not cap:
+        return None
+    priced = cap.get("priced")
+    priced = priced if isinstance(priced, int) and not isinstance(priced, bool) else None
+    return {"priced": priced, "components": cap.get("components") if priced is not None else None,
+            "usd": _usd_batch(cap, points, rung, root, ended) if priced is not None else None,
+            "per_point": _rate(priced, points) if priced and rung == "done" else None,
+            "points": points, "rung": rung, "reads_subagents": bool(cap.get("reads_subagents")),
+            "supplied": int(cap.get("delegated_tokens") or 0),
+            "reason": None if priced is not None else (cap.get("priced_reason")
+                                                       or cap.get("reason"))}
+
+
+def _usd_batch(cap: dict, points: int, rung: str, root, ended=None) -> dict:
+    """The capture's estimated US dollars, each model's own components priced from the table
+    (`run_state.usd`), per delivered point by the priced figure's own rule, with the table's
+    effective date and its stale mark (`prices.stale`) judged on the day the run ended
+    (`_run_end`), today while it is open."""
+    table, error = run_state.price_table(root)
+    got = run_state.usd(cap.get(run_state.BY_MODEL), table, ended)
+    return {"usd": got["usd"], "covered": got["covered"], "unpriced": got["unpriced"],
+            "per_point": (got["usd"] / points
+                          if got["usd"] is not None and points and rung == "done" else None),
+            "effective": got["effective"], "stale": got["stale"],
+            "reason": f"the price table cannot be read: {error}" if error else got["reason"]}
+
+
+def _usd_sentence(d: dict | None) -> str:
+    """The retro's dollar clause: the run's estimated dollars and dollars per point, what they
+    leave unpriced, and the table's effective date, marked STALE when `prices.stale` says so."""
+    if not d:
+        return ""
+    def money(v: float) -> str:
+        return f"${v:,.2f}" if v >= 1 else f"${v:.4f}"
+    table = (f"price table effective {d['effective'] or 'never'}"
+             + (" (STALE: its newest price is older than pricing.stale_after_days)"
+                if d["stale"] else ""))
+    if d["usd"] is None:
+        return f" Estimated US dollars: not stated, {d['reason']}; {table}."
+    per = f", {money(d['per_point'])} per point" if d["per_point"] is not None else ""
+    left = ("".join(f"; {u['model']} is not priced ({100 * u['share']:.1f}% of the priced "
+                    f"tokens), and is not counted as $0" for u in d["unpriced"])
+            if d["unpriced"] else "")
+    return (f" Estimated US dollars: {money(d['usd'])}{per}, covering "
+            f"{100 * d['covered']:.1f}% of the priced tokens{left}; {table}.")
+
+
+def _priced_lines(p: dict | None) -> list[str]:
+    """The priced total on one line, then each component on its own line, or one line naming
+    why no priced figure is stated. Nothing when no harness capture was made."""
+    if not p:
+        return []
+    if p["priced"] is None:
+        return [f"**Priced cost: not stated.** {p['reason'] or 'no priced reading'}"]
+    if p["per_point"]:
+        per = f", {p['per_point']:,} per point over {p['points']} delivered points."
+    elif not p["points"]:
+        per = ". No per-point figure: no delivered unit carries Points."
+    else:
+        per = (f". No per-point figure: the run was driven to the `{p['rung']}` rung, and only "
+               f"a build run earns one.")
+    reach = ("Read once per message from the main thread and every subagent transcript."
+             if p["reads_subagents"] else
+             "Read once per message from the main thread only, a lower bound, since no "
+             "subagent transcript was read.")
+    outside = (f" The {p['supplied']:,} tokens supplied by delegated agents are outside it."
+               if p["supplied"] else "")
+    comps = p["components"] or {}
+    # The dollars follow the reach sentence, so the line still opens with the priced tokens,
+    # their per-point figure and what the meter read, as it did before dollars were stated.
+    return [f"**Priced cost: {p['priced']:,} {run_state.PRICED_LABEL}**{per} {reach}"
+            f"{_usd_sentence(p.get('usd'))} Each component is its count times its weight."
+            f"{outside}",
+            "\n".join(f"- {run_state.COMPONENT_NAMES[c]}: {int(comps.get(c) or 0):,} "
+                      f"x{run_state.TOKEN_WEIGHTS[c]:g}" for c in run_state.TOKEN_COMPONENTS)]
+
+
+def _by_model(rated: list[dict]) -> dict:
+    """The rated units grouped by the model that delivered them, each with its own ratio.
+
+    This is what a refusal to average hands back. A model with no recorded name groups under
+    `unrecorded` - it is not silently merged with the model in use today."""
+    out: dict[str, dict] = {}
+    for u in rated:
+        # A unit delivered across more than one model belongs to NO single model's row -
+        # booking its summed tokens into one would poison that model's calibration. It is left out
+        # of the per-model breakdown (the batch-level ratio is already refused as mixed).
+        if u["model"] == MODEL_MIXED:
+            continue
+        b = out.setdefault(u["model"] or "unrecorded",
+                           {"units": [], "estimate": 0, "actual_tokens": 0})
+        b["units"].append(u["id"])
+        b["estimate"] += u["estimate"]
+        b["actual_tokens"] += u["actual_tokens"]
+    for b in out.values():
+        b["n"] = len(b["units"])
+        b["ratio"] = (round(b["estimate"] / b["actual_tokens"], 2)
+                      if b["actual_tokens"] else None)
+    return out
+
+
+def _fmt(n) -> str:
+    return f"{n:,}" if isinstance(n, (int, float)) else "-"
+
+
+#: The estimator's SHAPE is not fixed, and the history must survive it changing. It has changed
+#: twice already (a complexity-weighted budget, then a flat per-unit rate, now a rate per point),
+#: and a cell that only knew how to render the estimator of the day would make every older row
+#: unreadable the moment it moved - which would quietly delete the only evidence that the older
+#: model was wrong. So a cell is `KEY=INT` pairs, whatever the keys are, and the two names the
+#: history already carries in short form are read back into the keys they stood for.
+LEGACY_CONSTANT_KEYS = {"base": "BASE_TOKEN_BUDGET", "tpc": "TOKENS_PER_COGNITIVE"}
+LEGACY_CONSTANT_SHORT = {v: k for k, v in LEGACY_CONSTANT_KEYS.items()}
+CONSTANTS_PAIR_RE = re.compile(r"([A-Za-z_][\w]*)\s*=\s*(-?\d+)")
+
+
+def constants_cell(c) -> str:
+    """The estimator that produced a forecast, as one table cell. Recorded, not assumed: a row
+    must say which model it is judging, or it says nothing.
+
+    The two keys the existing history was written with keep their short spelling, so the rows
+    already on disk round-trip byte-for-byte rather than being rewritten under a new schema."""
+    if not isinstance(c, dict) or not c:
+        return "mixed" if c == "mixed-constants" else "-"
+    return " ".join(f"{LEGACY_CONSTANT_SHORT.get(k, k)}={v}" for k, v in c.items())
+
+
+def parse_constants(cell: str):
+    """A `Constants` cell back into the estimator it names, or None when the row records none
+    (a legacy row, whose estimate was re-derived and therefore is not a forecast at all)."""
+    pairs = CONSTANTS_PAIR_RE.findall(cell or "")
+    if not pairs:
+        return "mixed-constants" if (cell or "").strip().lower() == "mixed" else None
+    return {LEGACY_CONSTANT_KEYS.get(k.lower(), k): int(v) for k, v in pairs}
+
+
+#: What each sample class means, in the retro and in the history. Written next to the number so
+#: nobody has to know the convention to read the row correctly.
+SAMPLE_NOTE = {
+    "in-sample": "IN-SAMPLE: the constants in force were FITTED to these actuals. This ratio "
+                 "is TRAINING ERROR - it lands near 1.0x by construction and is not evidence "
+                 "the estimator works. It is excluded from the accuracy the planner reports.",
+    "out-of-sample": "OUT-OF-SAMPLE: forecast by the constants in force, on a sprint they were "
+                     "not fitted to. This is the only kind of row that tells you anything.",
+    "stale-constants": "STALE CONSTANTS: forecast by a DIFFERENT estimator from the one now in "
+                       "force. It judges that one, not this one, and is excluded.",
+    "mixed-constants": "MIXED CONSTANTS: this batch was forecast across a change of estimator, "
+                       "so it judges no single model. Excluded.",
+    "unforecast": "UNFORECAST: no plan-time forecast was recorded, so there is no prediction to "
+                  "judge. Nothing is re-derived to fill the gap.",
+}
+
+
+def _points_lines(res: dict) -> list[str]:
+    """The velocity, the rate it implies, and the decomposition rule ANSWERED - one paragraph
+    each, and none of them printed when there is nothing measured to say it about.
+
+    This is the half of the report that asks whether the SIZES were right. A token ratio only
+    ever said whether one number matched another; a rate per point says whether the team's
+    estimate of how big the work was survived contact with the work.
+    """
+    b = res["batch"]
+    # The headline: the run's priced cost, then each of its components.
+    out: list[str] = _priced_lines(b.get("priced"))
+    # CR0278: the SPRINT-level tokens-per-point (harness-tracked actual over the delivered points).
+    # Printed first and unconditionally when supplied, so an INTERACTIVE sprint - which has no
+    # per-unit actuals and would otherwise fall into the "no velocity" branch below - still gets a
+    # real, deterministic velocity number. Descriptive, never a target.
+    if b.get("sprint_tokens_per_point"):
+        out.append(
+            f"**Sprint tokens/point: {b['sprint_tokens_per_point']:,}** "
+            f"({b['sprint_actual_tokens']:,} tokens over {b['delivered_points']} delivered points, "
+            f"harness-tracked). The token count is deterministic (supply it with `accuracy "
+            f"--tokens N`) - not UNMEASURED. A descriptive velocity, never a target.")
+    elif b.get("sprint_actual_tokens") and not b.get("delivered_points"):
+        out.append(
+            f"**{b['sprint_actual_tokens']:,} tokens supplied, but no rate:** the batch has no "
+            f"delivered unit carrying Points, so there is no denominator. Size the delivered "
+            f"stories/bugs, or the rate stays uncomputable.")
+    # VELOCITY: the PRIMARY planning read - points delivered / elapsed sprint hours,
+    # ceremony INCLUDED - and the SECONDARY worker-time figure. Both DESCRIPTIVE, never a target.
+    dp = b.get("delivered_points")
+    if dp:
+        if b.get("points_per_elapsed_hour"):
+            src = "run-state" if b.get("elapsed_source") == "run-state" else "operator-supplied"
+            # THE DENOMINATOR'S OWN QUALIFIER. A run-state span with no recorded gap has had no
+            # idle deducted, and calling that "elapsed" invites it to be read as working time.
+            span_kind = (" - a CALENDAR SPAN with no idle deducted, since the run recorded no "
+                         "gap; it is not working time"
+                         if b.get("elapsed_source") == "run-state"
+                         and not b.get("sprint_elapsed_idle_gaps") else "")
+            # THE OTHER NUMERATOR, beside the one the ratio uses. Naming the rejected points is
+            # what separates a slow sprint from a rejected one; without it the row understates
+            # and hides its own most interesting fact.
+            wrote = b.get("written_points")
+            unacc = b.get("unaccepted_points")
+            gap = (f" It WROTE {wrote} point(s): {unacc} more shipped and were not accepted "
+                   f"({', '.join(b.get('unaccepted_ids') or [])}), so this rate measures "
+                   f"acceptance, not output." if unacc else "")
+            out.append(
+                f"**Velocity: {b['points_per_elapsed_hour']} points/elapsed-hour** "
+                f"({dp} points ACCEPTED over {b['sprint_elapsed_hours']}h, {src}{span_kind}, "
+                f"ceremony included).{gap} This is "
+                f"the planning number - points per SESSION within the observed single-session "
+                f"envelope; it is NOT a linear per-point rate to extrapolate to a 1-point or "
+                f"100-point sprint, and it is descriptive, never a target.")
+        else:
+            out.append(
+                f"**Velocity (points/elapsed-hour): UNMEASURED.** No run-state elapsed for this "
+                f"sprint (an interactive sprint's wall-clock would count operator-away gaps as "
+                f"sprint time). Supply a real elapsed with `accuracy --elapsed-hours H` to record it "
+                f"- descriptive, never a target.")
+        if b.get("points_per_worker_hour"):
+            out.append(
+                f"  secondary (tool-tuning): {b['points_per_worker_hour']} points/worker-hour over "
+                f"{b['worker_hours']}h of runner worker time, ceremony removed - NOT the planning "
+                f"number, distinct from the elapsed velocity above.")
+        else:
+            out.append("  secondary (points/worker-hour): UNMEASURED - no runner worker-time "
+                       "records (an interactive sprint has none).")
+    # Printed beside the cost it is about rather than left in the dict. A derivation that is
+    # correct and never rendered is the state `critic brief --tier` was in for a whole sprint.
+    if b.get("review_cost"):
+        out.append("Review passes - read from the verdict ledger:")
+        out.extend(render_review_cost(b["review_cost"]))
+    if not b["points"]:
+        if res["n_measured"]:
+            out.append(
+                f"**No points recorded at plan time** for the rated units, so this sprint "
+                f"records NO velocity. It is not zero and it is not assumed: a size the plan "
+                f"never wrote down is a size nobody predicted, and it is not reconstructed "
+                f"from the artefacts as they stand today.")
+        return out
+
+    rate = b["tokens_per_point"]
+    if rate:
+        out.append(
+            f"**Velocity: {b['points']} points delivered**, at **{rate:,} tokens per point** "
+            f"({_fmt(b['actual_tokens'])} tokens over {res['n_sized']} sized unit(s)). That "
+            f"rate is MEASURED here and derived from the history in VELOCITY.md - it is never "
+            f"a constant, so the next plan forecasts with what this project actually costs.")
+    elif b.get("refused"):
+        out.append(
+            f"**Velocity: {b['points']} points delivered.** No tokens-per-point rate is "
+            f"reported: this batch was delivered by more than one model, and a rate pooled "
+            f"across two models describes neither.")
+    if res.get("unsized"):
+        out.append(
+            f"Unsized: {', '.join(res['unsized'])}. Measured and forecast, but the plan "
+            f"recorded no Points, so they add nothing to the velocity and nothing to the rate.")
+
+    over, within = b["oversized"], b["tokens_per_point_within"]
+    if over:
+        detail = ", ".join(
+            f"**{u['id']}** ({u['points']} points, {_fmt(u['tokens_per_point'])} tokens/pt)"
+            for u in over)
+        against = (f"against **{within:,} tokens/pt** for the units at or below "
+                   f"{b['split_above']}" if within else
+                   "and there is no unit at or below the threshold to price it against")
+        out.append(
+            f"**Above {b['split_above']} points, and SHOULD HAVE BEEN SPLIT: {detail}** - "
+            f"{against}. This is the decomposition rule answered with THIS sprint's evidence "
+            f"rather than taken on faith: above the threshold the estimate stops being worth "
+            f"having (in the blind re-estimation the 13s ran 1.9x cheaper per point than every "
+            f"band below - systematically over-estimated), so a unit this size is a triage "
+            f"failure, not an estimation problem. Split it next time and the rate holds.")
+    elif b["points"]:
+        out.append(
+            f"Every sized unit came in at or below {b['split_above']} points, so the "
+            f"decomposition rule held and the rate above is uncontaminated by an over-sized "
+            f"unit.")
+    return out
+
+
+def size_verdict(u: dict, rate) -> str:
+    """Was the SIZE right? A unit whose tokens-per-point sits inside the band around its own
+    sprint's rate was sized correctly RELATIVE to the rest of the batch - which is the only
+    claim a relative estimate ever makes. Outside it, the call was too big or too small, and
+    the report says which. With no rate (nothing sized) there is nothing to compare against,
+    and it says that instead of guessing."""
+    if not u.get("tokens_per_point") or not rate:
+        return "-"
+    ratio = u["tokens_per_point"] / rate
+    if ratio > 1 + SIZE_BAND:
+        return f"under-sized ({ratio:.2f}x)"    # it cost MORE per point than the batch did
+    if ratio < 1 - SIZE_BAND:
+        return f"over-sized ({ratio:.2f}x)"
+    return "sized right"
+
+
+def accuracy_block(res: dict) -> str:
+    """The generated markdown the retro carries: the table, the coverage, and the caveat."""
+    b = res["batch"]
+    rate = b.get("tokens_per_point")
+    rows = ["| Unit | Points | Estimate (plan-time) | Actual | Ratio (est/actual) | Tokens/pt | "
+            "Size | Wall | Model |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for u in res["units"]:
+        model = u.get("model") or "-"
+        pts = _fmt(u["points"])
+        if u["state"] == "measured":
+            wall = f"{u['wall_time_s']}s" if u["wall_time_s"] is not None else "-"
+            size = ("**SHOULD HAVE BEEN SPLIT**" if u["oversized"]
+                    else size_verdict(u, rate))
+            rows.append(f"| {u['id']} | {pts} | {_fmt(u['estimate'])} | "
+                        f"{_fmt(u['actual_tokens'])} | {u['ratio']}x | "
+                        f"{_fmt(u['tokens_per_point'])} | {size} | {wall} | {model} |")
+        elif u["state"] == "unmeasured":
+            rows.append(f"| {u['id']} | {pts} | {_fmt(u['estimate'])} | - | "
+                        f"**UNMEASURED** ({u['reason']}) | - | - | - | {model} |")
+        else:
+            rows.append(f"| {u['id']} | - | - | {_fmt(u['actual_tokens'])} | "
+                        f"**UNFORECAST** ({u['reason']}) | - | - | - | {model} |")
+    wall = f"{b['wall_time_s']}s" if b["wall_time_s"] is not None else "-"
+    ratio = f"**{b['ratio']}x**" if b["ratio"] is not None else (
+        "**REFUSED**" if b.get("refused") else "-")
+    models = ", ".join(res.get("models") or []) or "-"
+    rows.append(f"| **Batch (rated units only)** | **{_fmt(b['points'])}** | "
+                f"**{_fmt(b['estimate'])}** | **{_fmt(b['actual_tokens'])}** | {ratio} | "
+                f"**{_fmt(rate)}** | | **{wall}** | {models} |")
+
+    n, m, f = res["n_units"], res["n_measured"], res["n_forecast"]
+    lines = [ACCURACY_BEGIN, "", *rows, "",
+             f"**{m} of {n} unit(s) measured; {f} of {n} forecast at plan time.**"]
+    for para in _points_lines(res):
+        lines += ["", para]
+    if b.get("refused"):
+        lines += ["", b["refused"], ""]
+        lines.append("| Model | Units | Estimate | Actual | Ratio |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for model, seg in sorted((res.get("by_model") or {}).items()):
+            r = f"{seg['ratio']}x" if seg["ratio"] is not None else "-"
+            lines.append(f"| {model} | {', '.join(seg['units'])} | {_fmt(seg['estimate'])} | "
+                         f"{_fmt(seg['actual_tokens'])} | {r} |")
+    if res["unmeasured"]:
+        lines.append(
+            f"Unmeasured: {', '.join(res['unmeasured'])}. They are excluded from the batch "
+            f"ratio - an unmeasured unit is not evidence that the estimate was right.")
+    if res["unforecast"]:
+        lines.append(
+            f"Unforecast: {', '.join(res['unforecast'])}. No plan-time forecast was recorded "
+            f"for them, so they are excluded too. The estimate is NOT re-derived from today's "
+            f"constants: a number computed at judgement time, by the model being judged, is "
+            f"not a prediction.")
+    if m == 0:
+        lines.append("No unit in this batch is rated, so this sprint says nothing about the "
+                     "estimator's accuracy.")
+    note = SAMPLE_NOTE.get(res.get("sample"), "")
+    lines += ["",
+              f"Forecast by `{constants_cell(res.get('constants'))}`, recorded at plan time. "
+              f"{note}".strip(),
+              "",
+              "Ratio is estimate / actual: above 1 the plan over-forecast, below 1 it "
+              "under-forecast. Nothing is re-fitted here - see VELOCITY.md for the trend across "
+              "sprints, and change the constants only on evidence a human has looked at.",
+              ACCURACY_END]
+    return "\n".join(lines)
+
+
+def write_accuracy(root, res: dict) -> Path:
+    """Record the block in the retro. Idempotent: refreshing replaces the generated block
+    between its markers and leaves everything the author wrote around it untouched."""
+    path = Path(res["path"])
+    text = path.read_text(encoding="utf-8")
+    block = accuracy_block(res)
+
+    if ACCURACY_BEGIN in text and ACCURACY_END in text:
+        head, rest = text.split(ACCURACY_BEGIN, 1)
+        _old, tail = rest.split(ACCURACY_END, 1)
+        new = head + block + tail
+    elif (m := ACCURACY_HEADING_RE.search(text)):
+        # The section exists but was written by hand: keep the heading and the prose, and
+        # insert the generated block directly under the heading. One blank line parts it
+        # from what follows, and at the foot of the file it ends on a single newline.
+        at = m.end()
+        tail = text[at:].lstrip("\n")
+        new = text[:at] + "\n\n" + block + ("\n\n" + tail if tail else "\n")
+    else:
+        heading = f"\n## {ACCURACY_SECTION}\n\n{block}\n"
+        anchor = re.search(r"(?m)^##\s+Actions raised\s*$", text)
+        new = (text[:anchor.start()] + heading.lstrip("\n") + "\n" + text[anchor.start():]
+               if anchor else text.rstrip("\n") + "\n" + heading)
+
+    sdlc_md.atomic_write(path, new)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# The velocity history: what the estimator has actually done, sprint by sprint.
+# ---------------------------------------------------------------------------
+
+#: Where the harness keeps its per-session transcripts, overridable for tests and
+#: non-standard installs. Defined beside the reader in `lib.run_state` (which stamps the
+#: run's opening baseline from the same meter) and re-exported here.
+TRANSCRIPTS_ENV = run_state.TRANSCRIPTS_ENV
+
+#: The CURRENT session's harness-tracked token total. The ONE reader, shared with the
+#: baseline `open_run` stamps - see `run_state.session_tokens`. It is a per-SESSION total,
+#: which is why the close does not record it directly: `run_attributed_tokens` below narrows
+#: it to this run. A reading of the main thread alone is a LOWER BOUND on what the run cost,
+#: since delegated work is missing from it; one that holds the subagent transcripts is not.
+harness_tokens = run_state.session_tokens
+
+
+def _priced_window(opening: dict, closing: dict) -> dict:
+    """The priced half of the window `run_attributed_tokens` measures: each component's delta
+    from the `opening` reading to the `closing` one, priced by the run total's own rule, or
+    `priced` None with `priced_reason` when a reading predates the priced meter."""
+    got = run_state._priced_delta([[opening, closing]])  # noqa: SLF001 - one pricing rule
+    return {k: got.get(k) for k in ("priced", "components", "priced_reason", run_state.BY_MODEL,
+                                    run_state.PREMIUM_REQUESTS)}
+
+
+def run_attributed_tokens(root, retro_id: str, transcripts_dir=None) -> dict:
+    """The tokens the open run is known to have spent, for the retro that is being recorded -
+    or a stated reason there is no such number. Over a reading of the main thread alone the run
+    spent AT LEAST this, since delegated work nobody supplied a total for is absent from it.
+    Whether a supplied delegated total is added is decided by the predicate the sprint report
+    reads, `run_token_total`'s `includes_subagents` over the run's STAMPS (over a run holding
+    only its legacy baseline, that baseline with this reading as its close, the inputs the
+    report passes it for one): over a run whose stamps say their readings hold the subagent
+    transcripts it is not added, and over one whose stamps carry no such flag it is, so the
+    retro and the report add the same totals. A harness other than Claude answers through the
+    flag its own reader gave, stamped with each reading, and the basis then names that harness
+    and quotes its reader's basis in place of the Claude transcript's wording, which is
+    unchanged. Same shape as `harness_tokens`: {"tokens",
+    "source", "basis"} or {"tokens": None, "reason"}.
+
+    `retro_id` is REQUIRED, and the units are read from that retro, because the delta is only
+    this retro's spend if the open run is the run that delivered it. Reading the open run and
+    trusting the caller to have asked about the right one is how a number correct about one
+    sprint gets stamped on another.
+
+    The harness meter is cumulative per SESSION, not per sprint. Closing a second sprint in
+    one session against the raw meter books the first sprint's spend - and the conversation
+    around it - as the second sprint's own: it published 341,450 then 472,691 tokens/point
+    against a measured ~25,000/pt rate, and both had to be blanked by hand afterwards. So
+    the run's opening reading is subtracted from the current one.
+
+    NOT ATTRIBUTABLE, never a fallback to the raw total, when:
+
+    * no run is open, or the open run carries no baseline (it was opened before the baseline
+      existed - the live case at this fix's own sprint);
+    * the open run's batch does not COVER the units the retro records, so the run that is open
+      is not the run that delivered this sprint;
+    * the current session is not the one the baseline was taken in, so the two readings are
+      of different meters;
+    * the meter reads at or below the baseline, which is the same statement by other means.
+
+    The failure mode this closes is a published number that LOOKS measured, so every one of
+    those returns no number at all rather than a plausible one.
+    """
+    try:
+        state = run_state.read(root)
+    except run_state.RunStateError as exc:
+        return {"tokens": None, "reason": f"not attributable: the run state is unreadable ({exc})"}
+    rid = state.get("run_id") or "the current run"
+    base = state.get(run_state.TOKEN_BASELINE)
+    baseline = base.get("tokens") if isinstance(base, dict) else None
+    if not isinstance(baseline, int) or isinstance(baseline, bool) or baseline < 0:
+        return {"tokens": None, "reason": (
+            f"not attributable: {rid} carries no session-token baseline, so the session total "
+            f"cannot be separated from any earlier sprint's in the same session. A run opened "
+            f"before the baseline existed reports no token figure rather than a session-wide "
+            f"one")}
+    # WHOSE spend is it? The meter says what the open run cost; only the batch says whether the
+    # open run is the one this retro records. `sprint close` always works on the open run, but
+    # `accuracy --id <an older retro> --tokens-from-harness` after a later `sprint plan --write`
+    # does not, and the delta would land on the older sprint's row with nothing saying so.
+    units = retro_units(root, retro_id)
+    if not _run_covers(state, units):
+        named = ", ".join(units) if units else "no units at all"
+        return {"tokens": None, "reason": (
+            f"not attributable: {rid}'s batch does not cover the units {retro_id} records "
+            f"({named}), so its spend is a different sprint's. Record {retro_id} from the run "
+            f"that delivered it, or supply the figure with `accuracy --tokens N`")}
+    cap = harness_tokens(root, transcripts_dir)
+    if not cap.get("tokens"):
+        return {"tokens": None, "reason": f"not attributable: {cap.get('reason')}"}
+    # The source is half the record, so a MISSING source refuses rather than waves through. The
+    # earlier `base.get("source") and cap.get("source") and ...` form disabled the guard entirely
+    # whenever either side lacked one, which is the failure mode the guard exists to prevent: an
+    # unsourced baseline is precisely the one that cannot be shown to be this meter's.
+    if not base.get("source") or not cap.get("source"):
+        return {"tokens": None, "reason": (
+            f"not attributable: {rid}'s baseline does not name the session it was read from, so "
+            f"it cannot be shown to be a reading of this meter. A delta between two meters that "
+            f"may not be the same one is not a spend")}
+    if base["source"] != cap["source"]:
+        return {"tokens": None, "reason": (
+            f"not attributable: {rid} took its baseline in session {Path(base['source']).name} "
+            f"but this close is running in {Path(cap['source']).name} - two different meters, "
+            f"so their difference is not a spend")}
+    rebased = ""
+    if (cap.get(run_state.METER) == run_state.METER_BASIS
+            and base.get(run_state.METER) != run_state.METER_BASIS):
+        # The opening reading was taken on an earlier counting basis (per record, or the main
+        # thread alone) and the current one on this basis: the opening reading is re-derived from
+        # the transcript up to its own time - the run's stamps carry it once a stamp on this
+        # basis has landed - and never subtracted across the two bases.
+        at = base.get("at")
+        redone = next((s for s in state.get(run_state.TOKEN_STAMPS) or []
+                       if isinstance(s, dict) and s.get("kind") == run_state.REDERIVED
+                       and str(s.get("source") or "") == str(base["source"])
+                       and s.get(run_state.REDERIVES) == at), None) or run_state.rederive(
+            str(base["source"]), [at])[at]
+        if not isinstance(redone.get("tokens"), int):
+            return {"tokens": None, "reason": (
+                f"not attributable: {rid}'s opening reading of {baseline:,} was taken on an "
+                f"earlier counting basis and cannot be re-derived under the current one "
+                f"({redone.get('reason')}), and the difference of two counting bases is not a "
+                f"spend")}
+        rebased = (f"; the opening reading of {baseline:,}, taken on an earlier counting basis, "
+                   f"was re-derived from the transcript up to {base.get('at')} as "
+                   f"{redone['tokens']:,} under the current one")
+        baseline = redone["tokens"]
+    delta = cap["tokens"] - baseline
+    if delta <= 0:
+        return {"tokens": None, "reason": (
+            f"not attributable: the session meter reads {cap['tokens']:,}, at or below {rid}'s "
+            f"opening baseline of {baseline:,} - no spend can be derived from that")}
+    # MEASURED (main thread) + SUPPLIED (delegated), and the sum is a LOWER BOUND. The two halves
+    # are different evidence and stay separately named: the delta is a meter reading, a delegated
+    # total is a figure an agent reported. Neither the label nor the arithmetic may imply that
+    # the transcript saw the delegated work. A run whose readings hold the subagent transcripts
+    # DID see it, so over one the supplied totals are not added: that would count each agent
+    # twice. Which run that is, is the STAMPS' answer, the one the report adds by: a run whose
+    # stamps carry no such flag adds them however this one reading was taken. A run holding
+    # only its legacy baseline is read from that baseline with this reading as its close, the
+    # inputs the report passes `run_token_total` for one.
+    reads_agents = bool(cap.get("includes_subagents"))
+    whole = bool(run_state.run_token_total(state, cap).get("includes_subagents"))
+    delegated = run_state.delegated_records(state)
+    supplied = 0 if whole else run_state.delegated_total(state)
+    total = delta + supplied
+    # The sentences below are the Claude transcript's, kept word for word. Another harness's
+    # reading is stated in its reader's own words, and "main thread" appears only where they
+    # say it.
+    harness = run_state.harness_of(cap)
+    claude = harness == run_state.CLAUDE
+    if claude:
+        meter = (f"the current-session total {cap['tokens']:,} less the {baseline:,} on the "
+                 f"meter when the run opened " + (
+                     "(input + output + cache write, once per message, over the main thread "
+                     "and its subagent transcripts)" if reads_agents else
+                     "(input + output + cache creation; cache reads excluded)") + rebased)
+        bound = (f"a LOWER BOUND, not the run's cost: the meter read the main thread's "
+                 f"transcript and no subagent's, so any delegated work no one supplied a total "
+                 f"for is missing from it")
+        held, measured = "The subagents are already in the reading", "on the main thread"
+        spend = "its MAIN-THREAD spend"
+    else:
+        meter = (f"the {harness} reading {cap['tokens']:,} less the {baseline:,} it read when "
+                 f"the run opened, on its reader's own basis: {cap.get('basis')}" + rebased)
+        bound = (f"a LOWER BOUND, not the run's cost: the {harness} reading leaves delegated "
+                 f"agents' spend out, so any delegated work no one supplied a total for is "
+                 f"missing from it")
+        held = f"The {harness} reading already holds delegated agents' spend"
+        measured, spend = f"by the {harness} reader", f"as the {harness} reader measured it"
+    if whole:
+        basis = (f"{rid} cost {total:,}: {meter}. {held}"
+                 + (f", so the {len(delegated)} delegated total(s) supplied are not added"
+                    + ("" if claude else ": adding them would count that spend twice")
+                    if delegated else ""))
+    elif reads_agents:
+        # This reading holds the subagent transcripts and the run's stamps do not say theirs
+        # did: the totals are added as the report adds them, and the figure is not called a
+        # floor, since an agent both supplied and read here would be in it twice.
+        basis = (f"{rid} cost {total:,}: {meter}"
+                 + (f", plus {supplied:,} SUPPLIED by {len(delegated)} delegated agent(s)"
+                    if supplied else "")
+                 + (". This reading holds the subagent transcripts" if claude else
+                    f". The {harness} reading holds delegated agents' spend")
+                 + ", but the run's meter stamps do not say theirs did, so "
+                 + ("the delegated totals supplied are added, as the sprint report adds them, "
+                    "and an agent that ran as a subagent of this session is counted in both"
+                    if supplied else "no delegated total was supplied to add"))
+    elif supplied:
+        basis = (f"{rid} cost AT LEAST {total:,}: {delta:,} MEASURED {measured} "
+                 f"({meter}), plus {supplied:,} SUPPLIED by {len(delegated)} delegated "
+                 f"agent(s), which is a figure they reported rather than one measured here. "
+                 f"{bound}")
+    else:
+        basis = (f"{rid} cost AT LEAST {delta:,}, {spend}: {meter}. No delegated "
+                 f"total was supplied, and {bound}. Record one with "
+                 f"`accuracy --delegated-tokens N --delegated-agent NAME`")
+    return {"tokens": total, "measured_tokens": delta, "delegated_tokens": supplied,
+            "delegated_records": len(delegated), "lower_bound": not (whole or reads_agents),
+            # The model the transcript names for the counted usage, carried through from the
+            # capture so the interactive close can book the row in the (project, model) cell
+            # rather than the unrecorded-model one. `mixed` when the session spanned two.
+            "model": cap.get("model"),
+            "source": cap["source"], "basis": basis,
+            # The counting basis the Source cell names (`harness_source`), and the priced half
+            # of the same window, which no supplied total enters.
+            run_state.METER: cap.get(run_state.METER), "reads_subagents": reads_agents,
+            **_priced_window(redone if rebased else base, cap)}
+
+
+def _tokens_cover_points(row: dict) -> bool:
+    """True when a history row's Actual tokens describe the same units as its Points.
+
+    Two honest shapes: every unit measured (the Actual is the full per-unit sum), or none
+    measured with an Actual present (the Actual is the sprint-level harness total, which by
+    definition covers the whole batch). A partly measured row pairs a partial numerator
+    with a full denominator, so it carries no rate."""
+    measured, units = row.get("measured"), row.get("units")
+    if measured is None or units is None:
+        return False
+    if measured == units:
+        return True
+    return measured == 0 and bool(row.get("actual_tokens"))
+
+
+def velocity_path(root) -> Path:
+    return Path(root) / VELOCITY_FILE
+
+
+def _velocity_num(cell: str):
+    raw = (cell or "").replace(",", "").replace("*", "").rstrip("x").strip()
+    try:
+        return float(raw) if "." in raw else int(raw)
+    except ValueError:
+        return None
+
+
+def _velocity_word(cell: str) -> str | None:
+    """A one-word cell, or None for the `-` this file writes into an empty one. Absence has one
+    spelling on the way in and another on the way out, and a reader that missed the difference
+    would report the dash as a recorded value."""
+    raw = (cell or "").strip()
+    return raw if raw and raw != "-" else None
+
+
+def _velocity_index(line: str) -> dict[str, int] | None:
+    """Column name -> position, from the table's header row. None when the line is not one."""
+    cells = sdlc_md.table_cells(line)
+    if not cells or cells[0].strip().lower() != "retro":
+        return None
+    idx: dict[str, int] = {}
+    for pos, cell in enumerate(cells):
+        name = cell.strip().lower()
+        # The LONGEST unclaimed prefix wins, and a cell files exactly one key. `overhead bound`
+        # starts with `overhead`, so a first-match rule gave one cell to both keys whenever the
+        # narrower name had not already been claimed by an earlier column - which is precisely a
+        # header carrying the bound and no ratio, where the bound was then read as the ratio.
+        # Declaration order used to matter and no longer does, which is the point: the ordering
+        # was load-bearing, undocumented in the only place it acted, and the comment that did
+        # describe it was wrong about what protected it.
+        best: tuple[str, str] | None = None
+        for prefix, key in VELOCITY_COLUMNS:
+            if name.startswith(prefix) and key not in idx and (best is None or len(prefix) > len(best[0])):
+                best = (prefix, key)
+        if best is not None:
+            idx[best[1]] = pos
+    return idx
+
+
+def velocity_history(root) -> list[dict]:
+    """The accumulated history, oldest first. The read a plan makes: how the estimator has
+    performed on real sprints, next to the constants it is about to forecast with.
+
+    Every row carries the estimator that produced its forecast, so the reader can tell whether
+    the row is evidence about the model in force or its own training error. A row with no
+    recorded constants recorded no forecast, and `sprint.sample_class` reads it as exactly
+    that - it is never assumed to have been forecast by whatever is in force today."""
+    path = velocity_path(root)
+    if not path.is_file():
+        return []
+    idx: dict[str, int] | None = None
+    out: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if idx is None:
+            idx = _velocity_index(line)
+            continue
+        cells = sdlc_md.table_cells(line)
+        if not cells or len(cells) < 2:
+            continue
+        rid = cells[0].strip()
+        # EITHER FORM reads, and both report the canonical one. The writer normalises now, but a
+        # row minted dashed before it did must not stay invisible - it holds a real measurement,
+        # and the next upsert rewrites it clean only if this read can see it first.
+        if not re.fullmatch(r"RETRO-?\d{4}", rid, re.IGNORECASE):
+            continue
+        rid = sdlc_md.norm_id(rid)
+
+        def cell(key: str, pos_map=idx, row=cells):
+            pos = pos_map.get(key)
+            return row[pos].strip() if pos is not None and pos < len(row) else ""
+
+        model = cell("model").strip()
+        note = cell("note").strip()
+        # A model id is ONE token (`claude-opus-4-8`, `mixed`, `unrecorded`). A Model cell
+        # holding a sentence is a row somebody corrected by hand before the Note column
+        # existed, when the last cell was the only place a reason could go. Read it as the
+        # note it is: a sentence must never reach the per-model segmentation as a model, and
+        # the next rewrite then puts it in the column that now exists for it.
+        if " " in model:
+            note, model = note if note and note != "-" else model, "-"
+        out.append({"id": rid.upper(), "date": cell("date"),
+                    "units": _velocity_num(cell("units")),
+                    "measured": _velocity_num(cell("measured")),
+                    "forecast": _velocity_num(cell("forecast")),
+                    # The velocity. Absent on a row written before points were recorded, and
+                    # absent is what it stays: an unsized sprint delivered no measurable points,
+                    # and back-filling one from the artefacts as they stand today would be
+                    # inventing a prediction after the fact.
+                    "points": _velocity_num(cell("points")),
+                    # The other numerator. Absent on a row written before the column existed,
+                    # and absent on a row whose sprint had nothing rejected - a cell here means
+                    # "some work shipped and was not accepted", never a repeat of Points.
+                    "written_points": _velocity_num(cell("written_points")),
+                    "oversized": _velocity_num(cell("oversized")),
+                    # A recorded 0 reads as ABSENT, for the same reason the Actual cell beside
+                    # it does: it can only be the empty rated-unit sum the old writer published,
+                    # and read as a number it is a plan-time prediction of zero tokens. 12 of
+                    # the 17 rows on disk when this was fixed carried one.
+                    "estimate": _velocity_num(cell("estimate")) or None,
+                    # A recorded 0 reads as ABSENT, not as a spend of nothing. No sprint costs
+                    # zero tokens, so a 0 in this column can only be the empty rated-unit sum
+                    # the old writer published, and rows carrying one are on disk. Read as 0 it
+                    # would be a data point about a sprint's cost; read as absent it is what it
+                    # is, and the next rewrite republishes it as a blank rather than a figure.
+                    "actual_tokens": _velocity_num(cell("actual_tokens")) or None,
+                    "ratio": _velocity_num(cell("ratio")),
+                    "wall_time_s": _velocity_num(cell("wall_time_s")),
+                    # The overhead split. Read back, not merely written: the columns were
+                    # declared in VELOCITY_COLUMNS and computed into the row, and both the
+                    # header and this reader dropped them - so the figure reached the file's
+                    # contract and nothing downstream could ever see it. Absent stays absent;
+                    # a 0 here would read as a sprint with no overhead at all. The bound is a
+                    # word, not a number, and a row written before the column existed carries
+                    # none - which reads as a ratio of unrecorded provenance, never as an exact
+                    # one.
+                    "overhead_ratio": _velocity_num(cell("overhead_ratio")),
+                    "overhead_bound": _velocity_word(cell("overhead_bound")),
+                    "constants": parse_constants(cell("constants")),
+                    "sample": cell("sample") or None,
+                    "model": model if model and model != "-" else None,
+                    "note": note if note and note != "-" else None,
+                    # Absent on every row written before the column existed, and absent is what
+                    # it stays. None reads as UNRECORDED downstream, never as a measurement.
+                    "source": cell("source").strip() or None,
+                    "priced_per_point": _velocity_num(cell("priced_per_point"))})
+    return sorted(out, key=lambda r: r["id"])
+
+
+def _retro_index(rid: str) -> int:
+    """The numeric part of a retro id, for bounding a window. 0 when it has none."""
+    m = re.search(r"(\d+)\s*$", sdlc_md.norm_id(rid) or "")
+    return int(m.group(1)) if m else 0
+
+
+def velocity_gaps(root, since: str | None = None) -> dict:
+    """Every retro on disk with NO row in the velocity record, oldest first.
+
+    Nothing else detects this. `velocity_history` reads the rows that are there and the report
+    prints them, so a retro that never reached the file is invisible to both: the record can rot
+    with no command saying so, and a skipped accuracy write cannot be told from a sprint that
+    never happened. The rows are read with the same reader the planner uses, so a row the reader
+    cannot parse counts as the gap it effectively is.
+
+    `since` bounds the window at a retro id, by the same doctrine the close-owed baseline obeys:
+    a project adopting this must not be handed a tail of history nothing can ever clear.
+    """
+    have = {r["id"] for r in velocity_history(root)}
+    floor = _retro_index(since) if since else 0
+    d = Path(root) / RETRO_DIR
+    gaps: list[dict] = []
+    total = 0
+    if d.is_dir():
+        for p in sorted(d.glob("RETRO*.md")):
+            m = _STEM_ID_RE.match(p.stem)
+            if not m:
+                continue
+            rid = sdlc_md.norm_id(m.group(1))
+            if _retro_index(rid) < floor:
+                continue
+            total += 1
+            if rid in have:
+                continue
+            text = sdlc_md.read_text_safe(p)
+            dm = DATE_RE.search(text)
+            gaps.append({"id": rid, "date": dm.group(1).strip() if dm else "",
+                         "path": str(p)})
+    gaps.sort(key=lambda g: g["id"])
+    return {"gaps": gaps, "since": sdlc_md.norm_id(since) if since else None,
+            "retros": total, "rows": len(have),
+            "basis": "a retro with no row in the velocity record. The row is the demand, not a "
+                     "token total: a row with a blank Actual and the reason it is blank records "
+                     "that the sprint's cost was not recoverable, which no row at all does"}
+
+
+#: The rate is the median of the most recent RATE_WINDOW usable rows for the model doing the
+#: work; below RATE_MIN_ROWS of them it falls back to the latest single-model rows of any model,
+#: and with none of those to the rows that record no model at all. Recency outranks the model:
+#: once RATE_MIN_ROWS rows recording no model are newer than every row that chain picked, the
+#: picked rows are stale and the newest rows are measured instead.
+RATE_WINDOW = 5
+RATE_MIN_ROWS = 3
+
+
+def _single_model(row: dict) -> str | None:
+    """The row's model when it names exactly one, else None (no model, or several)."""
+    m = row.get("model")
+    return m if m and m not in (MODEL_MIXED, MODEL_UNRECORDED) else None
+
+
+def _unrecorded(row: dict) -> bool:
+    """The row records no model (never one naming several: those were paid by two payers)."""
+    return (row.get("model") or MODEL_UNRECORDED) == MODEL_UNRECORDED
+
+
+def _row_tokens_per_point(row: dict) -> float | None:
+    """A row's tokens per point, or None when its tokens do not cover its points."""
+    if not row.get("points") or not isinstance(row.get("actual_tokens"), (int, float)):
+        return None
+    return row["actual_tokens"] / row["points"] if _tokens_cover_points(row) else None
+
+
+def _row_minutes_per_point(row: dict) -> float | None:
+    """A row's active minutes per point. A runner row's Wall (s) is the summed worker time of
+    the measured units, so it covers the points only when every unit was measured; a close's
+    whole-sprint row (Measured 0) carries one only when every delivered unit had a measured time
+    (`_run_active_seconds`), so it covers them."""
+    wall, units = row.get("wall_time_s"), row.get("units")
+    if not row.get("points") or not isinstance(wall, (int, float)) or wall <= 0:
+        return None
+    return wall / 60 / row["points"] if units and row.get("measured") in (units, 0) else None
+
+
+def work_model(root, rows: list[dict] | None = None) -> str | None:
+    """The model that will do the work: the open run's latest token stamp naming one model,
+    else the model of the latest VELOCITY row naming one. Both are what the close already
+    records; the session transcript is not re-read at plan time."""
+    try:
+        state = run_state.read(root)
+    except run_state.RunStateError:
+        state = {}
+    if state.get("outcome") == run_state.RUNNING:
+        for stamp in reversed(state.get(run_state.TOKEN_STAMPS) or []):
+            m = _single_model(stamp or {})
+            if m:
+                return m
+    rows = velocity_history(root) if rows is None else rows
+    return next((m for m in map(_single_model, reversed(rows)) if m), None)
+
+
+def _rolling_median(rows: list[dict], per_point, model: str | None) -> tuple:
+    """`(median, rows used, source)` for `model`, or `(None, [], None)` with no usable row.
+
+    The chain: the model's own rows, then any single model's rows, then the rows that
+    record no model. Recency outranks the chain: when RATE_MIN_ROWS or more rows recording no
+    model are newer than every row it picked, those newer rows are the rate. A model's rows
+    from before the record stopped naming models describe work no longer being done."""
+    rated = [(i, r, v) for i, r in enumerate(rows) if (v := per_point(r)) is not None]
+    usable = [u for u in rated if _single_model(u[1])]
+    unrec = [u for u in rated if _unrecorded(u[1])]
+    mine = [u for u in usable if u[1]["model"] == model]
+    if len(mine) >= RATE_MIN_ROWS:
+        pick, how = mine[-RATE_WINDOW:], f"measured on {model}"
+    elif usable:
+        pick = usable[-RATE_WINDOW:]
+        how = (f"fallback: {len(mine)} row(s) for {model or 'no named model'}, under "
+               f"{RATE_MIN_ROWS}, so the latest rows of any single model")
+    elif unrec:
+        pick, how = unrec[-RATE_WINDOW:], "measured on unrecorded-model rows"
+    else:
+        return None, [], None
+    newer = [u for u in unrec if u[0] > pick[-1][0]]
+    if len(newer) >= RATE_MIN_ROWS:
+        how = (f"measured on the newest rows, which name no single model: {len(newer)} "
+               f"row(s) newer than {pick[-1][1]['id']} outrank the rows up to it")
+        pick = newer[-RATE_WINDOW:]
+    pick = [(r, v) for _, r, v in pick]
+    used = [r for r, _ in pick]
+    return (statistics.median(v for _, v in pick), used,
+            f"{how}: median of {', '.join(r['id'] for r in used)}")
+
+
+def measured_rate(root, model: str | None = None) -> dict:
+    """THE TOKENS-PER-POINT RATE, DERIVED FROM THE HISTORY. Never a constant.
+
+    The median tokens per point of the most recent RATE_WINDOW usable VELOCITY rows for the
+    model doing the work (`model`, else `work_model`). A row naming no model, or several, is
+    skipped and named, never fatal. Fewer than RATE_MIN_ROWS rows for that model fall back to
+    the latest single-model rows of any model, and `source` says so. With no single-model row
+    at all, the rows naming no model are measured as a last resort, and `source` says that
+    too. Whichever rows that picks, RATE_MIN_ROWS or more newer rows naming no model outrank
+    them, and `source` says the rows it measured name no single model. With no usable row
+    there is NO rate - None, and the caller quotes its seed.
+    """
+    project = telemetry.project_name(root)
+    rows = velocity_history(root)
+    model = model or work_model(root, rows)
+    rate, used, source = _rolling_median(rows, _row_tokens_per_point, model)
+    skipped = [r["id"] for r in rows
+               if _row_tokens_per_point(r) is not None and not _single_model(r) and r not in used]
+    by_model: dict[str, dict] = {}
+    for m in sorted({_single_model(r) for r in rows} - {None}):
+        v, mused, _ = _rolling_median([r for r in rows if r.get("model") == m],
+                                      _row_tokens_per_point, m)
+        if mused:
+            by_model[m] = {"project": project, "sprints": [r["id"] for r in mused],
+                           "n": len(mused), "tokens_per_point": round(v),
+                           "points": sum(r["points"] for r in mused),
+                           "actual_tokens": sum(r["actual_tokens"] for r in mused),
+                           "oversized": sum(int(r.get("oversized") or 0) for r in mused)}
+    return {
+        "project": project, "model": model,
+        "tokens_per_point": round(rate) if rate else None,
+        "source": source or "none: no VELOCITY row records points and tokens for one model",
+        "sprints": [r["id"] for r in used],
+        # Every Source the rate pooled, a counting basis among them: rows on two bases pooled
+        # into one median are not one figure, and the reader is told so.
+        "sources": sorted({r["source"] if r.get("source") not in (None, "-")
+                           else SOURCE_UNRECORDED for r in used}),
+        "points": sum(r["points"] for r in used),
+        "actual_tokens": sum(r["actual_tokens"] for r in used),
+        "oversized": sum(int(r.get("oversized") or 0) for r in used),
+        "skipped": skipped,
+        "by_model": by_model,
+        "basis": "the rolling median of tokens over points delivered, per VELOCITY.md row, for "
+                 "the model doing the work. Derived from the record every time it is read; "
+                 "never stored and never fitted. Pooling across projects is `collate_rate`'s",
+    }
+
+
+def minutes_per_point(root, model: str | None = None) -> dict:
+    """`{value, source}`: active minutes per point by `measured_rate`'s rule, over the rows
+    whose Wall (s) records worker time. `value` None and source `not measured` without one."""
+    rows = velocity_history(root)
+    value, _, source = _rolling_median(rows, _row_minutes_per_point,
+                                       model or work_model(root, rows))
+    if value is None:
+        return {"value": None, "source": "not measured"}
+    return {"value": round(value, 2), "source": source}
+
+
+# ---------------------------------------------------------------------------
+# The cost-regression baseline: a run's priced cost per point against recent runs'.
+# ---------------------------------------------------------------------------
+
+#: Past runs priced once from the harness transcripts by `cost-baseline add`, kept apart from
+#: VELOCITY.md, whose rows are never recomputed.
+COST_BASELINE_FILE = "sdlc-studio/retros/COST-BASELINE.md"
+#: A run whose priced cost per point is over this multiple of its baseline is a close known
+#: issue, and its retro must name the cause. Over, not at: a run at exactly 1.5 x is not flagged.
+COST_REGRESSION_RATIO = 1.5
+#: Below this many priced runs no median is formed, and the configured baseline stands in.
+COST_MIN_RUNS = 3
+#: The most recent priced runs the median is taken over.
+COST_WINDOW = RATE_WINDOW
+#: The key of that configured baseline. Its shipped value lives in config-defaults.yaml alone.
+COST_BASELINE_KEY = "cost.baseline_per_point"
+#: The retro section a flagged run's cause is named in, and the close known issue's source.
+COST_SECTION = "Cost"
+COST_ISSUE = "cost"
+COST_BASELINE_HEADER = (
+    "# Cost baseline\n\n"
+    "<!-- Written by `retro.py cost-baseline add`: one row per past run, priced once from the\n"
+    "harness transcripts over its window. Kept apart from VELOCITY.md, whose rows are never\n"
+    "recomputed. The close's trailing median reads them beside VELOCITY.md's Priced/pt. -->\n\n"
+    "| Retro | Window | Points | Priced | Priced/pt | Weights | Recorded |\n"
+    "| --- | --- | --- | --- | --- | --- | --- |\n")
+
+
+def cost_baseline_path(root) -> Path:
+    return Path(root) / COST_BASELINE_FILE
+
+
+def cost_baseline_rows(root) -> list[dict]:
+    """COST-BASELINE.md's rows in file order: `{id, window, points, priced, per_point}`."""
+    path = cost_baseline_path(root)
+    if not path.is_file():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        cells = [c.strip() for c in sdlc_md.table_cells(line) or []]
+        if len(cells) < 5 or not re.fullmatch(r"RETRO-?\d{4}", cells[0], re.IGNORECASE):
+            continue
+        out.append({"id": sdlc_md.norm_id(cells[0]).upper(), "window": cells[1],
+                    "points": _velocity_num(cells[2]), "priced": _velocity_num(cells[3]),
+                    "per_point": _velocity_num(cells[4])})
+    return out
+
+
+def priced_runs(root, exclude: str | None = None) -> list[dict]:
+    """Every run with a priced cost per point, oldest first: `{id, per_point, from}`.
+
+    VELOCITY.md's rows carrying a Priced/pt figure and COST-BASELINE.md's rows, one per retro (a
+    VELOCITY row wins over a baseline row for the same retro), less `exclude`: the run being
+    judged is never its own baseline. A row with no priced figure is not counted, never read as 0.
+    """
+    runs: dict[str, dict] = {}
+    for row in cost_baseline_rows(root):
+        if isinstance(row["per_point"], (int, float)) and row["per_point"] > 0:
+            runs[row["id"]] = {"id": row["id"], "per_point": row["per_point"],
+                               "from": Path(COST_BASELINE_FILE).name}
+    for row in velocity_history(root):
+        value = row.get("priced_per_point")
+        if isinstance(value, (int, float)) and value > 0:
+            runs[row["id"]] = {"id": row["id"], "per_point": value,
+                               "from": Path(VELOCITY_FILE).name}
+    skip = sdlc_md.norm_id(exclude).upper() if exclude else None
+    return sorted((r for rid, r in runs.items() if rid != skip),
+                  key=lambda r: _retro_index(r["id"]))
+
+
+def _configured_baseline(root) -> tuple[int | None, str]:
+    """`cost.baseline_per_point` as a whole number, or None and why it is not one."""
+    import config  # noqa: PLC0415 - deferred sibling: only the cost check reads the config
+    raw = config.get(root, COST_BASELINE_KEY)
+    # YAML reads a bare `off` as False, and a quoted one stays text: both mean off.
+    if raw is False or (isinstance(raw, str) and raw.strip().lower() == "off"):
+        return None, f"`{COST_BASELINE_KEY}` is off"
+    if raw is None:
+        return None, f"no `{COST_BASELINE_KEY}` is configured"
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return None, (f"`{COST_BASELINE_KEY}` is {raw!r}, not a whole number of priced tokens per "
+                      f"point, so it is ignored")
+    return raw, ""
+
+
+def cost_baseline(root, exclude: str | None = None) -> dict:
+    """THE BASELINE the close, `validate`'s demand and the plan's budget all read.
+
+    `{per_point, kind, retros, runs, basis}`. With COST_MIN_RUNS or more priced runs
+    (`priced_runs`), the median of the COST_WINDOW most recent, `kind` "median", and `retros`
+    the runs it was taken over. With fewer, the configured `cost.baseline_per_point`, `kind`
+    "configured", named in `basis`. With that off, unset or unreadable, `per_point` None and
+    `kind` "unmeasured", and `basis` says how many priced runs there are and that COST_MIN_RUNS
+    are needed."""
+    runs = priced_runs(root, exclude)
+    if len(runs) >= COST_MIN_RUNS:
+        pick = runs[-COST_WINDOW:]
+        ids = [r["id"] for r in pick]
+        return {"per_point": statistics.median(r["per_point"] for r in pick), "kind": "median",
+                "retros": ids, "runs": len(runs),
+                "basis": f"the median of the {len(pick)} most recent priced runs "
+                         f"({', '.join(ids)})"}
+    value, why = _configured_baseline(root)
+    count = f"{len(runs)} priced run(s), and {COST_MIN_RUNS} are needed for a median"
+    if value is None:
+        return {"per_point": None, "kind": "unmeasured", "retros": [], "runs": len(runs),
+                "basis": f"{count}; {why}"}
+    return {"per_point": value, "kind": "configured", "retros": [], "runs": len(runs),
+            "basis": f"the configured baseline `{COST_BASELINE_KEY}` ({count})"}
+
+
+def cost_issue(root, retro_id: str) -> dict | None:
+    """The cost known issue the run's close recorded for `retro_id`, or None. Read from the run
+    state, never from the retro: whether the cause is owed is the close's finding."""
+    try:
+        state = run_state.read(root) or {}
+    except run_state.RunStateError:
+        return None
+    rid = sdlc_md.norm_id(retro_id or "").upper()
+    return next((g for g in state.get(run_state.CLOSE_KNOWN_ISSUES) or []
+                 if isinstance(g, dict) and g.get("source") == COST_ISSUE
+                 and sdlc_md.norm_id(str(g.get("retro") or "")).upper() == rid), None)
+
+
+def cost_cause_errors(root, retro_id: str, text: str) -> list[str]:
+    """The `## Cost` demand: one error when the run carries a cost issue and the retro's
+    section holds no bullet of its own, nothing otherwise."""
+    issue = cost_issue(root, retro_id)
+    if not issue or _real_bullets(sections(text).get(COST_SECTION, [])):
+        return []
+    return [f"missing cause - the close recorded this run's cost as a known issue "
+            f"({issue.get('ratio')} x its baseline per point), so '## {COST_SECTION}' must name "
+            f"the cause in at least one bullet that is not a {{{{placeholder}}}}"]
+
+
+def _iso_z(at) -> str:
+    return at.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _weights_cell() -> str:
+    return ", ".join(f"{run_state.COMPONENT_NAMES[c]} {run_state.TOKEN_WEIGHTS[c]}"
+                     for c in run_state.TOKEN_COMPONENTS)
+
+
+def window_priced(root, since, until) -> dict:
+    """The priced cost of the harness transcripts between `since` and `until` (datetimes),
+    read by the meter's own reader: each session's components at `until` less those at `since`,
+    once per message, its subagents included, priced from the one weight table.
+
+    `{priced, components, sessions}`. RAISES ValueError naming why when the window holds no
+    transcript record, or when a transcript cannot be read: an empty window is not a cost of 0.
+    """
+    d = Path(os.environ.get(run_state.TRANSCRIPTS_ENV)
+             or run_state._harness_transcript_dir(root))  # noqa: SLF001 - the meter's own dir
+    if not d.is_dir():
+        raise ValueError(f"no harness transcript directory at {d}")
+    spans = []
+    for path in sorted(d.glob("*.jsonl")):
+        try:
+            # The meter's reader and aggregation (noqa SLF001): one reading rule, not a copy.
+            collected = run_state._collect(path)  # noqa: SLF001
+            moments = [sdlc_md.parse_iso8601(rec[2]) if rec[2] else None
+                       for rec in collected["records"]]
+            if not any(m and since < m <= until for m in moments):
+                continue
+            closing = run_state._aggregate(collected, until)  # noqa: SLF001
+            opening = (run_state._aggregate(collected, since)  # noqa: SLF001
+                       if any(m and m <= since for m in moments) else None)
+        except run_state._MeterError as exc:  # noqa: SLF001
+            raise ValueError(str(exc)) from exc
+        ends = [{"tokens": agg["tokens"], "components": agg["components"],
+                 "subagents": agg["includes_subagents"]} for agg in (opening, closing) if agg]
+        if opening is None:
+            ends.insert(0, {"tokens": 0, "components": dict.fromkeys(run_state.TOKEN_COMPONENTS, 0),
+                            "subagents": closing["includes_subagents"]})
+        spans.append(ends)
+    if not spans:
+        raise ValueError(f"no transcript record in {d} falls between {_iso_z(since)} and "
+                         f"{_iso_z(until)}, so the window has no cost to record")
+    got = run_state._priced_delta(spans)  # noqa: SLF001 - one pricing rule
+    return {"priced": got["priced"], "components": got["components"], "sessions": len(spans)}
+
+
+#: Below this many qualifying whole-sprint rows the fixed per-sprint term is UNMEASURED: a fit
+#: to one point cannot separate a fixed cost from a marginal one at all, and there is nothing to
+#: fit. The APPLICATION threshold - how many rows before the fit may enter a forecast total - is
+#: higher and lives with the planner (a line through two points is exact and proves nothing).
+FIXED_MIN_QUALIFYING = 2
+
+
+def _fit_fixed_marginal(points: list[float], actuals: list[float]) -> "tuple[float, float] | None":
+    """Least-squares fit of `actual = fixed + marginal * points`, returning (fixed, marginal), or
+    None when the points do not vary (a vertical spread cannot separate the two terms)."""
+    n = len(points)
+    sx, sy = sum(points), sum(actuals)
+    sxx = sum(p * p for p in points)
+    sxy = sum(p * a for p, a in zip(points, actuals))
+    denom = n * sxx - sx * sx
+    if denom == 0:
+        return None
+    marginal = (n * sxy - sx * sy) / denom
+    fixed = (sy - marginal * sx) / n
+    return fixed, marginal
+
+
+def fixed_sprint_cost(root) -> dict:
+    """THE FIXED PER-SPRINT COST, MEASURED from this project's own whole-sprint actuals.
+
+    The token forecast prices the BUILD (points x a marginal rate). Two measured sprints showed
+    the model has no parameter at all for the rest - the ceremony, the review rounds, the repairs
+    and the close - and at real batch sizes that omission dwarfs the term the model does have.
+    This fits it: `actual = fixed + marginal x points` across the record's WHOLE-SPRINT rows.
+
+    A qualifying row carries recorded Points and a whole-sprint Actual - a sprint-level total that
+    INCLUDES the ceremony (Measured is 0: the Actual is the harness meter over the whole session,
+    not a per-unit build sum). A per-unit build sum (Measured equals Units) is EXCLUDED and named:
+    it omits the very ceremony the fixed term exists to price, so fitting against it would fit the
+    fixed cost to data that never contained it.
+
+    UNMEASURED, with no figure at all - not the seed, not zero, not a scaled default - when fewer
+    than `FIXED_MIN_QUALIFYING` rows qualify. It states how many it found, and the fit names the
+    retro ids it rests on, so the number is traceable to the rows that produced it. This measures;
+    whether a fit may be APPLIED to a forecast total is the planner's separate decision.
+
+    Read-only and fail-safe: an unreadable record yields UNMEASURED, never an exception.
+    """
+    try:
+        rows = velocity_history(root)
+    except Exception as exc:  # noqa: BLE001 - no record must never break a plan
+        sdlc_md.debug("retro.fixed_sprint_cost", exc)
+        rows = []
+    qualifying: list[dict] = []
+    excluded: list[dict] = []
+    for r in rows:
+        pts = r.get("points")
+        actual = r.get("actual_tokens")
+        if not pts or not isinstance(actual, (int, float)) or actual <= 0:
+            continue
+        measured, units = r.get("measured"), r.get("units")
+        if measured == 0:
+            qualifying.append(r)                     # whole-sprint total, ceremony included
+        elif isinstance(measured, (int, float)) and measured and measured == units:
+            excluded.append({"id": r.get("id"), "reason": (
+                "a per-unit build sum (Measured equals Units) omits the ceremony the fixed term "
+                "exists to price, so counting it would fit the fixed cost against data that never "
+                "contained it")})
+    n = len(qualifying)
+    base = {"fixed": None, "marginal": None, "sprints": [q.get("id") for q in qualifying],
+            "n": n, "min": FIXED_MIN_QUALIFYING, "excluded": excluded, "unmeasured": True}
+    if n < FIXED_MIN_QUALIFYING:
+        base["reason"] = (
+            f"UNMEASURED: {n} of the {FIXED_MIN_QUALIFYING} whole-sprint rows needed to fit a "
+            f"fixed per-sprint term were found in VELOCITY.md"
+            + (f", and {len(excluded)} per-unit build-sum row(s) were excluded (they omit the "
+               f"ceremony the term prices)" if excluded else "")
+            + ". No figure is supplied - not the seed, not zero, not a default")
+        return base
+    fit = _fit_fixed_marginal([float(q["points"]) for q in qualifying],
+                              [float(q["actual_tokens"]) for q in qualifying])
+    if fit is None:
+        base["reason"] = (f"UNMEASURED: the {n} qualifying whole-sprint rows all carry the same "
+                          f"point count, so a fixed term cannot be separated from a marginal one")
+        return base
+    fixed, marginal = fit
+    return {"fixed": int(round(fixed)), "marginal": int(round(marginal)),
+            "sprints": [q.get("id") for q in qualifying], "n": n, "min": FIXED_MIN_QUALIFYING,
+            "excluded": excluded, "unmeasured": False,
+            "reason": (f"fitted from {n} whole-sprint row(s) "
+                       f"({', '.join(q.get('id') or '?' for q in qualifying)}) as "
+                       f"actual = {int(round(fixed)):,} + {int(round(marginal)):,} x points")}
+
+
+def collate_rate(roots) -> dict:
+    """THE CROSS-PROJECT TOKENS-PER-POINT RATE, per (PROJECT, MODEL) CELL. Never a pooled figure.
+
+    This is the reader for the multi-project tuning run: the operator forward-ports the skill onto
+    several repos, each stamps its own project on every record, and their evidence is pooled here.
+    The cell is read off the RECORD's own `project` and `model` - never off the directory it was
+    read from - so records physically copied into one place stay attributable, which is the whole
+    reason the project is stamped on the row and not inferred at read time.
+
+    SEGMENT OR REFUSE, never silently average - the same rule `measured_rate` and the accuracy
+    ratio already obey, now on the project axis too. A rate is computed WITHIN each (project,
+    model) cell; NO number is ever summed across two cells. A points-vs-cost figure pooled across
+    a fast project and a slow one, or across two models, describes neither - this project has twice
+    withdrawn a finding to exactly that confound (a field that flipped sign between cohorts, and a
+    field whose mere presence became a calendar artefact). So the pooled total is REFUSED and the
+    per-cell rows are handed back instead. A record with no project reads as `unknown`; it is its
+    own cell, never folded into a named project.
+
+    A unit is rated only with BOTH a plan-time forecast carrying points AND a measured actual
+    carrying tokens - the same bar every other rate obeys. Everything else is excluded, not
+    invented.
+    """
+    if isinstance(roots, (str, Path)):
+        roots = [roots]
+    cells: dict[tuple, dict] = {}
+    for root in roots:
+        forecasts = telemetry.forecasts(root)
+        actuals = telemetry.actuals(root)
+        for uid, fc in forecasts.items():
+            rec = actuals.get(uid, {})
+            points = fc.get("points")
+            tokens = rec.get("tokens")
+            if not (isinstance(points, int) and points > 0
+                    and isinstance(tokens, (int, float)) and tokens > 0):
+                continue
+            # The project and model are the RECORD's own - the actual's if it carries them, else
+            # the forecast's - never the directory's. `unknown`/`unrecorded` are their own cells.
+            project = rec.get("project") or fc.get("project") or telemetry.PROJECT_UNKNOWN
+            model = rec.get("model") or "unrecorded"
+            cell = cells.setdefault((project, model),
+                                    {"project": project, "model": model, "units": [],
+                                     "points": 0, "actual_tokens": 0})
+            cell["units"].append(uid)
+            cell["points"] += points
+            cell["actual_tokens"] += tokens
+    out = []
+    for (project, model), c in sorted(cells.items()):
+        c["n"] = len(c["units"])
+        c["tokens_per_point"] = _rate(c["actual_tokens"], c["points"])
+        out.append(c)
+    projects = sorted({c["project"] for c in out})
+    models = sorted({c["model"] for c in out})
+    refused = None
+    if len(out) > 1:
+        why = []
+        if len(projects) > 1:
+            why.append(f"{len(projects)} projects ({', '.join(projects)})")
+        if len(models) > 1:
+            why.append(f"{len(models)} models ({', '.join(models)})")
+        refused = (f"REFUSED: the pooled evidence spans {' and '.join(why) or 'more than one cell'}. "
+                   f"A tokens-per-point rate across two cells describes neither - read the "
+                   f"per-(project, model) rows. Pooling them is the cohort confound this project "
+                   f"has twice withdrawn a finding to.")
+    return {
+        "cells": out,
+        "projects": projects,
+        "models": models,
+        "refused": refused,
+        "basis": "actual tokens over points delivered, WITHIN each (project, model) cell, read "
+                 "from the record's own project and model. Never summed across cells; a record "
+                 "with no project is its own `unknown` cell, never folded into a named one",
+    }
+
+
+def model_cell(res: dict) -> str:
+    """The model a sprint's rated units were delivered by, as one history cell.
+
+    `mixed` when more than one delivered it - and a mixed row records NO ratio, because a ratio
+    across two models is a statement about neither.
+
+    For an INTERACTIVE sprint the per-unit `models` set is empty (there is no per-unit attempt
+    telemetry), so the model captured from the harness transcript (`sprint_model`) is used
+    instead - a single id, or `mixed` for a session that spanned two. The per-unit set wins
+    whenever it is present, so a runner sprint's measured models are never overwritten."""
+    models = res.get("models") or []
+    if len(models) > 1:
+        return MODEL_MIXED
+    if models:
+        return models[0]
+    sprint_model = res.get("sprint_model")
+    if isinstance(sprint_model, str) and sprint_model.strip():
+        return sprint_model.strip()
+    return "-"
+
+
+def _note_cell(text) -> str:
+    """One table cell from a reason written for a human: single line, no pipe, or `-`."""
+    flat = " ".join(str(text or "").split()).replace("|", "/")
+    return flat or "-"
+
+
+def _actual_note(res: dict, actual, existing=None) -> str | None:
+    """WHY this row's Actual (tokens) cell is blank, or None when it is not blank.
+
+    A blank with no reason beside it is indistinguishable from an oversight, and this project
+    has already published the alternative: a `0` that read as a measurement.
+
+    THIS RUN'S OWN STATEMENT FIRST, then what the row already carries, then the generic fact:
+
+    - the close's not-attributable reason, which names the run, the meter, or the baseline that
+      was missing;
+    - an explicit `--tokens 0`, which is an operator RETRACTING a figure they know to be wrong.
+      A total was supplied, deliberately, and the generic sentence below says the opposite;
+    - the reason already recorded against this row. The column was added to stop a hand-written
+      reason being lost, and regenerating it unconditionally lost it on the row's own next
+      write - a rescued figure beside an overwritten reason for it. A recorded reason for a
+      cell that is still blank is still the reason it is blank;
+    - the generic statement, for a row that has never carried one.
+    """
+    if actual is not None:
+        return None
+    capture = (res.get("token_capture") or "").strip()
+    if capture:
+        return capture
+    if (res.get("batch") or {}).get("sprint_tokens_supplied"):
+        return ("retracted: a sprint total WAS supplied, as 0, withdrawing a figure recorded "
+                "here in error. The cell is blank by instruction, not for want of a look")
+    recorded = " ".join(str(existing or "").split())
+    return recorded or (
+        "not attributable: no unit carries per-unit telemetry and no sprint total was "
+        "supplied, so the sprint's token cost is unrecorded rather than 0")
+
+
+#: WHERE a row's Actual (tokens) figure came from. Two of the three are machine reads; the
+#: third is an operator's typed claim, and a plan that cannot tell them apart quotes a typed
+#: number as evidence of what a sprint cost. Absent is its own value: a row written before the
+#: column existed records no provenance, and nothing back-fills one for it.
+SOURCE_PER_UNIT = "per-unit"    # summed from per-unit telemetry - only a runner writes it
+SOURCE_HARNESS = "harness"      # read off the harness transcript meter by --tokens-from-harness
+SOURCE_SUPPLIED = "supplied"    # typed by an operator into `accuracy --tokens N`
+#: The harness meter read PLUS delegated totals the agents themselves reported. Part machine
+#: read, part claim, and the whole is a LOWER BOUND: the transcript carries no subagent usage,
+#: so a delegated agent nobody supplied a total for is still missing from it.
+SOURCE_HARNESS_SUPPLIED = "harness+supplied"
+#: Not a recorded value: cmd_accuracy's signal that it re-used the figure already on the row,
+#: so whatever provenance that row holds is the provenance of the figure it still holds.
+SOURCE_UNCHANGED = "unchanged"
+#: The counting basis a harness Source names in parentheses after its kind, once the meter
+#: counts each message once. A bare `harness` was counted on an earlier basis and says not which.
+SOURCE_BASIS_SUBAGENTS = "main thread and subagents, once per message"
+SOURCE_BASIS_MAIN_THREAD = "main thread, once per message"
+#: How a row with no Source is named where the Sources a rate pooled are listed.
+SOURCE_UNRECORDED = "unrecorded"
+
+
+def harness_source(kind: str | None, cap: dict) -> str | None:
+    """A harness `kind` naming the counting basis of the capture `cap` it came from:
+    `harness (main thread and subagents, once per message)`. Any other kind, and a capture not
+    on the current meter's basis, is returned as it is."""
+    if kind not in (SOURCE_HARNESS, SOURCE_HARNESS_SUPPLIED) or (
+            cap.get(run_state.METER) != run_state.METER_BASIS):
+        return kind
+    basis = SOURCE_BASIS_SUBAGENTS if cap.get("reads_subagents") else SOURCE_BASIS_MAIN_THREAD
+    return f"{kind} ({basis})"
+
+
+def source_kind(cell: str | None) -> str | None:
+    """A Source cell's kind with its basis dropped: `harness (...)` reads `harness`."""
+    return cell.split(" (", 1)[0].strip() if cell else None
+
+
+def _actual_source(res: dict, actual, existing=None) -> str | None:
+    """The provenance mark for this row's Actual cell, or None when there is nothing to mark.
+
+    A per-unit sum outranks everything: every unit carried its own record. Otherwise the figure
+    is sprint-level, and the two ways one arrives are not the same evidence."""
+    if actual is None:
+        return None
+    if res.get("n_measured"):
+        return SOURCE_PER_UNIT
+    declared = (res.get("token_source") or "").strip()
+    if declared == SOURCE_UNCHANGED:
+        return existing or None
+    if source_kind(declared) in (SOURCE_HARNESS, SOURCE_SUPPLIED, SOURCE_HARNESS_SUPPLIED):
+        return declared
+    if (res.get("batch") or {}).get("sprint_tokens_supplied"):
+        return SOURCE_SUPPLIED
+    return existing or None
+
+
+def supplied_sprint_tokens(root, retro_id: str) -> int | None:
+    """The sprint total an operator typed with `accuracy --tokens N --write`, read back from
+    the velocity row it was written to, or None. Only a `supplied` row: a harness capture is a
+    reading of the run's meter, which the report reads from the run record itself."""
+    rid = sdlc_md.norm_id(retro_id)
+    row = next((r for r in velocity_history(root) if r["id"] == rid), None)
+    if not row or row.get("source") != SOURCE_SUPPLIED:
+        return None
+    tokens = row.get("actual_tokens")
+    return int(tokens) if tokens else None
+
+
+def _overhead_terms(root, unit_ids) -> dict:
+    """`{overhead_ratio, overhead_bound}` for this batch, or both absent.
+
+    Read from `sprint_report`, which owns the computation, through the one entry point that
+    supplies EVERY component. Never recomputed: two readings of one question is how they come to
+    disagree, and this one is written to the file the next sprint plans from. Passing the
+    components in blank does not fail either - it quietly drops the gate and mutation time and
+    returns a smaller ratio than the close report printed from the same run.
+
+    The BOUND travels with the ratio because it is what makes two rows comparable: a floor
+    measured from one component of three is not the same quantity as an exact figure, and a bare
+    number in a history invites exactly that comparison. It is a fact about which records the run
+    wrote, not an arithmetic residue of the figures beside it.
+
+    Any failure yields ABSENCE, because a reporting figure must not break a close and a zero
+    would read as a sprint with no overhead."""
+    try:
+        import sprint_report  # noqa: PLC0415 - deferred; validate must not pay for it
+        ov = sprint_report.overhead_split(Path(root), list(unit_ids or []))
+    except Exception as exc:  # noqa: BLE001 - a reporting term never fails a close
+        sdlc_md.debug("retro._overhead_terms", exc)
+        return {}
+    if not ov.get("measured"):
+        return {}
+    return {"overhead_ratio": ov.get("ratio"), "overhead_bound": ov.get("bound")}
+
+
+def record_velocity(root, res: dict) -> Path:
+    """Upsert this retro's row into the history. Keyed by retro id, so re-running a sprint's
+    accuracy report corrects its row rather than double-counting the sprint.
+
+    The row records the plan-time estimate and the constants that produced it. The Sample cell
+    is written for a human reading the file; the planner re-derives it at read time from those
+    two facts, so a later refit reclassifies the row instead of leaving it quoted as validation
+    for a model it helped fit.
+
+    REFUSED, never written, when the batch failed its own count cross-check: a partially-parsed
+    batch pairs a whole-sprint token numerator with a partial points denominator, and a row that
+    wrong in the file the planner re-measures from is worse than no row. The write path refuses
+    first; this is the second guard, so no future caller can reach the file around it."""
+    check = res.get("batch_check")
+    if isinstance(check, dict) and check.get("ok") is False:
+        raise BatchCountMismatch(_batch_mismatch_message(check, res.get("id", "?")))
+    b = res["batch"]
+    # `ratio` is already None for a mixed-model sprint (accuracy refuses to pool it), so the
+    # history inherits the refusal rather than re-deciding it in a second place.
+    # NORMALISED, never verbatim: the id arrives in whichever form the caller held it - the
+    # close scaffolds `RETRO-0060`, the files are named `RETRO0060` - and a dashed row is one
+    # this file's own reader never parses. The row lands on disk and every consumer is blind to
+    # it, which is the same failure `find_retro` was fixed for.
+    row = {"id": sdlc_md.norm_id(res["id"]) or res["id"].upper(),
+           "date": res.get("date") or "", "units": res["n_units"],
+           "measured": res["n_measured"], "forecast": res.get("n_forecast"),
+           # THE VELOCITY, and the count of units that were too big to be worth sizing. Both
+           # recorded, so the rate can be derived from this file and its contamination seen.
+           # Points-per-sprint is the PRIMARY series this file exists to hold, and it is
+           # independent of whether anyone forecast the units: DELIVERED points (artefact-read)
+           # first, the plan-recorded rated sum as the fallback for a batch whose artefacts
+           # carry no points. The ratio columns keep their forecast gate - an unforecast unit
+           # says nothing about the estimator, but its points were still delivered.
+           "points": b.get("delivered_points") or b.get("points") or None,
+           # WRITTEN: what the sprint produced, beside what was accepted. Absent rather than
+           # zero when the two are equal, so a cell means "some work was rejected" and never
+           # merely repeats the column to its left.
+           "written_points": (b.get("written_points")
+                              if (b.get("unaccepted_points") or 0) > 0 else None),
+           "oversized": len(b.get("oversized") or []),
+           # The Actual cell: the per-unit sum for a measured (runner) sprint; the sprint-level
+           # harness total for an interactive one that has no per-unit actuals. Never both
+           # blended - which one a row carries is decidable from its own Measured cell.
+           # The plan-time forecast over every unit that carried one, NOT the sum over the rated
+           # units: a sprint that measured nothing rated nothing, so that sum was over an empty
+           # set and published 0 as a prediction. Falsy is an absence here, exactly as it is in
+           # the Actual cell below, and the preservation rule is the same.
+           #
+           # ONE limb, deliberately. A fallback to `b["estimate"]` - the rated-unit sum - read
+           # as a live alternative and was dead code: the rated units are a subset of the
+           # forecast ones and no estimate is negative, so `estimate <= plan_estimate` always,
+           # and `plan_estimate` is absent only when NO unit was forecast, which makes the
+           # rated sum 0 too. Restoring that limb would restore the exact 0-as-a-prediction
+           # this column was fixed to stop publishing.
+           "estimate": b.get("plan_estimate") or None,
+           "actual_tokens": (b["actual_tokens"] if res["n_measured"]
+                             else (b.get("sprint_actual_tokens") or b["actual_tokens"])),
+           "ratio": b["ratio"], "wall_time_s": b["wall_time_s"],
+           # The overhead ratio and whether it is exact or a floor. The ratio reached the close
+           # report and stopped there, and VELOCITY.md is the only file a figure survives in to
+           # be compared across sprints - so the measurement answered its question once per
+           # sprint and forgot. Absent (not 0) when unattributable: this file is read as
+           # evidence, and a zero would be evidence of a sprint with no overhead at all.
+           "overhead_ratio": b.get("overhead_ratio"),
+           "overhead_bound": b.get("overhead_bound"),
+           "constants": res.get("constants"), "sample": res.get("sample"),
+           "model": model_cell(res)}
+    history = velocity_history(root)
+    # A rewrite must never replace a recorded number with the absence of one: an interactive
+    # sprint's harness-captured actual would otherwise be erased by ANY later plain re-run,
+    # whose per-unit sum is 0. Preserved here, in the writer itself, so every caller is
+    # covered; a truthy new actual (per-unit sums, an explicit --tokens) still overrides.
+    #
+    # An explicit `--tokens 0` is the one falsy value that is an INSTRUCTION, not an absence:
+    # the operator retracting a wrongly recorded actual. It reaches here as
+    # `sprint_tokens_supplied` because zero cannot be told from absent by truthiness, and it
+    # clears the cell rather than re-quoting the figure being retracted.
+    #
+    # The row as it already stands, read ONCE: the figure, the reason, and the provenance are
+    # three facts about the same cell, and each is preserved by the same rule - this run's own
+    # statement wins, and what is already recorded is never discarded for want of one.
+    existing = next((r for r in history if r["id"] == row["id"]), None)
+    # The forecast log lives in `.local/`, which is not committed, so a re-record on another
+    # clone - or after a prune - sees no forecast at all. A recorded prediction is never
+    # replaced by the absence of one; only a fresh forecast overrides it.
+    if not row["estimate"] and existing and existing.get("estimate"):
+        row["estimate"] = existing["estimate"]
+    if not row["actual_tokens"]:
+        if b.get("sprint_tokens_supplied"):
+            row["actual_tokens"] = None
+        elif existing and existing.get("actual_tokens"):
+            row["actual_tokens"] = existing["actual_tokens"]
+    # Whatever is left falsy here is an ABSENCE, and the cell says so. `b["actual_tokens"]` is
+    # a sum over the RATED units, so a sprint that rated none - every interactive sprint -
+    # summed an empty set to 0 and published it in a column named Actual (tokens). The
+    # Tokens/pt cell beside it already refused, so the row contradicted itself; three rows were
+    # corrected by hand, and the third correction was overwritten by the next close.
+    if not row["actual_tokens"]:
+        row["actual_tokens"] = None
+    row["note"] = _actual_note(res, row["actual_tokens"], (existing or {}).get("note"))
+    row["source"] = _actual_source(res, row["actual_tokens"], (existing or {}).get("source"))
+    # The priced cost per point travels with the capture that formed it: written under that
+    # capture's Source, kept while the row's figure and Source are the ones it was recorded
+    # beside, and dropped once either changes. Never computed for a row that carries none.
+    priced = b.get("priced") or {}
+    if row["source"] and row["source"] == res.get("token_source") and priced.get("per_point"):
+        row["priced_per_point"] = priced["per_point"]
+    elif existing and (row["source"], row["actual_tokens"]) == (
+            existing.get("source"), existing.get("actual_tokens")):
+        row["priced_per_point"] = existing.get("priced_per_point")
+    rows = [r for r in history if r["id"] != row["id"]] + [row]
+    rows.sort(key=lambda r: r["id"])
+
+    lines = [VELOCITY_HEADER.rstrip("\n")]
+    for r in rows:
+        ratio = f"{r['ratio']}x" if r["ratio"] is not None else "-"
+        sample = r.get("sample") or _sample_of(r["id"], r.get("constants"))
+        # Derived at write time from the two columns beside it, and never read back as though it
+        # were a measurement. It is here for a human reading the file, not for a tool.
+        # Only when tokens and points describe the SAME set of units: a fully measured sprint
+        # (per-unit sums cover everything) or a wholly unmeasured one whose Actual is the
+        # sprint-level harness total. A partial per-unit sum over the full delivered points
+        # would understate the real rate, so it gets no cell.
+        rate = (_rate(r["actual_tokens"] or 0, r.get("points") or 0)
+                if _tokens_cover_points(r) else None)
+        # An EMPTY cell is not a value, and a `|  |` in a markdown table is a lint failure as
+        # well as an ambiguity: a retro that records no Date renders `-`, like every other
+        # absent cell in the row.
+        lines.append(f"| {r['id']} | {r['date'] or '-'} | {_fmt(r['units'])} | "
+                     f"{_fmt(r['measured'])} | "
+                     f"{_fmt(r.get('forecast'))} | {_fmt(r.get('points'))} | "
+                     f"{_fmt(r.get('written_points'))} | "
+                     f"{_fmt(r['estimate'])} | "
+                     f"{_fmt(r['actual_tokens'])} | {ratio} | {_fmt(rate)} | "
+                     f"{_fmt(r.get('priced_per_point'))} | "
+                     f"{_fmt(r.get('oversized'))} | {_fmt(r['wall_time_s'])} | "
+                     f"{_fmt(r.get('overhead_ratio'))} | "
+                     f"{r.get('overhead_bound') or '-'} | "
+                     f"{constants_cell(r.get('constants'))} | {sample} | "
+                     f"{r.get('model') or '-'} | {_note_cell(r.get('note'))} | "
+                     f"{r.get('source') or '-'} |")
+    path = velocity_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sdlc_md.atomic_write(path, "\n".join(lines) + "\n")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# MEASURE THE ESTIMATOR: per estimator, per model, and the coercion answer.
+# ---------------------------------------------------------------------------
+# The loop could quote what estimation is like IN GENERAL - a population average from a study of
+# other people - and could not tell an operator whether THEIR judgement was any good. Those are
+# different questions and only the second is actionable: a population figure measures, to an
+# unknown degree, how much people CARE rather than how well they could estimate if they did, and
+# no study can separate the two. A per-person figure against measured actuals can.
+#
+# THE RULE, applied on all three axes: SEGMENT OR REFUSE, never silently average.
+#   - per MODEL: a figure spanning two models is refused. Cost per unit means nothing without
+#     knowing which model paid it.
+#   - per ESTIMATOR: never pooled, and never INFERRED. An unclaimed estimate belongs to nobody.
+#   - per ERA: a size given freely and a size extracted by a gate are different data.
+#
+# And what a unit is RATED on is the SIZE THE PLAN RECORDED, not the size on the artefact today.
+# Same rule as the token forecast: a size revised after the outcome is not a prediction, and this
+# project has already seen one revised (M at filing, L by the time it closed).
+
+#: Units below which a cohort says nothing. A correlation off two points is a line through two
+#: points; a direction off one is an anecdote.
+MIN_FOR_CORRELATION = 3
+MIN_FOR_DIRECTION = 2
+#: Rated units per era before the coercion comparison is allowed to claim an answer.
+MIN_FOR_COERCION = 5
+#: How far a class must sit from an estimator's own scale before the miss is called directional
+#: rather than noise.
+BIAS_BAND = 0.15
+
+
+def _pearson(xs: list, ys: list) -> float | None:
+    """Correlation, or None when there is nothing to correlate (too few points, or no variance
+    on one axis - an estimator who called everything M has told us nothing about ordering)."""
+    n = len(xs)
+    if n < MIN_FOR_CORRELATION:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    if not sxx or not syy:
+        return None
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    return round(sxy / (sxx * syy) ** 0.5, 3)
+
+
+def _bias(units: list[dict]) -> list[dict]:
+    """The CLASSES of unit an estimator systematically under- or over-calls.
+
+    A correlation tells you whether someone ranks work correctly. It does not tell them what to
+    DO differently, and a bare r is not correctable. A direction is: "your 3s cost three times
+    what your own scale implies" is an instruction. So each class (the size called, and the kind
+    of unit) is priced against the estimator's OWN per-point rate - not against an absolute -
+    because the question is whether they are internally consistent, not whether their points mean
+    what someone else's points mean.
+    """
+    pts = [u["points"] for u in units]
+    act = [u["actual_tokens"] for u in units]
+    rate = sum(act) / sum(pts) if sum(pts) else 0
+    classes: dict[str, list[dict]] = {}
+    for u in units:
+        classes.setdefault(f"{u['points']}-point", []).append(u)
+        if u.get("type"):
+            classes.setdefault(f"type {u['type']}", []).append(u)
+    out: list[dict] = []
+    for name, members in sorted(classes.items()):
+        observed = sum(m["actual_tokens"] for m in members) / len(members)
+        expected = rate * (sum(m["points"] for m in members) / len(members))
+        ratio = round(observed / expected, 2) if expected else None
+        if len(members) < MIN_FOR_DIRECTION or ratio is None:
+            direction = "not enough units"
+        elif ratio > 1 + BIAS_BAND:
+            direction = "under-calls"     # it cost MORE than their own scale implies
+        elif ratio < 1 - BIAS_BAND:
+            direction = "over-calls"
+        else:
+            direction = "calibrated"
+        out.append({"class": name, "n": len(members), "ratio": ratio,
+                    "direction": direction,
+                    "units": sorted(m["id"] for m in members)})
+    return out
+
+
+def _estimator_segments(units: list[dict]) -> dict:
+    """Per-estimator figures within ONE model. Never across two - the caller has already
+    grouped by model, because that is the only way this figure means anything."""
+    by: dict[str, list[dict]] = {}
+    for u in units:
+        by.setdefault(u["estimator"], []).append(u)
+    out: dict[str, dict] = {}
+    for name, members in by.items():
+        r = _pearson([m["points"] for m in members], [m["actual_tokens"] for m in members])
+        out[name] = {
+            "n": len(members),
+            "units": sorted(m["id"] for m in members),
+            "r": r,
+            "mean_actual": round(sum(m["actual_tokens"] for m in members) / len(members)),
+            "bias": _bias(members),
+        }
+    return out
+
+
+def _coercion(units: list[dict]) -> dict:
+    """THE COERCION HAZARD, answered with evidence rather than opinion.
+
+    The grooming gate makes a SIZE COMPULSORY at filing. If sizing is a chore an engineer
+    resents, a compulsory estimate is a CARELESS estimate - and a careless number is strictly
+    worse than none, because it looks like data and is averaged in as though it were an estimate.
+    The gate may be manufacturing precisely the noise it exists to remove.
+
+    So: compare the sizes recorded when they were freely given against the sizes recorded once
+    they were demanded, and report what comes out.
+
+    AND CARRY THE CONFOUND. Before/after IS a cohort split. Everything else about a project moves
+    over the same period - the work gets bigger, the units get harder, the team learns - and a
+    difference between the eras is a difference between two cohorts, not proof of an effect of
+    the gate. This project has already been bitten by exactly this shape once: a size field that
+    only EXISTED on the later, larger units made itself look predictive purely by being present.
+    A small cohort here says NOTHING, and the report says so rather than quoting an r it cannot
+    support.
+    """
+    eras = {"voluntary": [], "compulsory": [], "unknown": []}
+    for u in units:
+        eras.setdefault(u["era"], []).append(u)
+    by_era = {
+        era: {"n": len(members),
+              "units": sorted(m["id"] for m in members),
+              "r": _pearson([m["points"] for m in members],
+                            [m["actual_tokens"] for m in members]),
+              "mean_actual": (round(sum(m["actual_tokens"] for m in members) / len(members))
+                              if members else None)}
+        for era, members in eras.items()
+    }
+    vol, comp = by_era["voluntary"], by_era["compulsory"]
+    answerable = (vol["n"] >= MIN_FOR_COERCION and comp["n"] >= MIN_FOR_COERCION
+                  and vol["r"] is not None and comp["r"] is not None)
+    caveat = (
+        "Before/after IS a cohort split: everything else moved over the same period, so a "
+        "difference between the eras is confounded with the calendar and is NOT proof that the "
+        "gate caused it. Read it as a signal to look harder, never as a finding.")
+    if answerable:
+        delta = comp["r"] - vol["r"]
+        if delta < -0.15:
+            verdict = (f"the compulsory size is WORSE ({comp['r']:+.2f} against "
+                       f"{vol['r']:+.2f} freely given) - consistent with the coercion hazard, "
+                       f"and the gate may be manufacturing the noise it exists to remove")
+        elif delta > 0.15:
+            verdict = (f"the compulsory size is BETTER ({comp['r']:+.2f} against "
+                       f"{vol['r']:+.2f} freely given) - the hazard is not visible here")
+        else:
+            verdict = (f"the two eras are indistinguishable ({comp['r']:+.2f} against "
+                       f"{vol['r']:+.2f}) - compulsion has not measurably degraded the estimate")
+        answer = f"{verdict}. {caveat}"
+    else:
+        answer = (
+            f"NOT ANSWERABLE from the evidence held: {vol['n']} rated unit(s) recorded freely "
+            f"and {comp['n']} under compulsion, against a floor of {MIN_FOR_COERCION} each. The "
+            f"data CANNOT separate the effect of the gate from the effect of the calendar, and "
+            f"nothing here should be read as evidence either way - that is itself the result, "
+            f"not a gap to be filled with an r off a handful of units. {caveat}")
+    return {"by_era": by_era, "answered": answerable, "answer": answer, "caveat": caveat,
+            "min_per_era": MIN_FOR_COERCION,
+            "unknown_era": by_era["unknown"]["n"],
+            "basis": "the Points AS RECORDED AT PLAN TIME, and the compulsion in force when the "
+                     "plan read them. A size on the artefact today may have been revised after "
+                     "the outcome, and a value revised with hindsight is not a prediction"}
+
+
+ESTIMATOR_UNATTRIBUTED = "unattributed"
+ERA_UNKNOWN = "unknown"
+
+
+def _era_of(root, uid: str, stamped) -> str:
+    """The compulsion a size was recorded under. The STAMP on the forecast record wins; the
+    planner's declared cutoffs answer for evidence recorded before the stamp existed.
+
+    Deferred and guarded, exactly like `_sample_of`: the gate's path must not pay for the
+    planner's import graph, and a planner that cannot answer leaves the era UNKNOWN - which is
+    reported as its own cohort, never quietly filed on one side of the split."""
+    try:
+        import sprint  # noqa: PLC0415
+        era = getattr(sprint, "size_gate_era", None) or getattr(sprint, "effort_gate_era", None)
+        if era:
+            return era(root, uid, stamped)
+    except Exception as exc:  # noqa: BLE001 - an unclassifiable unit is reported, never fatal
+        sdlc_md.debug("retro._era_of", exc)
+    return stamped if stamped in ("compulsory", "voluntary") else ERA_UNKNOWN
+
+
+def estimator_report(root) -> dict:
+    """Estimate vs actual, ACROSS SPRINTS, segmented per estimator and per model.
+
+    Rates a unit on the POINTS THE PLAN RECORDED (`telemetry.forecasts`) against what the run
+    actually cost (`telemetry.actuals`). That is the question the loop exists to answer and the
+    only one worth asking: does this estimator's sense of how big a job is track what the job
+    costs? Blind, on 21 delivered units, points scored r = +0.68 against measured cost where
+    every computed metric managed +0.03 - so this is the axis that carries the signal, and it is
+    the axis the report measures.
+
+    Three states, and only the first is rated - the other two are named, counted, and excluded
+    from every figure:
+
+      rated        Points recorded at plan time, and a measured actual
+      unsized      no Points were recorded at plan time. The artefact may carry a size now, but
+                   there is no record of what it said when the plan was made, and a size read
+                   back with hindsight is not an estimate
+      unmeasured   no actual. Silence is not a measurement
+    """
+    forecasts = telemetry.forecasts(root)
+    actuals = telemetry.actuals(root)
+
+    units: list[dict] = []
+    for uid, fc in forecasts.items():
+        rec = actuals.get(uid, {})
+        tokens = rec.get("tokens")
+        points = fc.get("points")
+        points = points if isinstance(points, int) and points > 0 else None
+        u = {"id": uid, "type": rec.get("type"), "model": rec.get("model") or "unrecorded",
+             "estimator": fc.get("estimator") or ESTIMATOR_UNATTRIBUTED,
+             "points": points,
+             "era": _era_of(root, uid, fc.get("size_gate") or fc.get("effort_gate")),
+             "actual_tokens": tokens if isinstance(tokens, (int, float)) and tokens > 0 else None}
+        if u["actual_tokens"] is None:
+            u["state"] = "unmeasured"
+        elif points is None:
+            u["state"] = "unsized"
+        else:
+            u["state"] = "rated"
+        units.append(u)
+    units.sort(key=lambda u: u["id"])
+
+    rated = [u for u in units if u["state"] == "rated"]
+    models = sorted({u["model"] for u in rated})
+    by_model = {
+        model: {
+            "n": len([u for u in rated if u["model"] == model]),
+            "mean_actual": round(sum(u["actual_tokens"] for u in rated if u["model"] == model)
+                                 / max(1, len([u for u in rated if u["model"] == model]))),
+            "estimators": _estimator_segments([u for u in rated if u["model"] == model]),
+        }
+        for model in models
+    }
+    for seg in by_model.values():
+        # Who to TRUST, named: the estimator whose calls track cost best within this model. It is
+        # only a ranking, over the units each was given - and a ranking of ONE is not a ranking,
+        # so with a single estimator there is nobody to prefer and the report says nothing.
+        ranked = [(name, s["r"]) for name, s in seg["estimators"].items() if s["r"] is not None]
+        seg["best_estimator"] = max(ranked, key=lambda p: p[1])[0] if len(ranked) > 1 else None
+
+    refused = (f"REFUSED: the rated units were delivered by {len(models)} different models "
+               f"({', '.join(models)}). One accuracy figure across two models describes neither, "
+               f"so it is segmented per model and never pooled." if len(models) > 1 else None)
+    pooled = None
+    if len(models) == 1 and rated:
+        pooled = _pearson([u["points"] for u in rated], [u["actual_tokens"] for u in rated])
+    return {
+        "units": units,
+        "n_units": len(units),
+        "n_rated": len(rated),
+        "unsized": [u["id"] for u in units if u["state"] == "unsized"],
+        "unmeasured": [u["id"] for u in units if u["state"] == "unmeasured"],
+        "models": models,
+        "by_model": by_model,
+        "pooled": pooled,
+        "refused": refused,
+        "coercion": _coercion(rated),
+        "basis": "the Points recorded at PLAN TIME against the measured actual. A unit the plan "
+                 "did not size, and a unit nobody measured, are each named and excluded - "
+                 "neither is coerced into a number",
+    }
+
+
+def _render_estimator(rep: dict) -> None:
+    """The report an operator reads: whose judgement to weight, and what to correct."""
+    print(f"estimator accuracy: {rep['n_rated']} of {rep['n_units']} unit(s) rated "
+          f"(Points recorded at plan time, and a measured actual)")
+    for tag, ids in (("unsized (no Points recorded when the plan was made - and a size read "
+                      "off the artefact today is not a prediction)", rep["unsized"]),
+                     ("unmeasured (no actual - silence is not a measurement)",
+                      rep["unmeasured"])):
+        if ids:
+            print(f"  excluded, {tag}: {', '.join(ids)}")
+    if rep["refused"]:
+        print(f"\n  {rep['refused']}")
+    for model, seg in sorted(rep["by_model"].items()):
+        print(f"\n  model {model}: {seg['n']} rated unit(s), mean {seg['mean_actual']:,} tokens")
+        for name, s in sorted(seg["estimators"].items()):
+            r = f"r = {s['r']:+.2f}" if s["r"] is not None else "r = n/a (too few units, or " \
+                                                                "every call the same size)"
+            print(f"    {name}: {s['n']} unit(s), {r}, mean {s['mean_actual']:,} tokens")
+            for b in s["bias"]:
+                if b["direction"] in ("under-calls", "over-calls"):
+                    print(f"      {b['direction']} {b['class']} by {b['ratio']}x "
+                          f"({b['n']} unit(s): {', '.join(b['units'])})")
+        if seg["best_estimator"]:
+            print(f"    trust: {seg['best_estimator']} - their calls track cost best on this "
+                  f"model. It ranks the estimators over the units each was given; it is not a "
+                  f"licence to price a unit by their number")
+    c = rep["coercion"]
+    print("\n  coercion check (is a COMPULSORY size a CARELESS size?):")
+    for era in ("voluntary", "compulsory", "unknown"):
+        e = c["by_era"][era]
+        r = f"r = {e['r']:+.2f}" if e["r"] is not None else "r = n/a"
+        print(f"    {era:11} {e['n']} rated unit(s), {r}")
+    print(f"    {c['answer']}")
+
+
+def cmd_estimator(args) -> int:
+    rep = estimator_report(args.root)
+    if args.format == "json":
+        print(json.dumps(rep, indent=2))
+        return 0
+    _render_estimator(rep)
+    return 0
+
+
+def cmd_accuracy(args) -> int:
+    tokens = getattr(args, "tokens", None)
+    capture_note = None
+    # A delegated agent's own reported total, recorded against the open run BEFORE the capture
+    # below reads it. The harness transcript never sees a subagent, so this is the only way a
+    # fan-out sprint's delegated spend reaches the record at all - and it is a claim, so it is
+    # recorded as `supplied` and published as part of a lower bound.
+    delegated = getattr(args, "delegated_tokens", None)
+    unit, minutes = getattr(args, "delegated_unit", ""), getattr(args, "delegated_minutes", None)
+    if delegated is None and (unit or minutes is not None):
+        print("--delegated-unit and --delegated-minutes describe a --delegated-tokens record; "
+              "nothing was recorded", file=sys.stderr)
+        return 2
+    if delegated is not None:
+        try:
+            rec = run_state.record_delegated_tokens(
+                args.root, delegated, agent=getattr(args, "delegated_agent", "") or "",
+                unit=unit or "", minutes=minutes)
+        except ValueError as exc:
+            print(f"delegated total refused: {exc}", file=sys.stderr)
+            return 1
+        if rec is None:
+            print("no run is open, so the delegated total was not recorded against one - "
+                  "supply the sprint's whole figure with `--tokens N` instead")
+        else:
+            print(f"delegated total recorded (supplied, not measured): {rec['tokens']:,}"
+                  + (f" for {rec['agent']}" if rec["agent"] else "")
+                  + (f" against {rec['unit']}" if rec.get("unit") else "")
+                  + (f", {rec['minutes']:g} minutes" if rec.get("minutes") else ""))
+            batch = {sdlc_md.norm_id(u) for u in run_state.read(args.root).get("batch") or []}
+            if rec.get("unit") and rec["unit"] not in batch:
+                print(f"warning: {rec['unit']} is not in the open run's batch - the total counts "
+                      f"in the run's, but no per-unit row shows it", file=sys.stderr)
+    # WHERE the figure below came from, decided where it is fetched rather than inferred later.
+    # An explicit `--tokens N` is an operator's typed claim; the branches below overwrite this
+    # with what they actually did.
+    token_source = SOURCE_SUPPLIED if tokens is not None else None
+    # The model the harness capture attributes the spend to, for the interactive close. Set only
+    # by the capture branch below; None otherwise, so a runner sprint's per-unit models stand.
+    sprint_model = None
+    # The harness capture the figure came from, when this run makes one: its priced half and
+    # the counting basis its Source names.
+    cap: dict = {}
+    if tokens is None and getattr(args, "tokens_from_harness", False):
+        # The close's path: capture the harness-tracked total itself. An actual already on
+        # the sprint's row is NEVER re-stamped from a (possibly different) session - the
+        # explicit --tokens above remains the operator's override for corrections.
+        existing = next((r for r in velocity_history(args.root)
+                         if r["id"] == args.id.upper().replace("-", "")
+                         or r["id"] == args.id.upper()), None)
+        if existing and existing.get("actual_tokens"):
+            # Reused, not merely skipped: the upsert rewrites the whole row, so dropping the
+            # figure here would erase the recorded actual while claiming to protect it.
+            tokens = existing["actual_tokens"]
+            # The figure is the one already on the row, so its provenance is too. Re-stamping
+            # it from this path would relabel a harness capture as an operator's typed claim.
+            token_source = SOURCE_UNCHANGED
+            # And so is the model that spent it. The upsert rewrites the whole row, and leaving
+            # this None rewrote it with no model: every row a close recorded twice (a second
+            # attempt, a re-close) lost its model, and calibration fell back to another model's
+            # rows. The row's own model, else the one the run's meter names.
+            sprint_model = (_single_model(existing)
+                            or _run_meter_model(args.root, retro_units(args.root, args.id)))
+            capture_note = (f"token actual already recorded for {args.id} "
+                            f"({existing['actual_tokens']:,}) - reused, not re-captured; "
+                            f"correct it with an explicit `--tokens N`")
+        else:
+            # THIS RUN's spend, not the session's. The meter is cumulative per session, so a
+            # second sprint closed in one session would otherwise book the first sprint's
+            # tokens too. No baseline, no number - never a session-wide fallback.
+            cap = run_attributed_tokens(args.root, args.id)
+            if cap["tokens"]:
+                tokens = cap["tokens"]
+                # The model that spent it, captured alongside the total, so the row books into
+                # the (project, model) cell rather than the unrecorded-model one.
+                sprint_model = cap.get("model")
+                # Part meter read, part reported claim: the row must say so, or a figure half
+                # of which nobody measured would be published under a machine read's provenance.
+                token_source = (SOURCE_HARNESS_SUPPLIED if cap.get("delegated_tokens")
+                                else SOURCE_HARNESS)
+                capture_note = (f"token actual captured from the harness transcript: "
+                                + ("AT LEAST " if cap.get("lower_bound", True) else "")
+                                + f"{tokens:,} ({cap['basis']}; {cap['source']})")
+            else:
+                capture_note = (f"token actual NOT ATTRIBUTABLE: {cap['reason']}. The sprint's "
+                                f"token cost is left unrecorded rather than filled with a "
+                                f"session-wide total; supply a real figure with "
+                                f"`accuracy --tokens N` if you have one")
+    if token_source == SOURCE_UNCHANGED:
+        cap = {"priced": None, "priced_reason": (
+            "the token actual already recorded was reused, not re-captured, so no component "
+            "was read again; the row keeps the Priced/pt it was recorded with")}
+    res = accuracy(args.root, args.id, sprint_tokens=tokens,
+                   elapsed_hours=getattr(args, "elapsed_hours", None),
+                   sprint_model=sprint_model, priced=cap or None)
+    if token_source:
+        res["token_source"] = harness_source(token_source, cap)
+    if capture_note:
+        res["token_capture"] = capture_note
+        if args.format != "json":
+            print(capture_note)
+    if not res["ok"]:
+        print(f"retro {args.id}: {res['errors'][0]}", file=sys.stderr)
+        return 1
+    # THE BATCH CROSS-CHECK. Before ANY write: a Batch field that parses to a different count
+    # than the retro's own `Delivered: N / M` header is refused, so neither the retro's accuracy
+    # block nor a VELOCITY.md row is written and nothing already recorded is disturbed. This is
+    # the range-in-the-Batch defect - the parser expands no ranges, so a partial denominator
+    # would otherwise reach the file the planner re-measures its rate from.
+    check = res.get("batch_check") or {}
+    if check.get("ok") is False:
+        print(_batch_mismatch_message(check, res["id"]), file=sys.stderr)
+        return 1
+    if args.write:
+        write_accuracy(args.root, res)
+        record_velocity(args.root, res)
+
+    if args.format == "json":
+        print(json.dumps(res, indent=2))
+        return 0
+
+    if not res["units"]:
+        print(f"retro {res['id']}: no units named in '> **Batch:**' - nothing to measure")
+        return 1
+    for u in res["units"]:
+        model = f"  model={u['model']}" if u.get("model") else ""
+        if u["state"] == "measured":
+            wall = f"{u['wall_time_s']}s" if u["wall_time_s"] is not None else "-"
+            split = "  SHOULD HAVE BEEN SPLIT" if u["oversized"] else ""
+            print(f"  [measured  ] {u['id']:8} pts={_fmt(u['points']):>3}  "
+                  f"est={_fmt(u['estimate']):>9}  actual={_fmt(u['actual_tokens']):>9}  "
+                  f"{u['ratio']}x  {_fmt(u['tokens_per_point']):>7}/pt  "
+                  f"wall={wall}{model}{split}")
+        elif u["state"] == "unmeasured":
+            print(f"  [UNMEASURED] {u['id']:8} pts={_fmt(u['points']):>3}  "
+                  f"est={_fmt(u['estimate']):>9}  actual=        -  ({u['reason']})")
+        else:
+            print(f"  [UNFORECAST] {u['id']:8} pts=  -  est=        -  "
+                  f"actual={_fmt(u['actual_tokens']):>9}  ({u['reason']})")
+    b = res["batch"]
+    ratio = f"{b['ratio']}x" if b["ratio"] is not None else "n/a"
+    print(f"\nbatch (rated units only): est={_fmt(b['estimate'])} actual="
+          f"{_fmt(b['actual_tokens'])} -> {ratio}")
+    for para in _points_lines(res):     # the velocity, the rate, and the decomposition answer
+        print(para.replace("**", ""))
+    if b.get("refused"):
+        print(b["refused"])
+        for model, seg in sorted((res.get("by_model") or {}).items()):
+            r = f"{seg['ratio']}x" if seg["ratio"] is not None else "n/a"
+            print(f"  {model:24} {seg['n']} unit(s)  est={_fmt(seg['estimate']):>9}  "
+                  f"actual={_fmt(seg['actual_tokens']):>9}  {r}")
+    elif res.get("models"):
+        print(f"delivered by {', '.join(res['models'])}")
+    print(f"{res['n_measured']} of {res['n_units']} unit(s) measured; "
+          f"{res['n_forecast']} of {res['n_units']} forecast at plan time")
+    if res["unmeasured"]:
+        print(f"UNMEASURED: {', '.join(res['unmeasured'])}")
+    if res["unforecast"]:
+        print(f"UNFORECAST: {', '.join(res['unforecast'])} - no plan-time forecast was "
+              f"recorded, and none is re-derived. They are excluded from both sides")
+    print(f"forecast by {constants_cell(res.get('constants'))} - "
+          f"{SAMPLE_NOTE.get(res.get('sample'), res.get('sample'))}")
+    if res["n_measured"] == 0:
+        print("no unit is rated - this sprint says nothing about accuracy")
+    if args.write:
+        print(f"recorded in {res['path']} and {velocity_path(args.root)}")
+    else:
+        print("--write records it in the retro and appends the sprint's row to VELOCITY.md")
+    return 0
+
+
+def _report_gaps(args) -> int:
+    """`velocity --gaps`: the retros the record never recorded. Non-zero when there are any, so
+    a gate or a close can branch on it rather than a human noticing a missing line."""
+    rep = velocity_gaps(args.root, since=getattr(args, "since", None))
+    if args.format == "json":
+        print(json.dumps(rep, indent=2))
+        return 1 if rep["gaps"] else 0
+    window = f" since {rep['since']}" if rep["since"] else ""
+    if not rep["gaps"]:
+        print(f"velocity record: no gap{window} - all {rep['retros']} retro(s) in the window "
+              f"carry a row in {VELOCITY_FILE}.")
+        return 0
+    print(f"velocity record: {len(rep['gaps'])} of {rep['retros']} retro(s){window} have NO row "
+          f"in {VELOCITY_FILE}. Each is a close whose accuracy write did not run, so the "
+          f"tokens-per-point rate the plans quote was never measured against it:")
+    for g in rep["gaps"]:
+        print(f"  {g['id']}  {g['date'] or '(no date recorded)'}")
+    print("Record one with `retro.py accuracy --id RETROxxxx --write`. A sprint whose token "
+          "cost cannot be recovered still gets a row: a blank Actual with the reason stated is "
+          "a fact about that sprint, and no row at all is indistinguishable from an oversight.")
+    return 1
+
+
+def cmd_velocity(args) -> int:
+    """The history the next plan reads: the points delivered per sprint, the tokens-per-point
+    rate DERIVED from them, and how the forecast has actually performed."""
+    rows = velocity_history(args.root)
+    if getattr(args, "gaps", False):
+        return _report_gaps(args)
+    rate = measured_rate(args.root)
+    if args.format == "json":
+        print(json.dumps({"history": rows, "rate": rate}, indent=2))
+        return 0
+    if not rows:
+        print(f"no velocity history yet ({VELOCITY_FILE}) - record one with "
+              f"'retro.py accuracy --id RETROxxxx --write'")
+        return 0
+    for r in rows:
+        ratio = f"{r['ratio']}x" if r["ratio"] is not None else "n/a"
+        sample = _sample_of(r["id"], r.get("constants"))
+        model = r.get("model") or MODEL_UNRECORDED
+        pts = _fmt(r.get("points"))
+        # The SAME rule the file's own Tokens/pt column obeys: a rate only where the tokens and
+        # the points describe the same units. Dividing an absent Actual by the points printed
+        # `0/pt` beside an `actual= -` on the same line.
+        tpp = _fmt(_rate(r["actual_tokens"] or 0, r.get("points") or 0)
+                   if _tokens_cover_points(r) else None)
+        over = f"  ({r['oversized']} over {sdlc_md.POINTS_SPLIT_ABOVE}pt)" if r.get(
+            "oversized") else ""
+        print(f"  {r['id']}  {r['date']:12} {r['measured']}/{r['units']} measured  "
+              f"pts={pts:>4}  est={_fmt(r['estimate']):>9} actual={_fmt(r['actual_tokens']):>9}  "
+              f"{ratio:>6}  {tpp:>7}/pt  [{sample}]  {model}{over}")
+
+    # THE RATE, DERIVED. Not a constant, not stored - a quotient of the two columns above,
+    # recomputed on every read, so it cannot drift away from the evidence that produced it.
+    print()
+    if rate["skipped"]:
+        print(f"{len(rate['skipped'])} row(s) skipped: they name no single model")
+    if rate["tokens_per_point"]:
+        print(f"MEASURED RATE: {rate['tokens_per_point']:,} tokens per point for "
+              f"{rate['model'] or 'no named model'} ({rate['source']}).")
+        print("Derived from this history every time it is read - never stored and never fitted, "
+              "so it is re-measured each sprint instead of decaying into a constant nobody "
+              "dares touch.")
+        if rate["oversized"]:
+            print(f"CAVEAT: {rate['oversized']} unit(s) in that history were delivered above "
+                  f"{sdlc_md.POINTS_SPLIT_ABOVE} points, and a point stops being a stable unit "
+                  f"of cost up there. The rate is dragged downward by them - split those units "
+                  f"and it will rise.")
+    else:
+        print("NO MEASURED RATE: no sprint has recorded the points it delivered, so there is "
+              "nothing to divide the tokens by. Nothing is assumed in its place - a rate "
+              "borrowed from another project is not a measurement of this one.")
+
+    oos = [r for r in rows if _sample_of(r["id"], r.get("constants")) == "out-of-sample"
+           and isinstance(r["ratio"], (int, float))]
+    # PER MODEL, never pooled. A mean over a sprint delivered by a smaller model and one
+    # delivered by a larger describes neither of them, and the moment a second model is used the
+    # history would silently mix them into one meaningless figure. So the mean is quoted for each
+    # model separately, and a mixed-model sprint (whose ratio was refused at record time) carries
+    # no ratio to pool in the first place.
+    by_model: dict[str, list[dict]] = {}
+    for r in oos:
+        by_model.setdefault(r.get("model") or MODEL_UNRECORDED, []).append(r)
+    if oos:
+        if len(by_model) > 1:
+            print("\nOUT-OF-SAMPLE accuracy, SEGMENTED PER MODEL - it is never pooled, because a "
+                  "mean across two models is a statement about neither:")
+        for model, group in sorted(by_model.items()):
+            mean = sum(r["ratio"] for r in group) / len(group)
+            print(f"\n{len(group)} OUT-OF-SAMPLE sprint(s) on {model}, mean {mean:.2f}x "
+                  f"(estimate / actual; above 1 the plan over-forecasts)")
+    else:
+        print("\nno out-of-sample sprint yet - nothing here is evidence that the estimator in "
+              "force works")
+    excluded = len(rows) - len(oos)
+    if excluded:
+        print(f"{excluded} row(s) excluded from that figure: a sprint whose actuals the "
+              f"constants were fitted to is training error, a sprint forecast by a different "
+              f"estimator judges that one, not this one, and a sprint that MIXED models records "
+              f"no ratio at all")
+    print("A trend, not a calibration. The forecast constants are changed by a human "
+          "reading this, never automatically - a fit to a few sprints fits noise.")
+    return 0
+
+
+def cmd_collate(args) -> int:
+    """The multi-project rate reader: the tokens-per-point rate per (project, model) cell, pooled
+    across several project evidence directories and never summed across cells."""
+    roots = args.roots or [args.root]
+    rep = collate_rate(roots)
+    if args.format == "json":
+        print(json.dumps(rep, indent=2))
+        return 0
+    if not rep["cells"]:
+        print("no rated units across those projects - a unit needs both a plan-time forecast "
+              "with points and a measured actual")
+        return 0
+    if rep["refused"]:
+        print(rep["refused"])
+        print()
+    for c in rep["cells"]:
+        print(f"  {c['project']:20} {c['model']:20} {c['n']:>3} unit(s)  "
+              f"{c['points']:>4} pt  {c['actual_tokens']:>10,} tok  -> "
+              f"{_fmt(c['tokens_per_point'])}/pt")
+    print("\nEach row is one (project, model) cell. No rate is pooled across cells - a figure "
+          "spanning two projects or two models describes neither.")
+    return 0
+
+
+def cmd_validate(args) -> int:
+    res = validate(args.root, args.id)
+    if args.format == "json":
+        print(json.dumps(res, indent=2))
+    else:
+        if res["ok"]:
+            n_l, n_f = len(res["lessons"]), len(res["findings"])
+            print(f"retro {res['id']}: ok - {n_l} lesson(s), {n_f} finding(s) all dispositioned "
+                  f"({len(res['filed'])} filed, {len(res['fixed'])} fixed in-sprint, "
+                  f"{len(res['declined'])} declined)")
+        else:
+            print(f"retro {res['id']}: FAIL")
+            for e in res["errors"]:
+                print(f"  - {e}")
+        # On BOTH paths. A retro that is structurally fine and still holds the template's
+        # worked examples passes this check, so the only thing standing between that and a
+        # signed-off close is saying so out loud.
+        if res.get("demonstration"):
+            print(f"  ! {len(res['demonstration'])} line(s) are still the template's worked "
+                  f"EXAMPLES, not this sprint's content - replace them before the close reads "
+                  f"this as a filled-in retro:")
+            for line in res["demonstration"][:6]:
+                print(f"      {line}")
+    return 0 if res["ok"] else 1
+
+
+def cmd_cost_baseline(args) -> int:
+    """`cost-baseline add`: price a past run's window from the transcripts, once, and append its
+    row to COST-BASELINE.md. Nothing here writes VELOCITY.md."""
+    root, rid = args.root, sdlc_md.norm_id(args.retro).upper()
+    since, until = sdlc_md.parse_iso8601(args.since), sdlc_md.parse_iso8601(args.until)
+    if since is None or until is None or until <= since:
+        print(f"cost-baseline refused: --since {args.since} and --until {args.until} must be "
+              f"ISO-8601 stamps with an offset, the first before the second", file=sys.stderr)
+        return 2
+    if find_retro(root, rid) is None:
+        print(f"cost-baseline refused: no retro {rid} in {RETRO_DIR}/", file=sys.stderr)
+        return 2
+    if any(r["id"] == rid for r in cost_baseline_rows(root)):
+        print(f"cost-baseline refused: {rid} already has a row in {COST_BASELINE_FILE}, and a "
+              f"run is priced once; nothing was written", file=sys.stderr)
+        return 1
+    points = _delivered_points(root, retro_units(root, rid))
+    if not points:
+        print(f"cost-baseline refused: {rid}'s units carry no delivered points, so no cost per "
+              f"point can be formed; nothing was written", file=sys.stderr)
+        return 1
+    try:
+        got = window_priced(root, since, until)
+    except ValueError as exc:
+        print(f"cost-baseline refused: {exc}; nothing was written", file=sys.stderr)
+        return 1
+    if not isinstance(got["priced"], int):
+        print("cost-baseline refused: the window's readings carry no priced components; "
+              "nothing was written", file=sys.stderr)
+        return 1
+    per_point = round(got["priced"] / points)
+    window = f"{_iso_z(since)} to {_iso_z(until)}"
+    path = cost_baseline_path(root)
+    body = path.read_text(encoding="utf-8") if path.is_file() else COST_BASELINE_HEADER
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body.rstrip("\n") + "\n" + f"| {rid} | {window} | {points} | "
+                    f"{got['priced']:,} | {per_point:,} | {_weights_cell()} | "
+                    f"{sdlc_md.now_date()} |\n", encoding="utf-8")
+    print(f"cost-baseline: {rid} recorded in {COST_BASELINE_FILE} - {got['priced']:,} "
+          f"{run_state.PRICED_LABEL} over {window} from {got['sessions']} session(s), "
+          f"{points} point(s), {per_point:,} per point")
+    return 0
+
+
+def cmd_dispose(args) -> int:
+    """Read-only: what has been decided, and what still needs deciding."""
+    res = validate(args.root, args.id)
+    if res["path"] is None:
+        print(f"retro {args.id}: not found", file=sys.stderr)
+        return 1
+    rows = res["findings"]
+    if args.format == "json":
+        print(json.dumps({"id": res["id"], "findings": rows}, indent=2))
+        return 0 if all(r["state"] != "undecided" for r in rows) else 1
+    if not rows:
+        print(f"retro {res['id']}: no findings recorded under '## Actions raised'")
+        return 1
+    for r in rows:
+        mark = {"filed": "filed   ", "fixed": "fixed   ", "declined": "declined",
+                "undecided": "UNDECIDED"}[r["state"]]
+        extra = f" -> {r['detail']}" if r["detail"] else ""
+        print(f"  [{mark}] {r['finding'][:64]}{extra}")
+    left = sum(1 for r in rows if r["state"] == "undecided")
+    n_filed = sum(1 for r in rows if r["state"] == "filed")
+    n_fixed = sum(1 for r in rows if r["state"] == "fixed")
+    n_declined = sum(1 for r in rows if r["state"] == "declined")
+    # The three dispositioned states are named separately: a sprint that repaired eleven
+    # findings must not read as having declined eleven.
+    print(f"\n{len(rows)} finding(s): {n_filed} filed, {n_fixed} fixed in-sprint, "
+          f"{n_declined} declined, {left} undecided")
+    if left:
+        print("file each with scripts/file_finding.py, record it fixed in-sprint "
+              "('fixed-in: <sha or unit>'), or decline it with a reason "
+              "('declined: <why>') - all three are green, silence is not")
+    return 1 if left else 0
+
+
+def _flat(value) -> str:
+    return " ".join(str(value or "").split()).lower()
+
+
+def _recorded(text: str, entries: list[dict]) -> bool:
+    """Is this lesson already in the store? Judged on the WHOLE lesson: an entry's body keeps
+    the full text as a paragraph of its own, and a one-sentence lesson is its own headline
+    (compared as the heading carries it, without trailing punctuation or a trailing `...`: an
+    entry written before the headings lost their full stop has no copy of it in its body). A headline is never compared with a headline: two
+    lessons opening on the same sentence share one, and the second was dropped as a duplicate,
+    while an elided headline that had lost its `...` matched nothing and was recorded again."""
+    want = _flat(text)
+    for e in entries:
+        paragraphs = {_flat(p) for p in re.split(r"\n\s*\n", str(e.get("body") or ""))}
+        if want in paragraphs or (lessons.heading_title(_flat(e.get("title")))
+                                  == lessons.heading_title(want)):
+            return True
+    return False
+
+
+def extract_run(root, supplied: str | None, retro_id: str) -> str:
+    """The run a classed Try item's hit is counted against: `--run` when given, else the OPEN
+    run's id, else - with no run open - the retro id. A manual extract during the close must
+    name the run the close will, or one repeat is recorded under two runs. Raises
+    `run_state.RunStateError` when the run state exists but cannot be read."""
+    if supplied:
+        return supplied
+    state = run_state.read(root)
+    if state.get("outcome") == run_state.RUNNING and state.get("run_id"):
+        return state["run_id"]
+    return retro_id
+
+
+def _extract_classes(args, retro_id: str, tags: list[dict], run: str) -> str:
+    """Count each classed Try item on the class store: a hit on a known class, a new row for a
+    new one. Keyed on the retro, never on the run: a `new` tag read again from the retro that
+    recorded the class is that record, not a repeat, and a hit is one per (retro, unit) - so a
+    manual extract and the close's own converge whatever run each names. Returns the summary
+    suffix for the extract line."""
+    if not tags:
+        return ""
+    source = f"retro:{retro_id}"
+    rows = lessons.load_store(args.root)
+    hits, new = 0, 0
+    for tag in tags:
+        row = lessons.find_class(rows, tag["code"] if tag["kind"] == "hit" else tag["class"])
+        if row is None:
+            lessons.new_lesson(rows, tag["class"], tag["rule"], tag["behaviour"],
+                               tag["inject"], run, source)
+            new += 1
+        elif tag["kind"] == "new" and row.get("recorded_source") == source:
+            continue
+        elif lessons.add_hit(row, run, tag["unit"], source):
+            hits += 1
+    if (hits or new) and not args.dry_run:
+        lessons.save_store(args.root, rows)
+    verb = "would record" if args.dry_run else "recorded"
+    return f"; {lessons.STORE_FILE}: {verb} {new} new class(es), {hits} repeat hit(s)"
+
+
+def cmd_extract(args) -> int:
+    """Lift the retro's lessons into the project store, so a lesson written in a retro
+    reaches the digest the next sprint plan prints. Without this the retro is a diary.
+
+    The lesson is TITLED from its first sentence and BODIED with its full text. Titling from the
+    first physical line cut the headline wherever the author happened to wrap it, and those
+    headlines are exactly what `sprint plan` prints as the lessons digest - a lesson whose
+    headline stops mid-clause is one the next sprint skims past.
+
+    Idempotent by content: a lesson already in the store is not added twice, so running
+    extract on the same retro repeatedly converges rather than duplicating.
+
+    A Try item tagged with its failure class (TRY_TAG_RE) goes to the class store instead: a
+    known class gains a hit for `--run`, a new class writes a new row. Nothing is written while
+    any tag is malformed or names a code the store does not hold.
+    """
+    res = validate(args.root, args.id)
+    if res["path"] is None:
+        print(f"retro {args.id}: not found", file=sys.stderr)
+        return 1
+    found = res["lessons"]
+    if not found:
+        print(f"retro {args.id}: no lessons to extract")
+        return 0
+    errors = class_errors(args.root, found)
+    if errors:
+        for e in errors:
+            print(f"retro {args.id}: {e}", file=sys.stderr)
+        return 1
+    classed = [(t, try_class(t)) for t in found]
+    found = [t for t, tag in classed if tag is None]
+    tags = [tag for _t, tag in classed if tag]
+    try:
+        run = extract_run(args.root, args.run, res["id"]) if tags else ""
+    except run_state.RunStateError as exc:
+        print(f"retro {args.id}: cannot tell which run the repeats belong to: {exc}",
+              file=sys.stderr)
+        return 1
+    # The retro's lessons go to the committed log; a legacy gitignored one moves first,
+    # and two logs are two machines' records that only a person can merge.
+    mig = lessons.migrate_legacy_log(args.root)
+    if lessons.migration_message(mig):
+        print(f"retro {args.id}: {lessons.migration_message(mig)}", file=sys.stderr)
+    if mig.get("conflict"):
+        return 1
+    counted = _extract_classes(args, res["id"], tags, run)
+
+    log = lessons.default_project_file(args.root)
+    existing_text = log.read_text(encoding="utf-8") if log.is_file() else lessons.PROJECT_HEADER
+    existing = lessons.parse_project_lessons(existing_text)
+
+    added, skipped = [], []
+    for text in found:
+        title = lesson_title(text)
+        if _recorded(text, existing):
+            skipped.append(title)
+            continue
+        added.append((title, text))
+        existing.append({"title": title, "body": text})
+
+    if args.dry_run:
+        for title, _text in added:
+            print(f"  + would add: {title[:70]}")
+        for t in skipped:
+            print(f"  = already recorded: {t[:70]}")
+        print(f"\n{len(added)} to add, {len(skipped)} already present{counted}")
+        return 0
+
+    log.parent.mkdir(parents=True, exist_ok=True)
+    for title, text in added:
+        # The body keeps the WHOLE lesson - the title is a headline, never a truncation of the
+        # record. Only when the heading carries the lesson exactly are the two the same thing: a
+        # sentence's closing full stop is not in its heading, so the sentence is in the body.
+        body = (f"{text}\n\nRecorded from retro {res['id']}." if text != lessons.heading_title(title)
+                else f"Recorded from retro {res['id']}.")
+        rc = lessons.cmd_add(argparse.Namespace(
+            title=title, body=body, root=args.root,
+            tags="", origin=res["id"], epic=None, wave=None,
+            validity_days=lessons.DEFAULT_VALIDITY_DAYS, global_=False,
+            project_file=str(log), lessons_dir=None, format="text"))
+        if rc != 0:
+            print(f"failed to record: {title[:60]}", file=sys.stderr)
+            return rc
+
+    print(f"retro {res['id']}: {len(added)} lesson(s) extracted, {len(skipped)} already present"
+          f"{counted}")
+    if added:
+        print("regenerate the summary so the next sprint reads them: lessons.py summary")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The parser, PUBLISHED, so a caller can enumerate this script's verbs without running it.
+
+    It was built inline inside `main`, which meant the verbs existed only for the length of one
+    invocation: `sprint_report.cycle_drift` - the guard that checks the compulsory checklist has
+    not drifted from the ceremony it certifies - could not read them, and reported two of its
+    eighteen rows UNVERIFIABLE rather than checked. A guard that cannot see a script is a guard
+    reporting its own blindness, and the rest of the family already publishes this.
+    """
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--root", default=".")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    for name, fn, helptext in (
+        ("validate", cmd_validate, "content check: sections, lessons, dispositions (the gate's leg)"),
+        ("dispose", cmd_dispose, "report each finding and whether it is filed, declined or undecided"),
+        ("extract", cmd_extract, "lift the retro's lessons into the lessons stores: a classed "
+                                 "Try item counts on its class in lessons.jsonl"),
+        ("accuracy", cmd_accuracy, "estimate vs actual for the batch, in points and tokens: the "
+                                   "plan's forecast against telemetry, and any unit that should "
+                                   "have been split"),
+        ("velocity", cmd_velocity, "points delivered per sprint, and the tokens-per-point rate "
+                                   "derived from that history"),
+        ("estimator", cmd_estimator, "measure the ESTIMATOR: per-estimator and per-model accuracy "
+                                     "of the recorded Points, the classes each systematically "
+                                     "under- or over-calls, and the coercion check"),
+        ("collate", cmd_collate, "the tokens-per-point rate per (project, model) cell, pooled "
+                                 "across several project evidence dirs and never summed across "
+                                 "cells - the multi-project tuning read"),
+    ):
+        p = sub.add_parser(name, help=helptext)
+        if name not in ("velocity", "estimator", "collate"):  # these span sprints, not one
+            p.add_argument("--id", required=True, help="retro id, e.g. RETRO0022")
+        if name == "collate":
+            p.add_argument("--roots", nargs="+", metavar="DIR",
+                           help="the project evidence roots to pool (default: --root). Each "
+                                "record names its own project, so they may be separate dirs or "
+                                "one pooled dir")
+        p.add_argument("--format", choices=("text", "json"), default="text")
+        if name == "velocity":
+            p.add_argument("--gaps", action="store_true",
+                           help="report every retro on disk with NO row in the velocity record "
+                                "and exit non-zero, so a skipped accuracy write is visible "
+                                "instead of looking like a sprint that never happened")
+            p.add_argument("--since", metavar="RETROxxxx",
+                           help="bound the gap report at a retro id, so adopting it creates no "
+                                "tail of history nothing can clear")
+        if name == "extract":
+            p.add_argument("--dry-run", action="store_true")
+            p.add_argument("--run", default=None, metavar="RUN_ID",
+                           help="the run a classed Try item's hit is counted against "
+                                "(default: the open run, else the retro id)")
+        if name == "accuracy":
+            p.add_argument("--write", action="store_true",
+                           help="record the report in the retro and append the sprint's row "
+                                "to the velocity history (default: read-only)")
+            p.add_argument("--tokens", type=int, default=None, metavar="N",
+                           help="the sprint's ACTUAL token spend (harness-tracked). Supply it for "
+                                "an interactive sprint - which records no per-unit actual - to get "
+                                "a real tokens-per-point over the delivered points")
+            p.add_argument("--tokens-from-harness", dest="tokens_from_harness",
+                           action="store_true",
+                           help="capture the sprint's actual token spend from the harness's "
+                                "current-session transcript instead of supplying --tokens by "
+                                "hand. The close passes this; a re-read of an old retro must "
+                                "not, because the current session is not that sprint. An "
+                                "already-recorded actual is never overwritten (an explicit "
+                                "--tokens still is the override), and a failed capture states "
+                                "plainly why. Best-effort ATTRIBUTION: the most recently "
+                                "modified transcript is taken as this session, so a close run "
+                                "beside a concurrent session can capture the wrong one - the "
+                                "recorded basis says exactly what was read")
+            p.add_argument("--delegated-tokens", dest="delegated_tokens", type=int,
+                           default=None, metavar="N",
+                           help="one delegated agent's OWN reported token total, recorded "
+                                "against the open run. The harness transcript carries no "
+                                "subagent usage, so a fan-out sprint's delegated spend can only "
+                                "be supplied - it is recorded as a claim, and the captured "
+                                "figure is published as a lower bound on what the run cost. "
+                                "Repeat the command once per agent")
+            p.add_argument("--delegated-agent", dest="delegated_agent", default="",
+                           metavar="NAME",
+                           help="which agent reported the --delegated-tokens figure")
+            p.add_argument("--delegated-unit", dest="delegated_unit", default="",
+                           metavar="ID",
+                           help="the unit the agent worked on: the report reads a unit's tagged "
+                                "totals as its agent tokens and agent minutes")
+            p.add_argument("--delegated-minutes", dest="delegated_minutes", type=float,
+                           default=None, metavar="M",
+                           help="the agent's own reported duration in minutes, for "
+                                "--delegated-tokens")
+            p.add_argument("--elapsed-hours", dest="elapsed_hours", type=float, default=None,
+                           metavar="H",
+                           help="the sprint's real elapsed hours (start to close), for the PRIMARY "
+                                "points-per-elapsed-hour velocity. Supply it for an interactive "
+                                "sprint whose run-state has no clean elapsed; descriptive, never a "
+                                "target")
+        p.set_defaults(func=fn)
+
+    cost = sub.add_parser("cost-baseline", help="the past runs the close's cost check is "
+                                                "measured against, kept in COST-BASELINE.md")
+    cost_sub = cost.add_subparsers(dest="action", required=True)
+    add = cost_sub.add_parser("add", help="price a past run's window from the harness "
+                                          "transcripts and append its row; VELOCITY.md is "
+                                          "untouched")
+    add.add_argument("--retro", required=True, help="the retro whose run the window covers")
+    add.add_argument("--since", required=True, metavar="ISO",
+                     help="the window's start, e.g. 2026-10-01T09:00:00Z")
+    add.add_argument("--until", required=True, metavar="ISO", help="the window's end")
+    add.set_defaults(func=cmd_cost_baseline)
+
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    # `argv` is a parameter like the rest of the family: a main that reads `sys.argv` directly
+    # cannot be driven by a caller or a test, which is how this one escaped the anchor contract.
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    # Resolve the root ONCE and write it back, so every verb below anchors on the tree the
+    # run belongs to. The family default `.` means "work it out from here", not "the cwd
+    # is the project": otherwise a run from a subdirectory acts on a stray tree and exits 0.
+    args.root = str(sdlc_md.resolve_root(args))
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

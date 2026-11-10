@@ -1,0 +1,1110 @@
+#!/usr/bin/env python3
+"""Run telemetry recorder: the project's measured evidence, and the forecasts it judges.
+
+Two logs, both COMMITTED, both under `sdlc-studio/retros/evidence/`:
+
+  actuals-*.jsonl    what a unit actually cost - one record per unit close.
+  forecasts-*.jsonl  what the planner PREDICTED it would cost, recorded when it predicted it.
+
+**No upload, no network.** Tokens are recorded only when the caller passes them (a script
+cannot read them reliably). The loop wires `record` on each unit close.
+
+WHY THEY ARE COMMITTED, AND NOT IN `.local/`
+--------------------------------------------
+Both logs are PROJECT EVIDENCE, not user-local runtime state. `.local/` is for state you can
+delete and lose nothing: run-state, worklists, caches, the repo map, the allocation lock - all
+of it regenerable by re-running a tool. These two are the opposite kind of thing. They are
+OBSERVATIONS of runs that already happened, and no tool can regenerate them: re-run the sprint
+and you get different numbers, not the same ones.
+
+Kept in `.local/`, they were on one machine. On a fresh clone, on CI, or for anybody else,
+every forecast was absent, every unit read UNFORECAST, and the entire estimate-vs-actual
+history read as no-evidence - so the estimator could not be falsified by anyone but the machine
+that ran the sprint. The rule is the one `retro.py` already applies to `VELOCITY.md`: evidence
+the team cannot read on a fresh clone is not evidence. `VELOCITY.md` is the committed SUMMARY;
+these are the committed per-unit rows underneath it, and they live beside it for that reason.
+
+SHARDING, AND THE MERGE STORY
+-----------------------------
+A single append-only JSONL is a bad shape for a file two people can both append to. So each log
+is sharded, one file per UTC day (`actuals-2026-07-14.jsonl`); readers concatenate the shards in
+name order, which is chronological, so the ordering both readers depend on is preserved.
+
+  Two sprints closed on different days, on different branches -> DIFFERENT FILES. Git merges
+  them cleanly and no record can be lost.
+
+  Two sprints closed on the same day, on different branches -> the same file, appended at the
+  end by both sides -> a MERGE CONFLICT, with both sides' records visible between the markers,
+  which a human resolves by keeping both. That is the intended outcome, and it is why the log is
+  deliberately NOT given a union merge driver: union would silently interleave, and interleaving
+  can flip which forecast for a unit is FIRST - quietly rewriting a prediction.
+
+The shard key is the day, not the sprint's retro id, because the retro does not exist yet when
+these records are written: the forecast is recorded at PLAN time and the actuals during the run,
+while the retro id is minted at close. Keying by it would mean rewriting the log afterwards -
+editing, with hindsight, the very record that exists to be un-editable.
+
+Nothing here is rolled. A bounded roll drops the OLDEST records first, which on a committed
+evidence log means deleting history out of git; the day shard bounds the file instead.
+
+Subcommands:
+  record    Append one run-outcome record.
+  forecast  Append one plan-time forecast record (what the planner predicted, and with what).
+  show      Print the recorded records (count + the JSON); `--forecasts` for the forecast log.
+  migrate   Move a pre-existing `.local/` log into the committed evidence dir, without loss.
+  backfill  Stamp the `project` on every record that predates the field, so evidence recorded
+            before projects were attributed is not lost the moment it is pooled with another.
+
+WHY EVERY RECORD CARRIES ITS PROJECT
+------------------------------------
+The evidence from several projects is pooled to tune the tokens-per-point rate. The instant two
+projects land in one place, a unit from this repo is indistinguishable from a unit from another
+unless the record itself says which project produced it. So the project is STAMPED ON THE RECORD
+at write time, resolved from the repo (not passed per call), and it travels with the row wherever
+the row is copied. A measurement is taken once and cannot be backfilled - so is its attribution,
+which is why the stamp lands when the record is written, not when it is later read. An older
+record with no `project` still reads: it is reported as `unknown`, never invented.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # resolve sibling imports (critic)
+from lib import sdlc_md  # noqa: E402
+
+# The committed evidence dir, beside the retros and the velocity history it is the rows of.
+EVIDENCE = Path("sdlc-studio") / "retros" / "evidence"
+ACTUALS_PREFIX = "actuals"
+FORECASTS_PREFIX = "forecasts"
+
+# Where the logs used to live: user-local, gitignored, one machine. Still READ, so a project
+# that upgrades the skill does not lose the evidence it already has; `migrate` moves it. The
+# legacy log is read FIRST, which is also its correct chronological place - it predates every
+# shard.
+LEGACY_ACTUALS = Path("sdlc-studio") / ".local" / "telemetry.jsonl"
+LEGACY_FORECASTS = Path("sdlc-studio") / ".local" / "forecasts.jsonl"
+
+# The shard a migrated legacy log lands in. Named to sort BEFORE any dated shard, because
+# everything in it happened before the migration.
+MIGRATED_SHARD = "0000-migrated"
+
+# The captured fields. Optional ones are omitted when not supplied. The tier_* fields
+# (routing) record which model tier was recommended vs actually delivered a unit,
+# so per-tier escape/escalation rates become measurable - the routing calibration loop.
+FIELDS = ("id", "type", "iterations", "wall_time_s", "stages", "critic_verdict",
+          "complexity", "churn", "reopened", "tokens",
+          "tier_recommended", "tier_delivered", "model", "escalated", "attempts")
+
+# `attempts` is a list of `{model, tokens}` - ONE entry per model invocation on a unit, in order.
+# It makes an escalation visible AND priceable: a unit rejected on a cheap model and re-run on a
+# dearer one carries `[{model: haiku, tokens: N1}, {model: opus, tokens: N2}]`, whose SUMMED cost is
+# the true cost - a cheap-first choice that escalated is not cheap. Additive and non-destructive: a
+# legacy record has no `attempts` and reads as a SINGLE attempt via `attempts_of`, so the 361
+# existing per-unit records need no migration and keep meaning exactly what they meant.
+
+# ---------------------------------------------------------------------------
+# The project, resolved from the repo and stamped on every record.
+# ---------------------------------------------------------------------------
+#: What a record whose project could not be resolved, or that predates the field, reports as.
+#: Never a guess at which project it was - a pooled row that cannot be attributed says so.
+PROJECT_UNKNOWN = "unknown"
+
+
+# ---------------------------------------------------------------------------
+# IDLE GAPS: the intervals a run spent WAITING, not working. ONE implementation.
+# ---------------------------------------------------------------------------
+# A run that stops for an operator answer keeps accruing wall-clock, and the wall-clock is the
+# denominator of the points-per-elapsed-hour series. An idle gap therefore makes that number a
+# lie while it still reads as a measurement - the exact class of false-but-plausible figure this
+# project keeps paying to remove.
+#
+# THE RULE LIVES HERE, ONCE, AND EVERY READER SHARES IT (D0052, following the BG0243 precedent
+# where the shared rule was EXTRACTED rather than copied). Two consumers need the same
+# deduction - the run-state elapsed the sprint reports, and the retro's elapsed hours - and a
+# second copy would drift into a second definition of how long a sprint took.
+#
+# A gap with no `to` is OPEN and contributes NOTHING. Closing it at `now` would book every hour
+# since the run stopped as measured idle time, which is a different claim from the one the
+# record supports: the gap has no measured length until the run comes back.
+IDLE_GAPS = "idle_gaps"
+_ISO_Z = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _parse_iso(value) -> "datetime | None":
+    """Any ISO-8601 stamp carrying an explicit UTC offset, normalised to UTC. None otherwise.
+
+    THIS IS THE ONE STAMP READER FOR THE WHOLE MEASUREMENT PATH, so what it refuses is what the
+    reports cannot see - and a refusal is not reported as one bad row. `sprint_report._run_window`
+    skips a run whose `started_at` will not parse; with no window the report says no run state
+    names this sprint's units, which is false and reads as a sprint that measured nothing.
+
+    It matched ONE hand-written pattern, `%Y-%m-%dT%H:%M:%SZ` - the form this project writes via
+    `sdlc_md.now_iso8601()`, but not the form the standard library writes. `.isoformat()` on an
+    aware datetime yields `+00:00`, and that call is live in this tree (gate.py's cost and
+    sign-off records, review_prep's freshness stamp), as it is in any consuming project whose
+    state this reads. The Z form stays the fast path; anything else goes through
+    `fromisoformat`, with `Z` rewritten as `+00:00` so Python 3.10 accepts it too.
+
+    A NAIVE stamp is still refused. It names no instant, and calling it UTC would invent the one
+    fact it is missing - unreadable is the honest reading of it. Sub-second precision is kept
+    rather than rounded away."""
+    return sdlc_md.parse_iso8601(value)
+
+
+def idle_gaps(state: dict) -> list[dict]:
+    """The CLOSED idle intervals recorded on a run state, each with its measured seconds.
+
+    An entry missing either end, or whose end precedes its start, is dropped rather than
+    guessed at: a malformed gap must not silently shorten a sprint's measured elapsed."""
+    out: list[dict] = []
+    for gap in (state or {}).get(IDLE_GAPS) or []:
+        if not isinstance(gap, dict):
+            continue
+        start, end = _parse_iso(gap.get("from")), _parse_iso(gap.get("to"))
+        if start is None or end is None or end <= start:
+            continue
+        out.append({**gap, "seconds": (end - start).total_seconds()})
+    return out
+
+
+def idle_hours(state: dict) -> float:
+    """Total measured idle hours on a run state. 0.0 when nothing is recorded - which is a
+    measured absence of waiting, not an unmeasured one, because a gap is only ever written."""
+    return round(sum(g["seconds"] for g in idle_gaps(state)) / 3600.0, 3)
+
+
+def _idle_within(gaps: list[dict], start, end) -> float:
+    """Seconds of recorded idle that fall INSIDE `[start, end]` - the intersection, never the
+    whole gap.
+
+    THE DEDUCTION MAY ONLY REMOVE TIME THE MEASURED WINDOW ACTUALLY CONTAINED. Deducting a
+    gap's full length regardless of where it sat subtracted time the wall clock never held:
+    `sprint stop` opens a gap immediately BEFORE it closes the run, so the gap begins at
+    `ended_at` and closes entirely afterwards, and a run that worked two hours then waited
+    three reported ZERO hours worked - which `retro` publishes as points per elapsed-hour.
+    Clamping rather than refusing to record such a gap keeps the wait itself measured (it is
+    a real fact about the operator loop, reported as `recorded_idle_hours`) while keeping the
+    arithmetic true for every shape, including a gap that straddles either end.
+    """
+    total = 0.0
+    for gap in gaps:
+        gs, ge = _parse_iso(gap.get("from")), _parse_iso(gap.get("to"))
+        if gs is None or ge is None:
+            continue
+        lo, hi = max(gs, start), min(ge, end)
+        if hi > lo:
+            total += (hi - lo).total_seconds()
+    return total
+
+
+def elapsed_excluding_idle(started_at, ended_at, state: dict) -> dict:
+    """`{raw_hours, idle_hours, recorded_idle_hours, hours, gaps}` - the wall-clock a run was
+    open, the idle DEDUCTED from it, the idle RECORDED in total, and the difference. `hours` is
+    None when either end is missing or the span is not positive: an open run has no measured
+    elapsed, and extending it to `now` would report its own age as sprint time.
+
+    `idle_hours` is the in-window idle, so `raw_hours - idle_hours == hours` always reads true;
+    `recorded_idle_hours` is every gap in full, so a wait outside the window is still visible
+    rather than dropped. The deduction is floored at 0 - a recorded idle longer than the run is
+    malformed data, and negative elapsed is not the honest reading of it."""
+    start, end = _parse_iso(started_at), _parse_iso(ended_at)
+    gaps = idle_gaps(state)
+    recorded = round(sum(g["seconds"] for g in gaps) / 3600.0, 3)
+    if start is None or end is None:
+        return {"raw_hours": None, "idle_hours": 0.0, "recorded_idle_hours": recorded,
+                "hours": None, "gaps": gaps}
+    idle = round(_idle_within(gaps, start, end) / 3600.0, 3)
+    raw = round((end - start).total_seconds() / 3600.0, 3)
+    if raw <= 0:
+        return {"raw_hours": raw, "idle_hours": idle, "recorded_idle_hours": recorded,
+                "hours": None, "gaps": gaps}
+    return {"raw_hours": raw, "idle_hours": idle, "recorded_idle_hours": recorded,
+            "hours": round(max(0.0, raw - idle), 3), "gaps": gaps}
+
+
+def _git(repo_root: Path | str, *args: str) -> str:
+    """`git -C <root> <args>` stdout, or "" when git is absent, times out, or the command fails.
+    Read-only and best-effort: resolving the project must never break the recording path."""
+    try:
+        r = subprocess.run(["git", "-C", str(repo_root), *args],
+                           capture_output=True, text=True, check=False, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+def _repo_from_url(url: str) -> str:
+    """The repository name out of a git remote URL, for every URL shape git accepts:
+    `git@host:owner/repo.git`, `https://host/owner/repo.git`, `ssh://.../repo`, a local path.
+    The trailing `.git` and any trailing slash are stripped; the last path component is the name."""
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return ""
+    tail = url.replace(":", "/").rsplit("/", 1)[-1]
+    if tail.endswith(".git"):
+        tail = tail[:-4]
+    return tail.strip()
+
+
+def project_name(repo_root: Path | str) -> str:
+    """The project a record produced in `repo_root` belongs to. Stable for a given repo, needs no
+    per-call argument, and resolved from the repo itself in this order:
+
+      1. the git remote `origin`'s repository name - canonical, and it survives the working
+         directory being renamed or the clone living at a different path on another machine;
+      2. else the repository's top-level directory name (`git rev-parse --show-toplevel`) - the
+         answer when the repo has no `origin` yet (a fresh `git init`);
+      3. else the resolved root directory's own name - the answer when the tree is not a git repo
+         at all. Only when even that is empty does it fall back to `unknown`.
+
+    There is no config-file option: the directory name is always available, so a `project.name`
+    setting would be an unreachable fourth branch and one more surface to keep in sync."""
+    root = Path(repo_root).resolve()
+    name = _repo_from_url(_git(root, "remote", "get-url", "origin"))
+    if name:
+        return name
+    top = _git(root, "rev-parse", "--show-toplevel")
+    if top:
+        return Path(top).name
+    return root.name or PROJECT_UNKNOWN
+
+
+def shard_id() -> str:
+    """The shard a record written now belongs to: the UTC date. Known at write time, always,
+    with no dependency on run state; sorts chronologically; partitions the log the way sprints
+    partition time."""
+    return sdlc_md.now_date()
+
+
+def _shard_path(repo_root: Path | str, prefix: str, shard: str | None = None) -> Path:
+    return Path(repo_root) / EVIDENCE / f"{prefix}-{shard or shard_id()}.jsonl"
+
+
+def _shards(repo_root: Path | str, prefix: str, legacy: Path) -> list[Path]:
+    """Every file the log is made of, OLDEST FIRST: the un-migrated legacy `.local/` log (when a
+    project still has one), then the tracked shards in name order.
+
+    The order is load-bearing on both sides - the actuals reader takes the last non-null value
+    per field, and the forecast reader takes the FIRST record for a unit - so it is defined by
+    the filename, never by directory iteration order."""
+    out: list[Path] = []
+    old = Path(repo_root) / legacy
+    if old.is_file():
+        out.append(old)
+    d = Path(repo_root) / EVIDENCE
+    if d.is_dir():
+        out.extend(sorted(d.glob(f"{prefix}-*.jsonl")))
+    return out
+
+
+def _read_jsonl(paths: list[Path]) -> list[dict]:
+    """Every record across the shards. A malformed line is skipped, never fatal - one corrupt
+    line must not cost the whole evidence base."""
+    out: list[dict] = []
+    for p in paths:
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                out.append(rec)
+    return out
+
+
+def _append(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row) + "\n")
+
+
+def actuals_path(repo_root: Path | str, shard: str | None = None) -> Path:
+    """The actuals shard a record written now is appended to. Public: the loop, the tests and
+    an operator all need to be able to name the file the evidence lands in."""
+    return _shard_path(repo_root, ACTUALS_PREFIX, shard)
+
+
+def forecasts_path(repo_root: Path | str, shard: str | None = None) -> Path:
+    """The forecast shard a record written now is appended to."""
+    return _shard_path(repo_root, FORECASTS_PREFIX, shard)
+
+
+_path = actuals_path
+
+
+# ---------------------------------------------------------------------------
+# The delivered model, ON THE ARTEFACT.
+# ---------------------------------------------------------------------------
+# The model was captured here and went nowhere a reader would ever look. You could not open a
+# bug and see what built it; the committed history had no model column; and while the log lived
+# in `.local/` a fresh clone lost the attribution entirely. It matters three times over: which
+# model delivered a change is audit information, a cost-per-unit figure means nothing without
+# knowing which model paid it, and a benchmark that compares models needs exactly this field.
+#
+# So the close STAMPS it on the unit. Idempotent (a re-record updates the line rather than adding
+# a second), last-model-wins (the model that delivered the final state is the one that delivered
+# it), and best-effort: a stamp that cannot land must never cost the measurement.
+DELIVERED_BY_RE = re.compile(r"(?im)^([^\S\n]*>[^\S\n]*)\*\*Delivered-by:\*\*.*$")
+
+
+def stamp_delivery(repo_root: Path | str, unit_id: str, model: str) -> Path | None:
+    """Record on the ARTEFACT the model that delivered it. Returns the path, or None when there
+    is no artefact to stamp.
+
+    Writes into the header metadata blockquote (the contiguous `>` run under the H1) and nowhere
+    else, so a prose blockquote or a table in the body cannot be corrupted."""
+    found = sdlc_md.find_by_id(repo_root, unit_id)
+    if not found:
+        return None
+    path = found[0]
+    text = path.read_text(encoding="utf-8")
+    line = f"> **Delivered-by:** {str(model).strip()}"
+    if DELIVERED_BY_RE.search(text):
+        new = DELIVERED_BY_RE.sub(lambda m: f"{m.group(1)}**Delivered-by:** {model}", text, count=1)
+    else:
+        lines = text.splitlines()
+        h1 = next((i for i, ln in enumerate(lines) if ln.lstrip().startswith("# ")), None)
+        if h1 is None:
+            return None
+        i = h1 + 1
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        if i < len(lines) and lines[i].lstrip().startswith(">"):
+            last = i
+            while last + 1 < len(lines) and lines[last + 1].lstrip().startswith(">"):
+                last += 1
+            lines.insert(last + 1, line)
+        else:  # no header metadata block - open one directly under the H1
+            lines[h1 + 1:h1 + 1] = ["", line]
+        new = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    if new != text:
+        sdlc_md.atomic_write(path, new)
+    return path
+
+
+def record(repo_root: Path | str, fields: dict) -> dict:
+    """Append one record (only the recognised, non-None fields), and stamp the delivering model
+    on the unit itself. Best-effort: a write failure is swallowed (telemetry must never break
+    the loop)."""
+    rec = {k: fields[k] for k in FIELDS if fields.get(k) is not None}
+    rec["project"] = project_name(repo_root)   # stamped at write time, from the repo itself
+    try:
+        _append(_path(repo_root), [rec])
+    except Exception as exc:  # noqa: BLE001 - telemetry is advisory; never raise into the loop
+        sdlc_md.debug("telemetry.record", exc)
+    # The delivering model to stamp: the flat `model` when present, else the LAST attempt's model
+    #. An escalated unit carries an attempts list with no flat model - the very unit that
+    # most needs the audit attribution - so deriving it from `attempts_of[-1]` (retro's own
+    # delivering-model rule) is what keeps the stamp from silently skipping the escalation case.
+    stamp_model = rec.get("model")
+    if stamp_model is None:
+        atts = attempts_of(rec)
+        stamp_model = next((a.get("model") for a in reversed(atts) if a.get("model")), None)
+    if rec.get("id") and stamp_model:
+        try:
+            stamp_delivery(repo_root, str(rec["id"]), str(stamp_model))
+        except Exception as exc:  # noqa: BLE001 - a stamp that cannot land never costs the measurement
+            sdlc_md.debug("telemetry.stamp_delivery", exc)
+    return rec
+
+
+def attempts_of(rec: dict) -> list[dict]:
+    """The per-attempt breakdown of a unit record as `[{model, tokens}, ...]`, in order.
+
+    The compatibility shim between the per-attempt schema and every record that predates it: a
+    record carrying a real `attempts` list yields it (dropping empty entries); a legacy record with
+    only the flat `model`/`tokens` reads as ONE implicit attempt. So an escalation is summed
+    correctly AND a legacy single-model unit is unchanged - one reader, both shapes, no migration.
+    A record with neither yields an empty list (nothing was measured), never a fabricated attempt."""
+    raw = rec.get("attempts")
+    if isinstance(raw, list) and raw:
+        out = []
+        for a in raw:
+            if isinstance(a, dict) and (a.get("model") is not None or a.get("tokens") is not None):
+                out.append({"model": a.get("model"), "tokens": a.get("tokens")})
+        if out:
+            return out
+    if rec.get("model") is not None or rec.get("tokens") is not None:
+        return [{"model": rec.get("model"), "tokens": rec.get("tokens")}]
+    return []
+
+
+# --- Pricing: offline, config-driven, honest about what it cannot price -------------------
+# Rough ESTIMATE defaults in US dollars per 1,000,000 tokens - a starting point, NOT a quote, and
+# deliberately round so no one mistakes them for a contract rate. Set `pricing.<model-id>` (the
+# full id) or `pricing.<family>` in `.config.yaml` to your actual rate; the full id wins. A model
+# that is neither here nor in config is reported
+# UNPRICED (its tokens are counted, its dollars are not) - never priced by a guess. Offline: no
+# network, no live price feed, because a report a CAB reads must be reproducible from the repo alone.
+DEFAULT_PRICES: dict[str, float] = {"opus": 30.0, "sonnet": 6.0, "haiku": 1.0}
+
+
+def _model_family(model: str | None) -> str:
+    """The pricing key for a model id. The estimate defaults are CLAUDE rates, so a family default
+    is applied only to a Claude model (`claude-opus-4-8` -> `opus`) or the bare family name - never
+    to a FOREIGN model whose name merely contains a family string (`gpt-opus-mini` must NOT be
+    priced as opus). Anything else keys by its own normalised name, so an operator can still price it
+    explicitly with `pricing.<that-name>`; unset, it is unpriced."""
+    m = (model or "").strip().lower()
+    if "claude" in m or m in DEFAULT_PRICES:
+        for fam in DEFAULT_PRICES:
+            if fam in m:
+                return fam
+    return m
+
+
+def model_price(repo_root: Path | str, model: str | None) -> float | None:
+    """US dollars per 1,000,000 tokens for a model: a configured `pricing.<model-id>` (the full id,
+    e.g. `claude-opus-4-8` or a dotted foreign id `gpt-4.1`) if set, else `pricing.<family>` (e.g.
+    `opus`), else the estimate default, else None (unpriced - the caller must say so, never
+    substitute a number).
+
+    The pricing BLOCK is fetched once and indexed by the raw id, NOT looked up as a dotted config
+    key: `config.get(root, f"pricing.{model}")` splits every '.' as a path separator, so a
+    point-release id like `gpt-4.1` became `pricing->gpt-4->1` and silently missed. The
+    raw-id key is tried before the family so an operator's `pricing.claude-opus-4-8: 12` overrides
+    the family/estimate, matching the `pricing.<model>` hint the report and US0173 print.
+
+    A non-POSITIVE configured price is refused (returns None -> UNPRICED), not honoured: a negative
+    price would SUBTRACT from the batch total - a flattering figure, the exact class this subsystem
+    exists to prevent - and a zero price is indistinguishable from 'could not price it'."""
+    import config  # lazy: telemetry is a leaf
+    block = config.get(repo_root, "pricing", {})   # one whole-block read - no per-key dot-splitting
+    pricing = block if isinstance(block, dict) else {}
+    fam = _model_family(model)
+    raw = (model or "").strip()
+    for key in (raw, fam):                          # raw model id first, then the family key
+        if key and key in pricing:
+            try:
+                price = float(pricing[key])
+            except (TypeError, ValueError):
+                return None
+            return price if price > 0 else None
+    return DEFAULT_PRICES.get(fam)
+
+
+def unit_cost(repo_root: Path | str, rec: dict) -> dict:
+    """The TRUE cost of a unit, summed over its attempts so rework is included: a unit rejected on a
+    cheap model and re-run on a dearer one costs the SUM, not the last line. Returns
+    `{tokens, cost, unpriced}` - `cost` is US dollars at configured/estimated rates over the PRICED
+    attempts; `unpriced` lists any attempt model with no price (its tokens are still counted, so the
+    figure never silently drops spend - it says which models it could not put a number on)."""
+    tokens, cost, unpriced = 0, 0.0, []
+    for a in attempts_of(rec):
+        tk = a.get("tokens") or 0
+        tokens += tk
+        price = model_price(repo_root, a.get("model"))
+        if price is None:
+            label = a.get("model") or "unrecorded"   # a tokens-only attempt has no model to name
+            if label not in unpriced:
+                unpriced.append(label)
+        else:
+            cost += (tk / 1_000_000) * price
+    return {"tokens": tokens, "cost": round(cost, 4), "unpriced": unpriced}
+
+
+def read_all(repo_root: Path | str) -> list[dict]:
+    """Every actuals record across the shards, oldest first. Malformed lines are skipped (a
+    corrupt line never breaks a read)."""
+    return _read_jsonl(_shards(repo_root, ACTUALS_PREFIX, LEGACY_ACTUALS))
+
+
+#: The per-unit fields an actual is made of. `type`, `model` and `project` are context, not
+#: measurements; the rest are what a run actually cost. `project` rides through so a pooled read
+#: keeps each unit's project - the whole point of stamping it on the record.
+ACTUAL_FIELDS = ("type", "model", "project", "tokens", "wall_time_s", "iterations", "complexity",
+                 "churn", "critic_verdict", "attempts")
+
+#: CONTEXT fields take the last non-null value seen (the last record that carried one wins). The
+#: COST-bearing fields (tokens/wall_time_s/attempts) do NOT - they aggregate across a unit's
+#: records, so a reopen-reclose second cycle SUMS with the first instead of overwriting.
+_CONTEXT_FIELDS = ("type", "project", "iterations", "complexity", "churn", "critic_verdict")
+
+
+def latest_actuals(records: list[dict]) -> dict[str, dict]:
+    """Per-unit measured actuals, keyed by normalised id. Context fields take the LAST non-null
+    value; the COST-bearing fields AGGREGATE across the unit's records.
+
+    Last-non-null for context, not last-record: the loop appends a second, bare record on close
+    (`{"id": "BG0126", "type": "bug"}`), so taking the last record wholesale would erase a
+    measurement that was genuinely taken. A field no record ever carried stays ABSENT - it is
+    never defaulted to 0, because an unmeasured unit must be reportable as unmeasured rather
+    than as a unit that cost nothing.
+
+    Cost AGGREGATES across records. A reopen-reclose, or any unit closed more than once,
+    produces more than one record; the last-non-null merge silently kept only the LAST cycle's
+    tokens/wall-time and dropped the rest, understating the rework-included true cost. So each
+    record becomes its implicit attempt(s) - `attempts_of` reads a flat model/tokens as one
+    attempt - concatenated in order, and wall-time sums. The bucket's `tokens` is the summed
+    attempt tokens and its `model` the delivering (last) attempt's, so a flat reader and the
+    attempts reader (unit_cost, the spend report) can never disagree.
+
+    Event records (those carrying an `event` key) are not unit closes and are excluded.
+    """
+    out: dict[str, dict] = {}
+    for rec in records:
+        if rec.get("event"):
+            continue
+        rid = sdlc_md.norm_id(str(rec.get("id") or "").strip())
+        if not rid:
+            continue
+        bucket = out.setdefault(rid, {})
+        for field in _CONTEXT_FIELDS:
+            val = rec.get(field)
+            if val is not None:
+                bucket[field] = val
+        # the last-non-null model is a context fallback; the delivering model computed below,
+        # from the aggregated attempts, overrides it when there are any.
+        if rec.get("model") is not None:
+            bucket["model"] = rec["model"]
+        atts = attempts_of(rec)
+        if atts:
+            bucket.setdefault("_attempts", []).extend(atts)
+        w = rec.get("wall_time_s")
+        if isinstance(w, (int, float)):
+            bucket["_wall"] = bucket.get("_wall", 0) + w
+    for bucket in out.values():
+        atts = bucket.pop("_attempts", None)
+        if atts:
+            bucket["attempts"] = atts
+            token_vals = [a.get("tokens") for a in atts if a.get("tokens") is not None]
+            if token_vals:  # only fabricate no `tokens` key - an absent measurement stays absent
+                bucket["tokens"] = sum(token_vals)
+            last_model = next((a.get("model") for a in reversed(atts) if a.get("model")), None)
+            if last_model is not None:
+                bucket["model"] = last_model
+        w = bucket.pop("_wall", None)
+        if w is not None:
+            bucket["wall_time_s"] = round(w, 3) if isinstance(w, float) else w
+    return out
+
+
+def actuals(repo_root: Path | str) -> dict[str, dict]:
+    """`latest_actuals` over the project's telemetry log. The single read the retro's
+    estimate-vs-actual report goes through."""
+    return latest_actuals(read_all(repo_root))
+
+
+# ---------------------------------------------------------------------------
+# The forecast log: what the planner PREDICTED, recorded when it predicted it.
+# ---------------------------------------------------------------------------
+# The actuals above are one side of the estimate-vs-actual ratio. This is the other side, and
+# it has to be a RECORD for exactly the same reason they do.
+#
+# An estimate re-derived at judgement time, from the constants it is meant to be judging, is
+# not a prediction. Recalibrate and every past sprint is retroactively deemed to have forecast
+# something else, so the ratio drifts toward 1.0x and the loop can never falsify its own
+# estimator. It is not hypothetical: a recorded 5.2x miss was the entire evidence for a
+# recalibration, and the recalibration erased it.
+#
+# It lives NEXT TO the actuals, in the same committed evidence directory, because it is the
+# same kind of thing: a per-unit run record, keyed by unit id, written once by the tool that
+# observed it. Its own log rather than a record type inside the actuals, so the two can never
+# evict or overwrite one another.
+#
+# FIRST WINS. The reader takes the EARLIEST record for a unit. Re-planning a batch after the
+# work is done must not be able to rewrite what was predicted before it started; a later record
+# is kept as history and never overrides. Hindsight is not a forecast. That is why the shards
+# are read in name order and never merged by a union driver: a reordering silently changes which
+# prediction is the one that stands.
+
+#: A forecast record. `points` is the SIZE the plan recorded, on the modified Fibonacci scale;
+#: `tokens` is the number the plan quoted (points x the measured rate); `constants` is the
+#: estimator that produced it (so a later reader can tell whether the row was forecast by the
+#: estimator now in force, or by a different one); `planned_at` is when the plan was made.
+#:
+#: POINTS ARE THE SIZE, AND THEY ARE RECORDED HERE - not read off the artefact at judgement
+#: time. Same rule as the token number, for the same reason: a size revised once the outcome was
+#: known is not a prediction, and this project has already watched one get revised. Velocity
+#: (points delivered per sprint) and the tokens-per-point rate derived from it are both read out
+#: of these records, so if the size is not on the record the sprint is UNSIZED and nothing
+#: invents a number for it.
+#:
+#: The ATTRIBUTION of the size call rides here too, recorded at PLAN TIME for the same reason:
+#:   `estimator`  WHO made the size call ("unattributed" when nobody claimed it - never guessed)
+#:   `size_gate`  under what compulsion: `compulsory` (the grooming gate refuses an unsized
+#:                unit) or `voluntary`. A compulsory estimate from someone who does not want to
+#:                estimate is a careless one, and that hazard is only testable if the compulsion
+#:                in force is on the record.
+#:
+#: `seed`, `seed_source` and `complexity` are the inputs of the RETIRED per-unit estimator. They
+#: are kept in the schema because records already carry them, and an evidence log is not
+#: rewritten to suit today's model - nothing writes them now.
+FORECAST_FIELDS = ("id", "tokens", "points", "seed", "seed_source", "complexity",
+                   "estimator", "size_gate", "constants", "planned_at")
+
+#: The field `size_gate` used to be called `effort_gate`, when the size was an Effort. A caller
+#: still passing the old name is understood, so no record is lost across the rename; the log is
+#: written under the new one.
+LEGACY_GATE_FIELD = "effort_gate"
+
+
+_forecast_path = forecasts_path
+
+
+def read_forecasts(repo_root: Path | str) -> list[dict]:
+    """Every forecast record across the shards, oldest first. A malformed line is skipped,
+    never fatal."""
+    return [r for r in _read_jsonl(_shards(repo_root, FORECASTS_PREFIX, LEGACY_FORECASTS))
+            if r.get("id")]
+
+
+def forecasts(repo_root: Path | str) -> dict[str, dict]:
+    """The plan-time forecast per unit, keyed by normalised id. FIRST record wins - see the
+    note above. The single read the retro's estimate-vs-actual report goes through; it never
+    recomputes an estimate."""
+    out: dict[str, dict] = {}
+    for rec in read_forecasts(repo_root):
+        rid = sdlc_md.norm_id(str(rec.get("id") or "").strip())
+        if rid:
+            out.setdefault(rid, rec)
+    return out
+
+
+def record_forecasts(repo_root: Path | str, records: list[dict]) -> dict:
+    """Append the plan's per-unit forecasts. Idempotent: a record identical to one already
+    held for that unit (same tokens, same constants) is not written twice, so re-planning an
+    unchanged batch does not grow the log.
+
+    NOT best-effort, unlike `record`. A telemetry write that fails costs a measurement; a
+    forecast write that fails silently would leave the planner announcing a forecast that was
+    never recorded, which is the whole defect. The caller is told, and says so.
+    """
+    have = read_forecasts(repo_root)
+    seen = {(sdlc_md.norm_id(str(r.get("id"))), r.get("tokens"),
+             json.dumps(r.get("constants"), sort_keys=True)) for r in have}
+    proj = project_name(repo_root)   # resolved once; every fresh row is stamped with the repo's
+    fresh: list[dict] = []
+    already: list[str] = []
+    for rec in records:
+        rid = sdlc_md.norm_id(str(rec.get("id") or "").strip())
+        if not rid:
+            continue
+        key = (rid, rec.get("tokens"), json.dumps(rec.get("constants"), sort_keys=True))
+        if key in seen:
+            already.append(rid)
+            continue
+        seen.add(key)
+        rec = dict(rec)
+        if rec.get("size_gate") is None and rec.get(LEGACY_GATE_FIELD) is not None:
+            rec["size_gate"] = rec[LEGACY_GATE_FIELD]   # the rename, absorbed - never dropped
+        row = {k: rec[k] for k in FORECAST_FIELDS if rec.get(k) is not None}
+        row["id"] = rid
+        row["project"] = proj      # stamped at write time - it is never taken from the caller
+        fresh.append(row)
+    if fresh:
+        _append(_forecast_path(repo_root), fresh)
+    return {"path": str(_forecast_path(repo_root)),
+            "recorded": [r["id"] for r in fresh], "already": already}
+
+
+# ---------------------------------------------------------------------------
+# Migration: a `.local/` log, moved into the committed evidence dir without loss.
+# ---------------------------------------------------------------------------
+
+def migrate(repo_root: Path | str) -> dict:
+    """Move any pre-existing `.local/` log into `retros/evidence/`, so evidence recorded before
+    the logs were committed reaches the repository instead of dying with the machine.
+
+    Loss-proof by construction, and then CHECKED. When the destination does not exist the file
+    is RENAMED - the bytes are not rewritten, so there is nothing to get wrong. When it does,
+    the lines absent from the destination are appended, and the source is only unlinked once
+    every one of its lines has been verified present. A dropped record here would be
+    unrecoverable: these runs cannot be re-measured.
+    """
+    root = Path(repo_root)
+    report: dict = {"moved": [], "skipped": []}
+    for legacy, prefix in ((LEGACY_ACTUALS, ACTUALS_PREFIX),
+                           (LEGACY_FORECASTS, FORECASTS_PREFIX)):
+        src = root / legacy
+        if not src.is_file():
+            report["skipped"].append(str(legacy))
+            continue
+        dst = _shard_path(root, prefix, MIGRATED_SHARD)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        lines = [ln for ln in src.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        if not dst.exists():
+            src.replace(dst)                      # a rename: the bytes are untouched
+        else:
+            have = {ln.strip() for ln in dst.read_text(encoding="utf-8").splitlines()}
+            missing = [ln for ln in lines if ln.strip() not in have]
+            with dst.open("a", encoding="utf-8") as fh:
+                for ln in missing:
+                    fh.write(ln.rstrip("\n") + "\n")
+            landed = {ln.strip() for ln in dst.read_text(encoding="utf-8").splitlines()}
+            absent = [ln for ln in lines if ln.strip() not in landed]
+            if absent:
+                raise RuntimeError(
+                    f"refusing to remove {src}: {len(absent)} record(s) did not reach {dst}")
+            src.unlink()
+        report["moved"].append({"from": str(legacy), "to": str(dst.relative_to(root)),
+                                "records": len(lines)})
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Backfill: stamp the project on records that predate the field.
+# ---------------------------------------------------------------------------
+
+def backfill_project(repo_root: Path | str, project: str | None = None) -> dict:
+    """Stamp `project` on every record in this repo's evidence shards that has none yet.
+
+    Evidence recorded before the field existed has a KNOWN project - it is this repo - so the
+    attribution can be stamped now without inventing anything (unlike a measurement, which cannot
+    be reconstructed). The project defaults to the one resolved from the repo.
+
+    Loss-proof by construction, and then CHECKED. Each line is parsed, the key is added only when
+    absent (idempotent, and a record that already names a project is left exactly as it is), and
+    the row is rewritten with every other value untouched. After writing, the shard is re-read and
+    every original record must be present with all of its non-project values unchanged, or the
+    write is refused: a backfill that corrupted the only evidence base the project has would be
+    unrecoverable.
+    """
+    root = Path(repo_root)
+    proj = project or project_name(root)
+    d = root / EVIDENCE
+    report: dict = {"project": proj, "files": [], "stamped": 0, "already": 0}
+    if not d.is_dir():
+        return report
+    for path in sorted(d.glob("*.jsonl")):
+        raw = path.read_text(encoding="utf-8")
+        before = [json.loads(ln) for ln in raw.splitlines() if ln.strip()]
+        out_lines: list[str] = []
+        stamped = already = 0
+        for rec in before:
+            if isinstance(rec, dict) and "project" not in rec:
+                rec = {**rec, "project": proj}
+                stamped += 1
+            elif isinstance(rec, dict):
+                already += 1
+            out_lines.append(json.dumps(rec))
+        if not stamped:
+            report["already"] += already
+            continue
+        new_text = "\n".join(out_lines) + ("\n" if raw.endswith("\n") or out_lines else "")
+        # Verify BEFORE replacing the file: every original record must survive value-for-value.
+        check = [json.loads(ln) for ln in new_text.splitlines() if ln.strip()]
+        if len(check) != len(before):
+            raise RuntimeError(f"refusing to write {path}: record count changed "
+                               f"({len(before)} -> {len(check)})")
+        strip = lambda r: {k: v for k, v in r.items() if k != "project"}
+        for old, got in zip(before, check):
+            if strip(old) != strip(got):
+                raise RuntimeError(f"refusing to write {path}: a record's values changed")
+        sdlc_md.atomic_write(path, new_text)
+        report["files"].append({"file": path.name, "stamped": stamped, "already": already})
+        report["stamped"] += stamped
+        report["already"] += already
+    return report
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_attempts(pairs: list[str] | None, blob: str | None) -> list[dict] | None:
+    """The per-attempt list a writer supplies, as `[{model, tokens}, ...]` in order, or None
+    when neither form was given. Two writer forms, one shape - the escalation the loop records is
+    a cheap-first attempt re-run on a dearer model, and `attempts_of`/`unit_cost` read exactly this.
+
+      --attempt haiku:1000  (repeatable, MODEL:TOKENS, order preserved)
+      --attempts '[{"model": "haiku", "tokens": 1000}, ...]'  (JSON, for a structured caller)
+
+    Refuses a malformed entry loudly (ValueError) rather than dropping it: a silently discarded
+    attempt is exactly the true-cost blind spot BG0152 exists to close."""
+    out: list[dict] = []
+    for pair in pairs or []:
+        model, sep, tok = str(pair).rpartition(":")
+        if not sep or not model.strip() or _int(tok) is None:
+            raise ValueError(f"--attempt expects MODEL:TOKENS, got {pair!r}")
+        out.append({"model": model.strip(), "tokens": _int(tok)})
+    if blob:
+        try:
+            loaded = json.loads(blob)
+        except ValueError as exc:
+            raise ValueError(f"--attempts expects a JSON list, got {blob!r}: {exc}") from exc
+        if not isinstance(loaded, list):
+            raise ValueError(f"--attempts expects a JSON list, got {type(loaded).__name__}")
+        for a in loaded:
+            if not isinstance(a, dict) or (a.get("model") is None and a.get("tokens") is None):
+                raise ValueError(f"--attempts entry needs a model and/or tokens, got {a!r}")
+            out.append({"model": a.get("model"), "tokens": _int(a.get("tokens"))})
+    return out or None
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    attempts = parse_attempts(getattr(args, "attempt", None), getattr(args, "attempts", None))
+    fields = {"id": args.id, "type": args.type, "iterations": _int(args.iterations),
+              "wall_time_s": _int(args.wall_time_s), "stages": args.stages,
+              "critic_verdict": args.verdict, "complexity": _int(args.complexity),
+              "churn": _int(args.churn), "reopened": args.reopened, "tokens": _int(args.tokens),
+              "tier_recommended": args.tier_recommended,
+              "tier_delivered": args.tier_delivered,
+              "model": args.model, "escalated": args.escalated, "attempts": attempts}
+    rec = record(args.root, fields)
+    print(json.dumps(rec) if args.format == "json" else f"recorded {rec.get('id', '?')}")
+    return 0
+
+
+def summarise(records: list[dict]) -> dict:
+    """Per-type aggregates over the raw records: count, mean iterations, mean wall
+    time, reopen rate, verdict mix. A field absent from every record of a type is
+    None, never a fabricated 0 - the summary reports what was measured.
+
+    Event records (those carrying an `event` key, such as the plan-review events older logs
+    hold) are NOT unit-close records and are excluded - pooling them would inflate a phantom
+    `unknown` type."""
+    unit_recs = [r for r in records if not r.get("event")]
+    out: dict = {}
+    for rec in unit_recs:
+        t = rec.get("type") or "unknown"
+        b = out.setdefault(t, {"count": 0, "_iters": [], "_wall": [],
+                               "_reopened": [], "verdicts": {}})
+        b["count"] += 1
+        if isinstance(rec.get("iterations"), (int, float)):
+            b["_iters"].append(rec["iterations"])
+        if isinstance(rec.get("wall_time_s"), (int, float)):
+            b["_wall"].append(rec["wall_time_s"])
+        if rec.get("reopened") is not None:
+            b["_reopened"].append(str(rec["reopened"]).strip().lower() in ("yes", "true", "1"))
+        v = rec.get("critic_verdict")
+        if v:
+            b["verdicts"][v] = b["verdicts"].get(v, 0) + 1
+    for b in out.values():
+        iters, wall, reop = b.pop("_iters"), b.pop("_wall"), b.pop("_reopened")
+        b["mean_iterations"] = round(sum(iters) / len(iters), 2) if iters else None
+        b["mean_wall_time_s"] = round(sum(wall) / len(wall), 2) if wall else None
+        b["reopen_rate"] = round(sum(reop) / len(reop), 3) if reop else None
+    # Per-delivered-tier grouping (verdict mix + reopen rate) - the routing
+    # calibration signal. Emitted only when some record actually carries a tier, so a
+    # non-routed project's summary is byte-identical to before.
+    tiers: dict = {}
+    for rec in unit_recs:
+        t = rec.get("tier_delivered")
+        if not t:
+            continue
+        b = tiers.setdefault(t, {"count": 0, "_reopened": [], "_escalated": [],
+                                  "verdicts": {}})
+        b["count"] += 1
+        if rec.get("reopened") is not None:
+            b["_reopened"].append(str(rec["reopened"]).strip().lower() in ("yes", "true", "1"))
+        if rec.get("escalated") is not None:
+            b["_escalated"].append(str(rec["escalated"]).strip().lower() in ("yes", "true", "1"))
+        v = rec.get("critic_verdict")
+        if v:
+            b["verdicts"][v] = b["verdicts"].get(v, 0) + 1
+    if tiers:
+        for b in tiers.values():
+            reop, esc = b.pop("_reopened"), b.pop("_escalated")
+            b["reopen_rate"] = round(sum(reop) / len(reop), 3) if reop else None
+            b["escalation_rate"] = round(sum(esc) / len(esc), 3) if esc else None
+        out["by_tier"] = tiers
+    return out
+
+
+def _constants(pairs: list[str] | None) -> dict:
+    """The estimator that produced a forecast, as `KEY=INT` pairs.
+
+    Deliberately open: the estimator's shape has changed twice already, and a recorder that
+    hardcodes today's field names cannot record yesterday's forecast or tomorrow's. What the log
+    needs is that the estimator be NAMED on the row, not that it be one particular estimator.
+    """
+    out: dict = {}
+    for pair in pairs or []:
+        key, _, val = str(pair).partition("=")
+        key = key.strip()
+        if not key or _int(val) is None:
+            raise ValueError(f"--constant expects KEY=INT, got {pair!r}")
+        out[key] = _int(val)
+    return out
+
+
+def cmd_forecast(args: argparse.Namespace) -> int:
+    """Record ONE plan-time forecast by hand. `sprint plan` records the batch's forecasts
+    itself; this exists so a forecast recoverable from the record (an old retro's own
+    estimate-vs-actual table) can be restored, and so the log can be inspected."""
+    points = sdlc_md.check_points(args.points) if args.points is not None else None
+    rec = {"id": args.id, "tokens": _int(args.tokens), "points": points,
+           "estimator": args.estimator, "size_gate": args.size_gate,
+           "planned_at": args.planned_at or sdlc_md.now_iso8601(),
+           "constants": _constants(args.constant)}
+    res = record_forecasts(args.root, [rec])
+    if args.format == "json":
+        print(json.dumps(res, indent=2))
+        return 0
+    if res["recorded"]:
+        size = f", {points} point(s)" if points else ""
+        print(f"recorded forecast {args.id} ({rec['tokens']:,} tokens{size}) -> {res['path']}")
+    else:
+        print(f"forecast {args.id} already recorded, unchanged - the first one stands")
+    if points is not None and (warn := sdlc_md.points_split_warning(points)):
+        print(warn, file=sys.stderr)
+    return 0
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    res = migrate(args.root)
+    if args.format == "json":
+        print(json.dumps(res, indent=2))
+        return 0
+    if not res["moved"]:
+        print("nothing to migrate - no .local/ evidence log is left behind")
+        return 0
+    for m in res["moved"]:
+        print(f"moved {m['records']} record(s): {m['from']} -> {m['to']}")
+    print("the evidence is now under sdlc-studio/retros/evidence/ - git add it, and it will "
+          "survive a fresh clone")
+    return 0
+
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    res = backfill_project(args.root, args.project)
+    if args.format == "json":
+        print(json.dumps(res, indent=2))
+        return 0
+    if not res["stamped"]:
+        print(f"nothing to backfill - every record already names a project ({res['project']})")
+        return 0
+    for f in res["files"]:
+        print(f"stamped {f['stamped']} record(s) in {f['file']} ({f['already']} already named)")
+    print(f"project '{res['project']}' stamped on {res['stamped']} record(s) - git add the "
+          f"evidence dir; a pooled row is now attributable")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    if getattr(args, "forecasts", False):
+        recs = read_forecasts(args.root)
+        if args.format == "json":
+            print(json.dumps(recs, indent=2))
+            return 0
+        for r in recs:
+            c = r.get("constants") or {}
+            est = " ".join(f"{k}={v}" for k, v in sorted(c.items())) or "-"
+            pts = r.get("points")
+            print(f"  {r['id']:8} est={r.get('tokens', 0):>9,}  "
+                  f"points={pts if pts is not None else '-':>3}  [{est}]  "
+                  f"planned {r.get('planned_at', '-')}")
+        print(f"{len(recs)} forecast record(s); the FIRST for a unit is its plan-time forecast")
+        return 0
+    recs = read_all(args.root)
+    if getattr(args, "summary", False):
+        s = summarise(recs)
+        if args.format == "json":
+            print(json.dumps(s, indent=2))
+        else:
+            by_tier = s.pop("by_tier", None)
+            unit_n = sum(b["count"] for b in s.values())
+            print(f"{unit_n} unit record(s), {len(s)} type(s)")
+            for t, b in sorted(s.items()):
+                verdicts = ", ".join(f"{k}:{n}" for k, n in sorted(b["verdicts"].items())) or "-"
+                print(f"  {t:8} count={b['count']} mean_iterations={b['mean_iterations']} "
+                      f"mean_wall_time_s={b['mean_wall_time_s']} "
+                      f"reopen_rate={b['reopen_rate']} verdicts[{verdicts}]")
+            if by_tier:
+                print("by tier delivered:")
+                for t, b in sorted(by_tier.items()):
+                    verdicts = ", ".join(f"{k}:{n}" for k, n in sorted(b["verdicts"].items())) or "-"
+                    print(f"  {t:8} count={b['count']} reopen_rate={b['reopen_rate']} "
+                          f"escalation_rate={b['escalation_rate']} verdicts[{verdicts}]")
+        return 0
+    print(json.dumps(recs, indent=2) if args.format == "json" else f"{len(recs)} record(s)")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Run telemetry recorder.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("record", help="Append one run-outcome record.")
+    r.add_argument("--id"); r.add_argument("--type"); r.add_argument("--iterations")
+    r.add_argument("--wall-time-s", dest="wall_time_s"); r.add_argument("--stages")
+    r.add_argument("--verdict"); r.add_argument("--complexity"); r.add_argument("--churn")
+    r.add_argument("--reopened"); r.add_argument("--tokens")
+    r.add_argument("--tier-recommended", dest="tier_recommended")
+    r.add_argument("--tier-delivered", dest="tier_delivered")
+    r.add_argument("--model"); r.add_argument("--escalated")
+    r.add_argument("--attempt", action="append", metavar="MODEL:TOKENS",
+                   help="one model invocation on this unit, e.g. haiku:1000. Repeatable and "
+                        "ORDER-PRESERVING: a cheap-first unit that escalated records both "
+                        "attempts, and the true cost is their SUM (unit_cost), not the last line")
+    r.add_argument("--attempts", metavar="JSON",
+                   help="the per-attempt list as a JSON array of {model, tokens} - the "
+                        "structured form of --attempt for a caller that already holds the list")
+    r.add_argument("--root", default="."); r.add_argument("--format", choices=("text", "json"), default="text")
+    r.set_defaults(func=cmd_record)
+    f = sub.add_parser("forecast", help="Record one plan-time token forecast (the estimate side "
+                                        "of the ratio; `sprint plan` records a batch's itself).")
+    f.add_argument("--id", required=True); f.add_argument("--tokens", required=True)
+    f.add_argument("--points", help="the size the plan recorded, on the modified Fibonacci "
+                                    "scale (1, 2, 3, 5, 8, 13, 20). Velocity and the "
+                                    "tokens-per-point rate are both derived from it")
+    f.add_argument("--estimator", help="WHO made the size call (default: unattributed - it is "
+                                       "never inferred from whoever filed the unit)")
+    f.add_argument("--size-gate", dest="size_gate",
+                   choices=("compulsory", "voluntary"),
+                   help="was the size compulsory at filing, or freely given? The coercion "
+                        "hazard is only testable if the compulsion is on the record")
+    f.add_argument("--constant", action="append", metavar="KEY=INT",
+                   help="the estimator in force at plan time, e.g. TOKENS_PER_POINT=25000. "
+                        "Repeatable. Recorded, never recomputed: a row must say which model "
+                        "produced its number, or it judges nothing")
+    f.add_argument("--planned-at", dest="planned_at", help="when the plan was made (ISO8601)")
+    f.add_argument("--root", default=".")
+    f.add_argument("--format", choices=("text", "json"), default="text")
+    f.set_defaults(func=cmd_forecast)
+    s = sub.add_parser("show", help="Print recorded records.")
+    s.add_argument("--summary", action="store_true",
+                   help="aggregate per type: count, mean iterations/wall-time, reopen rate, verdict mix")
+    s.add_argument("--forecasts", action="store_true",
+                   help="print the plan-time forecast log instead of the measured actuals")
+    s.add_argument("--root", default="."); s.add_argument("--format", choices=("text", "json"), default="text")
+    s.set_defaults(func=cmd_show)
+    m = sub.add_parser("migrate", help="move a pre-existing .local/ evidence log into the "
+                                       "committed evidence dir (no loss; verified)")
+    m.add_argument("--root", default=".")
+    m.add_argument("--format", choices=("text", "json"), default="text")
+    m.set_defaults(func=cmd_migrate)
+    b = sub.add_parser("backfill", help="stamp `project` on records that predate the field "
+                                        "(no loss; verified). The project is resolved from the "
+                                        "repo unless --project overrides it")
+    b.add_argument("--project", help="the project to stamp (default: resolved from the repo)")
+    b.add_argument("--root", default=".")
+    b.add_argument("--format", choices=("text", "json"), default="text")
+    b.set_defaults(func=cmd_backfill)
+    sdlc_md.add_global_root(p)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    # Resolve the root ONCE and write it back, so every verb below anchors on the tree the
+    # run belongs to. The family default `.` means "work it out from here", not "the cwd
+    # is the project": otherwise a run from a subdirectory acts on a stray tree and exits 0.
+    args.root = str(sdlc_md.resolve_root(args))
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,122 @@
+<!--
+Load when: /sdlc-studio mutation, code verify --mutation, or "can this test fail?"
+Dependencies: SKILL.md (always loaded first)
+Related: reference-test-best-practices.md#mutation-check, reference-scripts.md, help/verify.md
+-->
+
+# /sdlc-studio mutation - an opt-in probe: can these tests fail?
+
+## You can just ask
+
+| Just say... | Runs |
+| --- | --- |
+| "Would these tests actually catch a break in target.py?" | `mutation.py run --files target.py --test "<suite>"` |
+| "Mutation-check what this release changed" | `mutation.py run --since v3.3.0 --test "<suite>"` |
+| "Mutation-check this story's surface" | `mutation.py run --story US0051 --test "<suite>"` |
+| "Which of these tests assert nothing?" | `mutation.py prefilter --tests tests/*.py` |
+| "What did that run cost and find?" | `mutation.py yield --run <MRUN-id>` |
+| "I am about to rewrite source in place" | `mutation.py window open --owner <who> --paths <files>` |
+
+Mutation testing is opt-in: run it when you want to know, and no gate reads its result.
+`verify_ac` shows an AC's tests **pass**; this probe asks whether they can **fail**. It applies
+a declared, bounded fault set to the surface, re-runs the tests per mutation, and reports
+**killed** (good - the test pins the behaviour) vs **survived** (a finding worth reading - the
+test stayed green over broken code).
+
+Four verbs: `run` mutates and reports, `yield` reads back what one run cost and what was filed
+from it, `window` declares (or clears, or reports) that a process is rewriting source files in
+place so a concurrent commit is refused rather than staging a half-mutated tree - `run` opens
+and closes its own - and `prefilter` lists test files with no recognisable assertion.
+
+## Quick Reference
+
+```bash
+python3 <skill>/scripts/mutation.py run --files src/loader.py --test "python3 -m unittest discover"
+python3 <skill>/scripts/mutation.py run --since HEAD~1 --test "npm test"
+python3 <skill>/scripts/mutation.py run --story US0051 --test "pytest -q"
+python3 <skill>/scripts/mutation.py yield --run MRUN-20260925T090000-a1b2c3
+python3 <skill>/scripts/mutation.py prefilter --tests tests/test_*.py
+python3 <skill>/scripts/mutation.py window open --owner "a reviewer" --paths src/loader.py \
+    --note "hand-applying a mutant"
+python3 <skill>/scripts/mutation.py window status
+python3 <skill>/scripts/mutation.py window close --owner "a reviewer"
+```
+
+## What it does
+
+1. Enumerates mutations over the surface from the declared fault classes -
+   `invert-guard`, `stub-return-null`, `unset-delivered-field`, `no-op-mapper` - using
+   per-language pattern profiles (`.py`, `.js`/`.ts`, `.go` invert-guard).
+2. Confirms the baseline is green first. A red or broken baseline cannot judge anything, so
+   the run **refuses** immediately - no mutant is applied, the report is marked `refused` with
+   the remedy, and the exit is non-zero. (Running the mutants over red code would only produce
+   a worthless all-`error` report a run could mistake for done.)
+3. Applies one mutation at a time, re-runs `--test`, restores the original bytes, and
+   verdicts it killed / survived / error. A kill (`TaskStop`/SIGTERM) or crash mid-mutant
+   still restores via an atexit and SIGTERM handler, so a run never strands a mutant on disk.
+   Against a SIGKILL those handlers never run, so the original bytes are also persisted to
+   `sdlc-studio/.local/mutation-inflight.json` BEFORE each mutant lands: the next run
+   restores from that sidecar first (reported as `recovered`), so a stranded mutant is
+   never read back as the original. An unreadable sidecar refuses the run and names the
+   git restore path.
+4. Writes `sdlc-studio/.local/mutation-report.json`, the **latest run** - every mutant's
+   verdict and the git rev - last-write-wins, and appends one row to
+   `sdlc-studio/.local/mutation-series.jsonl`, what the run cost and what it found.
+   `mutation.py yield --run <id>` reads that row back beside the artefacts filed from the run.
+   No per-target ledger is kept, and no gate lane reads either file: mutation testing is this
+   command, run when you want it, and `gate.py --only mutation` is refused as an unknown lane.
+5. Names what the survivors were measured against: the report and the text output carry
+   the test files the command statically resolves to (`selected_tests`; UNRESOLVED when
+   no file, directory or module token parses - never a guessed empty set), and a
+   **WARNING** per test file that references a target module but sits outside that
+   selection - the manufactured-survivor condition: a run scoped below the target's real
+   coverage over-reports absence, so a survivor from a narrow run must be read against
+   the recorded command (`test_cmd` in the JSON), not as proof of a missing test. The
+   warning is advisory and never changes the exit code: a deliberately narrow run stays
+   legal, and stays honest about what it covered. Two reading notes: selection is FILE
+   granularity (`--ignore`/`--deselect` paths are honoured as unselected; a `-k` filter
+   inside a selected file is invisible to it), and the reference check matches the target's
+   module name as a bare word, so a file merely mentioning it can warn - a false warning
+   costs reading time, never a verdict.
+
+## Reading the verdicts
+
+- **killed** - the test failed against the mutant: it pins the behaviour. Only viable
+  mutants can kill: a Python mutant is compile-checked first, and one that cannot parse
+  records **unviable** (evidence of nothing - any suite, however vacuous, fails on it).
+- **survived** - the test stayed green over broken code: a finding. Triage note: a
+  code-shaped line inside a docstring can mutate without changing behaviour and
+  false-survive on non-Python files; Python string interiors are excluded automatically.
+- **error** - the runner itself broke on a mutant (missing command, timeout); never counted
+  as a kill. (A red baseline does not reach this state - it refuses the whole run up front.)
+- The report records the **git rev**, which attributes the survivor counts to the run that
+  produced them.
+
+## Retired verbs
+
+`register`, `retract`, `retractions` and `audit` recorded hand-applied mutants in a per-target
+ledger and read it back. Nothing reads a ledger any more, so each is refused by name and points
+at `mutation.py run`: to see whether a test can fail, run the mutants and read the verdicts.
+
+## Honest degrade
+
+- A file/class the profiles cannot mutate is listed **un-checked**, never passed.
+- `--max-mutations N` (default `quality.mutation_max`, else 25) bounds cost; the budget
+  distributes round-robin with files as the fast axis (every file gets coverage before
+  any class repeats), and enumerations beyond the ceiling are counted as **truncated** -
+  un-checked coverage, not clean.
+- With `--since REF` the ceiling is spent on the **changed lines first**, and only the
+  remainder reaches untouched code - otherwise a low ceiling on a large file samples
+  peripheral helpers and reports a kill rate about code nobody edited. The report carries
+  `diff_mutations` / `diff_applied` / `diff_covered`, and a run that could not reach every
+  mutant on the diff says so rather than leaving it to be inferred from the truncation count.
+- Lines inside docstrings/multi-line strings are not enumerated (they mutate nothing
+  and would false-survive); a file the tokeniser cannot parse has that exclusion
+  skipped and NOTED in the un-checked list.
+- Exit is non-zero on any survivor or error.
+
+## See Also
+
+- `reference-test-best-practices.md#mutation-check` - the discipline this probes
+- `reference-scripts.md` - the full catalogue entry
+- `help/verify.md` - the passing half of the claim

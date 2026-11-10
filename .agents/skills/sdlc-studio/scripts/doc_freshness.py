@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""Advisory check: do the project's state documents still tell the truth?
+
+`sdlc-studio/reviews/LATEST.md` is the project's state anchor - read first after every reset. It
+drifts silently: it once claimed 606 tests (was 622), ~66 disclosure advisories (was 0), and a
+workstream "deferred" (was shipped), and nothing caught it. This check compares the facts LATEST.md
+*claims* against reality and flags the mismatches. The same treatment is given to the census counts
+and release baseline of the TRD, PRD and TSD, which rotted the same way. Advisory (never blocks) and
+skill-only (no-op where there is no SKILL.md). It only checks a fact a document actually states - it
+never demands one, and it reports the claims it could not find as UNCHECKED rather than counting
+them as green.
+"""
+from __future__ import annotations
+
+import argparse
+
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import sdlc_md  # noqa: E402
+
+
+def _skill_dir(root: Path) -> Path:
+    return root / ".claude" / "skills" / "sdlc-studio"
+
+
+def _read(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _true_version(skill_dir: Path) -> str | None:
+    m = re.search(r'^\s*version:\s*"([\d.]+)"', _read(skill_dir / "SKILL.md"), re.M)
+    return m.group(1) if m else None
+
+
+def _true_test_count(skill_dir: Path) -> int:
+    tdir = skill_dir / "scripts" / "tests"
+    return sum(len(re.findall(r"^\s*def test_", _read(f), re.M))
+               for f in sorted(tdir.glob("test_*.py"))) if tdir.is_dir() else 0
+
+
+def _true_disclosure_count(root: Path) -> int | None:
+    try:
+        import disclosure
+        r = disclosure.check(root)
+        return len(r["findings"]) if r["applicable"] else None
+    except Exception:  # noqa: BLE001 - the freshness check must never crash the gate
+        return None
+
+
+# LATEST.md phrasings that assert a sign-off or closure is still OUTSTANDING. Kept to the words
+# that mean "not done yet" so the check never fires on a document reporting the opposite (a
+# sign-off that LANDED, a run that CLOSED). If none of these match, the anchor states no such
+# claim and this check stays silent - it only ever checks a fact the document actually makes.
+_SIGNOFF_OUTSTANDING = (
+    re.compile(r"sign-?off\b[^.\n]{0,40}?\b(?:owed|outstanding|pending|awaited|awaiting|"
+               r"not\s+landed|still\s+needed)\b", re.I),
+    re.compile(r"\b(?:owed|outstanding|pending|awaiting)\b[^.\n]{0,25}?sign-?off\b", re.I),
+    re.compile(r"\bnot\s+(?:yet\s+)?closed\b", re.I),
+    re.compile(r"\bunreviewed\b", re.I),
+)
+
+
+def _claims_signoff_outstanding(text: str) -> bool:
+    return any(p.search(text) for p in _SIGNOFF_OUTSTANDING)
+
+
+def _close_landed(root: Path, state: dict) -> bool:
+    """True when the run's own record says the close it describes has LANDED: the run carries an
+    `ended_at` (or a terminal outcome), and `close_owed` reports nothing still owed. Both are read
+    from state the anchor claims to summarise, so a LATEST.md still calling the sign-off owed is
+    contradicted by the very run it narrates. When a close is GENUINELY owed the anchor is right,
+    so this returns False and nothing is flagged."""
+    try:
+        from lib import run_state
+        ended = bool(state.get("ended_at")) or state.get("outcome") in run_state.CLOSED
+    except Exception:  # noqa: BLE001 - never crash the gate
+        ended = bool(state.get("ended_at"))
+    if not ended:
+        return False
+    try:
+        import close_owed
+        rep = close_owed.owed(root)
+        if rep.get("owed") or rep.get("velocity_owed"):
+            return False
+    except Exception:  # noqa: BLE001 - close_owed is advisory here; absence is not a landing claim
+        pass
+    return True
+
+
+# --- claim-anchored census counts ---------------------------------------------------------------
+# The predecessor guard read the FIRST match of a count pattern anywhere in the document and
+# compared it as a floor, so an exact claim that had rotted upward ("58 scripts", 67 present)
+# satisfied `actual >= claimed` and the guard reported green on the very numbers it existed to
+# catch. Two rules replace that, and both are properties of the CLAIM rather than of the file:
+#
+#   * every occurrence of a claim is checked, not the first - a claim is a sentence, and each
+#     sentence that makes it is judged on its own, so a stale restatement cannot shelter behind a
+#     correct one earlier in the file;
+#   * the comparison form is read off the claim's own wording - "60+ scripts" is a floor, "58
+#     scripts" is an exact count - so a number written as exact is judged as exact.
+#
+# Nothing here consults a file mtime or a "last verified" stamp. The verdict is computed from the
+# measured value, so a stale number cannot pass by sitting in a recently-touched or freshly stamped
+# file, and a document nobody checked is not mistaken for one whose counts match: a claim the
+# document does not make is returned UNCHECKED, never counted as a pass.
+_CENSUS_MEASURES = {
+    "scripts": lambda sd: len(list((sd / "scripts").glob("*.py"))),
+    "reference files": lambda sd: len(list(sd.glob("reference-*.md"))),
+    "help files": lambda sd: len(list((sd / "help").glob("*.md"))),
+}
+# A count preceded by one of these words ("about 50 scripts", "~50 scripts") is a band around the
+# number, not a pin on it, so it is judged as one rather than as an exact count.
+_APPROX = r"(?P<approx>\b(?:about|around|roughly|approximately)\s+|~\s*)?"
+_CENSUS_CLAIMS = {
+    "scripts": re.compile(_APPROX + r"(?P<n>\d+)(?P<floor>\+?)\s+scripts\b", re.I),
+    "reference files": re.compile(_APPROX + r"(?P<n>\d+)(?P<floor>\+?)\s+reference\s+files?\b",
+                                  re.I),
+    "help files": re.compile(_APPROX + r"(?P<n>\d+)(?P<floor>\+?)\s+help\s+files?\b", re.I),
+}
+# The release a document names as its baseline ("Coverage: v6.1.0 as cut, plus ..."), read as the
+# dotted number after the `v`. It must equal SKILL.md's version: a baseline whose major, minor or
+# patch figure differs is reported as stale.
+_BASELINE_CLAIM = re.compile(r"\bCoverage:\**\s*v(?P<version>\d+(?:\.\d+)+)", re.I)
+# The documents the census reads. Each is judged on the claims it makes itself.
+CENSUS_DOCUMENTS = ("sdlc-studio/trd.md", "sdlc-studio/prd.md", "sdlc-studio/tsd.md")
+# A floor claim ("60+") is honest while reality sits above it, but a floor left far enough behind
+# is as stale as a wrong exact number - it was the floor reading that let "58 scripts" pass at 67.
+# An approximate claim ("about 50") is held to the same ratio either side of its number. The band
+# is stated here rather than left implicit so the finding can name the rule it applied.
+_FLOOR_STALE_RATIO = 1.25
+
+# A document's revision history NARRATES the claims it used to make, usually quoting the stale
+# number beside its correction. Those are not current assertions, so the census scan stops at the
+# history heading; scanning it would make every correction re-report the defect it fixed.
+_HISTORY_HEADING = re.compile(r"^#{1,3}\s+(?:Revision\s+History|Changelog)\s*$", re.I | re.M)
+
+
+def _current_body(text: str) -> str:
+    m = _HISTORY_HEADING.search(text)
+    return text[: m.start()] if m else text
+
+
+def _claim_quote(text: str, m: re.Match) -> str:
+    """The claim's own words - a bounded window around the match, so a finding names the sentence
+    that is wrong rather than a line number that moves the next time the file is edited."""
+    return " ".join(text[max(0, m.start() - 40): m.end() + 40].split())
+
+
+def census_claims(repo_root: Path | str = ".", doc: str = "sdlc-studio/trd.md") -> dict:
+    """Check every census count and release baseline `doc` currently states against the tree.
+
+    Returns {checked, unchecked, findings, applicable, document}. `checked` carries one record per
+    occurrence, each holding the measured `actual` alongside the `claimed` value - the verdict is
+    derived from that number, which is what makes 'the counts match' distinguishable from 'nobody
+    looked'. `unchecked` names the claims the document does not make, and the baseline when
+    SKILL.md states no version to judge it by.
+    """
+    root = Path(repo_root)
+    skill_dir = _skill_dir(root)
+    path = root / doc
+    if not (skill_dir / "SKILL.md").exists() or not path.exists():
+        return {"checked": [], "unchecked": [], "findings": [], "applicable": False,
+                "document": doc}
+    body = _current_body(_read(path))
+    checked: list[dict] = []
+    unchecked: list[str] = []
+    findings: list[dict] = []
+    for name, pattern in _CENSUS_CLAIMS.items():
+        matches = list(pattern.finditer(body))
+        if not matches:
+            unchecked.append(name)
+            continue
+        actual = _CENSUS_MEASURES[name](skill_dir)
+        for m in matches:
+            claimed, is_floor = int(m.group("n")), m.group("floor") == "+"
+            if is_floor:
+                form = "floor"
+                ok = claimed <= actual < claimed * _FLOOR_STALE_RATIO
+                why = (f"a floor claim holds while the count sits in [{claimed}, "
+                       f"{claimed * _FLOOR_STALE_RATIO:g})")
+            elif m.group("approx"):
+                form = "approximate"
+                low, high = claimed / _FLOOR_STALE_RATIO, claimed * _FLOOR_STALE_RATIO
+                ok = low <= actual < high
+                why = f"an approximate claim holds while the count sits in [{low:g}, {high:g})"
+            else:
+                form, ok = "exact", claimed == actual
+                why = "an exact claim holds only on the exact count"
+            record = {"claim": name, "claimed": claimed, "actual": actual, "form": form, "ok": ok,
+                      "quote": _claim_quote(body, m)}
+            checked.append(record)
+            if not ok:
+                stated = " ".join(f"{m.group('approx') or ''}{m.group('n')}{m.group('floor')}"
+                                  .split())
+                findings.append({
+                    "kind": "census-drift",
+                    "detail": (f"{doc} claims {stated} {name}; {actual} counted in the "
+                               f"workspace ({why}) - stale claim: \"{record['quote']}\""),
+                })
+    baselines = list(_BASELINE_CLAIM.finditer(body))
+    version = _true_version(skill_dir)
+    if not baselines or version is None:
+        unchecked.append("baseline")
+        baselines = []
+    for m in baselines:
+        claimed_version = m.group("version")
+        record = {"claim": "baseline", "claimed": claimed_version, "actual": version,
+                  "form": "exact", "ok": claimed_version == version,
+                  "quote": _claim_quote(body, m)}
+        checked.append(record)
+        if not record["ok"]:
+            findings.append({
+                "kind": "census-drift",
+                "detail": (f"{doc} names v{claimed_version} as its baseline; SKILL.md is "
+                           f"{version} (a baseline holds only on the release SKILL.md's version "
+                           f"names) - stale claim: \"{record['quote']}\""),
+            })
+    return {"checked": checked, "unchecked": unchecked, "findings": findings,
+            "applicable": True, "document": doc}
+
+
+def check(repo_root: Path | str = ".") -> dict:
+    """Findings (all advisory). {findings, ok, applicable, census}, where `census` holds one
+    `census_claims` result per document in CENSUS_DOCUMENTS. Applicable only on the skill repo
+    with a LATEST.md or one of those documents present; only facts the documents state are
+    checked."""
+    root = Path(repo_root)
+    skill_dir = _skill_dir(root)
+    latest = root / "sdlc-studio" / "reviews" / "LATEST.md"
+    census = [census_claims(root, doc) for doc in CENSUS_DOCUMENTS]
+    if not (skill_dir / "SKILL.md").exists() or not (
+            latest.exists() or any(c["applicable"] for c in census)):
+        return {"findings": [], "ok": True, "applicable": False, "census": census}
+    findings: list[dict] = [f for c in census for f in c["findings"]]
+    text = _read(latest) if latest.exists() else ""
+
+    def claim(pattern: str):
+        m = re.search(pattern, text, re.I)
+        return m.group(1) if m else None
+
+    # version
+    cv, tv = claim(r"project version:\**\s*([\d.]+)"), _true_version(skill_dir)
+    if cv and tv and cv != tv:
+        findings.append({"kind": "version-drift",
+                         "detail": f"LATEST.md says version {cv}; SKILL.md is {tv}"})
+    # test count
+    ct = claim(r"([\d,]+)\s+script tests")
+    if ct:
+        ct_n, tt = int(ct.replace(",", "")), _true_test_count(skill_dir)
+        if ct_n != tt:
+            findings.append({"kind": "test-count-drift",
+                             "detail": (f"LATEST.md says {ct_n} tests; {tt} test functions "
+                                        f"counted statically in scripts/tests (the runner may "
+                                        f"report fewer for skips/subclasses - claim this number)")})
+    # disclosure count
+    cd = claim(r"disclosure[^\d]{0,8}(\d+)")
+    if cd is not None:
+        td = _true_disclosure_count(root)
+        if td is not None and int(cd) != td:
+            findings.append({"kind": "disclosure-drift",
+                             "detail": f"LATEST.md says disclosure {cd}; actual is {td}"})
+    # the load-bearing claim a resuming agent acts on - has the owed sign-off landed - compared
+    # against state the tool already holds; the document being wrong here sends a fresh context
+    # looking for a signature that arrived.
+    try:
+        from lib import run_state
+        state = run_state.read(root)
+    except Exception:  # noqa: BLE001 - an unreadable run state must not crash the advisory gate
+        state = {}
+    # sign-off / closure the anchor calls outstanding, once the run says it landed
+    if _claims_signoff_outstanding(text) and _close_landed(root, state):
+        findings.append({"kind": "signoff-drift",
+                         "detail": ("LATEST.md still calls a sign-off or closure outstanding, but "
+                                    "the run carries an end and close_owed reports none owed - the "
+                                    "signature it says is owed has landed. A resuming agent will "
+                                    "hunt for an owed sign-off that arrived")})
+    # anchor-window ceiling: the anchor is re-read at every session start, so
+    # it must stay a WINDOW (current state + one-line history), not a ledger
+    # of full past-sprint paragraphs duplicating the retros
+    from lib import sdlc_md
+    try:
+        ceiling = int(sdlc_md.project_override(root, "docs.latest_max_lines", 80))
+    except (TypeError, ValueError):
+        ceiling = 80
+    n_lines = len(text.splitlines())
+    if n_lines > ceiling:
+        over = n_lines - ceiling
+        longest = _longest_sections(text)
+        where = ""
+        if longest:
+            named = "; ".join(f"'{title}' ({count} lines)" for title, count in longest)
+            where = f" The longest sections are {named} - trim there first."
+        findings.append({"kind": "anchor-ledger",
+                         "detail": (f"LATEST.md is {n_lines} lines, {over} over the "
+                                    f"{ceiling}-line ceiling (docs.latest_max_lines), and is "
+                                    f"re-read every session start - move past-sprint "
+                                    f"paragraphs to their retros and keep one History line "
+                                    f"each.{where}")})
+    return {"findings": findings, "ok": not findings, "applicable": True, "census": census}
+
+
+def _longest_sections(text: str, top: int = 3) -> list[tuple[str, int]]:
+    """The `top` longest markdown sections of `text`, each as (title, line count).
+
+    A section runs from one heading to the next at the same or a shallower level; its count
+    includes the heading line, so the counts sum back to the document and the refusal can
+    aim a trim rather than leave it to guesswork. Lines before the first heading are booked
+    against a synthetic 'preamble' so nothing is uncounted."""
+    lines = text.splitlines()
+    sections: list[tuple[str, int]] = []
+    title = "(preamble)"
+    count = 0
+    started = False
+    for line in lines:
+        m = re.match(r"^(#{1,6})\s+(.*\S)\s*$", line)
+        if m:
+            if started or count:
+                sections.append((title, count))
+            title = m.group(2).strip()
+            count = 1
+            started = True
+        else:
+            count += 1
+    if started or count:
+        sections.append((title, count))
+    # Ties broken by first appearance so the order is stable for a test to assert.
+    ranked = sorted(range(len(sections)), key=lambda i: (-sections[i][1], i))
+    return [sections[i] for i in ranked[:top]]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The parser, as a module-level function so the surface can be enumerated without
+    running the command. `lib/surface.py` walks every one of these; a parser built inside
+    `main()` is invisible to it, which is a verb no coverage number can count."""
+    ap = argparse.ArgumentParser(description="Flag stale facts in LATEST.md (advisory).")
+    ap.add_argument("--root", default=".")
+    sdlc_md.add_format_arg(ap)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    # Resolve the root ONCE and write it back, so every verb below anchors on the tree the
+    # run belongs to. The family default `.` means "work it out from here", not "the cwd
+    # is the project": otherwise a run from a subdirectory acts on a stray tree and exits 0.
+    args.root = str(sdlc_md.resolve_root(args))
+    r = check(args.root)
+    if args.format == "json":
+        print(json.dumps(r, indent=2))
+        return 0  # advisory: report, never fail
+    if not r["applicable"]:
+        print("doc-freshness: N/A (not the skill repo, or no state documents)")
+        return 0
+    if r["ok"]:
+        print("doc-freshness: state documents are fresh")
+    else:
+        print(f"doc-freshness: {len(r['findings'])} stale claim(s):")
+        for f in r["findings"]:
+            print(f"  [{f['kind']}] {f['detail']}")
+    # Say what was actually verified. A silent green cannot tell a document whose counts were
+    # measured and matched from one that states no count at all, and the two are different facts.
+    for census in r.get("census") or []:
+        if not census.get("applicable"):
+            continue
+        passed = sum(1 for c in census["checked"] if c["ok"])
+        print(f"  census: {passed}/{len(census['checked'])} claim(s) in "
+              f"{census['document']} verified against the tree"
+              + (f"; not stated (unchecked): {', '.join(census['unchecked'])}"
+                 if census["unchecked"] else ""))
+    return 0  # advisory: report, never fail
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

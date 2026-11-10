@@ -1,0 +1,2334 @@
+#!/usr/bin/env python3
+"""Deterministic artifact create + close cascade.
+
+`new` creates ANY numbered/indexed artifact (epic, story, plan, bug, cr, rfc, test-spec,
+workflow) as a structured scaffold AND wires it: allocate a collision-free id, render a
+valid file (required sections so it passes validate), append the index data-table row
+(built generically from that index's own header), recompute counts, and wire cross-links
+(a story into its parent epic's Story Breakdown). `close` terminal-transitions an artifact
+and cascades (reusing transition). The agent fills the scaffold's content; the wiring is
+deterministic. This replaces the ~10-step hand cascade (the v2.x friction).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import conventions, sdlc_md, tiers  # noqa: E402
+import file_finding  # noqa: E402  (reuse _slug, _next_number, append_index_row)
+import reconcile  # noqa: E402
+import triage_noise  # noqa: E402  (v3 triage noise controls; dormant on v2)
+import transition  # noqa: E402
+
+# The disp-id form per type (cr/rfc carry a dash: `CR-0001`, every other type `US0001`).
+# The one per-type fact this module owns - the statuses beside it are NOT restated here.
+_DASH = {
+    "epic": False,
+    "story": False,
+    "plan": False,
+    "test-spec": False,
+    "workflow": False,
+    "bug": False,
+    "cr": True,
+    "rfc": True,
+    "issue": False,
+    "charter": False,
+}
+
+# Per-type create status, terminal (close) status, and disp-id form. The two statuses are
+# DERIVED from the status vocabulary in `lib.sdlc_md` - the one authority the validator, the
+# transition gate and the archiver already read - so a vocab change lands in one file rather
+# than silently drifting between three copies of the same table.
+SPEC = {
+    t: {"status": sdlc_md.create_status(t),
+        "terminal": sdlc_md.default_terminal_status(t),
+        "dash": dash}
+    for t, dash in _DASH.items()
+}
+_PREFIX_TYPE = {sdlc_md.ARTIFACT_TYPES[t][1].upper(): t for t in SPEC}
+
+# Scaffold richness, lean to rich - from lib.tiers, the one authority the creator, the
+# validator, the transition gate and the conformance backstop all share. `planning` is the
+# pre-implementation tier: the sections a story must settle to be planned and prioritised
+# (ACs with Verify, scope, technical notes) and none of the
+# implementation furniture. Creation stamps ONLY `planning` (`> **Template:** planning`); a
+# `full` stamp is written by `promote` alone, and only after it has added the sections - which
+# is what lets the gate check a `full` claim instead of believing it.
+MINIMAL, PLANNING, FULL = tiers.MINIMAL, tiers.PLANNING, tiers.FULL
+TEMPLATE_TIERS = tiers.TEMPLATE_TIERS
+TIER_FIELD = tiers.TIER_FIELD
+
+
+def _disp(type_: str, n: int) -> str:
+    p = sdlc_md.ARTIFACT_TYPES[type_][1]
+    return f"{p}-{n:04d}" if SPEC[type_]["dash"] else f"{p}{n:04d}"
+
+
+def _schema_v3(root: Path) -> bool:
+    """True when the project opted into schema v3 (`schema_version: 3` in `.config.yaml`).
+    Thin alias for the shared `sdlc_md.is_schema_v3` (one authority; both degrade to v2 on a
+    PyYAML-less machine)."""
+    return sdlc_md.is_schema_v3(root)
+
+
+def _alloc_ids(root: Path, type_: str) -> tuple[str, str]:
+    """(file_id, disp) for a new artifact, era-aware. v2 allocates the next sequential number
+    (file_id `CR0001`, disp `CR-0001`); v3 mints a collision-checked short ULID where the
+    file_id and disp are the single canonical form `BG-01JQK3F8`."""
+    prefix = sdlc_md.ARTIFACT_TYPES[type_][1]
+    if _schema_v3(root):
+        ident = sdlc_md.mint_v3_id(root, type_)  # the one shared era-v3 allocator
+        return ident, ident
+    n = file_finding._next_number(root, type_)
+    return f"{prefix}{n:04d}", _disp(type_, n)
+
+
+def _create_status(type_: str, root: Path) -> str:
+    """The status a freshly-filed artefact starts in. Findings (bug/cr/rfc) land in `inbox`
+    under schema v3, so a different seat triages them into the workflow proper;
+    every other type - and all types under v2 - keeps its per-type SPEC create status."""
+    if type_ in sdlc_md.FINDING_TYPES and _schema_v3(root):
+        return sdlc_md.INBOX_STATUS
+    return SPEC[type_]["status"]
+
+
+def _text(f: dict, key: str, placeholder: str) -> str:
+    """Caller-supplied content for one section, else the scaffold placeholder the agent fills.
+    Free text is prose-safed (markdown-safe plus the metadata-line guard), so a creator never
+    mints a lint-red artefact nor a body line a reader takes for provenance."""
+    val = f.get(key)
+    return file_finding._prose_safe(val) if isinstance(val, str) and val.strip() else placeholder
+
+
+def _list(f: dict, key: str) -> list[str]:
+    """A list field's items. A bare STRING is one item, never one item per character.
+
+    `--fields-file` accepts arbitrary JSON, so `"acs": "the fix holds"` is a shape a caller
+    reaches for. Iterating it character by character produced 31 criteria reading `- [ ] t`,
+    `- [ ] h`, `- [ ] e` at exit 0."""
+    items = f.get(key)
+    if isinstance(items, str):
+        items = [items] if items.strip() else []
+    return [file_finding._md_safe(i) for i in items if str(i).strip()] \
+        if isinstance(items, (list, tuple)) else []
+
+
+#: The refusal a retired `--target` (or a `target` field) meets. The tier was written on every
+#: supplied AC and read by nothing, so it is refused by name rather than silently dropped.
+TARGET_RETIRED = ("the verification-target tier is retired - no gate reads it, and an AC's "
+                  "`Verify:` line is its proof. Omit --target. Nothing was written.")
+
+
+def _refuse_target(f: dict) -> None:
+    """Refuse a story field that asks for the retired verification-target tier."""
+    if str(f.get("target") or "").strip():
+        raise ValueError(TARGET_RETIRED)
+
+
+def _verifiers_of(f: dict) -> list[str]:
+    """The executable checks supplied alongside the ACs, VERBATIM.
+
+    Never markdown-safed. A Verify line is a command `verify_ac` reads back and runs, and
+    markdown-safing an underscore rewrites it: `rg -q my_token src/` becomes
+    ``rg -q `my_token` src/``. For a list-form verb (pytest and friends, `shell=False`) those
+    backticks are only a corrupted literal argument - the check silently stops checking what it
+    says it checks. For a SHELL-backed verb, `_build_command` returns a string run under
+    `shell=True`, and the same rewrite is command substitution: the backticked token executes.
+    Verbatim is the only form that is both correct and safe. A line break is refused - it would
+    inject a second directive line into the AC block, and only the first is the one anyone read.
+    That refusal is the shared one (`require_single_line`), so a Verify expression and every
+    other single-line field are judged by one rule and one character class.
+
+    Positional, as `file_finding.criteria_block` reads it: a blank entry stays an empty slot
+    (a criterion with no verifier), so the verifiers after it keep their own criteria. Every
+    renderer writes no Verify line for an empty slot.
+    """
+    out: list[str] = []
+    for i, v in enumerate((f.get("verify") or []), 1):
+        s = str(v)
+        out.append(sdlc_md.require_single_line(f"verify[{i}]", s.strip()) if s.strip() else "")
+    return out
+
+
+# A pipe the author escaped for markdown (`\|`) is deliberate; a bare one is the mistake.
+_BARE_PIPE_RE = re.compile(r"(?<!\\)\|")
+
+
+def check_pipe_acs(f: dict) -> list[str]:
+    """Warnings for each `--ac` carrying a bare pipe with no `--verify` at the same position.
+
+    `--ac` pairs with `--verify` POSITIONALLY. Writing the verifier inside the criterion instead,
+    as `criterion|pytest path::Node`, is a natural guess and several other tools take that shape -
+    and it used to be accepted in silence. The whole string then became prose: the
+    identifier-backticking pass rewrote the command into a code span, the pipe stayed embedded in
+    the criterion text, and the artefact shipped with no `Verify:` line the runner could ever see.
+    An AC that reads as groomed but carries no executable check is worse than one that is refused.
+
+    Advisory by design, and positional: a criterion whose position DOES carry a `--verify` is left
+    alone, so a correctly-paired pair is byte-identical to what it always was and no working path
+    changes. Returns the notes; the caller prints them (a library that prints leaks into every
+    caller)."""
+    acs = _list(f, "acs")
+    if not acs:
+        return []
+    supplied = len([v for v in (f.get("verify") or []) if str(v).strip()])
+    notes: list[str] = []
+    for i, a in enumerate(acs, 1):
+        if i <= supplied or not _BARE_PIPE_RE.search(str(a)):
+            continue
+        head = str(a).split("|", 1)[0].strip()
+        notes.append(
+            f"--ac[{i}] carries an unescaped '|' and no --verify was paired with it: "
+            f"{str(a)[:120]!r}. The verifier does not go inside the criterion - pass it as the "
+            f"{i}th --verify (`--ac {head!r} --verify 'pytest ...'`), or escape the pipe as '\\|' "
+            f"if it really is prose. Written as-is it becomes prose with no Verify line.")
+    return notes
+
+
+# What the duplicate check reads, and the bars it fires at. MEASURED against this repo's own
+# backlog (1356 artefacts): 34 candidate pairs, 63 artefacts with at least one candidate, and the
+# re-filing that motivated the check IS among them. A bar that fired on ordinary vocabulary would
+# be switched off within a week, so the numbers were checked before the thresholds were fixed.
+DUP_TYPES = ("epic", "story", "bug", "cr", "rfc", "issue")
+DUP_MIN_SHARED_TOKENS = 4     # two 3-word titles overlapping fully is coincidence, not a duplicate
+DUP_TITLE_SIM = 0.8           # titles alone: only a near-restatement counts
+DUP_SHARED_AFFECTS_SIM = 0.4  # ... and the bar drops when both also name the same file
+
+
+def _title_overlap(a: set[str], b: set[str]) -> float:
+    """The shorter title's distinctive words that reappear in the longer one (overlap coefficient).
+
+    Jaccard was tried first and MEASURED too weak for this job: the duplicate that motivated the
+    check - two bugs on one file, filed a day apart - scores 0.21, because one title is three times
+    the length of the other and the union swamps the intersection. Containment is the property a
+    re-filing actually has, and the same pair scores 0.44 under it."""
+    return len(a & b) / min(len(a), len(b)) if a and b else 0.0
+
+
+def duplicate_candidates(repo_root: Path | str, type_: str, title: str,
+                         fields: dict | None = None) -> list[dict]:
+    """Existing artefacts a new one with this title would probably duplicate.
+
+    Reads TERMINAL artefacts too. Re-filing something already fixed is the case that wastes the
+    most time - the author reads a closed bug's symptom nowhere, files it again, and the work is
+    done twice - so scoping this to the open backlog would miss the case that matters most.
+
+    Compared within one type: an epic and the CR it was decomposed from share a title BY DESIGN,
+    and recycling that structural pairing as a duplicate claim would bury the real ones.
+
+    Advisory only, and it must never break a mint: any failure (an unreadable artefact, a missing
+    sibling module) degrades to no candidate, exactly as the finding filer's own lens does."""
+    try:
+        import backlog_triage as bt
+        root = Path(repo_root)
+        if type_ not in DUP_TYPES:
+            return []
+        new_tokens = bt._tokens(title)
+        if not new_tokens:
+            return []
+        affects_line = f"> **Affects:** {(fields or {}).get('affects') or ''}"
+        new_affects = {a for a in (bt._affect_key(root, x)
+                                   for x in sdlc_md.affects_files(affects_line)) if a}
+        out: list[dict] = []
+        for p in sdlc_md.artifact_files(type_, root):
+            cid = sdlc_md.extract_record_id(p.stem)
+            if not cid:
+                continue
+            try:
+                text = p.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            other = bt._tokens(sdlc_md.extract_h1_title(text) or "")
+            if len(other & new_tokens) < DUP_MIN_SHARED_TOKENS:
+                continue
+            shared = sorted({a for a in (bt._affect_key(root, x)
+                                         for x in sdlc_md.affects_files(text)) if a} & new_affects)
+            score = _title_overlap(other, new_tokens)
+            if score < (DUP_SHARED_AFFECTS_SIM if shared else DUP_TITLE_SIM):
+                continue
+            status = (sdlc_md.extract_field(text, "Status") or "?").strip()
+            out.append({"id": cid, "type": type_, "status": status, "shared": shared,
+                        "similarity": round(score, 2),
+                        "title": sdlc_md.extract_h1_title(text) or ""})
+        return sorted(out, key=lambda c: (-c["similarity"], c["id"]))
+    except Exception as exc:  # noqa: BLE001 - a duplicate warning never fails a mint
+        sdlc_md.debug("artifact.duplicate_candidates", exc)
+        return []
+
+
+def duplicate_note(c: dict) -> str:
+    """One candidate as the line a reader acts on: the id, its status, and why it was raised."""
+    where = f", shares {', '.join(c['shared'])}" if c.get("shared") else ""
+    return (f"possible duplicate of {c['id']} [{c['status']}]: "
+            f"{int(c['similarity'] * 100)}% of the shorter title's words{where} - "
+            f"{c['title'][:100]}")
+
+
+class DuplicateRefused(ValueError):
+    """`--strict` met a duplicate candidate. Raised BEFORE any id is allocated or any file
+    written, so a refusal never leaves a half-minted artefact behind."""
+
+
+class PersonaRefused(ValueError):
+    """`--strict` met a `--persona` the design-persona registry does not declare. Raised BEFORE
+    any id is allocated or any file written, so a refusal leaves nothing half-minted."""
+
+
+def _resolve_persona(root: Path | str, requested, strict: bool = False, label: str = "",
+                     affects=None) -> str:
+    """The Persona a story is minted with, resolved through the design-persona registry.
+
+    ONE resolver for every minting path, so `new`, `batch` and the commands that mint in bulk
+    cannot disagree about who a story serves:
+
+    - no persona given -> the declared Primary, the project's design target; with two or
+      more, the one whose interface the unit's `affects` lies in (`_interface_primary`);
+    - a registered name -> its canonical spelling from the registry;
+    - an unregistered name -> minted anyway with a warning naming who IS registered, and
+      REFUSED under `strict` before anything is allocated;
+    - the NEGATIVE persona -> warned, never refused: the registry calls that persona a signal
+      to decline, and a story citing them as the reason something is out of scope is
+      legitimate work. The judgement is the author's, made with the signal in front of them.
+
+    An ABSENT registry resolves nothing and says nothing: with no declared design target,
+    inventing a default would attribute every story to a persona the project never declared.
+    """
+    name = str(requested or "").strip()
+    reg = sdlc_md.persona_registry(root)
+    where = f" [{label}]" if label else ""
+    if not reg.available:
+        # No registry at all is the greenfield case and needs no comment. A registry that is
+        # THERE but could not be read is a different fact, and saying nothing about it would
+        # report a resolved persona on a mint that resolved nothing.
+        if Path(reg.path).exists():
+            print(f"warning:{where} {reg.reason} - the persona was left exactly as given",
+                  file=sys.stderr)
+        return name
+    if not name:
+        primary = reg.primary
+        if primary is None:
+            print(f"warning:{where} no --persona given and {reg.path} declares no Primary, so "
+                  f"this story names no design target - declare one under a `## Primary` "
+                  f"heading, or pass --persona", file=sys.stderr)
+            return ""
+        return _interface_primary(reg, affects, where)
+    entry = reg.find(name)
+    if entry is None:
+        known = ", ".join(reg.names) or "nobody"
+        msg = (f"persona {name!r} is not declared in {reg.path} (registered: {known})")
+        if strict:
+            raise PersonaRefused(f"--strict:{where} {msg} - nothing was minted. Name a "
+                                 f"registered persona, add this one to the registry, or "
+                                 f"re-run without --strict.")
+        print(f"warning:{where} {msg} - minted anyway with the name as given; pick a registered "
+              f"persona or add this one to the registry", file=sys.stderr)
+        return name
+    if entry.role == "negative":
+        print(f"warning:{where} {entry.name} is the NEGATIVE design persona - the registry "
+              f"deliberately does not design for them. Minted anyway (never refused): confirm "
+              f"this story is a deliberate decline, not a backlog item.", file=sys.stderr)
+    return entry.name
+
+
+def _is_paperwork(path: str) -> bool:
+    """A test module (`file_finding.is_test_path`) or a file in a `changelog.d/` directory:
+    what a unit ships beside its change, so neither says whose interface the change is in."""
+    return file_finding.is_test_path(path) or "changelog.d" in path.split("/")[:-1]
+
+
+def _interface_primary(reg: sdlc_md.PersonaRegistry, affects, where: str = "") -> str:
+    """The Primary a story minted with no `--persona` names, chosen by the interface its
+    `affects` lies in. Interfaces are project data: the paths each Primary's card declares in
+    its `Interface` row (`sdlc_md.persona_interface_paths`), never paths carried here.
+
+    - one Primary -> that Primary, whatever the Affects;
+    - test modules and changelog fragments set aside, every remaining Affects path under the
+      declared paths of one Primary and no other -> that Primary;
+    - anything else (paths in two interfaces, a path in none, nothing left once the paperwork
+      is set aside) -> the first Primary the index lists;
+    - two or more Primaries and one with no interface path declared -> a warning naming it on
+      every such mint. Warned, never refused: the mint goes ahead as above.
+    """
+    primaries = reg.by_role("primary")
+    if len(primaries) == 1:
+        return primaries[0].name
+    declared = [(p, sdlc_md.persona_interface_paths(p.card) if p.card else None)
+                for p in primaries]
+    silent = [p.name for p, paths in declared if not paths]
+    if silent:
+        print(f"warning:{where} {len(primaries)} Primary personas, and no interface paths are "
+              f"declared for {', '.join(silent)} - name them in backticks in the card's "
+              f"`| **Interface** | ... |` Quick Reference row, or pass --persona. Until then a "
+              f"story is minted against {primaries[0].name}, the first listed in {reg.path}, "
+              f"unless its Affects lie wholly in one declared interface.", file=sys.stderr)
+    owners = set()
+    for path in file_finding.declared_affects(str(affects or "")):
+        path = path.removeprefix("./")
+        if _is_paperwork(path):
+            continue
+        hits = [p.name for p, paths in declared
+                if paths and any(path == d or path.startswith(d + "/") for d in paths)]
+        if len(hits) != 1:
+            return primaries[0].name
+        owners.add(hits[0])
+    return owners.pop() if len(owners) == 1 else primaries[0].name
+
+
+def _with_notes(result: dict, ac_warnings: list[str], dupes: list[dict]) -> dict:
+    """Attach a mint's advisory notes to its result. Carried on EVERY return path (including the
+    dry-run preview and the consolidation path), because a warning worth giving on one path is
+    worth giving on all of them - and the caller prints, so nothing is lost to a library print."""
+    if ac_warnings:
+        result["ac_warnings"] = ac_warnings
+    if dupes:
+        result["duplicate_warnings"] = dupes
+    return result
+
+
+def _story_acs(f: dict) -> str:
+    """The Acceptance Criteria body. Supplied criteria render as real, id'd ACs; with none
+    supplied the scaffold keeps its `{{placeholder}}` slots, which the validator reports as
+    unfilled - a scaffold is not yet a specified story, and the creator does not pretend it is.
+
+    A supplied criterion may carry its executable check (`--verify`, positional with `--ac`),
+    written only when given: there is no honest default for a Verify line - a placeholder would fail the validator, and `manual` would assert a
+    proof nobody ran. An AC with no Verify line is reported by conformance's `verifiable`
+    stage, which is the system saying so out loud rather than papering over it."""
+    acs = _list(f, "acs")
+    if not acs:
+        return ("### AC1: {{define}}\n\n- **Given** {{context}}\n- **When** {{action}}\n"
+                "- **Then** {{outcome}}\n- **Verify:** {{executable check}}\n")
+    verifies = _verifiers_of(f)
+    out: list[str] = []
+    for i, a in enumerate(acs, 1):
+        out.append(f"- **AC{i}:** {a}\n")
+        if i <= len(verifies) and verifies[i - 1]:
+            out.append(f"  - **Verify:** {verifies[i - 1]}\n")
+    return "".join(out)
+
+
+def _criteria_body(type_: str, f: dict) -> str:
+    """The supplied criteria in the shape their type's runner reads. A story takes its id'd
+    blocks; a bug takes the finding filer's `- [ ] **ACn**` rows with each positional `--verify`
+    beneath (`file_finding.criteria_block`, one writer for both creation paths), because a bug's
+    Verify lines are executed too. Every other type keeps a plain checklist."""
+    if type_ == "story":
+        return _story_acs(f)
+    acs = _list(f, "acs")
+    if type_ == "bug":
+        return file_finding.criteria_block(
+            "bug", {"acs": acs, "verify": _verifiers_of(f)}) + "\n" if acs else ""
+    return file_finding.checklist_block(acs, _verifiers_of(f)) + "\n" if acs else ""
+
+
+#: The User Story block's three lines and the field each is written from.
+_USER_STORY_LINES = (("As a", "role"), ("I want", "capability"), ("So that", "benefit"))
+
+
+def check_user_story_fields(f: dict) -> None:
+    """Refuse a user-story field that is not text, before anything is written: a list or number
+    has no line to go on, and writing the placeholder in its place would drop it at exit 0."""
+    for _label, key in _USER_STORY_LINES:
+        if f.get(key) is not None and not isinstance(f[key], str):
+            raise ValueError(f"'{key}' must be text, not {type(f[key]).__name__}")
+
+
+def _story_line(f: dict, key: str) -> str:
+    """One user-story field as the single line it is written on, or "" when not supplied.
+    Whitespace is collapsed: a break inside the value would split the line it belongs to."""
+    val = f.get(key)
+    return file_finding._prose_safe(" ".join(val.split())) \
+        if isinstance(val, str) and val.strip() else ""
+
+
+def _user_story(f: dict) -> str:
+    """The User Story block: each supplied field on its line, a `{{placeholder}}` otherwise."""
+    return "".join(f"**{label}** {_story_line(f, key) or '{{' + key + '}}'}\n"
+                   for label, key in _USER_STORY_LINES)
+
+
+def _fill_user_story(body: str, type_: str, f: dict) -> str:
+    """Write a story's supplied role, capability and benefit over a grafted template's lines.
+    A template with no such line gets the whole block under `## User Story`, so a supplied
+    value is never dropped."""
+    if type_ != "story":
+        return body
+    for label, key in _USER_STORY_LINES:
+        val = _story_line(f, key)
+        if not val:
+            continue
+        line = re.compile(rf"^\*\*{re.escape(label)}\*\* .*$", re.M)
+        if not line.search(body):
+            return _put_section(body, ("User Story",), _user_story(f))
+        body = line.sub(lambda _m, v=val, lb=label: f"**{lb}** {v}", body, count=1)
+    return body
+
+
+# The unfilled size slot, in the scale's own words - so a scaffold the caller never sized names
+# the vocabulary rather than an empty line. A bug never reaches it (the grooming gate
+# refuses an unsized one before any render); it is the honest placeholder for every other path.
+_POINTS_SLOT = "{{" + "|".join(str(p) for p in sdlc_md.POINTS_SCALE) + "}}"
+
+
+def _sizing_line(type_: str, f: dict) -> str:
+    """The sizing metadata line for a type, from `--size` or `--points`. A REQUEST or CONTAINER
+    (cr/rfc/epic) carries a T-shirt `Size`; a DELIVERY unit (story/bug) carries `Points`. Written
+    by the SAME writers the finding filer uses (`file_finding._size_line`), so the two creation
+    paths cannot disagree on what a type is sized by (LL0016 - the bug this closes was the two
+    creators writing different shapes for the same type). The wrong sizing flag for the type is
+    WARNED, never silently dropped (LL0008/BG0149 - a story's `--points` used to vanish)."""
+    delivery = type_ in ("story", "bug")
+    # UPGRADE PATH: a project that has NOT opted into the two-backlog workflow keeps the
+    # pre-two-backlog sizing flow - a CR created with legacy `--points` (and no `--size`) writes
+    # `Points`, which the grooming gate still tolerates, rather than being warned-and-dropped into
+    # an unsized state that creation would then refuse. Scoped to a CR: the CR is the request an
+    # existing project routinely created with points; an epic's points are DERIVED (a hand-set
+    # Points line would later read as `epic-points` drift) and an RFC never carried points, so
+    # neither takes the legacy tolerance. Only an ENFORCED project holds the strict per-type rule.
+    has_size, has_points = str(f.get("size") or "").strip(), str(f.get("points") or "").strip()
+    if type_ == "cr" and has_points and not has_size \
+            and not sdlc_md.two_backlog_enforced(f.get("_root", ".")):
+        return f"> **Points:** {f['points']}\n"
+    wrong = f.get("points") if not delivery else f.get("size")
+    if str(wrong or "").strip():
+        want, got = (("--size", "--points") if not delivery else ("--points", "--size"))
+        carries = ("a T-shirt Size" if not delivery else "Points")
+        noun = "RFC" if type_ == "rfc" else type_
+        article = "an" if noun[0].lower() in "aeiou" else "a"
+        print(f"warning: {article} {noun} carries {carries}, so {got} was ignored - pass {want}. "
+              f"Nothing was sized.", file=sys.stderr)
+    if delivery:
+        return f"> **Points:** {f['points']}\n" if has_points else ""
+    return file_finding._size_line(f)
+
+
+def check_charter(type_: str, f: dict) -> None:
+    """Refuse - BEFORE an id is allocated or a byte written - a charter no run could be opened
+    from.
+
+    A charter exists to be MATERIALISED: `sprint next` opens a run from it without asking again,
+    so the two things it must answer are what the run drives to and which units it selects. One
+    missing is not a thin charter, it is a charter that will stop the queue at the moment it
+    reaches the head - which is the worst place to discover it, because by then it is the thing
+    standing between the operator and their next run.
+
+    The appetite is deliberately NOT required: an absent one resolves from the project's capacity
+    at materialise time, which is the same rule `sprint plan` already follows.
+    """
+    if type_ != "charter":
+        return
+    missing = [name for name, key in (("a Sprint Goal", "goal"), ("a scope rule", "scope"))
+               if not str(f.get(key) or "").strip()]
+    if missing:
+        raise ValueError(
+            f"charter is missing {' and '.join(missing)} - refused. Nothing was allocated, "
+            f"nothing was written.\n"
+            f"  Why: a charter is materialised into a run without asking again, so one that "
+            f"cannot answer what the run drives to, or which units it selects, stops the queue "
+            f"at the moment it reaches the head.\n"
+            f"  Supply: --fields-file with `goal` and `scope`.")
+
+
+def _render(type_: str, disp: str, title: str, today: str, f: dict) -> str:
+    st = f.get("_status") or SPEC[type_]["status"]
+    # Provenance stamp - marks this artifact as tool-created (deterministic path). Raised-by is
+    # the typed authorship of record, stamped at creation from --author (defaulting to the
+    # invoking agent), so a schema-v3 artefact is never born failing its own authorship rule.
+    head = (f"# {disp}: {title}\n\n> **Status:** {st}\n> **Created:** {today}\n"
+            f"> **Created-by:** sdlc-studio new\n"
+            f"> **Raised-by:** {f.get('_raised_by') or sdlc_md.DEFAULT_AGENT_AUTHOR}\n")
+    # The tier stamp the promotion gate reads. Written ONLY for `planning` - the tier that
+    # owes the project a promotion before implementation. An unstamped artefact is not
+    # planning-tier, so nothing that predates the tier is gated by it.
+    if f.get("_tier") == PLANNING:
+        head += f"> **{TIER_FIELD}:** {PLANNING}\n"
+    # Record-only tranche reference: written ONLY as orchestrator pass-through (when the caller
+    # supplies it); sdlc-studio never allocates it. Absent otherwise.
+    if str(f.get("tranche") or "").strip():
+        head += f"> **Tranche:** {str(f['tranche']).strip()}\n"
+    # The files this unit will touch, in the ONE shape the planner parses - rendered by the same
+    # writer the finding filer uses, so the two creation paths cannot disagree about what the
+    # field looks like. Accepted for every type; DEMANDED of a bug (`check_groomed`).
+    head += file_finding._affects_line(f)
+    # The Author cell names the same authorship of record stamped above - never a literal, and
+    # a name rather than the typed triple (which is `Raised-by`'s job). One shared row writer
+    # with the filer, so both escape a `|` in a name instead of shifting the columns.
+    rev = (f"\n## Revision History\n\n| Date | Author | Change |\n| --- | --- | --- |\n"
+           f"{file_finding.rev_row(today, f, 'Created via `new` (deterministic)')}\n")
+    if type_ == "story":
+        # The Persona line is written only when a persona is named: an absent optional field is
+        # honestly absent, never an unresolved placeholder in the metadata block.
+        persona = f"> **Persona:** {f['persona']}\n" if str(f.get("persona") or "").strip() else ""
+        return (head + f"> **Epic:** {f.get('epic') or '-'}\n" + _sizing_line("story", f) + persona +
+                "\n## User Story\n\n" + _user_story(f) +
+                "\n## Acceptance Criteria\n\n" + _story_acs(f) + rev)
+    if type_ == "charter":
+        # A charter is the SHAPE of a run that has not happened. It deliberately carries no
+        # acceptance criteria: it delivers nothing itself, and the units it materialises carry
+        # their own. What it must carry is everything `sprint next` needs to open a run without
+        # asking again - the goal, the rule that selects the batch, and the appetite.
+        # The scope is TWO fields on purpose (D0127): prose for the reader deciding whether a
+        # queued run is still worth running, and a selector `sprint next` can resolve. A charter
+        # may be queued as intent with only the prose - `next` refuses it by name at materialise
+        # time rather than creation refusing an honest placeholder.
+        scope_q = str(f.get("scope_query") or "").strip()
+        return (head + f"> **Appetite:** {f.get('appetite') or 'default'}\n"
+                + (f"> **Scope query:** {scope_q}\n" if scope_q else "")
+                + "\n## Sprint Goal\n\n" + _text(f, "goal", "{{the goal this run drives to}}") +
+                "\n\n## Scope rule\n\n" + _text(f, "scope", "{{which units this charter selects}}") +
+                "\n\n## Seat review\n\n_Not yet reviewed._\n" + rev)
+    if type_ == "epic":
+        acs = _list(f, "acs")
+        ac_body = ("\n## Acceptance Criteria\n\n" + "".join(f"- [ ] {a}\n" for a in acs)) if acs else ""
+        return (head + _sizing_line("epic", f) + "\n## Summary\n\n" +
+                _text(f, "summary", "{{what this epic groups}}") +
+                "\n\n## Story Breakdown\n\n_No stories yet._\n" + ac_body + rev)
+    if type_ == "cr":
+        ac_body = _criteria_body("cr", f) or file_finding.NO_CR_CRITERIA + "\n"
+        return (head + f"> **Priority:** {f.get('priority', 'Medium')}\n"
+                f"> **Type:** {f.get('ctype', 'Feature')}\n" + _sizing_line("cr", f) + "\n"
+                "## Summary\n\n" + _text(f, "summary", "{{what changes and why}}") +
+                ("\n\n## Impact\n\n" + _text(f, "impact", "")
+                 if str(f.get("impact") or "").strip() else "") +
+                "\n\n## Acceptance Criteria\n\n" + ac_body + rev)
+    if type_ == "rfc":
+        options = _list(f, "options")
+        opt_body = ("".join(f"- **{o}**\n" for o in options) if options
+                    else "- **Option A** {{...}}\n")
+        return (head + _sizing_line("rfc", f) + "\n## Summary\n\n" +
+                _text(f, "summary", "{{the unsettled design}}") +
+                "\n\n## Design Options\n\n" + opt_body +
+                "\n## Recommendation\n\n" + _text(f, "recommendation", "TBD") +
+                "\n\n## Open Decisions\n\n"
+                "| # | Decision | Status |\n| --- | --- | --- |\n| D1 | {{decision}} | Open |\n" + rev)
+    if type_ == "bug":
+        # Points are the job SIZE of the fix; Severity is its urgency. Two axes, and the planner
+        # sizes on the first: a bug created without one is a unit `sprint plan` refuses.
+        #
+        # Criteria are rendered on the same terms as an epic's: written when supplied, absent
+        # when not. A bug WITHOUT them is a legitimate scaffold the criteria floor refuses at
+        # the transition to Fixed; a bug whose author WROTE them and had them dropped in silence
+        # is the failure that floor cannot help with, because by then the words are gone.
+        acs = _criteria_body("bug", f)
+        ac_body = f"\n## Acceptance Criteria\n\n{acs}" if acs else ""
+        return (head + f"> **Severity:** {normalise_severity(f.get('severity') or 'Medium')}\n" + _sizing_line("bug", f) +
+                "\n## Summary\n\n" + _text(f, "summary", "{{symptom}}") +
+                "\n\n## Steps to Reproduce\n\n" + _text(f, "steps", "{{steps}}") +
+                "\n\n## Proposed Fix\n\n" + _text(f, "fix", "{{fix}}") + "\n" + ac_body + rev)
+    if type_ == "issue":
+        # An Issue is a DISCOVERY item - a raw report/symptom, not yet reproduced or scoped. It
+        # carries a T-shirt Size (the discovery estimate) and a Severity (the urgency a triager
+        # prioritises on), but NO Points - it is not a delivery unit; `triage` turns it into the
+        # bugs that are. It has no ACs and no fix: those belong to the bugs it produces.
+        return (head + f"> **Severity:** {normalise_severity(f.get('severity') or 'Medium')}\n" + _sizing_line("issue", f) +
+                "\n## Report\n\n" + _text(f, "summary", "{{the raw report or symptom}}") +
+                "\n\n## Observed\n\n" + _text(f, "observed", "{{what was seen, where, environment}}") +
+                "\n" + rev)
+    return head + "\n## Overview\n\n" + _text(f, "summary", "{{purpose}}") + "\n" + rev
+
+
+def _core_template(type_: str) -> Path:
+    return tiers.core_template(type_)
+
+
+def _planning_template(type_: str) -> Path:
+    """The lean pre-implementation body for a type. Defined for the two types whose full
+    template has a structural floor a planning artefact cannot get under (story ~171 lines,
+    epic ~148); every other type's minimal scaffold is already that lean, and `_graft` falls
+    back to it when this file does not exist."""
+    return tiers.planning_template(type_)
+
+
+_AC_HEAD_RE = re.compile(r"^##\s+Acceptance Criteria\b.*$", re.M | re.I)
+_IMPACT_HEAD_RE = re.compile(r"^##\s+(?:Impact|Motivation)\b.*$", re.M | re.I)
+
+
+class ContentDropped(Exception):
+    """A field the caller supplied reached no part of the rendered artefact."""
+
+
+#: The caller-supplied content fields. Whether a given type stores a given one is NOT listed
+#: here and deliberately so: an enumeration of type/field pairs is a lower bound that forgets
+#: the next type added, which is exactly how a bug's criteria came to be discarded in silence.
+#: The check below asks the RENDERED DOCUMENT whether the caller's words are in it, so a type
+#: nobody thought about is covered on the day it is written.
+#: The user-story fields are landed by the story renderers, not `_land_supplied`, so on any other
+#: type this check is what refuses them rather than dropping them.
+_MUST_LAND = ("summary", "steps", "fix", "impact", "acs", "options", "recommendation",
+              *(key for _label, key in _USER_STORY_LINES))
+
+
+def _probe(value) -> str:
+    """A supplied field reduced to its alphanumerics - the form that survives rendering.
+
+    Markdown-safing inserts escapes and the renderers wrap values in bullets and headings, so a
+    literal substring test would report drops that never happened. Letters and digits pass
+    through all of it unchanged, so comparing on those alone tests presence without testing
+    formatting."""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())[:30]
+
+
+def _land_supplied(body: str, type_: str, f: dict) -> str:
+    """Append a section for any supplied content field the render found no home for.
+
+    `_fill_acs` was made unconditional with a `_put_section` fallback so criteria always land.
+    The other content fields were not given the same treatment, so `--summary` on a story -
+    a generic, documented flag - was REFUSED outright, and the verdict depended on which
+    template was selected. Refusing a caller's whole artefact for a field the TEMPLATE lacks
+    is a worse outcome than the silent drop it replaced; landing it is the outcome both were
+    standing in for."""
+    for key, names in _LANDABLE_SECTIONS:
+        probe = _probe(f.get(key))
+        if probe and probe not in re.sub(r"[^a-z0-9]+", "", body.lower()):
+            content = (_criteria_body(type_, f) if key == "acs" and type_ in ("story", "bug")
+                       else _rendered(key, f))
+            body = _put_section(body, names, content)
+    return body
+
+
+def _refuse_dropped_content(body: str, type_: str, f: dict) -> None:
+    """Refuse a render that silently discarded something the caller supplied.
+
+    A creator that accepts content and drops it is worse than one that never accepted it: the
+    caller gets exit 0 and a clean validator over an artefact its words never reached, and by
+    the time a downstream floor objects the words are gone and someone has to invent
+    replacements. Loud refusal at the moment of the drop is the only point where the content
+    still exists to be saved."""
+    haystack = re.sub(r"[^a-z0-9]+", "", body.lower())
+    for key in _MUST_LAND:
+        probe = _probe(f.get(key))
+        if probe and probe not in haystack:
+            raise ContentDropped(
+                f"a {type_} scaffold has no home for '{key}', so the value supplied for it "
+                f"reached none of the rendered artefact. Refused rather than written away - "
+                f"exit 0 over a document missing the caller's own words is the failure this "
+                f"check exists to prevent. Use a type that stores the field, or drop it.")
+
+
+def _fill_acs(body: str, type_: str, f: dict) -> str:
+    """Write the caller's criteria into the artefact's Acceptance Criteria section.
+
+    EVERY type, not an enumerated few. The type chooses only the SHAPE - a story's id'd
+    Given/When/Then blocks, a checkbox list everywhere else - and a template carrying no
+    such heading gets the section appended by `_put_section`, on the same never-drop rule
+    `_CONTENT_SECTIONS` already states. The enumeration this replaced (`story`, `cr`,
+    `epic`) dropped a bug's criteria in silence at exit 0, which is precisely the failure
+    that rule exists to prevent; an enumeration is a lower bound and forgets what nobody
+    thought of, so the shape is now derived and the storage is unconditional."""
+    acs = _list(f, "acs")
+    if not acs:
+        return body
+    filled = _criteria_body(type_, f)
+    m = _AC_HEAD_RE.search(body)
+    if not m:
+        return _put_section(body, ("Acceptance Criteria",), filled)
+    rest = body[m.end():]
+    nxt = re.search(r"^##\s", rest, re.M)  # `### ACn` subsections belong to this section
+    tail = rest[nxt.start():] if nxt else ""
+    return f"{body[:m.end()]}\n\n{filled}\n{tail}"
+
+
+def _fill_impact(body: str, type_: str, f: dict) -> str:
+    """Write a CR's impact statement and size estimate directly under its Impact heading.
+    The rich template heads straight into subsections, leaving the heading itself bodiless -
+    which reads as no impact statement at all."""
+    if type_ != "cr":
+        return body
+    block = ""
+    if str(f.get("impact") or "").strip():
+        block += f"\n\n{file_finding._prose_safe(f['impact'])}"
+    # A CR is a REQUEST - it carries a T-shirt Size, not points (the Size line is in the metadata
+    # head, written by _sizing_line; nothing points-shaped belongs in the CR body now).
+    m = _IMPACT_HEAD_RE.search(body)
+    if not block or not m:
+        return body
+    # the remainder already opens on its own blank line - do not stack a second (MD012)
+    return f"{body[:m.end()]}{block}{body[m.end():]}"
+
+
+# Each caller-supplied field and the section headings it may land under, in preference
+# order. A creator that accepts content and silently drops it is worse than one that never
+# accepted it: the caller gets exit 0 and a clean validator over an artefact its words never
+# reached. Nothing supplied is ever dropped - a template with no matching heading gets the
+# section appended rather than losing the content.
+_CONTENT_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("summary", ("Summary", "Overview")),
+    ("steps", ("Steps to Reproduce", "Reproduction")),
+    ("fix", ("Proposed Fix", "Fix")),
+    ("options", ("Design Options", "Options")),
+    ("recommendation", ("Recommendation",)),
+)
+#: Every field `_refuse_dropped_content` guards, with the section each lands under. It EXTENDS
+#: `_CONTENT_SECTIONS` with `acs` and `impact`, which have their own fillers on the graft path
+#: and had no home at all on the minimal one - so the guard refused them for types whose
+#: scaffold simply omits the heading. The check and the lander must cover the same set, or the
+#: guard refuses a field nothing was ever going to place.
+_LANDABLE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = _CONTENT_SECTIONS + (
+    ("impact", ("Impact", "Motivation")),
+    ("acs", ("Acceptance Criteria",)),
+)
+
+
+_REV_SECTION_RE = re.compile(r"^##\s+Revision History\b.*$", re.M | re.I)
+
+
+def _rendered(key: str, f: dict) -> str:
+    """One field's content as the markdown its section takes: a bullet list for the list
+    fields, markdown-safed prose otherwise. Empty when the caller supplied nothing."""
+    if key in ("options", "acs"):
+        items = _list(f, key)
+        return "".join(f"- **{o}**\n" for o in items) if items else ""
+    val = f.get(key)
+    return f"{file_finding._prose_safe(val)}\n" if isinstance(val, str) and val.strip() else ""
+
+
+def _put_section(body: str, names: tuple[str, ...], content: str) -> str:
+    """Replace the body of the first section named in `names` with `content`, or append the
+    section (before Revision History) when the template carries no such heading.
+
+    Only the PROSE body above the first `###` subsection is replaced: a template's `###`
+    scaffold prompts (a bug's `### Files Modified`/`### Tests Added`, an RFC's `### Option A`)
+    survive when the caller supplies the parent field, so an agent filling the artefact keeps
+    the guidance rather than having the supplied content silently swallow it."""
+    for name in names:
+        m = re.search(rf"^##\s+{re.escape(name)}\b.*$", body, re.M | re.I)
+        if not m:
+            continue
+        rest = body[m.end():]
+        # Stop at the first `###` subsection or the next `##` heading, whichever comes first -
+        # the prose above the first subsection is replaced; the subsections beneath it are kept.
+        nxt = re.search(r"^(?:##|###)\s", rest, re.M)
+        tail = rest[nxt.start():] if nxt else ""
+        return f"{body[:m.end()]}\n\n{content}\n{tail}"
+    section = f"## {names[0]}\n\n{content}"
+    m = _REV_SECTION_RE.search(body)
+    return f"{body[:m.start()]}{section}\n{body[m.start():]}" if m \
+        else f"{body.rstrip()}\n\n{section}"
+
+
+def _fill_content(body: str, type_: str, f: dict) -> str:
+    """Land the content the caller HAS in the grafted template. The graft leaves every
+    unsupplied slot as a `{{placeholder}}` for the agent, but supplied content must reach the
+    artefact - otherwise a batch that names its criteria still mints a scaffold the validator
+    rejects, which is how a decomposition ends up hand-stamping thirty files."""
+    for key, names in _CONTENT_SECTIONS:
+        content = _rendered(key, f)
+        if content:
+            body = _put_section(body, names, content)
+    return _fill_user_story(_fill_impact(_fill_acs(body, type_, f), type_, f), type_, f)
+
+
+def _graft(minimal: str, core_path: Path, type_: str = "", f: dict | None = None) -> str:
+    """The deterministic provenance head (identical to minimal, so validate/
+    provenance behave the same) followed by the section body of `core_path`.
+    Unsupplied placeholders stay unresolved for the agent. Falls back to minimal when the
+    template has no `## ` section body to graft."""
+    if "\n## " not in minimal or not core_path.exists():
+        return minimal
+    # provenance + metadata block. rstrip the trailing newline the metadata block ends on, or
+    # the join below stacks a second blank line before the first heading (MD012).
+    head = minimal[:minimal.index("\n## ")].rstrip("\n")
+    core = re.sub(r"^<!--.*?-->\n+", "", core_path.read_text(encoding="utf-8"),
+                  count=1, flags=re.DOTALL)
+    lines = core.splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.startswith("## ")), None)
+    if start is None:  # no section body to graft - keep minimal
+        return minimal
+    body = "\n".join(lines[start:]).rstrip()
+    # rstrip again: a section appended at the end of the body must not leave a trailing
+    # blank line once the file's closing newline is added (MD012).
+    return f"{head}\n\n{_fill_content(body, type_, f or {}).rstrip()}\n"
+
+
+def _render_full(type_: str, disp: str, title: str, today: str, f: dict) -> str:
+    """`--template full`: minimal head + the rich body from `templates/core/<type>.md`."""
+    return _graft(_render(type_, disp, title, today, f), _core_template(type_), type_, f)
+
+
+def _render_planning(type_: str, disp: str, title: str, today: str, f: dict) -> str:
+    """`--template planning`: the lean pre-implementation body, plus the tier stamp that
+    tells the transition gate this story owes a promotion before it can be implemented."""
+    f = {**f, "_tier": PLANNING}
+    return _graft(_render(type_, disp, title, today, f), _planning_template(type_), type_, f)
+
+
+def _select_render(root: Path, type_: str, template: str | None):
+    """The renderer for one scaffold: a project-declared template
+    (conventions.templates.<type>) wins over --template minimal/planning/full so the
+    scaffold matches the house shape the read-side checks expect; declared but
+    missing fails loud rather than silently falling back to the skill shape."""
+    proj = conventions.template_for(type_, root)
+    if proj is not None:
+        if not proj.exists():
+            raise conventions.ConventionsError(
+                f"conventions.templates.{type_} declares {proj}, which does not exist")
+        return lambda t, disp, title, today, f: _graft(
+            _render(t, disp, title, today, f), proj, t, f)
+    if template == FULL:
+        return _render_full
+    return _render_planning if template == PLANNING else _render
+
+
+def _rendered_template(root: Path, type_: str, template: str | None) -> str | None:
+    """The template `_select_render` renders with, as a reader should be told it: a project's
+    declared template by its path, else the `--template` tier."""
+    proj = conventions.template_for(type_, root)
+    if proj is None:
+        return template
+    try:
+        return proj.relative_to(root).as_posix()
+    except ValueError:
+        return str(proj)
+
+
+def _skill_root() -> Path:
+    """The skill directory (…/sdlc-studio/), where templates live - this script is in scripts/."""
+    return Path(__file__).resolve().parent.parent
+
+
+def _index_template(type_: str) -> Path:
+    return file_finding.index_template_path(type_)
+
+
+def _ensure_index(root: Path, type_: str, today: str) -> bool:
+    """Create a missing `<dir>/_index.md` on the empty-project first run.
+    Delegates to the shared `file_finding.ensure_index` (also used by `init`)."""
+    return file_finding.ensure_index(root, type_, today)
+
+
+def _header_cells(root: Path, type_: str) -> list[str] | None:
+    idx = Path(root) / sdlc_md.ARTIFACT_TYPES[type_][0] / "_index.md"
+    if not idx.exists():
+        return None
+    found = sdlc_md.find_data_header(idx.read_text(encoding="utf-8").splitlines())
+    return found[1] if found else None
+
+
+def _find_epic(root: Path, epic_id: str) -> Path | None:
+    """The epic file whose id matches exactly (never a substring: EP001 != EP0010). Uses the
+    era-aware `extract_record_id`: `split('-')[0]` yielded just `EP` for a v3 ULID filename
+    (`EP-01JQK3F8-reading.md`), so story-to-epic wiring failed on the default schema."""
+    eid = sdlc_md.norm_id(epic_id)
+    return next((p for p in sdlc_md.artifact_files("epic", Path(root))
+                 if sdlc_md.norm_id(sdlc_md.extract_record_id(p.stem) or "") == eid), None)
+
+
+def _wire_story_to_epic(root: Path, epic_id: str, disp: str, title: str,
+                        file_id: str, slug: str) -> bool:
+    """Append the story to its parent epic's Story Breakdown (idempotent)."""
+    ep = _find_epic(root, epic_id)
+    if ep is None:
+        return False
+    text = ep.read_text(encoding="utf-8")
+    # The sibling of the retired handoff appender, and it carried the same assumption. Fixing one
+    # instance of a class and leaving the other is the enumerated-list failure this repository
+    # keeps meeting, so both read the document rather than naming a marker.
+    line = (f"{sdlc_md.document_bullet(text)} [ ] "
+            f"[{disp}: {title}](../stories/{file_id}-{slug}.md)")
+    if f"[{disp}:" in text or f"[{disp}]" in text:  # already wired (exact, not substring: US0001 != US00012)
+        return True
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip().lower().startswith("## story breakdown"):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith("## "):
+                j += 1
+            # Insert after the LAST list item, preserving the section's existing structure
+            # (prose, internal blanks) - a full rebuild would collapse blanks and orphan a
+            # list against neighbouring prose (MD032). Only an item-less section is rebuilt.
+            last_item = max((k for k in range(i + 1, j)
+                             if lines[k].strip().startswith("- [")), default=None)
+            if last_item is not None:
+                lines.insert(last_item + 1, line)
+                nxt = last_item + 2  # guard: a blank before the next heading (no orphan)
+                if nxt < len(lines) and lines[nxt].lstrip().startswith("## "):
+                    lines.insert(nxt, "")
+            else:  # empty section (e.g. "_No stories yet._") - rebuild cleanly
+                keep = [lines[k] for k in range(i + 1, j)
+                        if lines[k].strip() and not lines[k].strip().startswith("_No stories")]
+                lines[i:j] = [lines[i], ""] + keep + [line, ""]
+            ep.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return True
+    return False
+
+
+def _refresh_epic_row(root: Path, epic_id: str) -> list[str]:
+    """Bring the epic's index row back in step with the census after a story is wired to it.
+
+    Minting a story changes a number in ANOTHER artefact's index row. Left to the next
+    `reconcile`, the index is stale from the moment the story lands until somebody remembers -
+    and the whole claim of this tooling is that the index is derived. Delegated to reconcile's
+    applier rather than reimplemented, so the mint path and the sweep write the cell the same way,
+    and so the hold on a value the census contradicts applies here too.
+
+    Errors are swallowed deliberately: a stale count is a smaller failure than a mint that fails
+    after the story file is already on disk.
+    """
+    if not epic_id:
+        return []
+    try:
+        return reconcile.apply_epic_index_derivable(root).get("synced", [])
+    except Exception as exc:  # noqa: BLE001 - never fail a completed mint on a derived cell
+        sdlc_md.debug("artifact._refresh_epic_row", exc)
+        return []
+
+
+# Meta-artifacts: tool-created, outside the status machinery (no status vocab, no
+# transition gate, no conformance stage) - a generated record OF a run, not a unit of work
+# that moves through one. Derived from `sdlc_md.META_TYPES`, never re-typed. A delivery review
+# found this literal surviving as a FOURTH copy of the same names inside the change filed to
+# abolish hand-copies - and it is the creator half of the creator/resolver pair BG0619 exists
+# to keep in step, so it is the copy that matters most. The one subtraction is the handoff: no
+# command writes one since the signed report carries the handed-over work, so it is not
+# creatable here, while `META_TYPES` keeps it so the HO files already on disk still resolve
+# and reconcile.
+META = tuple(t for t in sdlc_md.META_TYPES if t != "handoff")
+
+
+def _render_meta(type_: str, disp: str, title: str, today: str, f: dict | None = None) -> str:
+    """Retro renders from the shipped retro template (id/title/date filled, the
+    rest left as authoring scaffold); review gets a minimal findings scaffold."""
+    f = f or {}
+    if type_ == "retro":
+        tmpl = Path(__file__).resolve().parent.parent / "templates" / "reviews" / "retro.md"
+        if tmpl.exists():
+            text = tmpl.read_text(encoding="utf-8")
+            text = re.sub(r"^<!--.*?-->\n+", "", text, count=1, flags=re.DOTALL)
+            text = text.replace("RETRO-{{retro_id}}", disp)
+            text = text.replace("{{sprint_title}}", title).replace("{{date}}", today)
+            # The run it belongs to and the empty carried table, through the module that reads
+            # them back, so the header a retro is born with is the one `carried_issues` parses.
+            import retro  # noqa: PLC0415 - deferred; only a retro render needs it
+            return retro.fill_run_scaffold(text, str(f.get("run_id") or ""))
+    # A review records sign-offs, so its authorship of record must survive the scaffold path:
+    # stamp Raised-by from the resolved --author and write the real name into the revision row
+    # through the SAME writer _render uses, never a literal `{{author}}`.
+    raised_by = f.get("_raised_by") or sdlc_md.DEFAULT_AGENT_AUTHOR
+    return (f"# {disp}: {title}\n\n> **Date:** {today}\n"
+            f"> **Created-by:** sdlc-studio new\n"
+            f"> **Raised-by:** {raised_by}\n\n"
+            f"## Scope\n\n{{{{scope}}}}\n\n## Findings\n\n{{{{findings}}}}\n\n"
+            f"## Verdict\n\n{{{{verdict}}}}\n\n"
+            f"## Revision History\n\n| Date | Author | Change |\n| --- | --- | --- |\n"
+            f"{file_finding.rev_row(today, f, 'Created via `new` (deterministic)')}\n")
+
+
+def _ensure_meta_index(root: Path, rel: str, type_: str, today: str) -> bool:
+    """Create `<rel>/_index.md` from `templates/indexes/<type>.md` when it is missing, so a
+    project's FIRST retro/review/handoff is INDEXED rather than a missing-index reconcile
+    drift item the operator then clears by hand. Delegates to `file_finding.write_empty_index`,
+    the one index-writer that also backs `file_finding.ensure_index` (pipeline types), so a
+    meta index is rendered identically to a pipeline one - carrying the same blank-collapse.
+    Idempotent; never clobbers an existing index. Returns True iff it created the file."""
+    idx = root / rel / "_index.md"
+    tmpl = _skill_root() / "templates" / "indexes" / f"{type_}.md"
+    return file_finding.write_empty_index(idx, tmpl, today)
+
+
+def meta_new(repo_root: Path | str, type_: str, title: str, fields: dict | None = None,
+             dry_run: bool = False) -> dict:
+    """Create a retro/review: allocated id, rendered file, and an index row. The meta index is
+    bootstrapped on the first create when missing (retros/, reviews/, handoffs/), so a
+    project's first retro/review lands indexed rather than as reconcile drift; a project that
+    has deleted its index still gets one re-seeded, and the row is appended to it."""
+    if type_ not in META:
+        raise ValueError(f"unknown meta type {type_!r} (expected {'|'.join(META)})")
+    import next_id
+    root = Path(repo_root)
+    f = dict(fields or {})
+    sdlc_md.check_creator_fields({**f, "title": title})  # refuse an injected line before any write
+    today = f.get("date") or date.today().isoformat()
+    # Resolve the authorship of record once, the same way `new` does, so the review scaffold can
+    # stamp Raised-by and write the real name into its revision row instead of a literal placeholder.
+    f["_raised_by"] = sdlc_md.authorship_value(f.get("author"), root)
+    # Serialise allocate -> collision-check -> write -> index-append against concurrent
+    # writers (retro/review/handoff ids are always sequential, the case the lock most
+    # matters for), so two waves closing at once never mint the same id or clobber the index.
+    import contextlib  # noqa: PLC0415 - local, only this path needs it
+    with (contextlib.nullcontext() if dry_run else sdlc_md.allocation_lock(root)):
+        n = next_id.allocate_number(type_, root)
+        rel, prefix = next_id.META_TYPES[type_]
+        file_id = f"{prefix}{n:04d}"
+        disp = f"{prefix}-{n:04d}"
+        slug = file_finding._slug(title)
+        path = root / rel / f"{file_id}-{slug}.md"
+        if path.exists():
+            raise FileExistsError(path)
+        if dry_run:
+            # Predict indexing honestly (like new()'s dry-run): a row lands when the meta index
+            # exists with a data header, OR would be bootstrapped from a shipped index template.
+            idx = root / rel / "_index.md"
+            has_header = idx.exists() and sdlc_md.find_data_header(
+                idx.read_text(encoding="utf-8").splitlines()) is not None
+            would_bootstrap = (not idx.exists()) and (
+                _skill_root() / "templates" / "indexes" / f"{type_}.md").exists()
+            return {"id": disp, "file_id": file_id, "path": str(path),
+                    "indexed": has_header or would_bootstrap,
+                    "epic_linked": None, "dry_run": True}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sdlc_md.atomic_write(path, _render_meta(type_, disp, title, today, f))
+        _ensure_meta_index(root, rel, type_, today)  # bootstrap the meta index on first use
+        indexed = False
+        index_path = root / rel / "_index.md"
+        if index_path.exists():
+            lines = index_path.read_text(encoding="utf-8").splitlines()
+            hdr = sdlc_md.find_data_header(lines)
+            if hdr is not None:
+                row = sdlc_md.row_from_header(hdr[1], f"[{disp}]({file_id}-{slug}.md)", title,
+                                              "--", {"date": today, **f})
+                # bound the scan to the DATA table itself: stop at the first
+                # non-table line so a later link-first table never attracts the row
+                pos = hdr[0] + 2  # past header + separator
+                j = pos
+                while j < len(lines) and lines[j].strip().startswith("|"):
+                    j += 1
+                pos = j
+                lines.insert(pos, row)
+                sdlc_md.atomic_write(index_path, "\n".join(lines) + "\n")
+                indexed = True
+    return {"id": disp, "file_id": file_id, "path": str(path), "indexed": indexed,
+            "epic_linked": None, "dry_run": False}
+
+
+def new(repo_root: Path | str, type_: str, title: str, fields: dict | None = None,
+        dry_run: bool = False, consolidate: bool = True, strict: bool = False) -> dict:
+    """Create one artefact. `consolidate` (default True) governs the v3 finding-noise controls: a
+    Low-severity finding is normally folded into a themed consolidation CR and a session cap
+    refuses a flood. A DELIBERATE decomposition unit (a bug minted by `triage`) is not agent
+    finding-noise, so it passes `consolidate=False` to mint an individual bug regardless of
+    severity - otherwise a Low-severity triaged bug would silently become a CR on a v3 project, and
+    the caller (expecting a bug) would wire that CR as the Issue's child. Dormant on v2, where the
+    controls are off, so the flag only matters under schema v3.
+
+    `strict` (default False) turns the duplicate check from advisory into a refusal. Advisory is
+    the default deliberately: filing must never be blocked by a heuristic, or the heuristic becomes
+    a reason not to file. Under `strict` the refusal is raised before an id is allocated, so no
+    file and no index row survive it."""
+    if type_ not in SPEC:
+        raise ValueError(f"unknown type {type_!r} (expected one of {', '.join(SPEC)})")
+    root = Path(repo_root)
+    f = dict(fields or {})
+    # Parent link (spawning under an RFC/CR): validate BEFORE minting, wire both
+    # directions after - the same contract as file_finding's --parent.
+    _parent = (f.pop("parent", "") or "").strip()
+    _parent_path = None
+    if _parent:
+        _found = sdlc_md.find_by_id(root, _parent)
+        if not _found:
+            raise ValueError(f"--parent {_parent} does not resolve to any artefact - "
+                             f"a child is never minted against a missing parent")
+        _parent_path = _found[0]
+        _parent = sdlc_md.norm_id(_parent)
+    # A criterion object is read as its text and verifier, by the filer's own rule, before
+    # anything is allocated or written.
+    f = file_finding.criteria_objects(f)
+    # Refuse a field that would break out of its metadata line, index cell or bullet BEFORE
+    # anything is allocated or written - a half-created artefact carrying injected lines is
+    # worse than no artefact. One guard, every field, at the top of the one create path.
+    sdlc_md.check_creator_fields({**f, "title": title})
+    check_user_story_fields(f)
+    # A CR or RFC criterion is prose: refuse a command-shaped `Verify:` written into it, from the
+    # SAME authority the filer uses, so the two creation paths cannot disagree about what a
+    # request's acceptance criterion means. Nothing executes it: verify_ac runs the Verify lines
+    # of the types in `sdlc_md.EXECUTES_VERIFIERS` alone, and the shared check lets those through.
+    file_finding.check_prose_acs(type_, f)
+    # A declared `Affects` that resolves to nothing is refused HERE, from the ONE seam every
+    # writer shares - so a story minted through `new` cannot carry a fictional footprint any more
+    # than a bug filed through the finding filer can. Refuses only when NO declared path resolves
+    # (a not-yet-created file alongside an existing one is legitimate); names the closest basename.
+    file_finding.check_affects_resolvable(root, f.get("affects"), type_)
+    # ... and a `Verify:` selector naming no test that exists, from that SAME seam. US0667's
+    # criterion says BOTH writers refuse; only the filer did, so a story minted through `new`
+    # could carry a verifier pointing at nothing while the identical bug filed through
+    # `file_finding` was refused. A guard on one of two creation paths is a guard with a documented
+    # side door.
+    for _expr, _why in file_finding.check_verify_selectors(root, f):
+        # Report only what is SPECIFIC to this selector. `new` is the bulk creation path - `batch`
+        # mints many artefacts in one go - and the generic "cannot judge a shell verifier" case is
+        # the normal shape for a story, so noting it here fires on the ordinary write and buries
+        # the case that matters. The filer keeps that report, which is where it was asked for; the
+        # refusal, which is what this writer owes, is unconditional and happens above.
+        if _why and not _why.startswith("unknown runner"):
+            print(f"note: `Verify:` selector not judged here ({_why}): {_expr}",
+                  file=sys.stderr)
+    f["date"] = f.get("date") or date.today().isoformat()
+    f["_root"] = str(root)   # so the renderer can read the project's enforcement
+    # A bug created here is a unit `sprint plan` will be asked to plan, and this is a
+    # documented create path - not a side door. So it answers to the SAME grooming demand as the
+    # finding filer, from the same authority: the body about to be written is judged by the
+    # planner's own `breakdown` predicate, and refused here if the planner would refuse it there.
+    if type_ in file_finding.GROOMED_TYPES:
+        preview = _select_render(root, type_, f.get("template"))
+        file_finding.check_groomed(root, type_, preview(type_, "PREVIEW", title, f["date"], f))
+    # Same contract, one type along: refused before an id is allocated or a byte written.
+    check_charter(type_, f)
+    if type_ == "story":
+        if not f.get("epic"):
+            # Lite profile has no epic layer: a story sits directly under the PRD. Every
+            # other profile keeps the epic mandatory so no story is silently orphaned.
+            if sdlc_md.profile(root) != "lite":
+                raise ValueError("a story needs --epic <EPxxxx>")
+        elif _find_epic(root, f["epic"]) is None:
+            # Fail fast before writing - a story wired to a non-existent epic is an orphan whose
+            # dangling link only surfaces at the next integrity run.
+            raise ValueError(f"epic {f['epic']} not found - create it first, or fix the id")
+        _refuse_target(f)  # refuse a retired target / multi-line Verify BEFORE any write,
+        _verifiers_of(f)   # so a bad field never half-creates an artefact
+        # Who the story is FOR, resolved against the design-persona registry rather than carried
+        # as free text nothing downstream consumes. Resolved (and refused, under strict) here -
+        # before an id is allocated - so a refusal leaves nothing behind.
+        f["persona"] = _resolve_persona(root, f.get("persona"), strict=strict,
+                                        affects=f.get("affects"))
+    # A criterion carrying its verifier inside itself is warned by name here, positionally - it
+    # would otherwise be written out as prose with no Verify line anyone could run.
+    ac_warnings = check_pipe_acs(f)
+    # The cheapest triage lens, run BEFORE anything is minted: is this already on the record?
+    # Advisory by default; a refusal only under --strict, and raised here so nothing is written.
+    dupes = duplicate_candidates(root, type_, title, f)
+    if dupes and strict:
+        raise DuplicateRefused(
+            "--strict: " + "; ".join(duplicate_note(c) for c in dupes)
+            + " - nothing was minted. Re-run without --strict to file anyway.")
+    # Serialise allocate -> collision-check -> write -> index-append against concurrent
+    # writers, so two agents in one wave never mint the same id or clobber the index.
+    #
+    # NOT under `--dry-run`. Taking the lock OPENS a file in the target repository, so a preview
+    # whose whole contract is that it writes nothing wrote into the tree it was asked only to
+    # describe - found when the repo-writes lane refused a commit and the cause was traced rather
+    # than assumed. A preview has nothing to serialise: it mints no id and appends no row, and two
+    # previews naming the same candidate id is harmless because neither consumes it.
+    import contextlib  # noqa: PLC0415 - local, only this path needs it
+    with (contextlib.nullcontext() if dry_run else sdlc_md.allocation_lock(root)):
+        file_id, disp = _alloc_ids(root, type_)
+        slug = file_finding._slug(title)
+        path = root / sdlc_md.ARTIFACT_TYPES[type_][0] / f"{file_id}-{slug}.md"
+        if path.exists():
+            raise FileExistsError(path)
+        # Triage noise controls (v3 findings only, dormant on v2): a Low-severity finding folds
+        # into a themed consolidation CR; the session cap refuses a flood loudly. Routed here too
+        # so `artifact new` is not a bypass of the file_finding path.
+        sev = f.get("severity") or f.get("priority")
+        if consolidate and type_ in sdlc_md.FINDING_TYPES and triage_noise.should_consolidate(root, sev):
+            if _parent_path is not None:
+                # a consolidated finding merges into a THEMED CR, not the requested
+                # child - silently dropping the validated parent link would be the
+                # asymmetry class; refuse and let the caller mint deliberately
+                raise ValueError("--parent cannot combine with Low-severity consolidation "
+                                 "(the finding would merge into a themed CR, not the "
+                                 "parent's child) - pass consolidate=False / raise severity, "
+                                 "or drop --parent")
+            if dry_run:
+                return _with_notes({"id": None, "file_id": None, "path": None,
+                                    "consolidated": True, "dry_run": True}, ac_warnings, dupes)
+            res = triage_noise.consolidate_low_finding(root, type_, title, f, f["date"])
+            res.setdefault("indexed", True)
+            return _with_notes(res, ac_warnings, dupes)
+        if dry_run:  # preview: write nothing, report what would happen
+            idx_exists = _header_cells(root, type_) is not None
+            would_create_index = (not idx_exists) and _index_template(type_).exists()
+            return _with_notes({"id": disp, "file_id": file_id, "path": str(path),
+                                "indexed": idx_exists or would_create_index,
+                                "would_create_index": would_create_index,
+                                "epic_linked": (type_ == "story" and bool(f.get("epic"))) or None,
+                                # a preview writes no file, so the result is the one place
+                                # the persona a story would be minted against can be read
+                                **({"persona": f.get("persona") or None}
+                                   if type_ == "story" else {}),
+                                "dry_run": True}, ac_warnings, dupes)
+        if consolidate and type_ in sdlc_md.FINDING_TYPES:
+            triage_noise.enforce_session_cap(root)  # refuse the N+1th finding loudly (v3)
+        f["_status"] = _create_status(type_, root)  # era-aware: findings file into inbox under v3
+        f["_raised_by"] = sdlc_md.authorship_value(f.get("author"), root)
+        # The index Author column takes the resolved NAME, exactly as the filer's does: two
+        # creators, one column, one behaviour - never the raw triple, never a discarded identity.
+        f["author"] = sdlc_md.authorship_name(f["_raised_by"])
+        render = _select_render(root, type_, f.get("template"))
+        body = _land_supplied(render(type_, disp, title, f["date"], f), type_, f)
+        _refuse_dropped_content(body, type_, f)
+        prov = str(f.get("provenance") or "").strip()
+        if prov:
+            # The trust-boundary stamp the verify_ac shell gate reads: an ingested artefact
+            # (e.g. created --from-issue) carries its origin mechanically, on EVERY render
+            # path, so the control has a writer - not just prose. Inserted after Created-by.
+            body = re.sub(r"(^> \*\*Created-by:\*\*.*$)",
+                          rf"\1\n> **Provenance:** {prov}", body, count=1, flags=re.MULTILINE)
+        # Same reason as file_finding._render: a body carrying author prose can hold a
+        # bare ``` opener, and MD040 refuses it. Recognising a block needs the whole body.
+        sdlc_md.atomic_write(path, sdlc_md.normalise_fence_languages(body))
+        if consolidate and type_ in sdlc_md.FINDING_TYPES:
+            triage_noise.record_creation(root)  # count this minted finding (session budget)
+        index_created = _ensure_index(root, type_, f["date"])  # greenfield first run
+        header = _header_cells(root, type_)
+        indexed = False
+        if header:
+            # An epic's derived cells come from the tree, not from the caller: minted without
+            # them the Stories cell fell to the unrecognised-column `--` and a new epic was born
+            # drifted against the derivation that maintains it.
+            row = sdlc_md.row_from_header(header, f"[{disp}]({file_id}-{slug}.md)", title,
+                                          f["_status"], f,
+                                          derived=sdlc_md.derive_epic_row_cells(root, disp)
+                                          if type_ == "epic" else None)
+            indexed = file_finding.append_index_row(root, type_, row)
+        linked = _wire_story_to_epic(root, f["epic"], disp, title, file_id, slug) \
+            if (type_ == "story" and f.get("epic")) else None
+        if linked:
+            _refresh_epic_row(root, f["epic"])
+        if _parent_path is not None:
+            # wire BOTH directions inside the same lock as the mint (two concurrent
+            # same-parent spawns must not lose an update on Decomposed-into)
+            sdlc_md.insert_after_status(path, f"> **Parent:** {_parent}")
+            _existing = sdlc_md.decomposed_ids(_parent_path.read_text(encoding="utf-8"))
+            if sdlc_md.norm_id(disp) not in _existing:
+                sdlc_md.write_decomposed(_parent_path, [*_existing, sdlc_md.norm_id(disp)])
+    return _with_notes({"id": disp, "file_id": file_id, "path": str(path),
+                        "indexed": indexed, "index_created": index_created,
+                        "epic_linked": linked, "dry_run": False}, ac_warnings, dupes)
+
+
+def new_batch(repo_root: Path | str, type_: str, items: list[dict],
+              template: str = MINIMAL, dry_run: bool = False) -> dict:
+    """Create many artifacts of one type in a single atomic pass.
+
+    Reserve a contiguous id block up front (LL0002: reserve before writing), render each
+    file (the lean shape `new` writes by default; `planning` and `full` on request), append
+    every index row, and wire each story into its parent epic - one pass.
+    All-or-nothing: a missing epic or a file collision aborts before any write. `--dry-run`
+    returns the full id map and planned wiring."""
+    if type_ not in SPEC:
+        raise ValueError(f"unknown type {type_!r}")
+    root = Path(repo_root)
+    today = date.today().isoformat()
+    if not items:
+        raise ValueError("batch is empty")
+    items = [dict(it) for it in items]   # resolution rewrites fields; never mutate the caller's
+    # Validate the whole batch BEFORE writing anything (atomic) - a story wired to a
+    # missing epic is an orphan; a colliding id would corrupt the run.
+    groom_preview = (_select_render(root, type_, template)
+                     if type_ in file_finding.GROOMED_TYPES else None)
+    for i, it in enumerate(items, 1):
+        try:  # an injected line in item N aborts the batch here, before any id is reserved
+            # ... as does a key nobody reads, on the terms `--fields-file` refuses one: a
+            # misspelt key otherwise mints an artefact with that field silently missing.
+            unknown = sorted(k for k in it if k not in BATCH_ITEM_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"unknown field(s): {', '.join(unknown)} - known fields are "
+                    f"{', '.join(BATCH_ITEM_KEYS)}. A key nobody reads is a field that silently "
+                    f"went missing, so it is refused rather than ignored")
+            check_user_story_fields(it)
+            sdlc_md.check_creator_fields(it)
+            file_finding.check_prose_acs(type_, it)  # ... as does a pseudo-`Verify:` criterion
+            # ... as does a declared `Affects` that resolves to nothing, from the shared seam -
+            # so a bad path in ANY item aborts the whole batch here, before an id is reserved.
+            file_finding.check_affects_resolvable(root, it.get("affects"), type_,
+                                                  label=str(it.get("title") or f"item {i}"))
+            if groom_preview is not None:  # ... as does a bug the planner would refuse to plan
+                file_finding.check_groomed(root, type_, groom_preview(
+                    type_, "PREVIEW", str(it.get("title") or ""), today,
+                    {**it, "date": today, "_root": str(root)}))
+            # ... and so does a supplied field that would reach no part of the artefact. Checked
+            # HERE, against the same preview render, because `new_batch` promises all-or-nothing:
+            # run inside the write loop it left items 1..N-1 on disk, indexed and epic-wired,
+            # when item N was refused.
+            preview_render = groom_preview or _select_render(root, type_, template)
+            preview_fields = {**it, "date": today, "_root": str(root)}
+            _refuse_dropped_content(
+                _land_supplied(preview_render(type_, "PREVIEW", str(it.get("title") or ""),
+                                              today, preview_fields), type_, preview_fields),
+                type_, preview_fields)
+        except ValueError as exc:
+            raise ValueError(f"batch item {i}: {exc}") from exc
+    if type_ == "story":
+        for it in items:
+            if not it.get("epic"):
+                raise ValueError("each story item needs an 'epic'")
+            if _find_epic(root, it["epic"]) is None:
+                raise ValueError(f"epic {it['epic']} not found - create it first")
+            _verifiers_of(it)   # a bad Verify in item N aborts the batch before any write
+            # Same registry, same rules, same resolver as `new` - a story minted in bulk names
+            # the same design target it would have named one at a time. Resolved BEFORE any id
+            # is reserved, so the batch stays all-or-nothing.
+            it["persona"] = _resolve_persona(root, it.get("persona"),
+                                             label=str(it.get("title") or ""),
+                                             affects=it.get("affects"))
+    # CR0183/BG0076: allocate the id block + write all files under the advisory lock,
+    # so a concurrent `new`/`new_batch` cannot mint an overlapping id block. NOT under a preview,
+    # for the reason the single-artefact path carries: taking the lock OPENS a file in the target
+    # repository, and a preview that writes into the tree it was asked only to describe is the
+    # defect, not the serialisation. A preview reserves no block, so there is nothing to serialise.
+    import contextlib  # noqa: PLC0415 - local, only this path needs it
+    with (contextlib.nullcontext() if dry_run else sdlc_md.allocation_lock(root)):
+        v3 = _schema_v3(root)
+        create_status = _create_status(type_, root)  # era-aware: findings file into inbox under v3
+        n0 = None if v3 else file_finding._next_number(root, type_)
+        prefix = sdlc_md.ARTIFACT_TYPES[type_][1]
+        d = root / sdlc_md.ARTIFACT_TYPES[type_][0]
+        taken: set[str] = set()  # ids minted earlier in THIS batch (before any file is written)
+        plan = []
+        for i, it in enumerate(items):
+            if not it.get("title"):
+                raise ValueError("each item needs a 'title'")
+            if v3:
+                for _ in range(16):
+                    file_id = f"{prefix}-{sdlc_md.short_ulid()}"
+                    if file_id not in taken and not (d.exists() and any(d.glob(f"{file_id}-*.md"))):
+                        break
+                else:
+                    file_id = f"{prefix}-{sdlc_md.new_ulid()[:12]}"
+                taken.add(file_id)
+                n, disp = None, file_id
+            else:
+                n = n0 + i
+                file_id = f"{prefix}{n:04d}"
+                disp = _disp(type_, n)
+            slug = file_finding._slug(it["title"])
+            path = root / sdlc_md.ARTIFACT_TYPES[type_][0] / f"{file_id}-{slug}.md"
+            if path.exists():
+                raise FileExistsError(f"{path} (batch aborted, nothing written)")
+            plan.append({"n": n, "file_id": file_id, "disp": disp,
+                         "slug": slug, "path": path, "item": it})
+        if dry_run:
+            return {"type": type_, "count": len(plan),
+                    "template": _rendered_template(root, type_, template), "dry_run": True,
+                    "ids": [{"id": p["disp"], "path": str(p["path"]),
+                             "epic": p["item"].get("epic")} for p in plan]}
+        render = _select_render(root, type_, template)
+        _ensure_index(root, type_, today)
+        created = []
+        for p in plan:
+            it = p["item"]
+            f = dict(it)
+            f["date"] = today
+            f["_root"] = str(root)   # so the renderer reads the TARGET's enforcement, not the CWD
+            f["_status"] = create_status
+            f["_raised_by"] = sdlc_md.authorship_value(f.get("author"), root)
+            f["author"] = sdlc_md.authorship_name(f["_raised_by"])  # index cell: the name
+            p["path"].parent.mkdir(parents=True, exist_ok=True)
+            body = _land_supplied(render(type_, p["disp"], it["title"], today, f), type_, f)
+            sdlc_md.atomic_write(p["path"], body)
+            header = _header_cells(root, type_)
+            link = f"[{p['disp']}]({p['file_id']}-{p['slug']}.md)"
+            if header:
+                row = sdlc_md.row_from_header(
+                    header, link, it["title"], create_status, f,
+                    derived=sdlc_md.derive_epic_row_cells(root, p["disp"])
+                    if type_ == "epic" else None)
+                file_finding.append_index_row(root, type_, row)
+            if type_ == "story":
+                _wire_story_to_epic(root, it["epic"], p["disp"], it["title"], p["file_id"], p["slug"])
+                # The batch path is the one that skipped this before, so it is wired explicitly
+                # here rather than left to a shared tail nobody notices is missing.
+                _refresh_epic_row(root, it.get("epic", ""))
+            created.append({"id": p["disp"], "file_id": p["file_id"], "path": str(p["path"])})
+        return {"type": type_, "count": len(created),
+                "template": _rendered_template(root, type_, template),
+                "created": created, "dry_run": False}
+
+
+def infer_type_from_id(artifact_id: str) -> str | None:
+    """Artifact type from an id's LEADING alpha prefix (`BG0007`, `CR-0003`, and the v3
+    `BG-01JQK3F8` all yield `BG`). Collecting every alpha character breaks on ULIDs, whose
+    random tail contains letters."""
+    m = re.match(r"[A-Za-z]+", artifact_id.strip())
+    return _PREFIX_TYPE.get(m.group(0).upper()) if m else None
+
+
+def close(repo_root: Path | str, artifact_id: str, status: str | None = None,
+          metrics: dict | None = None, dry_run: bool = False, force: bool = False,
+          triaged_by: str | None = None) -> dict:
+    """Terminal-transition an artifact and cascade (reuse transition), then record a
+    telemetry event. Telemetry is advisory - it never affects the
+    close result (the recorder swallows its own failures). `force` bypasses the story->Done
+    AC-verify gate; it is inert for non-story types."""
+    type_ = infer_type_from_id(artifact_id)
+    if type_ is None:
+        raise ValueError(f"cannot infer type from id {artifact_id!r}")
+    # The default close target comes from the shared vocab authority, not from a table this
+    # module keeps - so `close` and the vocab can never disagree about what closed means.
+    st = status or sdlc_md.default_terminal_status(type_)
+    if dry_run:
+        # PREVIEW THROUGH THE REAL LADDER. Synthesising the target here consulted no gate, so
+        # `close --dry-run` answered "would close" for a story the real run then refused, and
+        # exited 0 while the real close exits 1 - a preflight that disagrees with the run it
+        # previews is worse than none, because it is consulted precisely to avoid the surprise.
+        # `transition` fires its gates on a dry run for exactly this reason and writes nothing;
+        # a refusal raises here and `main` reports it, as on the real path.
+        r = transition.transition(repo_root, artifact_id, st, force=force,
+                                  metrics=metrics, triaged_by=triaged_by, dry_run=True)
+        return {**r, "dry_run": True}
+    # transition records one telemetry event on entering the terminal set (and none on an
+    # idempotent re-close); pass the metrics through so close does not double-record.
+    return transition.transition(repo_root, artifact_id, st, force=force,
+                                 metrics=metrics, triaged_by=triaged_by)
+
+
+_SECTION_SPLIT_RE = re.compile(r"^(##\s+.*)$", re.M)
+
+
+def _tier_of(text: str) -> str | None:
+    """The artefact's declared template tier - one authority (lib.tiers)."""
+    return tiers.tier_of(text)
+
+
+def _sections(text: str) -> list[tuple[str, str]]:
+    """(heading text, block) for every `## ` section, in document order. A block runs to the
+    next `## ` heading, with the template's horizontal-rule separators trimmed - promotion
+    joins blocks with a blank line, so a stray `---` would render as a rule mid-document."""
+    out: list[tuple[str, str]] = []
+    parts = _SECTION_SPLIT_RE.split(text)
+    for i in range(1, len(parts), 2):
+        head = parts[i]
+        body = parts[i + 1] if i + 1 < len(parts) else ""
+        block = f"{head}{body}".rstrip()
+        while block.endswith("---"):  # drop the trailing rule (and the blank line above it)
+            block = block[: -len("---")].rstrip()
+        out.append((head[2:].strip(), block))
+    return out
+
+
+def _head_key(heading: str) -> str:
+    return heading.strip().lower()
+
+
+def promote(repo_root: Path | str, artifact_id: str, to: str = FULL) -> dict:
+    """Promote a planning-tier artefact to the full tier.
+
+    Every `## ` section the full template mandates and this artefact does not yet carry is
+    grafted in, in template order, with everything already written preserved verbatim; the
+    tier stamp is then re-cut to `full`. This is the remedy the transition gate names: a lean
+    story reaches implementation by GAINING the sections it was allowed to defer (the
+    constraint chain, edge cases, test scenarios, the rollback envelope), never by having the
+    gate waived. Idempotent - an artefact that is not planning-tier is already promoted and is
+    left untouched."""
+    if to != FULL:
+        raise ValueError(f"promote --to {to!r}: the only promotion target is {FULL!r}")
+    root = Path(repo_root)
+    hit = sdlc_md.find_by_id(root, artifact_id)
+    if hit is None:
+        raise ValueError(f"no artifact found for id {artifact_id!r}")
+    path, type_ = hit
+    text = path.read_text(encoding="utf-8")
+    tier = _tier_of(text)
+    # Promotion is owed whenever the artefact declares the planning tier OR is missing sections
+    # the full tier carries - which is also the remedy for an artefact whose `full` stamp was
+    # rewritten without the work. Nothing to add and nothing to correct is already promoted.
+    if tier != PLANNING and not tiers.missing_sections(text, type_):
+        return {"id": artifact_id, "type": type_, "path": str(path), "from": tier or FULL,
+                "to": tier or FULL, "promoted": False, "added": []}
+    core = _core_template(type_)
+    if not core.exists():
+        raise ValueError(f"no full template for type {type_!r} - nothing to promote into")
+    core_body = re.sub(r"^<!--.*?-->\n+", "", core.read_text(encoding="utf-8"),
+                       count=1, flags=re.DOTALL)
+    head = text[: text.index("\n## ")] if "\n## " in text else text.rstrip()
+    have = {_head_key(h): b for h, b in _sections(text)}
+    tmpl = _sections(core_body)
+    tmpl_keys = {_head_key(h) for h, _ in tmpl}
+    # sections this artefact has that the template does not know about (an agent's own
+    # additions) keep their place ahead of the revision log rather than being pushed past it
+    extra = [b for h, b in _sections(text) if _head_key(h) not in tmpl_keys]
+    blocks: list[str] = []
+    added: list[str] = []
+    for heading, block in tmpl:
+        key = _head_key(heading)
+        if key == "revision history":
+            blocks.extend(extra)
+            extra = []
+        if key in have:
+            blocks.append(have[key])
+        else:
+            blocks.append(block)
+            added.append(heading)
+    blocks.extend(extra)  # a template with no revision log - keep the additions at the end
+    body = "\n\n".join(b for b in blocks if b.strip())
+    new_text = transition._upsert_field(f"{head.rstrip()}\n\n{body}\n", TIER_FIELD, FULL)
+    sdlc_md.atomic_write(path, new_text)
+    return {"id": artifact_id, "type": type_, "path": str(path), "from": tier or MINIMAL,
+            "to": FULL, "promoted": True, "added": added}
+
+
+def cmd_promote(args: argparse.Namespace) -> int:
+    r = promote(args.root, args.id, to=args.to)
+    if args.format == "json":
+        print(json.dumps(r, indent=2))
+    elif r["promoted"]:
+        print(f"promoted {r['id']} {r['from']} -> {r['to']} "
+              f"({len(r['added'])} section(s) added: {', '.join(r['added']) or 'none'})")
+    else:
+        print(f"{r['id']} is already {r['to']}-tier - nothing to promote")
+    return 0
+
+
+#: The keys this creator accepts in a `--fields-file` document: the shared finding fields plus
+#: the ones only `artifact new` writes. Its own list, not the filer's: a key nobody here reads
+#: is a field that silently went missing, which is the class the file exists to end.
+FIELDS_FILE_KEYS: tuple[str, ...] = (*file_finding.COMMON_FIELDS_FILE_KEYS,
+                                     "epic", "persona", "template",
+                                     "provenance",
+                                     # A story's User Story block.
+                                     *(key for _label, key in _USER_STORY_LINES),
+                                     # A charter's own three: what the run drives to, the rule
+                                     # that selects its batch, and how much of a run it is worth.
+                                     "goal", "scope", "appetite", "scope_query")
+#: The keys a `batch` spec item may carry: the `--fields-file` document's, plus the
+#: orchestrator's `tranche` the renderer writes.
+BATCH_ITEM_KEYS: tuple[str, ...] = (*FIELDS_FILE_KEYS, "tranche")
+
+
+def cmd_new(args: argparse.Namespace) -> int:
+    if args.target is not None:
+        print(f"refused: {TARGET_RETIRED}", file=sys.stderr)
+        return 2
+    f = {k: v for k, v in {"epic": args.epic, "priority": args.priority, "ctype": args.ctype,
+                           "severity": args.severity, "author": args.author,
+                           "template": args.template, "persona": args.persona,
+                           "summary": args.summary, "steps": args.steps, "fix": args.fix,
+                           "impact": args.impact, "points": args.points,
+                           "size": args.size,
+                           "affects": args.affects,
+                           "acs": args.ac, "verify": args.verify,
+                           "options": args.option,
+                           "recommendation": args.recommendation,
+                           "provenance": getattr(args, "provenance", None),
+                           "parent": getattr(args, "parent", None)}.items() if v}
+    if args.title:
+        f["title"] = args.title
+    # The values that DID cross a shell, and only those - reported from the ONE helper the filer
+    # uses, so the two writers cannot drift into disagreeing about what a mangled field is.
+    file_finding.report_shell_hazards(f)
+    try:
+        from_file = (file_finding.load_fields_file(args.fields_file, FIELDS_FILE_KEYS)
+                     if args.fields_file else {})
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    f = {**from_file, **f}                   # an explicit flag wins over the document
+    try:
+        file_finding.check_verify_pairing(f)  # every verifier typed pairs with a criterion
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    # `--template` carries an argparse default, so it is always present and would otherwise
+    # override a template named in the document; the document wins unless the flag was typed.
+    if args.template == MINIMAL and "template" in from_file:
+        f["template"] = from_file["template"]
+    title = f.pop("title", None)
+    if not title:
+        print("error: no title - pass --title, or a \"title\" key in the --fields-file document",
+              file=sys.stderr)
+        return 2
+    try:
+        if args.type in META:
+            r = meta_new(args.root, args.type, title, f, dry_run=args.dry_run)
+        else:
+            r = new(args.root, args.type, title, f, dry_run=args.dry_run,
+                    strict=getattr(args, "strict", False))
+    except (DuplicateRefused, PersonaRefused, ContentDropped) as exc:
+        # A refusal is a message, not a traceback - and it names what to do next. Nothing was
+        # allocated or written, so there is no half-minted artefact to clean up.
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    except conventions.ConventionsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    for note in r.get("ac_warnings", []):
+        print(f"warning: {note}", file=sys.stderr)
+    for c in r.get("duplicate_warnings", []):
+        print(f"warning: {duplicate_note(c)} - merge, or confirm they are distinct",
+              file=sys.stderr)
+    verb = "would create" if r.get("dry_run") else "created"
+    if args.format == "json":
+        print(json.dumps(r, indent=2))
+    elif r.get("consolidated") or r.get("consolidated_into"):
+        # a Low finding folded into a themed consolidation CR - its result has its own shape
+        # (no epic wiring, no per-finding index row), so print it by that shape
+        if r.get("dry_run"):
+            print("would consolidate this Low finding into a themed CR (no artefact minted)")
+        else:
+            print(f"consolidated into {r['consolidated_into']} "
+                  f"({Path(r['path']).name}, created={bool(r.get('created'))})")
+    else:
+        print(f"{verb} {r['id']} -> {r['path']} "
+              f"(indexed={r.get('indexed')}, epic_linked={r.get('epic_linked')})")
+        # An artefact minted with an unfilled criteria scaffold is NOT finished, and saying so
+        # here is the difference between a tool that reports success and one that reports what
+        # it did. Reporting unqualified success sent authors away from a document that still
+        # needed writing, and they met that fact later as a refusal from another command.
+        _body = sdlc_md.read_text_safe(Path(r["path"])) or ""
+        if "{{criterion}}" in _body or "{{" in _body.split("## Acceptance Criteria", 1)[-1][:400]:
+            print("  NOT FINISHED: its acceptance criteria are still the scaffold placeholder. "
+                  "Author them before planning or reviewing this - `sprint plan` refuses an "
+                  "ungroomed unit, and a criterion nobody wrote is one nothing can check.")
+    return 0
+
+
+def cmd_batch(args: argparse.Namespace) -> int:
+    items = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    if not isinstance(items, list):
+        print("error: --spec must be a JSON list of items", file=sys.stderr)
+        return 1
+    try:
+        r = new_batch(args.root, args.type, items, template=args.template, dry_run=args.dry_run)
+    except conventions.ConventionsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(json.dumps(r, indent=2))
+        return 0
+    verb = "would create" if r.get("dry_run") else "created"
+    print(f"batch: {verb} {r['count']} {args.type}(s) (template={r['template']})")
+    for row in (r.get("ids") or r.get("created") or []):
+        print(f"  {row['id']} -> {row['path']}")
+    return 0
+
+
+def cmd_close(args: argparse.Namespace) -> int:
+    # Orchestrated close (one call = verdict + transition): every step is durable, so a
+    # refusal at the transition leaves the verdict recorded and a re-run completes. NOTE a
+    # re-run appends a fresh verdict row (append-only audit log, latest-wins for gates) - clear
+    # the refusal before retrying to keep the log tight.
+    # Self-review refuses BEFORE any write.
+    reviewer = getattr(args, "reviewer", None)
+    author = getattr(args, "author", None)
+    if reviewer or author:
+        if not (reviewer and author and args.verdict):
+            print("error: orchestrated close needs --verdict, --reviewer AND --author "
+                  "(or none of reviewer/author for the plain close)", file=sys.stderr)
+            return 2
+        import critic
+        independent, why = critic.independence(reviewer, author)
+        if not independent:
+            print(f"error: {why} - independence is the floor, so nothing was written",
+                  file=sys.stderr)
+            return 2
+    if reviewer and not args.dry_run:
+        # FIRST, so a verdict `critic.record_verdict` refuses (its vocabulary, the review
+        # rounds) leaves nothing written.
+        try:
+            critic.record_verdict(args.root, args.id, args.verdict, reviewer, author,
+                                  issues=getattr(args, "issues", "") or "")
+        except ValueError as exc:
+            print(f"error: {exc} - nothing was written", file=sys.stderr)
+            return 2
+    metrics = {}
+    if args.iterations is not None:
+        metrics["iterations"] = int(args.iterations)
+    if args.verdict:
+        metrics["critic_verdict"] = args.verdict
+    if args.wall_time_s is not None:
+        metrics["wall_time_s"] = int(args.wall_time_s)
+    if args.stages:
+        metrics["stages"] = args.stages
+    r = close(args.root, args.id, args.status, metrics or None, dry_run=args.dry_run,
+              force=getattr(args, "force", False),
+              triaged_by=getattr(args, "triaged_by", None))
+    verb = "would close" if r.get("dry_run") else "closed"
+    print(json.dumps(r, indent=2) if args.format == "json" else f"{verb} {args.id}")
+    return 0
+
+
+#: The severities the release bar and the disclosure page between them recognise. A value
+#: outside this set is in NEITHER, so both readers drop it and a finding absent from the
+#: bar reads exactly like a corpus that is clean. Refused at the point of filing rather
+#: than normalised: guessing what `major` meant would put a word nobody chose on the
+#: record. Both writers of this field carry it - guarding one leaves the class open
+#: through the other.
+SEVERITY_VOCAB = ("Critical", "High", "Medium", "Low")
+
+
+def normalise_severity(value: str | None) -> str:
+    """The canonical spelling of a severity, or raise `ValueError` naming the accepted set.
+
+    CASE-FOLDED, not case-sensitive. Both readers fold - `known_issues._matches` does, and its
+    own docstring says the corpus holds seven bugs written `high` - so a writer that refuses
+    them refuses 21 findings the release bar and the disclosure page classify perfectly well.
+    Folding case is not guessing at intent, which is what refusing an unrecognised word is for;
+    it is the same reading the readers already take.
+
+    Raising rather than returning a default: a severity nobody recognises is dropped by BOTH
+    readers, so it is absent from the release bar and the disclosure page at once, and absence
+    reads exactly like a clean corpus.
+    """
+    raw = (value or "").strip()
+    for known in SEVERITY_VOCAB:
+        if raw.casefold() == known.casefold():
+            return known
+    raise ValueError(
+        f"severity {raw!r} is not one of {', '.join(SEVERITY_VOCAB)}. A value outside that set "
+        f"is dropped by the release bar AND the disclosure page, so the finding is absent from "
+        f"both and the absence reads like a clean corpus.")
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Deterministic artifact create + close.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    n = sub.add_parser("new", help="Create + wire any numbered artifact.")
+    n.add_argument("--type", required=True, choices=tuple(SPEC) + META)
+    n.add_argument("--fields-file", dest="fields_file", metavar="ARTEFACT.json",
+                   help="THE RECOMMENDED PATH for anything with prose in it. A JSON object of "
+                        "the same field names, read straight off disk so no value crosses a "
+                        "shell. Backticks and `$(` are command substitution inside a shell "
+                        "argument, so on the flag path prose whose content is COMMANDS gets "
+                        "executed rather than stored. A file is also re-runnable, committable "
+                        "as evidence and diffable. An explicit flag overrides the document")
+    n.add_argument("--title", help="required unless the --fields-file document carries a title")
+    n.add_argument("--epic", help="parent epic (required for a story)")
+    n.add_argument("--parent", help="spawn as a child of an existing RFC/CR: the parent must resolve, and both link directions are wired at mint")
+    n.add_argument("--priority")
+    n.add_argument("--ctype", help="cr type")
+    n.add_argument("--severity",
+               help="bug severity - Critical, High, Medium or Low. A value outside that set is REFUSED rather than normalised: guessing what `major` meant would put a word nobody chose on the record, and a severity in neither the barred nor the disclosed set is dropped by the release bar and the disclosure page alike, silently")
+    n.add_argument("--provenance",
+                   help="origin stamp for ingested content (e.g. 'external' for a GitHub "
+                        "issue body) - the verify_ac shell gate refuses shell/eval/http "
+                        "verbs on externally-stamped artifacts")
+    n.add_argument("--author",
+                   help="authorship of record, stamped as `Raised-by`: 'Name; type; version' "
+                        "(type is human|persona|agent) or a bare name; defaults to the "
+                        "invoking agent (SDLC_AUTHOR when set)")
+    # Content the validator demands of a filled artefact. Supply it here and the artefact is
+    # born clean; omit it and the scaffold keeps the slot for the agent to fill.
+    n.add_argument("--persona",
+                   help="story: the design persona it serves, resolved against "
+                        "personas/index.md. Omitted, it defaults to the declared Primary "
+                        "(with two or more, the one whose card's Interface paths hold every "
+                        "--affects path but its tests and changelog fragments, else the first "
+                        "listed); an unregistered name is warned about (refused under --strict)")
+    n.add_argument("--summary", help="the Summary/Overview section")
+    n.add_argument("--steps", help="bug: steps to reproduce (the evidence a bug must carry)")
+    n.add_argument("--fix", help="bug: proposed fix")
+    n.add_argument("--impact", help="cr: who this affects and what breaks")
+    # No argparse `choices`: a bare "invalid choice" teaches nothing, and the reason the scale
+    # has no 7 is the whole lesson. `sdlc_md.check_points` - shared with the finding filer - is
+    # what refuses it, with the scale in the message.
+    n.add_argument("--points",
+                   help="the job SIZE of a DELIVERY unit (a story or a bug) on the modified "
+                        f"Fibonacci scale ({', '.join(str(p) for p in sdlc_md.POINTS_SCALE)}) - "
+                        "RELATIVE to units already delivered, not its urgency and not a time "
+                        "prediction. `sprint plan` refuses to plan a delivery unit nobody sized. "
+                        "A value off the scale is refused, never rounded. A cr/rfc/epic takes "
+                        "--size, not --points")
+    n.add_argument("--size",
+                   help="the T-shirt SIZE of a REQUEST or CONTAINER (a cr, rfc or epic) - "
+                        f"{' / '.join(sdlc_md.SIZE_SCALE)} - sized coarsely before it is "
+                        "decomposed into the delivery units that carry story points. A story or "
+                        "bug takes --points, not --size")
+    n.add_argument("--affects",
+                   help="comma-separated files this unit will touch, written as the `Affects` "
+                        "metadata line the planner reads. Required for a bug: "
+                        "`sprint plan` refuses a unit that names no files - it cannot size one, "
+                        "nor see two units colliding on the same file")
+    n.add_argument("--ac", action="append", help="acceptance criterion (repeatable)")
+    n.add_argument("--verify", action="append",
+                   help="story/bug: the executable check for the AC in the same position "
+                        "(repeatable; pairs with --ac). Omit it and the AC carries no Verify "
+                        "line - which conformance reports, rather than inventing one")
+    # RETIRED: kept only so a caller still passing it is refused by name (`cmd_new`).
+    n.add_argument("--target", help=argparse.SUPPRESS)
+    n.add_argument("--option", action="append", help="rfc design option (repeatable)")
+    n.add_argument("--recommendation", help="rfc: the recommended option")
+    n.add_argument("--template", choices=TEMPLATE_TIERS, default=MINIMAL,
+                   help="scaffold richness: minimal (default); planning (story/epic: ACs with "
+                        "Verify, scope, technical notes - no "
+                        "implementation furniture, and `promote` is required before an "
+                        "implementation status); or the full templates/core body")
+    n.add_argument("--root", default=".")
+    n.add_argument("--strict", action="store_true",
+                   help="refuse the mint when the title looks like a duplicate of an existing "
+                        "artefact, or when --persona names nobody the registry declares "
+                        "(default: report it and mint anyway)")
+    n.add_argument("--dry-run", action="store_true", dest="dry_run", help="preview; write nothing")
+    n.add_argument("--format", choices=("text", "json"), default="text")
+    n.set_defaults(func=cmd_new)
+    b = sub.add_parser("batch", help="Create many artifacts of one type in one atomic pass.")
+    b.add_argument("--type", required=True, choices=tuple(SPEC))
+    b.add_argument("--spec", required=True, help="JSON file: a list of {title, epic?, ...} items")
+    b.add_argument("--template", choices=TEMPLATE_TIERS, default=MINIMAL,
+                   help="scaffold richness, as for `new`: minimal (default, the lean shape); "
+                        "planning (the pre-implementation tier); or the full templates/core body")
+    b.add_argument("--root", default=".")
+    b.add_argument("--dry-run", action="store_true", dest="dry_run", help="preview the id map; write nothing")
+    b.add_argument("--format", choices=("text", "json"), default="text")
+    b.set_defaults(func=cmd_batch)
+    c = sub.add_parser("close", help="Terminal-transition an artifact + cascade + record telemetry.")
+    c.add_argument("--id", required=True)
+    c.add_argument("--status", help="override the per-type terminal status")
+    c.add_argument("--force", action="store_true",
+                   help="bypass the story->Done AC-verify gate (inert for non-stories)")
+    c.add_argument("--iterations", help="run metric: iterations to green (telemetry)")
+    c.add_argument("--verdict", help="run metric: critic verdict (telemetry)")
+    c.add_argument("--wall-time-s", dest="wall_time_s", help="run metric: wall time (telemetry)")
+    c.add_argument("--stages", help="run metric: stages passed (telemetry)")
+    sdlc_md.retire_flag(c, "--depth", "no depth tier is stamped any more; a bug's "
+                        "criteria and its `Verify:` run are its evidence - drop the flag")
+    c.add_argument("--reviewer", help="orchestrated close: record the critic verdict under "
+                                      "this reviewer (must differ from --author)")
+    c.add_argument("--author", help="orchestrated close: the authoring seat the verdict "
+                                    "judges (reviewer != author enforced up front)")
+    c.add_argument("--issues", help="orchestrated close: critic verdict issues/tier note")
+    c.add_argument("--triaged-by", dest="triaged_by",
+                   help="v3 finding close: the triaging seat as 'Name; type; version' - lets "
+                        "the one-call close clear the inbox triage gate too")
+    c.add_argument("--root", default=".")
+    c.add_argument("--dry-run", action="store_true", dest="dry_run", help="preview; write nothing")
+    c.add_argument("--format", choices=("text", "json"), default="text")
+    c.set_defaults(func=cmd_close)
+    pr = sub.add_parser("promote", help="Promote a planning-tier artifact to the full "
+                                        "template (adds the deferred sections; idempotent).")
+    pr.add_argument("--id", required=True, help="Artifact id, e.g. US0023 / EP0007")
+    pr.add_argument("--to", choices=(FULL,), default=FULL,
+                    help="promotion target (full - the tier implementation requires)")
+    pr.add_argument("--root", default=".")
+    pr.add_argument("--format", choices=("text", "json"), default="text")
+    pr.set_defaults(func=cmd_promote)
+    r = sub.add_parser("revision", help="Append a dated Revision History row per id (batch).")
+    sdlc_md.add_ids_argument(r, help_="artifact ids; repeat --id or pass --ids as one comma list")
+    r.add_argument("--note", required=True, help="the Change cell text")
+    r.add_argument("--author", help="the Author cell (default: sdlc)")
+    r.add_argument("--date", help="override the Date cell (default: today)")
+    r.add_argument("--root", default=".")
+    r.set_defaults(func=cmd_revision)
+    rt = sub.add_parser("retitle", help="Atomically retitle an artefact across the H1, the "
+                                        "filename slug and the index row, rewriting inbound "
+                                        "references or refusing and naming them.")
+    rt.add_argument("--id", required=True, help="Artifact id, e.g. CR-0406 / BG0265")
+    rt.add_argument("--title", required=True, help="the new title (the H1 tail, the slug and the "
+                                                   "index row are all rewritten from it)")
+    rt.add_argument("--root", default=".")
+    rt.add_argument("--dry-run", action="store_true", dest="dry_run",
+                    help="validate all four surfaces and report; write nothing")
+    rt.add_argument("--format", choices=("text", "json"), default="text")
+    rt.set_defaults(func=cmd_retitle)
+    sdlc_md.add_global_root(p)
+    return p
+
+
+_REV_HEAD_RE = re.compile(r"^##\s+Revision History\s*$", re.MULTILINE)
+
+
+def cmd_revision(args: argparse.Namespace) -> int:
+    """Append one dated Revision History row per id - the deterministic
+    close-out verb. A file without a Revision History section is refused
+    loudly (never silently skipped); one refusal does not abort the batch."""
+    import readiness
+    root = Path(args.root)
+    today = args.date or date.today().isoformat()
+    author = args.author or "sdlc"
+    # The three cells this verb writes. Refused up front, once: they are the same for every id
+    # in the batch, so a break in one would corrupt every row it touched.
+    sdlc_md.check_creator_fields({"date": today, "author": author, "note": args.note})
+    ids = sdlc_md.resolve_ids(args)
+    if not ids:
+        print("specify at least one id: --id (repeatable) or --ids as a comma list",
+              file=sys.stderr)
+        return 2
+    refused = 0
+    for rid in ids:
+        found = readiness.find_artifact(root, rid)
+        if found is None:
+            print(f"error: {rid}: no artifact file found", file=sys.stderr)
+            refused += 1
+            continue
+        path, _type = found
+        text = path.read_text(encoding="utf-8")
+        m = _REV_HEAD_RE.search(text)
+        if not m:
+            print(f"error: {rid}: no '## Revision History' section in {path.name} "
+                  f"- add the table before recording revisions", file=sys.stderr)
+            refused += 1
+            continue
+        # append after the LAST table row of the section (contiguous | rows)
+        lines = text.splitlines()
+        head_ln = text[:m.start()].count("\n")
+        j = head_ln + 1
+        last_row = None
+        while j < len(lines):
+            s = lines[j].strip()
+            if s.startswith("|"):
+                last_row = j
+            elif s.startswith("## ") or (last_row is not None and s and not s.startswith("|")):
+                break
+            j += 1
+        if last_row is None:
+            print(f"error: {rid}: Revision History section has no table in {path.name}",
+                  file=sys.stderr)
+            refused += 1
+            continue
+        # The note is prose in a table cell: a bare `_check, then _series` there is emphasis.
+        row = sdlc_md.join_row([today, author, file_finding._md_safe(args.note)])
+        lines.insert(last_row + 1, row)
+        path.write_text("\n".join(lines) + ("\n" if text.endswith("\n") else ""),
+                        encoding="utf-8")
+        print(f"revision recorded: {rid} ({path.name})")
+    return 1 if refused else 0
+
+
+# The one field with no deterministic writer until now: a title lives in the H1, the filename
+# slug and the index row link/title cell at once, and inbound references cite the filename. The
+# `# <ID>: <title>` H1 - the id prefix and colon are the anchor kept verbatim, the tail is the
+# rewritten title. A retitle without this anchor has no H1 surface to update, which AC names.
+# The id may be numeric or a v3/ULID crockford suffix: the ULID branch is tried first so a long
+# crockford suffix is not truncated to its leading digits by the numeric branch.
+_H1_RETITLE_RE = re.compile(
+    r"^(#[^\S\n]+[A-Za-z]+(?:-[0-9A-Za-z]{8,}|-?\d+):[^\S\n]*)(.+?)[^\S\n]*$", re.MULTILINE)
+
+
+#: A LEVEL-ONE ATX heading and nothing else: up to three spaces of indent, EXACTLY one hash,
+#: then whitespace or end of line. Deliberately not `#{1,6}`, and deliberately not
+#: `lstrip().startswith("#")` - three review rounds killed both. The wide patterns have nowhere
+#: safe to go in a document carrying no H1: they take the first `##` and overwrite it, and
+#: `## Summary` is on every bug artefact `_render` writes. The rule that ends this class is not
+#: a longer list of shapes, it is a NARROWER LICENCE TO OVERWRITE - see `_first_h1_line`.
+_H1_LINE_RE = re.compile(r"^ {0,3}#(?:\s|$)")
+
+#: A fence opener or closer. Both the CHARACTER and the RUN LENGTH matter: a four-backtick
+#: fence legitimately contains three-backtick fences, and a `~~~` block is not closed by
+#: ```` ``` ````. Matching a bare three-character prefix flips state on the inner fence and
+#: hands the caller a line that is inside a code block. Group 2 is the info string, which a
+#: CLOSING fence may not have.
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*(.*)$")
+
+_COMMENT_OPEN, _COMMENT_CLOSE = "<!--", "-->"
+
+
+def _front_matter_end(lines: list[str]) -> int:
+    """The index just past YAML front matter, or 0. Front matter exists only at line 1."""
+    if not lines or lines[0].strip() != "---":
+        return 0
+    for i in range(1, len(lines)):
+        if lines[i].strip() in ("---", "..."):
+            return i + 1
+    return 0        # unterminated: not front matter, so nothing is skipped
+
+
+def _first_h1_line(lines: list[str]) -> int | None:
+    """The index of the document's level-one ATX heading, or None when there is none to replace.
+
+    OUTSIDE every container that suspends markdown: a fenced code block, an HTML comment, and
+    YAML front matter. None is the SAFE answer and it is deliberately the common one - the
+    caller inserts rather than overwrites, so a shape this function does not understand costs a
+    duplicate heading and never a lost line. That asymmetry is the whole design: the expensive
+    failure is returning a wrong index, because the line is then gone and the command reports
+    success. Three rounds of review each found a new shape the previous version destroyed
+    (a fenced `#` comment, a `#hashtag`, an indented code line, `## Summary`, a `#` inside an
+    HTML comment, a `#` inside front matter); this version can only ever fail towards silence.
+    """
+    i, n = _front_matter_end(lines), len(lines)
+    fence: str | None = None
+    in_comment = False
+    while i < n:
+        line = lines[i]
+        m = _FENCE_RE.match(line)
+        if fence is not None:
+            # A closer matches the opener's character, is at least as long, and carries no
+            # info string. Anything else is content, INCLUDING a shorter run of the same char.
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
+                    and not m.group(2).strip():
+                fence = None
+        elif in_comment:
+            if _COMMENT_CLOSE in line:
+                in_comment = False
+        elif m:
+            fence = m.group(1)
+        elif _H1_LINE_RE.match(line) and _COMMENT_OPEN not in line:
+            return i
+        elif _COMMENT_OPEN in line and _COMMENT_CLOSE not in line.split(_COMMENT_OPEN, 1)[1]:
+            in_comment = True
+        i += 1
+    return None
+
+
+class RetitleBlocked(ValueError):
+    """A retitle refused because one of the four surfaces cannot be updated, naming which.
+
+    All-validate-then-write: raised BEFORE any surface is touched, so a blocked retitle leaves
+    the H1, the filename and the index row byte-identical (US0398 AC2). `surface` is one of
+    `h1` / `filename` / `index` / `references`, and the message states the fix (US0398 AC3)."""
+
+    def __init__(self, surface: str, message: str):
+        super().__init__(message)
+        self.surface = surface
+
+
+def _load_check_links(repo_root: Path | str):
+    """The check_links module (the link authority the retitle reuses to find inbound
+    references), located in the operated repo's `tools/` or this skill's own repo, or None.
+
+    check_links is a repo CI tool, not shipped runtime payload, so it is loaded by path rather
+    than imported - and its absence is a hard refusal, never a silent skip: a retitle that
+    could not see the inbound references would rename the file and leave them dangling, which
+    is the exact failure the reference handling exists to prevent."""
+    import importlib.util  # noqa: PLC0415 - local: only the retitle path needs it
+    candidates = [Path(repo_root) / "tools" / "check_links.py",
+                  Path(__file__).resolve().parents[4] / "tools" / "check_links.py"]
+    for cand in candidates:
+        if cand.exists():
+            spec = importlib.util.spec_from_file_location("check_links", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    return None
+
+
+class _WriteJournal:
+    """The prior bytes of every file a multi-file write phase is about to touch, so a fault
+    partway through can put all of them back.
+
+    A file that did NOT exist is recorded as such and REMOVED on rollback: a created-then-
+    abandoned destination is drift too, and leaving it is how a failed rename ends up with two
+    copies of one artefact. `rollback` never raises - it returns the paths it could not
+    restore, so the caller reports a partial rollback honestly instead of a clean-sounding
+    lie on top of the original fault.
+    """
+
+    def __init__(self) -> None:
+        self._before: dict[Path, bytes | None] = {}
+
+    def capture(self, path: Path | str) -> None:
+        p = Path(path)
+        if p not in self._before:
+            try:
+                self._before[p] = p.read_bytes() if p.is_file() else None
+            except OSError:
+                # Unreadable before the phase starts: record nothing rather than a wrong
+                # "did not exist", which rollback would act on by deleting it.
+                sdlc_md.debug("artifact.retitle.journal", f"cannot capture {p}")
+
+    def rollback(self) -> list[str]:
+        unrestored: list[str] = []
+        for p, before in self._before.items():
+            try:
+                if before is None:
+                    if p.exists():
+                        p.unlink()
+                else:
+                    p.write_bytes(before)
+            except OSError:
+                unrestored.append(str(p))
+        return unrestored
+
+
+def retitle(repo_root: Path | str, artifact_id: str, new_title: str,
+            dry_run: bool = False) -> dict:
+    """Atomically retitle an artefact across all three title surfaces - the H1, the filename
+    slug and the index row - and rewrite every inbound reference, or refuse before any write
+    if any surface cannot be updated (all-validate-then-write).
+
+    The title is the last field with no deterministic writer: it lives in the H1, the filename
+    slug and the index row's link/title cell at once, and a correction means editing all three
+    by hand plus repairing every inbound link. This is that writer. It validates the four
+    surfaces (H1 present, destination slug free, index row present, no inbound reference in
+    immutable archived history) and only then writes - so a blocked retitle leaves every surface
+    byte-identical. On success it records the previous title in a dated Revision History row."""
+    root = Path(repo_root)
+    # Refuse an injected title (a line break, a forged metadata line) before any lookup or write,
+    # from the one choke point every creator shares - a retitle is no escape hatch from it.
+    sdlc_md.check_creator_fields({"title": new_title})
+    new_title = new_title.strip()
+    if not new_title:
+        raise ValueError("retitle needs a non-empty --title")
+    hit = sdlc_md.find_by_id(root, artifact_id)
+    if hit is None:
+        raise ValueError(f"no artifact found for id {artifact_id!r}")
+    path, type_ = hit
+    # ANY family: a meta stem returns None from `extract_record_id`, and the old `or
+    # path.stem` fallback then handed the row writer the whole filename, which can never
+    # match an index row's id cell.
+    file_id = sdlc_md.any_record_id(path.stem) or path.stem
+    text = path.read_text(encoding="utf-8")
+
+    # --- surface 1: the H1 ---
+    m = _H1_RETITLE_RE.search(text)
+    if m is None:
+        # REPAIR rather than refuse. The H1 is the thinnest of the four surfaces and the only
+        # one a hand edit routinely breaks - a parenthetical before the colon, a dropped colon -
+        # and refusing left the artefact untouchable by the tool that exists to touch it, so the
+        # correction had to be made by hand across all four instead.
+        #
+        # The id written is the FILE'S canonical one, never `artifact_id`: `norm_id` folds case
+        # and the dash, so `--id bg0623` resolves, and composing the heading from what the caller
+        # typed would stamp a spelling the rest of the toolchain does not use. Never `path.stem`
+        # either, which is the whole filename.
+        #
+        # This is not an escape from the other three. The repair only decides what surface 1
+        # WILL be; surfaces 2 to 4 are validated below exactly as they are for a parseable H1,
+        # and a failure there still leaves nothing written.
+        repaired_h1 = f"# {file_id}: {new_title}"
+        old_title = ""
+    else:
+        repaired_h1 = None
+        old_title = m.group(2).strip()
+
+    # --- surface 2: the filename slug ---
+    new_slug = file_finding._slug(new_title)
+    new_name = f"{file_id}-{new_slug}.md"
+    dest = path.with_name(new_name)
+    if dest != path and dest.exists():
+        raise RetitleBlocked("filename",
+            f"{artifact_id}: the new title's slug collides with an existing file {new_name} - "
+            f"refusing to overwrite it. Choose a title whose first eight slug words differ, or "
+            f"resolve the collision first. Nothing was written.")
+
+    # --- surface 3: the index row (validated read-only; reconcile owns the write) ---
+    if not reconcile.retitle_index_row(root, type_, file_id, new_slug, new_title, dry_run=True):
+        rel = sdlc_md.type_home(type_)[0]
+        raise RetitleBlocked("index",
+            f"{artifact_id}: no index row in {rel}/_index.md to update - the index surface "
+            f"cannot be updated. Run `reconcile.py apply --scope {rel.split('/')[-1]}` to add "
+            f"the row first, then retitle. Nothing was written.")
+
+    # --- surface 4: inbound references ---
+    cl = _load_check_links(root)
+    if cl is None:
+        raise RetitleBlocked("references",
+            f"{artifact_id}: cannot locate check_links (tools/check_links.py) to find inbound "
+            f"references - refusing rather than rename the file and risk leaving links dangling. "
+            f"Nothing was written.")
+    refs = cl.inbound_references(root, path.name)
+    unrewritable = [r for r in refs if r["immutable"]]
+    rewritable = [r for r in refs if not r["immutable"]]
+    if unrewritable:
+        named = ", ".join(sorted({r["rel"] for r in unrewritable}))
+        raise RetitleBlocked("references",
+            f"{artifact_id}: {len(unrewritable)} inbound reference(s) sit in immutable archived "
+            f"history and cannot be rewritten: {named}. Renaming would leave them dangling, so "
+            f"the retitle is refused. Retitle before archiving, or leave the title. Nothing was "
+            f"written.")
+
+    if dry_run:
+        return {"id": artifact_id, "type": type_, "path": str(path), "new_path": str(dest),
+                "old_title": old_title, "new_title": new_title, "renamed": dest != path,
+                "references": [r["rel"] for r in rewritable], "dry_run": True}
+
+    # --- ALL FOUR SURFACES VALIDATED - now write ---
+    # Validation buys a refusal that leaves every surface byte-identical; it buys nothing once
+    # the writing starts. The phase below is a SEQUENCE of independent writes - the destination
+    # file, the unlink of the old name, the index row, then one rewrite per inbound reference -
+    # and a fault partway through left the artefact renamed, the index updated and the
+    # references half rewritten, which is the split-surface state validate-first exists to
+    # prevent. So the phase journals the prior bytes of every file it will touch and puts them
+    # all back if any single write raises.
+    journal = _WriteJournal()
+    journal.capture(path)
+    journal.capture(dest)
+    journal.capture(root / sdlc_md.type_home(type_)[0] / "_index.md")
+    for r in rewritable:
+        journal.capture(Path(r["path"]))
+    rewritten: list[str] = []
+    try:
+        if repaired_h1 is not None:
+            # The unparseable heading is REPLACED by a canonical one - and finding WHICH line to
+            # replace is the whole of the care here. An earlier version assumed line 1, on the
+            # reasoning that the H1 is the first line "by definition of the surface". That is
+            # false: `_H1_RETITLE_RE.search` scans the WHOLE document, so no match proves only
+            # that no line matches, never that line 1 is the heading. Measured on three real
+            # shapes, all exiting 0: a leading blank line left the broken heading alive at line
+            # 2 under an inserted one; front matter had its opening fence destroyed; and a
+            # document with no heading at all lost its `> **Status:**` line, which
+            # `known_issues._read` requires - silently turning one defect into another.
+            #
+            # So the ONLY line ever overwritten is an unambiguous LEVEL-ONE ATX heading sitting
+            # outside every container that suspends markdown - a fence, an HTML comment, YAML
+            # front matter. Everything else, including a `##` when the document carries no H1,
+            # gets the canonical heading INSERTED instead. The cost of a shape `_first_h1_line`
+            # does not understand is then a duplicate heading a human can see, never a deleted
+            # line the command reports success over. Insertion goes AFTER any front matter,
+            # because an H1 above `---` stops it being front matter at all.
+            lines = text.split("\n")
+            idx = _first_h1_line(lines)
+            if idx is None:
+                at = _front_matter_end(lines)
+                lines[at:at] = [repaired_h1, ""]
+            else:
+                lines[idx] = repaired_h1
+            new_text = "\n".join(lines)
+        else:
+            # A PARSEABLE heading keeps its own spelling of the id: group(1) is re-emitted
+            # verbatim, so a dashed or lowercase form the author chose survives the retitle.
+            new_text = _H1_RETITLE_RE.sub(lambda mm: mm.group(1) + new_title, text, count=1)
+        today = date.today().isoformat()
+        stamped, recorded = transition.append_revision_row(
+            new_text, today, sdlc_md.authorship_name(sdlc_md.authorship_value(None, root)),
+            f"Retitled: was {old_title!r}")
+        if recorded:
+            new_text = stamped
+        sdlc_md.atomic_write(dest, new_text)
+        if dest != path:
+            path.unlink()
+        reconcile.retitle_index_row(root, type_, file_id, new_slug, new_title, dry_run=False)
+        for r in rewritable:
+            rp = Path(r["path"])
+            body = rp.read_text(encoding="utf-8")
+            updated, n = cl.rewrite_inbound_links(body, path.name, new_name)
+            if n and updated != body:
+                sdlc_md.atomic_write(rp, updated)
+                rewritten.append(r["rel"])
+    except Exception as exc:  # noqa: BLE001 - ANY fault must put the tree back, then report
+        unrestored = journal.rollback()
+        if unrestored:
+            # An honest partial report beats a clean-sounding lie: whoever repairs this needs
+            # to know which files are in an unknown state.
+            raise RetitleBlocked("write",
+                f"{artifact_id}: the write failed ({exc}) AND the rollback could not restore "
+                f"{', '.join(unrestored)} - those files are in an unknown state and must be "
+                f"repaired by hand (restore them from git), then retry.") from exc
+        raise RetitleBlocked("write",
+            f"{artifact_id}: the write failed ({exc}) - every surface has been rolled back to "
+            f"its state before the retitle, so nothing is half-renamed. Fix the cause and "
+            f"retry.") from exc
+    return {"id": artifact_id, "type": type_, "path": str(dest),
+            "old_title": old_title, "new_title": new_title, "renamed": dest != path,
+            "revision_recorded": recorded, "references": sorted(set(rewritten)),
+            "dry_run": False}
+
+
+def cmd_retitle(args: argparse.Namespace) -> int:
+    try:
+        r = retitle(args.root, args.id, args.title, dry_run=args.dry_run)
+    except RetitleBlocked as exc:
+        print(f"retitle refused [{exc.surface}]: {exc}", file=sys.stderr)
+        return 1
+    if args.format == "json":
+        print(json.dumps(r, indent=2))
+        return 0
+    verb = "would retitle" if r.get("dry_run") else "retitled"
+    rename = f", renamed -> {Path(r['new_path' if r.get('dry_run') else 'path']).name}" \
+        if r["renamed"] else " (slug unchanged)"
+    refs = r.get("references") or []
+    print(f"{verb} {r['id']}: {r['old_title']!r} -> {r['new_title']!r}{rename}"
+          f"{f'; {len(refs)} inbound reference(s) rewritten' if refs else ''}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    # RESOLVE THE ROOT ONCE, AND WRITE IT BACK, so every verb below anchors on the same tree the
+    # guard just consulted. Resolving it only for the guard made the two disagree: the guard read
+    # the real project while each verb wrote through a bare `--root .`, so a run from a
+    # subdirectory minted into a stray `sdlc-studio/` beside the cwd - with an id the real
+    # workspace already held - and exited 0. A census that measured this script by its call sites
+    # then recorded it "anchored" while every write it makes was not.
+    args.root = str(sdlc_md.resolve_root(args))
+    # Every verb here writes. A write made through a mutated tool is one nobody can trust
+    # afterwards, so the applied-mutant window is a refusal, not a warning.
+    refusal = sdlc_md.inflight_refusal(Path(args.root))
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)

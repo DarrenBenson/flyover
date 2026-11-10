@@ -1,0 +1,378 @@
+"""Unit tests for route.py - difficulty-aware model-tier routing (RFC0026 / CR0189)."""
+from __future__ import annotations
+
+import importlib.util
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+SCRIPTS = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(SCRIPTS))
+
+spec = importlib.util.spec_from_file_location("route", SCRIPTS / "route.py")
+route = importlib.util.module_from_spec(spec)
+sys.modules["route"] = route
+spec.loader.exec_module(route)
+
+
+def _story(tmp: Path, *, affects: str | None = None, points: str | None = None,
+           acs: int = 0, name: str = "US0001-test-story.md") -> Path:
+    """Write a minimal story with the requested signal fields present."""
+    lines = ["# US0001: test story", "", "> **Status:** Ready"]
+    if affects is not None:
+        lines.append(f"> **Affects:** {affects}")
+    if points is not None:
+        lines.append(f"> **Story Points:** {points}")
+    lines += ["", "## Acceptance Criteria", ""]
+    for i in range(1, acs + 1):
+        lines += [f"### AC{i}: thing {i}", f"- **Given** x{i}", ""]
+    d = tmp / "sdlc-studio" / "stories"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
+
+
+def _code_file(tmp: Path, rel: str, complexity_blocks: int = 0) -> Path:
+    """A Python file with `complexity_blocks` nested-if functions to raise cognitive score."""
+    body = "def f(x):\n"
+    body += "".join(f"    {'    ' * i}if x > {i}:\n" for i in range(complexity_blocks))
+    body += f"    {'    ' * complexity_blocks}return x\n    return 0\n"
+    p = tmp / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+class EstimateTests(unittest.TestCase):
+    def test_estimate_emits_full_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            _code_file(tmp, "src/mod.py", complexity_blocks=3)
+            story = _story(tmp, affects="src/mod.py", points="5", acs=3)
+            est = route.estimate(tmp, story)
+            for key in ("difficulty_score", "difficulty_band", "confidence",
+                        "missing", "signals", "subscores"):
+                self.assertIn(key, est)
+            self.assertIsInstance(est["difficulty_score"], int)
+            self.assertGreaterEqual(est["difficulty_score"], 0)
+            self.assertLessEqual(est["difficulty_score"], 100)
+            self.assertEqual(est["missing"], [])
+            self.assertEqual(est["confidence"], "high")
+
+    def test_estimate_missing_signals_default_half_not_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            story = _story(tmp)  # no Affects, no points, no ACs
+            est = route.estimate(tmp, story)
+            # every subscore whose inputs did not resolve is 0.5, never 0
+            for name in est["missing"]:
+                self.assertEqual(est["subscores"][name], 0.5)
+            self.assertGreaterEqual(len(est["missing"]), 2)
+            self.assertEqual(est["confidence"], "low")
+            self.assertEqual(est["difficulty_score"], 50)  # all-missing = exactly midline
+
+    def test_estimate_new_files_raise_novelty(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            _code_file(tmp, "src/old.py", complexity_blocks=1)
+            greenfield = _story(tmp, affects="src/old.py, src/brand_new.py", acs=3,
+                                name="US0002-greenfield.md")
+            existing = _story(tmp, affects="src/old.py", acs=3,
+                              name="US0003-existing.md")
+            e_green = route.estimate(tmp, greenfield)
+            e_exist = route.estimate(tmp, existing)
+            self.assertGreater(e_green["subscores"]["novel"],
+                               e_exist["subscores"]["novel"])
+
+    def test_bands_map_to_tiers(self) -> None:
+        cfg = {}
+        self.assertEqual(route.band_for(10, cfg), ("trivial", "tiny"))
+        self.assertEqual(route.band_for(20, cfg), ("low", "small"))
+        self.assertEqual(route.band_for(45, cfg), ("medium", "medium"))
+        self.assertEqual(route.band_for(70, cfg), ("high", "large"))
+        self.assertEqual(route.band_for(85, cfg), ("extreme", "xlarge"))
+
+
+class DegradationTests(unittest.TestCase):
+    def test_sparse_map_degrades_upward_only(self) -> None:
+        models = {"small": "model-s", "large": "model-l"}
+        self.assertEqual(route.resolve_tier("tiny", models), ("small", "model-s"))
+        self.assertEqual(route.resolve_tier("small", models), ("small", "model-s"))
+        self.assertEqual(route.resolve_tier("medium", models), ("large", "model-l"))
+        self.assertEqual(route.resolve_tier("large", models), ("large", "model-l"))
+        # nothing at/above xlarge declared -> largest declared
+        self.assertEqual(route.resolve_tier("xlarge", models), ("large", "model-l"))
+
+    def test_empty_map_yields_tier_name_with_null_model(self) -> None:
+        self.assertEqual(route.resolve_tier("medium", {}), ("medium", None))
+
+    def test_unknown_tier_names_fail_loud_not_indexerror(self) -> None:
+        # a config typo (routing.models: {gigantic: x}) names the bad key, never a
+        # bare IndexError and never a silent ignore (LL0008)
+        with self.assertRaises(ValueError) as ctx:
+            route.resolve_tier("medium", {"gigantic": "x"})
+        self.assertIn("gigantic", str(ctx.exception))
+        with self.assertRaises(ValueError):
+            route.resolve_tier("large", {"small": "a", "gigantic": "x"})
+
+    def test_zero_config_denominators_degrade_not_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / "sdlc-studio").mkdir(parents=True)
+            (tmp / "sdlc-studio" / ".config.yaml").write_text(
+                "complexity:\n  cognitive_high: 0\n"
+                "story_quality:\n  sizing:\n    max_ac: 0\n    max_points: 0\n",
+                encoding="utf-8")
+            _code_file(tmp, "src/mod.py", complexity_blocks=2)
+            story = _story(tmp, affects="src/mod.py", points="5", acs=3)
+            est = route.estimate(tmp, story)  # must not raise ZeroDivisionError
+            self.assertIn("difficulty_score", est)
+
+
+class PickTests(unittest.TestCase):
+    def _routing_cfg(self, **over):
+        cfg = {"enabled": True, "models": {t: f"m-{t}" for t in route.TIERS},
+               "floor": {"bug": "small", "security": "medium"},
+               "critic_tier": "match",
+               "thresholds": {"tiny": 20, "small": 40, "medium": 60, "large": 80},
+               "escalation": {"max_same_tier": 2}}
+        cfg.update(over)
+        return cfg
+
+    def test_bug_kind_floor_lifts_trivial_to_small(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            bugs = tmp / "sdlc-studio" / "bugs"
+            bugs.mkdir(parents=True)
+            bug = bugs / "BG0001-tiny-bug.md"
+            bug.write_text("# BG0001: tiny bug\n\n> **Status:** Open\n"
+                           "> **Affects:** src/x.py\n", encoding="utf-8")
+            _code_file(tmp, "src/x.py", complexity_blocks=0)
+            picked = route.pick(tmp, bug, role="author", routing=self._routing_cfg())
+            idx = route.TIERS.index(picked["tier"])
+            self.assertGreaterEqual(idx, route.TIERS.index("small"))
+            self.assertIn("floor:bug", picked["adjustments"])
+
+    def test_low_confidence_bumps_one_tier_up(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            story = _story(tmp)  # everything missing -> low confidence, score 50 (medium)
+            picked = route.pick(tmp, story, role="author", routing=self._routing_cfg())
+            self.assertEqual(picked["tier"], "large")  # medium bumped up once
+            self.assertIn("confidence:low", picked["adjustments"])
+
+    def test_critic_matches_author_with_medium_floor_for_code(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            _code_file(tmp, "src/simple.py", complexity_blocks=0)
+            story = _story(tmp, affects="src/simple.py", points="1", acs=1)
+            author = route.pick(tmp, story, role="author", routing=self._routing_cfg())
+            critic = route.pick(tmp, story, role="critic", routing=self._routing_cfg())
+            # a trivially-scored CODE unit still gets a medium critic
+            self.assertGreaterEqual(route.TIERS.index(critic["tier"]),
+                                    route.TIERS.index("medium"))
+            self.assertGreaterEqual(route.TIERS.index(critic["tier"]),
+                                    route.TIERS.index(author["tier"]))
+
+    def test_critic_above_lifts_one_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            _code_file(tmp, "src/simple.py", complexity_blocks=0)
+            story = _story(tmp, affects="src/simple.py", points="1", acs=1)
+            match = route.pick(tmp, story, role="critic",
+                               routing=self._routing_cfg(critic_tier="match"))
+            above = route.pick(tmp, story, role="critic",
+                               routing=self._routing_cfg(critic_tier="above"))
+            self.assertGreaterEqual(route.TIERS.index(above["tier"]),
+                                    route.TIERS.index(match["tier"]))
+
+    def test_doc_only_unit_gets_no_medium_critic_floor(self) -> None:
+        """The CODE critic floor is for code. A doc-only unit must not collect it.
+
+        It asserts the ADJUSTMENT, not the resulting tier: a doc unit's tier legitimately
+        rises anyway, because its code signal is inapplicable and unknown difficulty is
+        routed UP. Pinning the tier here would pin that bug back in.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            doc = tmp / "docs" / "guide.md"
+            doc.parent.mkdir(parents=True)
+            doc.write_text("# guide\n", encoding="utf-8")
+            story = _story(tmp, affects="docs/guide.md", points="1", acs=1)
+            critic = route.pick(tmp, story, role="critic", routing=self._routing_cfg())
+            self.assertNotIn("critic:code-medium-floor", critic["adjustments"])
+
+    def test_a_doc_only_unit_is_never_trivial_with_high_confidence(self) -> None:
+        """The router scored a docs-only unit `trivial` with HIGH confidence and it cost
+        205,534 tokens. A markdown file RESOLVES and then scores 0 for code complexity - an
+        absence of measurement, which was read as a measurement of zero.
+
+        The load-bearing assertion is the CONFIDENCE. A tool is allowed to be wrong; it is not
+        allowed to be certain and wrong, because certainty is what suppresses the tier bump.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            doc = tmp / "docs" / "guide.md"
+            doc.parent.mkdir(parents=True)
+            doc.write_text("# guide\n", encoding="utf-8")
+            story = _story(tmp, affects="docs/guide.md", points="1", acs=1)
+            est = route.estimate(tmp, story)
+            self.assertEqual(est["confidence"], "low")
+            self.assertTrue(est["code_inapplicable"])
+            self.assertIn("code", est["missing"])
+            self.assertIn("risk", est["missing"])
+            self.assertNotEqual(est["difficulty_band"], "trivial")
+            # and the low confidence must actually MOVE the routing decision, not just be
+            # reported next to it - an unheeded warning is decoration
+            self.assertIn("confidence:low", route.pick(tmp, story,
+                                                       routing=self._routing_cfg())["adjustments"])
+
+    def test_a_code_unit_still_reads_its_code_signals(self) -> None:
+        """The inapplicable-signal fix must not blind the estimator to real code. A resolved
+        .py file scores, and its signals are present and confident."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            _code_file(tmp, "src/hot.py", complexity_blocks=12)
+            story = _story(tmp, affects="src/hot.py", points="5", acs=3)
+            est = route.estimate(tmp, story)
+            self.assertFalse(est["code_inapplicable"])
+            self.assertIsNotNone(est["signals"]["max_cognitive"])
+            self.assertNotIn("code", est["missing"])
+
+
+#: The two spellings of the one size field: canonical first, then the legacy spelling still on
+#: stories already written. `_story` writes only the second, so these fixtures do not use it.
+SIZE_SPELLINGS = (route.sdlc_md.POINTS_FIELD, "Story Points")
+
+
+def _sized_unit(tmp: Path, *, field: str | None, points: int | None, acs: int,
+                name: str = "US0001-sized.md") -> Path:
+    """A unit on two existing markdown Affects files, with `acs` criteria and the size field
+    written under the spelling named by `field` - or no size field at all when `field` is None."""
+    for rel in ("docs/a.md", "docs/b.md"):
+        f = tmp / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("a note\n", encoding="utf-8")
+    lines = ["# US0001: sized unit", "", "> **Status:** Ready",
+             "> **Affects:** docs/a.md, docs/b.md"]
+    if field is not None:
+        lines.append(f"> **{field}:** {points}")
+    if acs:
+        lines += ["", "## Acceptance Criteria", ""]
+        for i in range(1, acs + 1):
+            lines += [f"### AC{i}: thing {i}", f"- **Given** x{i}", ""]
+    d = tmp / "sdlc-studio" / "stories"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if field is not None:  # the fixture really declares the size, under that spelling
+        assert route.sdlc_md.extract_field(p.read_text(encoding="utf-8"), field) == str(points)
+    return p
+
+
+class DeclaredFieldsDoNotScoreTests(unittest.TestCase):
+    """An author-declared size field must not score. The band sets a unit's review depth, so a
+    `Points` value the author writes would otherwise choose how hard the author's work is read."""
+
+    def _read(self, tmp: Path, **kw) -> tuple[int, str, int]:
+        est = route.estimate(tmp, _sized_unit(tmp, **kw))
+        return est["difficulty_score"], est["difficulty_band"], est["signals"]["ac_count"]
+
+    def test_points_alone_does_not_move_the_score(self) -> None:
+        """Mutants: keep the legacy `Story Points` fallback feeding `spec` while dropping only the
+        canonical read; keep the canonical read while dropping the fallback; read `ac_count` first
+        with Points as the fallback when no criterion is counted. Each spelling and the zero-AC
+        variant is its own case, because each mutant moves exactly one of them."""
+        for acs in (1, 0):
+            for field in SIZE_SPELLINGS:
+                with self.subTest(spelling=field, acs=acs), tempfile.TemporaryDirectory() as d:
+                    tmp = Path(d)
+                    unsized = self._read(tmp, field=None, points=None, acs=acs)
+                    self.assertEqual(unsized[2], acs, "the fixture counts the wrong criteria")
+                    at_1 = self._read(tmp, field=field, points=1, acs=acs)
+                    at_8 = self._read(tmp, field=field, points=8, acs=acs)
+                    # score AND band, at 1, at 8 and with no size field at all
+                    self.assertEqual(at_1[:2], unsized[:2], f"{field}: 1 moved the estimate")
+                    self.assertEqual(at_8[:2], unsized[:2], f"{field}: 8 moved the estimate")
+        # the control: the same unit's score CAN move, through the criterion count the fix keeps
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            one = self._read(tmp, field=route.sdlc_md.POINTS_FIELD, points=1, acs=1)
+            six = self._read(tmp, field=route.sdlc_md.POINTS_FIELD, points=1, acs=6)
+            self.assertNotEqual(one[0], six[0], "one AC and six score the same - the fixture's "
+                                                "score cannot move, so the equalities prove nothing")
+
+    def test_ac_count_still_moves_the_spec_subscore(self) -> None:
+        """Mutants: drop `ac_count` from `spec` along with Points, or score a sized unit's `spec`
+        as zero - either way six criteria read no higher than one. Points 3 is on the fixture
+        because every real unit carries Points."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            field = route.sdlc_md.POINTS_FIELD
+            one = route.estimate(tmp, _sized_unit(tmp, field=field, points=3, acs=1))
+            six = route.estimate(tmp, _sized_unit(tmp, field=field, points=3, acs=6))
+            self.assertEqual((one["signals"]["ac_count"], six["signals"]["ac_count"]), (1, 6))
+            self.assertGreater(six["subscores"]["spec"], one["subscores"]["spec"])
+
+
+class EscalateTests(unittest.TestCase):
+    def test_escalate_steps_to_next_declared_tier(self) -> None:
+        models = {"tiny": "a", "medium": "b", "xlarge": "c"}
+        r = route.escalate_tier("tiny", models)
+        self.assertEqual((r["tier"], r["model"]), ("medium", "b"))
+        r = route.escalate_tier("medium", models)
+        self.assertEqual((r["tier"], r["model"]), ("xlarge", "c"))
+
+    def test_escalate_at_max_reports_at_max(self) -> None:
+        models = {"tiny": "a", "medium": "b"}
+        r = route.escalate_tier("medium", models)
+        self.assertTrue(r["at_max"])
+
+    def test_escalate_with_empty_map_walks_abstract_tiers(self) -> None:
+        r = route.escalate_tier("small", {})
+        self.assertEqual(r["tier"], "medium")
+        self.assertIsNone(r["model"])
+
+
+class CliTests(unittest.TestCase):
+    def test_estimate_cli_json(self) -> None:
+        import contextlib, io, json
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            _code_file(tmp, "src/mod.py", complexity_blocks=2)
+            story = _story(tmp, affects="src/mod.py", points="3", acs=2)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = route.main(["estimate", "--unit", str(story),
+                                 "--root", str(tmp), "--format", "json"])
+            self.assertEqual(rc, 0)
+            out = json.loads(buf.getvalue())
+            self.assertIn("difficulty_score", out)
+
+    def test_tiers_cli_resolves_map(self) -> None:
+        import contextlib, io, json
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / "sdlc-studio").mkdir(parents=True)
+            (tmp / "sdlc-studio" / ".config.yaml").write_text(
+                textwrap.dedent("""\
+                    routing:
+                      enabled: true
+                      models:
+                        small: model-s
+                        large: model-l
+                """), encoding="utf-8")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = route.main(["tiers", "--root", str(tmp), "--format", "json"])
+            self.assertEqual(rc, 0)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out["tiny"], {"tier": "small", "model": "model-s"})
+            self.assertEqual(out["xlarge"], {"tier": "large", "model": "model-l"})
+
+
+if __name__ == "__main__":
+    unittest.main()

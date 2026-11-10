@@ -1,0 +1,3959 @@
+"""Unit tests for critic.py - committed critic-verdict record (CR0023). RED first."""
+from __future__ import annotations
+
+import contextlib
+import importlib.util
+import io
+import re
+import json
+import sys
+import tempfile
+import shutil
+import unittest
+import unittest.mock
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve().parent.parent / "critic.py"
+REPO_ROOT = Path(__file__).resolve().parents[5]
+sys.path.insert(0, str(SCRIPT.parent))
+from lib.sdlc_md import norm_id as sdlc_md_norm  # noqa: E402
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location("critic", SCRIPT)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["critic"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@contextlib.contextmanager
+def _before_the_round_rules(mod):
+    """Seed a ledger written before US0872's round rules - several seats on one unit - which
+    every writer now refuses and every reader must still read."""
+    with unittest.mock.patch.object(mod, "round_refusal", lambda *a, **k: None):
+        yield
+
+
+class RecordTests(unittest.TestCase):
+    def test_record_and_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0017", "approve", reviewer="critic", author="builder")
+            v = mod.verdict_for(root, "US0017")
+            self.assertIsNotNone(v)
+            self.assertEqual(v["verdict"], "APPROVE")
+            self.assertEqual(v["reviewer"], "critic")
+            self.assertEqual(v["author"], "builder")  # both identities recorded on the verdict
+            self.assertEqual(mod.verdict_for(root, "US9999"), None)
+
+    def test_latest_wins_and_append_only(self) -> None:
+        # An approval retires a rejection when it ANSWERS it - same brief fingerprint, which is
+        # what identifies the seat and the round. Both rows carried no brief before BG0625, and
+        # two absent fingerprints compared equal, so this passed for the wrong reason: it was
+        # asserting the very defect that let a different seat's approval retire a rejection.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0017", "reject", author="builder", issues="bug",
+                               brief="abc123def456")
+            mod.record_verdict(root, "US0017", "approve", author="builder",
+                               brief="abc123def456")
+            self.assertEqual(len(mod.read_verdicts(root)), 2)        # append-only
+            self.assertEqual(mod.verdict_for(root, "US0017")["verdict"], "APPROVE")  # latest
+
+    def test_an_unbriefed_approval_does_not_retire_an_unbriefed_reject(self) -> None:
+        # The other half: with neither row carrying provenance, only the rejecting reviewer's
+        # own later APPROVE answers the rejection - another reviewer's does not.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0017", "reject", author="builder", issues="bug")
+            with _before_the_round_rules(mod):
+                mod.record_verdict(root, "US0017", "approve", reviewer="another-critic",
+                                   author="builder")
+            self.assertEqual(len(mod.read_verdicts(root)), 2)        # still append-only
+            self.assertEqual(mod.verdict_for(root, "US0017")["verdict"], "REJECT")
+
+    def test_pipe_in_issues_does_not_break_row(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0017", "approve", author="builder", issues="a | b")
+            self.assertEqual(len(mod.read_verdicts(root)), 1)
+
+    def test_torn_row_surfaces_a_warning_not_silent_drop(self) -> None:
+        # A crash mid-append can leave a truncated row in the append-only log. Such a
+        # row must be REPORTED, not silently swallowed - a dropped verdict a gate then
+        # reads as "no verdict" is a false signal. The well-formed rows still parse.
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load()
+            path = mod.verdicts_path(d)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "# Critic Verdicts\n\n"
+                "| Unit | Verdict | Reviewer | Author | Date | Issues |\n"
+                "| --- | --- | --- | --- | --- | --- |\n"
+                "| US0001 | APPROVE | critic | builder | 2026-01-01 | - |\n"
+                "| US0002 | APPROVE | critic |\n"  # torn: interrupted mid-write, 3 cells
+                "| US0003 | APPROVE | critic | builder | 2026-01-02 | - |\n",
+                encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rows = mod.read_verdicts(d)
+            self.assertIn("US0002", err.getvalue())  # the torn row is named, not silent
+            self.assertRegex(err.getvalue(), r"(?i)malformed")
+            units = [r["unit"] for r in rows]
+            self.assertIn("US0001", units)  # well-formed rows still parse
+            self.assertIn("US0003", units)
+
+
+class CliTests(unittest.TestCase):
+    def test_cli_record(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = mod.main(["record", "--brief", "abcdef123456",
+                               "--unit", "US0017", "--verdict", "approve",
+                               "--author", "builder", "--root", str(root)])
+            self.assertEqual(rc, 0, out.getvalue() + err.getvalue())
+            self.assertEqual(mod.verdict_for(root, "US0017")["verdict"], "APPROVE")
+            # Captured rather than left on the console, and ASSERTED rather than dropped: the
+            # command has to say what it wrote, which is the half a return code cannot carry.
+            self.assertIn("US0017", out.getvalue(),
+                          f"the CLI recorded a verdict without naming the unit:\n{out.getvalue()}")
+
+    def test_cli_record_requires_author(self) -> None:
+        # The authoring seat is mandatory: independence you cannot verify is none at all.
+        # Asserted as the PROPERTY - refused, named, nothing written - rather than as the
+        # SystemExit argparse used to raise. US0557 moved the check off argparse so one
+        # refusal can name every missing argument at once; a test pinned to the mechanism
+        # would have called that regression.
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load()
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                    contextlib.suppress(SystemExit):
+                rc = mod.main(["record", "--brief", "abcdef123456",
+                               "--unit", "US0017", "--verdict", "approve", "--root", d])
+                self.assertNotEqual(rc, 0)
+            self.assertIn("--author", out.getvalue() + err.getvalue())
+            self.assertIsNone(mod.verdict_for(Path(d), "US0017"),
+                              "a refused record must write nothing")
+
+    def test_underscores_escaped_to_avoid_md037(self):
+        # BG0023: underscored identifiers in the issues text must be escaped so they cannot
+        # pair into markdown emphasis (markdownlint MD037).
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load()
+            mod.record_verdict(d, "US0001", "approve", author="builder",
+                               issues="fixed _read and _index_row and gate.run_gate")
+            text = mod.verdicts_path(d).read_text(encoding="utf-8")
+            self.assertNotIn(" _read", text)        # no bare underscore-led token
+            self.assertIn(r"\_read", text)          # escaped instead
+            self.assertTrue(any(v["unit"] == "US0001" for v in mod.read_verdicts(d)))
+
+
+class IndependenceTests(unittest.TestCase):
+    """CR0117: author != reviewer is a mechanical floor, proven, not an honour-system note."""
+
+    def test_self_review_is_not_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load()
+            mod.record_verdict(d, "US0001", "approve", reviewer="dani", author="dani")
+            v = mod.verdict_for(d, "US0001")
+            self.assertFalse(mod.is_independent(v))   # reviewer == author blocks
+
+    def test_distinct_reviewer_is_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load()
+            mod.record_verdict(d, "US0001", "approve", reviewer="qa-amir", author="dani")
+            v = mod.verdict_for(d, "US0001")
+            self.assertTrue(mod.is_independent(v))     # reviewer != author passes
+
+    def test_missing_author_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load()
+            mod.record_verdict(d, "US0001", "approve", reviewer="qa-amir")  # no author
+            v = mod.verdict_for(d, "US0001")
+            self.assertEqual(v["author"], "-")
+            self.assertFalse(mod.is_independent(v))     # no recorded author -> not independent
+
+    def test_pre_gate_is_grandfathered_not_independent(self) -> None:
+        # A unit closed before the gate carries the visible PRE_GATE marker: it is
+        # NOT real independence (is_independent stays truthful), but is_pre_gate flags
+        # it so the conformance gate can grandfather it.
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load()
+            mod.record_verdict(d, "US0001", "approve",
+                               reviewer="self-review (light, docs)", author=mod.PRE_GATE)
+            v = mod.verdict_for(d, "US0001")
+            self.assertFalse(mod.is_independent(v))      # pre-gate is not real independence
+            self.assertTrue(mod.is_pre_gate(v))          # but it is grandfathered
+            self.assertFalse(mod.is_pre_gate(             # a real id is never pre-gate
+                {"author": "dani", "reviewer": "qa-amir"}))
+
+    def test_self_review_blocks_done_gate_distinct_passes(self) -> None:
+        # The gate uses critic, so prove the wiring end to end via conformance.
+        import importlib.util as _ilu
+        cpath = SCRIPT.parent / "conformance.py"
+        spec = _ilu.spec_from_file_location("conformance", cpath)
+        conf = _ilu.module_from_spec(spec)
+        sys.modules["conformance"] = conf
+        spec.loader.exec_module(conf)
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load()
+            mod.record_verdict(d, "US0001", "approve", reviewer="dani", author="dani")
+            self.assertFalse(conf.critic.is_independent(mod.verdict_for(d, "US0001")))
+            mod.record_verdict(d, "US0001", "approve", reviewer="qa-amir", author="dani")
+            self.assertTrue(conf.critic.is_independent(mod.verdict_for(d, "US0001")))
+
+    def test_self_review_keeps_critiqued_in_missing_at_done_gate(self) -> None:
+        # End-to-end: a Done story whose only APPROVE is a self-review (reviewer==author)
+        # must leave `critiqued` unmet in the conformance gate's `missing` list - the
+        # helper-level check is not enough; prove the gate itself blocks it. Swapping the
+        # reviewer to a distinct id then clears `critiqued`.
+        import importlib.util as _ilu
+        cpath = SCRIPT.parent / "conformance.py"
+        spec = _ilu.spec_from_file_location("conformance", cpath)
+        conf = _ilu.module_from_spec(spec)
+        sys.modules["conformance"] = conf
+        spec.loader.exec_module(conf)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            stories = root / "sdlc-studio" / "stories"
+            stories.mkdir(parents=True, exist_ok=True)
+            (stories / "US0001-sample.md").write_text("\n".join([
+                "# US0001: sample", "", "> **Status:** Done",
+                "> **Epic:** [EP0001: x](../epics/EP0001-x.md)", "",
+                "## Acceptance Criteria", "", "### AC1: works", "- **Given** a thing",
+                "- **Verify:** shell echo ok", "- **Verified:** yes (2026-01-01)",
+            ]) + "\n", encoding="utf-8")
+
+            def critiqued_state():
+                units = {u["id"]: u for u in conf.detect_conformance(root)["units"]}
+                return units["US0001"]
+
+            # Self-review APPROVE (reviewer == author): the gate must keep `critiqued` unmet.
+            mod.record_verdict(root, "US0001", "approve", reviewer="dani", author="dani")
+            u = critiqued_state()
+            self.assertIn("critiqued", u["missing"])
+            self.assertFalse(u["stages"]["critiqued"])
+            # A later verdict from a distinct reviewer clears it (latest row wins).
+            mod.record_verdict(root, "US0001", "approve", reviewer="qa-amir", author="dani")
+            u = critiqued_state()
+            self.assertNotIn("critiqued", u["missing"])
+            self.assertTrue(u["stages"]["critiqued"])
+
+    def test_legacy_five_column_row_reads_with_empty_author(self) -> None:
+        # Rows that pre-date the gate (5 columns, no Author) still parse; their author is
+        # empty, so they are correctly treated as not-yet-independent.
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load()
+            path = mod.verdicts_path(d)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "# Critic Verdicts\n\n"
+                "| Unit | Verdict | Reviewer | Date | Issues |\n| --- | --- | --- | --- | --- |\n"
+                "| US0001 | APPROVE | critic | 2026-01-01 | - |\n",
+                encoding="utf-8")
+            v = mod.verdict_for(d, "US0001")
+            self.assertEqual(v["verdict"], "APPROVE")
+            self.assertEqual(v["author"], "")
+            self.assertFalse(mod.is_independent(v))
+
+
+class SeatDriftWarningTests(unittest.TestCase):
+    """The persona lens must not drift out silently: recording a verdict under
+    a reviewer that matches no declared seat/amigo draws a warning naming the
+    declared options - advisory only, and silent where no personas exist."""
+
+    def _repo(self, d, with_amigo=True):
+        root = Path(d)
+        (root / "sdlc-studio").mkdir(parents=True)
+        if with_amigo:
+            ad = root / "sdlc-studio" / "personas" / "amigos"
+            ad.mkdir(parents=True)
+            (ad / "qa.md").write_text(
+                "<!-- role: qa -->\n# Sam Eriksson - QA amigo\n", encoding="utf-8")
+        return root
+
+    def _record(self, root, reviewer):
+        import contextlib, io
+        critic = _load()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = critic.main(["record", "--brief", "abcdef123456",
+                              "--unit", "CR0001", "--verdict", "approve",
+                              "--reviewer", reviewer, "--author", "builder",
+                              "--root", str(root)])
+        return rc, err.getvalue()
+
+    def test_unknown_reviewer_warns_and_names_seats(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, err = self._record(self._repo(d), "adversarial-critic (instance)")
+            self.assertEqual(rc, 0)                       # advisory: never refuses
+            self.assertIn("no declared seat", err)
+            self.assertIn("qa", err)                       # declared role named
+
+    def test_role_match_is_silent(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, err = self._record(self._repo(d), "Sam Eriksson (QA seat, review render)")
+            self.assertEqual(rc, 0)
+            self.assertNotIn("no declared seat", err)
+
+    def test_no_personas_dir_is_silent(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, err = self._record(self._repo(d, with_amigo=False), "anyone")
+            self.assertEqual(rc, 0)
+            self.assertNotIn("no declared seat", err)
+
+    def test_substring_inside_a_word_does_not_count(self):
+        # Sam's attack: 'production' contains 'product'; a role match must be
+        # a whole word, or free-text drift slips back past the warning
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(d)
+            ad = root / "sdlc-studio" / "personas" / "amigos"
+            (ad / "product.md").write_text(
+                "<!-- role: product -->\n# Lena Fischer - Product amigo\n",
+                encoding="utf-8")
+            rc, err = self._record(root, "final production check")
+            self.assertEqual(rc, 0)
+            self.assertIn("no declared seat", err)
+
+    def test_first_name_token_claims_the_seat(self):
+        # 'sam checked it' names the seat holder - that is a seat claim, not
+        # drift; token-level name matching keeps it silent
+        with tempfile.TemporaryDirectory() as d:
+            rc, err = self._record(self._repo(d), "sam checked it")
+            self.assertEqual(rc, 0)
+            self.assertNotIn("no declared seat", err)
+
+
+import contextlib  # noqa: E402
+import io  # noqa: E402
+import re  # noqa: E402
+
+
+def _workspace(root: Path) -> None:
+    d = root / "sdlc-studio" / "stories"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "US0001-x.md").write_text(
+        "# US0001: the thing\n\n> **Status:** In Progress\n"
+        "> **Affects:** src/a.py, src/b.py\n> **Points:** 3\n\n"
+        "## Acceptance Criteria\n\n### AC1: works\n\n- **Given** x\n- **When** y\n"
+        "- **Then** z\n- **Verify:** shell true\n", encoding="utf-8")
+    seats = root / "sdlc-studio" / "personas" / "seats"
+    seats.mkdir(parents=True, exist_ok=True)
+    (seats / "qa.md").write_text("<!-- role: qa -->\n# Sam - QA seat\n\ncharter text\n",
+                                 encoding="utf-8")
+
+
+def _banded_unit(root: Path, uid: str, *, heavy: bool) -> None:
+    """A unit that bands LOW or HIGH under `route.estimate`, on disk.
+
+    Two knobs move the band without touching the estimator: the number of resolvable Affects
+    paths (the scope subscore) and the criterion count (the spec subscore; the declared Points
+    does not score). A heavy unit declares five real files and nine criteria; a light one
+    declares a single doc file and one criterion.
+    Both are ordinary artefacts - nothing here supplies the band itself, which would make every
+    assertion below a statement about the fixture rather than about `route.estimate`.
+    """
+    d = root / "sdlc-studio" / "stories"
+    d.mkdir(parents=True, exist_ok=True)
+    if heavy:
+        files = [f"src/mod{i}.py" for i in range(5)]
+        for f in files:
+            fp = root / f
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text("def f():\n" + "    if True:\n        pass\n" * 40, encoding="utf-8")
+        affects, points = ", ".join(files), 13
+        acs = "".join(
+            f"### AC{i}: does thing {i}\n\n- **Given** x\n- **When** y\n- **Then** z\n"
+            f"- **Verify:** shell true\n\n" for i in range(1, 10))
+    else:
+        fp = root / "docs" / "note.md"
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text("a note\n", encoding="utf-8")
+        affects, points = "docs/note.md", 1
+        acs = ("### AC1: works\n\n- **Given** x\n- **When** y\n- **Then** z\n"
+               "- **Verify:** shell true\n")
+    (d / f"{uid}-x.md").write_text(
+        f"# {uid}: the thing\n\n> **Status:** In Progress\n"
+        f"> **Affects:** {affects}\n> **Points:** {points}\n\n"
+        f"## Acceptance Criteria\n\n{acs}", encoding="utf-8")
+    seats = root / "sdlc-studio" / "personas" / "seats"
+    seats.mkdir(parents=True, exist_ok=True)
+    (seats / "qa.md").write_text("<!-- role: qa -->\n# Sam - QA seat\n\ncharter text\n",
+                                 encoding="utf-8")
+
+
+class BriefTierTests(unittest.TestCase):
+    """US0641: `route.py` says it plainly - "Advisory only - no gate reads a tier".
+
+    A deterministic 0-100 difficulty with bands and a confidence has been stamped on every unit
+    at plan time since it was built, and nothing consumed it. `critic brief
+    --tier` existed and was cosmetic: one substituted sentence, never recorded, never read,
+    never checked. These pin the three steps that make it real - derived, recorded, READ.
+    """
+
+    def _band(self, root, uid):
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location("route", SCRIPT.parent / "route.py")
+        route = _ilu.module_from_spec(spec)
+        sys.modules["route"] = route
+        spec.loader.exec_module(route)
+        path = next((root / "sdlc-studio" / "stories").glob(f"{uid}-*.md"))
+        return route.estimate(root, path)["difficulty_band"]
+
+    def test_the_tier_is_derived_from_the_band_when_none_is_given(self) -> None:
+        """Mutant: keep the `full` default and ignore the band - both units brief full, and the
+        tiering is exactly as cosmetic as it was."""
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            _banded_unit(root, "US0001", heavy=False)
+            _banded_unit(root, "US0002", heavy=True)
+            # the fixture must actually band differently, or nothing below discriminates
+            self.assertNotEqual(self._band(root, "US0001"), self._band(root, "US0002"),
+                                "the fixture bands both units the same - it proves nothing")
+            self.assertEqual(mod.tier_for(root, "US0001"), "light")
+            self.assertEqual(mod.tier_for(root, "US0002"), "full")
+
+    def test_an_unresolvable_band_tiers_full(self) -> None:
+        """Mutant: treat a missing band as low - an unestimable unit gets the lighter review,
+        which is the wrong direction for an unknown risk."""
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            _banded_unit(root, "US0001", heavy=False)
+            self.assertEqual(mod.tier_for(root, "US9999"), "full", "an unknown unit")
+            self.assertEqual(mod.tier_for(root, "US0001"), "light", "the control bands light")
+            import route  # noqa: PLC0415 - the module `tier_for` reads the band from
+            with unittest.mock.patch.object(route, "estimate",
+                                            return_value={"difficulty_band": None}):
+                self.assertEqual(mod.tier_for(root, "US0001"), "full", "an unresolvable band")
+            with unittest.mock.patch.object(route, "estimate",
+                                            return_value={"difficulty_band": "enormous"}):
+                self.assertEqual(mod.tier_for(root, "US0001"), "full", "an unknown band name")
+            with unittest.mock.patch.object(route, "estimate",
+                                            side_effect=RuntimeError("the estimator died")):
+                self.assertEqual(mod.tier_for(root, "US0001"), "full", "a raising estimator")
+
+    def test_the_tier_is_a_parsed_field_on_the_verdict(self) -> None:
+        """Mutant: write the tier into the issues prose - the field is empty on read-back and
+        nothing downstream can act on it, which is where `--tier` already was."""
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            mod.record_verdict(root, "US0001", "approve", reviewer="qa", author="dev",
+                               tier="light")
+            self.assertEqual(mod.verdict_for(root, "US0001")["tier"], "light")
+            self.assertIn("| Tier |",
+                          mod.verdicts_path(root, "delivery").read_text(encoding="utf-8"))
+
+    def test_a_verdict_recorded_without_a_tier_reads_as_absent_not_full(self) -> None:
+        """Absent and `full` are different facts, and only absent is true of a verdict taken
+        before the column existed. Mutant: default the cell to `full` - every historical row
+        claims a depth nobody recorded, which is the over-claim the Brief column was added to
+        stop, repeated one column along."""
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            mod.record_verdict(root, "US0001", "approve", reviewer="qa", author="dev")
+            self.assertEqual(mod.verdict_for(root, "US0001")["tier"], "-")
+
+    def test_an_explicit_tier_overrides_the_derivation_and_is_recorded_as_explicit(self) -> None:
+        """Mutant: let the derivation win over the flag - an operator cannot ask for a deeper
+        pass than the band demands, and the record cannot tell a choice from a default."""
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            _banded_unit(root, "US0001", heavy=False)          # bands LOW -> derives light
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                mod.main(["brief", "--unit", "US0001", "--seat", "qa", "--tier", "full",
+                          "--root", str(root)])
+            self.assertIn("Full adversarial pass", out.getvalue())
+            self.assertIn("chosen", err.getvalue())
+            mod.record_verdict(root, "US0001", "approve", reviewer="qa", author="dev",
+                               tier="full", tier_explicit=True)
+            self.assertIn("explicit", mod.verdict_for(root, "US0001")["tier"])
+
+    def test_the_shipped_brief_verb_derives_the_tier_and_prints_it(self) -> None:
+        """THE LANE TEST (LL0040). `--tier` used to default to `full` in the PARSER, so a
+        derivation added in the library would never be reached. Mutant: restore that default -
+        every library case above still passes and this reddens."""
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            _banded_unit(root, "US0001", heavy=False)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = mod.main(["brief", "--unit", "US0001", "--seat", "qa",
+                               "--root", str(root)])
+            self.assertEqual(rc, 0, err.getvalue())
+            self.assertIn("review tier: light (derived", err.getvalue())
+            self.assertIn("--tier light", err.getvalue(),
+                          "the recording command must carry the tier, or it is printed and lost")
+
+    def test_the_shipped_record_verb_carries_the_tier_and_its_explicitness(self) -> None:
+        """THE LANE TEST that was missing, and its absence was fail-open: dropping `tier` and
+        `tier_explicit` from `cmd_record`'s call passed 359 tests. An unrecorded tier writes `-`,
+        `tier_covers` reads absent as COVERS, and the entire US0641 gate silently disarms with
+        nothing reddening anywhere.
+
+        The inconsistency is what makes it a finding rather than an oversight: the identical lane
+        IS tested for `brief --tier`, and was for the plan-review `--kind` while that existed. This
+        was the one omitted.
+
+        Mutant: drop either kwarg from the `record_verdict` call in `cmd_record` - this reddens
+        and nothing else does.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = mod.main(["record", "--unit", "US0017", "--verdict", "APPROVE",
+                               "--reviewer", "qa", "--author", "dev", "--tier", "light",
+                               "--brief", "abc123abc123", "--root", str(root)])
+            self.assertEqual(rc, 0, out.getvalue() + err.getvalue())
+            self.assertEqual(mod.verdict_for(root, "US0017")["tier"], "light")
+            # and the EXPLICIT marker travels too, or an operator's choice reads as a default
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                mod.main(["record", "--unit", "US0018", "--verdict", "APPROVE",
+                          "--reviewer", "qa", "--author", "dev", "--tier", "full",
+                          "--tier-explicit", "--brief", "abc123abc123", "--root", str(root)])
+            self.assertIn("explicit", mod.verdict_for(root, "US0018")["tier"])
+
+    def test_a_verb_recorded_tier_reaches_the_coverage_gate(self) -> None:
+        """End to end, across the module boundary: the verb writes it and `conformance` refuses
+        on it. Each half was tested and the join was not, which is where a fail-open hides.
+
+        Mutant: any break in the chain - the verb not passing the tier, the reader not parsing
+        it, coverage not consulting it - and a light review of a high-band unit reads as covered.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            _banded_unit(root, "US0002", heavy=True)
+            self.assertEqual(mod.tier_for(root, "US0002"), "full")
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                mod.main(["record", "--unit", "US0002", "--verdict", "APPROVE",
+                          "--reviewer", "qa", "--author", "dev", "--tier", "light",
+                          "--brief", "abc123abc123", "--root", str(root)])
+            import importlib.util as _ilu
+            spec = _ilu.spec_from_file_location("conformance", SCRIPT.parent / "conformance.py")
+            conf = _ilu.module_from_spec(spec)
+            sys.modules["conformance"] = conf
+            spec.loader.exec_module(conf)
+            self.assertFalse(conf.verdict_half_ok(root, "US0002", sprint_covers=False),
+                             "a light verdict recorded through the VERB covered a full-band unit")
+
+    def test_the_corpus_spans_more_than_one_band(self) -> None:
+        """The no-op guard. A band that always resolves the same way is a config key wearing the
+        appearance of a gate, and every other test here would still pass. Measured over THIS
+        repository rather than a fixture, because a fixture proves only that the estimator can
+        be made to move. Mutant: map every band to `full` - the split assertion reddens.
+        """
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location("route", SCRIPT.parent / "route.py")
+        route = _ilu.module_from_spec(spec)
+        sys.modules["route"] = route
+        spec.loader.exec_module(route)
+        mod = _load()
+        repo = SCRIPT.parent.parent.parent.parent.parent
+        # STRIDED across the whole corpus, stories and bugs alike. The first N bugs by id are
+        # the OLDEST bugs, and taking them banded 60 of 60 the same way - a sample that would
+        # have reported this gate as degenerate when it is not. `route.estimate` costs about
+        # 0.3s a unit, so the sample is bounded at 24 rather than run over all 1,171.
+        units = (sorted((repo / "sdlc-studio" / "stories").glob("US*.md"))
+                 + sorted((repo / "sdlc-studio" / "bugs").glob("BG*.md")))
+        if len(units) < 100:
+            self.skipTest("not enough corpus units to characterise the distribution")
+        # A FIXED walk, not a stride: a stride's sample moved with every artefact filed, and one
+        # filing shifted it onto 24 full units with no code change (BG0813). Walk in id order,
+        # interleaving stories and bugs so old bugs do not dominate, and stop as soon as both
+        # tiers are seen; the bound keeps a full walk near 4 s (`route.estimate` measured about 30 ms a unit).
+        stories = [u for u in units if u.name.startswith("US")]
+        bugs = [u for u in units if u.name.startswith("BG")]
+        walk = [u for pair in zip(stories, bugs) for u in pair]
+        tiers = []
+        for u in walk[:150]:
+            try:
+                band = route.estimate(repo, u)["difficulty_band"]
+            except Exception:      # noqa: BLE001 - an unreadable unit is not this test's subject
+                continue
+            tiers.append(mod.BAND_TIER.get(band, "full"))
+            if "light" in tiers and "full" in tiers:
+                break
+        self.assertGreaterEqual(len(tiers), 2, "too few units resolved to characterise")
+        self.assertGreater(tiers.count("light"), 0,
+                           f"no unit in {len(tiers)} bands light - the tiering is a no-op")
+        self.assertGreater(tiers.count("full"), 0,
+                           f"every unit in {len(tiers)} bands light - the tiering is a no-op "
+                           f"in the dangerous direction")
+
+
+class TierIgnoresDeclaredFieldsTests(unittest.TestCase):
+    """No author-declared field may gate review depth (D0150), and `Points` is one. The review
+    tier comes from `route.estimate`'s band, so a `Points` value the author writes must not move
+    it - read through `tier_for`, the function a brief asks, not through the estimator alone."""
+
+    @staticmethod
+    def _unit(root: Path, *, points: int, acs: int) -> None:
+        """US0001 on two existing markdown Affects files with `acs` criteria and `Points`."""
+        for rel in ("docs/a.md", "docs/b.md"):
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text("a note\n", encoding="utf-8")
+        d = root / "sdlc-studio" / "stories"
+        d.mkdir(parents=True, exist_ok=True)
+        criteria = "".join(f"### AC{i}: does thing {i}\n\n- **Given** x\n- **When** y\n"
+                           f"- **Then** z\n\n" for i in range(1, acs + 1))
+        (d / "US0001-x.md").write_text(
+            "# US0001: the thing\n\n> **Status:** In Progress\n"
+            f"> **Affects:** docs/a.md, docs/b.md\n> **Points:** {points}\n\n"
+            f"## Acceptance Criteria\n\n{criteria}", encoding="utf-8")
+
+    def test_points_alone_does_not_move_the_tier(self) -> None:
+        """Mutants: gate the Points removal behind a keyword that still counts Points by default,
+        so `plan_review`'s unchanged call scores it (8 reads full); score `spec` as missing when a
+        size was parsed (40, medium, full at both); score it zero when sized (six criteria read
+        28, light, and the control reddens)."""
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            for points in (1, 8):
+                with self.subTest(points=points):
+                    self._unit(root, points=points, acs=1)
+                    self.assertEqual(mod.tier_for(root, "US0001"), "light",
+                                     f"Points {points} alone moved the review tier")
+            # the control: the same unit reaches the deeper tier through its criterion count
+            self._unit(root, points=1, acs=6)
+            self.assertEqual(mod.tier_for(root, "US0001"), "full",
+                             "six criteria read light - the fixture cannot reach full, so the "
+                             "light assertions above prove nothing")
+
+
+class BoundedBriefTests(unittest.TestCase):
+    """US0642: the claim-inventory pass is the largest block in the brief and, in CR0510's
+    words, a finding generator by construction. On a low-band unit it costs more than the unit.
+    """
+
+    def test_the_claim_inventory_runs_at_full_tier_and_not_at_light(self) -> None:
+        """Mutant: emit the block unconditionally - the light assertion reddens and the bounded
+        brief buys nothing, which is the whole slice."""
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            _workspace(root)
+            full = mod.brief(root, "US0001", "qa", tier="full")
+            light = mod.brief(root, "US0001", "qa", tier="light")
+            self.assertIn("CLAIM INVENTORY", full)
+            self.assertNotIn("CLAIM INVENTORY", light)
+            self.assertLess(len(light), len(full))
+
+    def test_the_depth_line_and_the_sections_agree(self) -> None:
+        """Mutant: hard-code the depth sentence independently of the section switch - a brief
+        says light and reads full, which is two decisions where there is one."""
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            _workspace(root)
+            for tier, says_full in (("full", True), ("light", False)):
+                text = mod.brief(root, "US0001", "qa", tier=tier)
+                self.assertEqual("Full adversarial pass" in text, says_full, tier)
+                self.assertEqual("CLAIM INVENTORY" in text, says_full, tier)
+
+    def test_the_full_tier_enumeration_refusal_still_fires(self) -> None:
+        """Bounding the light tier must not weaken the full one. Mutant: relax the full-tier
+        validation while adding the light path - the guard that refuses a claim-inventory pass
+        omitting one of its four prose surfaces stops guarding."""
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            _workspace(root)
+            # The positive control first: a real FULL brief must still pass its own guard, or
+            # the four refusals below could be passing because the guard refuses everything.
+            mod.assert_brief_claim_pass(mod.brief(root, "US0001", "qa", tier="full"))
+            for surface in mod.CLAIM_SURFACES:
+                damaged = mod.brief(root, "US0001", "qa", tier="full").replace(
+                    surface, "SOMETHINGELSE")
+                with self.assertRaises(ValueError, msg=surface):
+                    mod.assert_brief_claim_pass(damaged)
+
+    def test_a_light_brief_keeps_the_four_load_bearing_parts(self) -> None:
+        """What a light brief KEEPS is stated, not left to whatever survived. Mutant: drop the
+        criteria from the light brief - a light review judges against a paraphrase, which is
+        the failure the shipped brief exists to prevent in the first place."""
+        with tempfile.TemporaryDirectory() as d:
+            root, mod = Path(d), _load()
+            _workspace(root)
+            light = mod.brief(root, "US0001", "qa", tier="light")
+            self.assertIn("personas/seats/qa.md", light)        # the seat charter
+            self.assertIn("src/a.py", light)                    # the bounded diff scope
+            self.assertIn("### AC1: works", light)              # the criteria, as law
+            self.assertIn("VERDICT: APPROVE or REJECT", light)  # the return contract
+
+
+class BriefTests(unittest.TestCase):
+    """US0189: critic brief assembles the seat-review prompt deterministically."""
+
+    def test_brief_carries_charter_acs_scope_and_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _workspace(root)
+            mod = _load()
+            text = mod.brief(root, "US0001", "qa")
+            self.assertIn("personas/seats/qa.md", text)       # charter reference
+            self.assertIn("### AC1: works", text)             # ACs verbatim
+            self.assertIn("src/a.py", text)                   # Affects-derived scope
+            self.assertIn("VERDICT: APPROVE or REJECT", text) # the return contract
+            self.assertIn("did NOT author", text)
+
+    def test_unknown_unit_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _workspace(root)
+            mod = _load()
+            with self.assertRaises(ValueError):
+                mod.brief(root, "US0999", "qa")
+
+    def test_unknown_seat_refused_naming_available(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _workspace(root)
+            mod = _load()
+            with self.assertRaises(ValueError) as ctx:
+                mod.brief(root, "US0001", "wizard")
+            self.assertIn("qa", str(ctx.exception))
+
+
+class FromVerdictTests(unittest.TestCase):
+    """US0189: record --from-verdict parses the returned block, refusing malformed input."""
+
+    BLOCK = ("Some preamble prose from the seat.\n"
+             "VERDICT: APPROVE\n"
+             "ISSUES: [new] minor thing at a.py:3; [pre-existing] another note\n"
+             "BLOCKING: none\n")
+
+    def _record(self, root: Path, block: str) -> tuple[int, str]:
+        mod = _load()
+        f = root / "verdict.txt"
+        f.write_text(block, encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = mod.main(["record", "--brief", "abcdef123456",
+                           "--unit", "US0001", "--reviewer", "Sam seat",
+                           "--author", "builder", "--from-verdict", str(f),
+                           "--root", str(root)])
+        return rc, err.getvalue()
+
+    def test_block_parsed_and_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            rc, _ = self._record(root, self.BLOCK)
+            self.assertEqual(rc, 0)
+            mod = _load()
+            v = mod.verdict_for(root, "US0001")
+            self.assertEqual(v["verdict"], "APPROVE")
+            self.assertIn("minor thing", v["issues"])
+
+    def test_blocking_content_folded_into_issues(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            rc, _ = self._record(root, self.BLOCK.replace(
+                "BLOCKING: none", "BLOCKING: [regression] the big one at b.py:9"))
+            self.assertEqual(rc, 0)
+            v = _load().verdict_for(root, "US0001")
+            # The fold now carries the finding's origin through with it, so the label and the
+            # text are no longer adjacent - assert both survive rather than their old spelling.
+            self.assertIn("BLOCKING:", v["issues"])
+            self.assertIn("the big one", v["issues"])
+            self.assertIn("[regression]", v["issues"],
+                          "the folded BLOCKING finding lost its origin")
+
+    def test_verdictless_block_refused_loudly(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            rc, err = self._record(root, "just prose, no verdict token\n")
+            self.assertNotEqual(rc, 0)
+            self.assertIn("VERDICT", err)
+            self.assertIsNone(_load().verdict_for(root, "US0001"))
+
+    def test_unknown_verdict_value_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            rc, err = self._record(root, "VERDICT: SMASHED-IT\nISSUES: none\n")
+            self.assertNotEqual(rc, 0)
+            self.assertIn("SMASHED-IT", err)
+
+    def test_duplicate_verdict_lines_refused_never_first_wins(self) -> None:
+        # "VERDICT: APPROVE ... VERDICT: REJECT" must refuse - an ambiguous block
+        # resolved in the author's favour is a forged approval
+        with tempfile.TemporaryDirectory() as d:
+            rc, err = self._record(Path(d),
+                                   "VERDICT: APPROVE\nISSUES: none\nVERDICT: REJECT\n")
+            self.assertNotEqual(rc, 0)
+            self.assertIn("2 VERDICT", err)
+
+    def test_lowercase_block_parsed_not_silently_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            rc, _ = self._record(root, "verdict: reject\nissues: [new] a real finding at a.py:3\n")
+            self.assertEqual(rc, 0)
+            v = _load().verdict_for(root, "US0001")
+            self.assertEqual(v["verdict"], "REJECT")
+            self.assertIn("a real finding", v["issues"])
+
+    def test_wrapped_issues_with_allcaps_word_not_truncated(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            rc, _ = self._record(root, "VERDICT: APPROVE\nISSUES: [new] first line;\n"
+                                       "[new] NOTE: this continuation belongs to issues\n"
+                                       "BLOCKING: none\n")
+            self.assertEqual(rc, 0)
+            v = _load().verdict_for(root, "US0001")
+            self.assertIn("NOTE: this continuation", v["issues"])
+
+    def test_echoed_contract_above_real_block_cannot_leak_placeholders(self) -> None:
+        block = ("The contract I was given said:\n"
+                 "VERDICT: APPROVE or REJECT\n"
+                 "ISSUES: <semicolon-separated findings>\n"
+                 "BLOCKING: <the subset>\n\n"
+                 "VERDICT: REJECT\nISSUES: [new] the actual finding\nBLOCKING: none\n")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            rc, _ = self._record(root, block)
+            self.assertEqual(rc, 0)  # the echo's "APPROVE or REJECT" is not a verdict line
+            v = _load().verdict_for(root, "US0001")
+            self.assertEqual(v["verdict"], "REJECT")
+            self.assertIn("the actual finding", v["issues"])
+            self.assertNotIn("<semicolon", v["issues"])
+
+    def test_stdin_dash_path(self) -> None:
+        import unittest.mock
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    unittest.mock.patch.object(sys, "stdin", io.StringIO(self.BLOCK)):
+                rc = mod.main(["record", "--brief", "abcdef123456",
+                               "--unit", "US0001", "--reviewer", "Sam seat",
+                               "--author", "builder", "--from-verdict", "-",
+                               "--root", str(root)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(mod.verdict_for(root, "US0001")["verdict"], "APPROVE")
+
+    def test_explicit_verdict_and_from_verdict_refused_together(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            f = root / "v.txt"
+            f.write_text(self.BLOCK, encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = mod.main(["record", "--brief", "abcdef123456",
+                               "--unit", "US0001", "--reviewer", "r",
+                               "--author", "a", "--verdict", "approve",
+                               "--from-verdict", str(f), "--root", str(root)])
+            self.assertNotEqual(rc, 0)
+            self.assertIn("mutually exclusive", err.getvalue())
+
+
+class RejoinderTests(unittest.TestCase):
+    """CR0329: the re-verdict loop's scaffolding emitted deterministically - the
+    prior verdict quoted verbatim, the refreshed scope, the same return contract."""
+
+    PRIOR = ("VERDICT: REJECT\n"
+             "ISSUES: [new] vacuous killing test at test_x.py:10; [new] docstring overclaims\n"
+             "BLOCKING: the vacuous killing test\n")
+
+    def _workspace(self, root: Path) -> None:
+        d = root / "sdlc-studio" / "stories"
+        d.mkdir(parents=True)
+        (d / "US0101-widget.md").write_text(
+            "# US0101: widget frobnicates\n\n> **Status:** Review\n> **Points:** 5\n"
+            "> **Affects:** widget.py\n\n## Acceptance Criteria\n\n### AC1: works\n"
+            "- **Verify:** shell echo ok\n", encoding="utf-8")
+        seats = root / "sdlc-studio" / "personas" / "seats"
+        seats.mkdir(parents=True)
+        (seats / "qa.md").write_text("# Sam Eriksson - QA seat\n<!-- role: qa -->\n",
+                                     encoding="utf-8")
+
+    def test_rejoinder_quotes_prior_verdict_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._workspace(root)
+            mod = _load()
+            text = mod.rejoinder_brief(root, "US0101", "qa", self.PRIOR)
+            self.assertIn("VERDICT: REJECT", text)                        # quoted
+            self.assertIn("vacuous killing test at test_x.py:10", text)   # verbatim issues
+            self.assertIn("BLOCKING: the vacuous killing test", text)
+            self.assertIn("widget.py", text)                              # refreshed scope
+            self.assertIn("VERDICT: APPROVE or REJECT", text)             # same contract
+
+    def test_malformed_prior_verdict_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._workspace(root)
+            mod = _load()
+            with self.assertRaises(ValueError):
+                mod.rejoinder_brief(root, "US0101", "qa", "no contract here")
+
+    def test_cli_rejoinder_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._workspace(root)
+            mod = _load()
+            f = root / "prior.txt"
+            f.write_text(self.PRIOR, encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = mod.main(["brief", "--unit", "US0101", "--seat", "qa",
+                               "--rejoinder", str(f), "--root", str(root)])
+            self.assertEqual(rc, 0)
+            self.assertIn("VERDICT: REJECT", out.getvalue())
+            bad = root / "bad.txt"
+            bad.write_text("nothing here", encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = mod.main(["brief", "--unit", "US0101", "--seat", "qa",
+                               "--rejoinder", str(bad), "--root", str(root)])
+            self.assertEqual(rc, 2)
+
+
+class RejoinderProbeTests(unittest.TestCase):
+    """CR0329: the re-run-your-mutants demand is structural - the lesson from the
+    two vacuous killing tests, in the ceremony, not just the lore."""
+
+    def test_rejoinder_demands_reexecuting_the_named_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            RejoinderTests._workspace(RejoinderTests(), root)
+            mod = _load()
+            text = mod.rejoinder_brief(root, "US0101", "qa", RejoinderTests.PRIOR)
+            low = text.lower()
+            self.assertIn("re-execute", low)
+            self.assertIn("mutant", low)
+            # the demand binds BEFORE approval and forbids trusting the summary -
+            # asserted on the rejoinder's own phrasing, not the base brief's contract
+            self.assertIn("before you may approve", low)
+            self.assertIn("a claim,\nnot evidence", low.replace("\r", ""))
+            # the contract appears TWICE: the base brief's copy AND the rejoinder tail
+            # (dropping the tail restatement must fail here)
+            self.assertEqual(text.count("VERDICT: APPROVE or REJECT"), 2)
+
+
+class ReviewRoundCountTests(unittest.TestCase):
+    """US0261 - the review round cap (`review.max_rounds`) resolves from config, default 2. The
+    cap itself is exercised through `critic.py record` in test_lean_review_cap."""
+
+    def test_ceiling_resolves_from_config_with_default(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            self.assertEqual(mod.review_ceiling(root), mod.DEFAULT_REVIEW_CEILING)
+            cfg = root / "sdlc-studio" / ".config.yaml"
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            cfg.write_text("review:\n  max_rounds: 7\n", encoding="utf-8")
+            try:
+                import yaml  # noqa: F401
+            except ImportError:
+                self.skipTest("PyYAML absent - the override path cannot be exercised")
+            self.assertEqual(mod.review_ceiling(root), 7)
+
+    def test_the_shipped_ceiling_default_is_two(self) -> None:
+        """The literal 2, pinned by value rather than through its own symbol: one review and
+        one re-check of its fixes. Comparing `review_ceiling` to `DEFAULT_REVIEW_CEILING` is
+        true for any value the constant takes, so it pins the wiring and not the number."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            self.assertEqual(mod.DEFAULT_REVIEW_CEILING, 2)
+            self.assertEqual(mod.review_ceiling(root), 2)   # no config present
+
+class ReadRowsHeaderTests(unittest.TestCase):
+    """BG0227 - the header skip is derived from the declared column names, not one table's
+    first-column literal, so a table led by any other column does not return its own header."""
+
+    def test_sprint_review_table_does_not_return_its_header_as_data(self) -> None:
+        """One frozen sprint review reads back as exactly one row.
+
+        The sprint-review table is led by `Base`, not `Unit`. A first-column literal skip
+        knows only `Unit`, so it returned the `| Base | Reviewer | ... |` header as a data
+        row with every cell set to its own column name.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            path = mod.sprint_review_path(root)
+            path.parent.mkdir(parents=True)
+            path.write_text("| Base | Reviewer | Author | Verdict | Date | Units | Findings |\n"
+                            "| --- | --- | --- | --- | --- | --- | --- |\n"
+                            "| - | seat | builder | APPROVE | 2026-09-01 | US0001 | f |\n",
+                            encoding="utf-8")
+            rows = mod.sprint_reviews(root)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["base"], "-")
+            self.assertEqual(rows[0]["reviewer"], "seat")
+            # the shape the defect produced: every cell equal to its own column name
+            self.assertNotIn({"base": "Base", "reviewer": "Reviewer", "author": "Author",
+                              "verdict": "Verdict", "date": "Date", "units": "Units",
+                              "findings": "Findings"}, rows)
+
+    def test_header_skip_generalises_to_a_table_with_unrelated_columns(self) -> None:
+        """A table whose columns share no name with any shipped table still loses its header.
+
+        This is the claim the docstring on `_read_rows` makes - that the skip cannot lapse
+        when the next table is added - reached directly rather than through a caller, because
+        no shipped caller uses these column names.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            path = root / "novel-table.md"
+            path.write_text("# Novel\n\n"
+                            "| Alpha | Beta |\n"
+                            "| --- | --- |\n"
+                            "| a1 | b1 |\n"
+                            "| a2 | b2 |\n", encoding="utf-8")
+            rows = mod._read_rows(path, ("alpha", "beta"))
+            self.assertEqual(rows, [{"alpha": "a1", "beta": "b1"},
+                                    {"alpha": "a2", "beta": "b2"}])
+
+    def test_a_data_row_that_looks_like_a_header_only_in_its_first_cell_is_kept(self) -> None:
+        """`Unit` as a first cell is data unless the WHOLE row is the column names.
+
+        The old literal skip dropped any row whose first cell read `Unit`; the column-name
+        match drops only the header itself.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            path = root / "look-alike.md"
+            path.write_text("| Unit | Reviewer |\n"
+                            "| --- | --- |\n"
+                            "| Unit | someone |\n", encoding="utf-8")
+            self.assertEqual(mod._read_rows(path, ("unit", "reviewer")),
+                             [{"unit": "Unit", "reviewer": "someone"}])
+
+
+_PRIOR = """VERDICT: REJECT
+ISSUES: MAJOR - the sibling sweep is blind to its own directory. I ran
+`pytest tests/test_repo_hygiene.py -k sibling` and mutated the guard at
+scripts/readiness.py:88; the killing test did not fail.
+Also MINOR - the docstring overstates what the second clause pins.
+BLOCKING: yes
+"""
+
+
+class NeutralBriefTests(unittest.TestCase):
+    """US0265 - the brief carries the work, not the framing that predicts a conclusion."""
+
+    def _root(self, d):
+        root = Path(d)
+        (root / "sdlc-studio" / "stories").mkdir(parents=True)
+        (root / "sdlc-studio" / "stories" / "US0001-x.md").write_text(
+            "# US0001: x\n\n> **Status:** Ready\n> **Affects:** a.py\n", encoding="utf-8")
+        seats = root / "sdlc-studio" / "personas" / "seats"
+        seats.mkdir(parents=True, exist_ok=True)
+        (seats / "qa-seat.md").write_text(
+            "<!-- role: qa -->\n# QA seat\n\n## Lens\n\nAssertion integrity.\n",
+            encoding="utf-8")
+        return root
+
+    def test_neutral_brief_carries_diff_and_risk_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            mod = _load()
+            text = mod.neutral_brief(root, "US0001", "qa")
+            self.assertIn("US0001", text)
+            self.assertTrue(len(text.strip()) > 100, "a brief must carry the work to be done")
+
+    def test_brief_omits_verdict_round_and_expected_conclusion(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            mod = _load()
+            text = mod.neutral_brief(root, "US0001", "qa", prior=_PRIOR, round_number=4)
+            # the return contract necessarily names both verdict words and BLOCKING - that is
+            # the reply format, not priming - so the property is checked with it excluded
+            self.assertEqual(mod.neutrality_violations(text), [])
+            body = text.replace(mod._RETURN_CONTRACT, "")
+            for banned in ("REJECT", "MAJOR", "MINOR", "BLOCKING"):
+                self.assertNotIn(banned, body, f"{banned} leaked outside the return contract")
+            self.assertNotRegex(body, r"(?i)round\s*4")
+            self.assertNotRegex(body, r"(?i)the pattern will continue|you will find|expect to find")
+
+    def test_probe_list_travels_without_its_framing(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            mod = _load()
+            text = mod.neutral_brief(root, "US0001", "qa", prior=_PRIOR)
+            # the factual re-execution demand survives...
+            self.assertIn("tests/test_repo_hygiene.py", text)
+            self.assertIn("scripts/readiness.py:88", text)
+            # ...as a DEMAND, not a bare list of paths: probes with no instruction to re-run
+            # them are decoration, and the re-execution is the half worth keeping
+            self.assertRegex(text, r"(?i)re-execute")
+            self.assertRegex(text, r"(?i)killing test fails")
+            # ...stripped of the verdict prose that surrounded it
+            self.assertNotIn("blind to its own directory", text)
+
+    def test_unparseable_probe_list_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            mod = _load()
+            with self.assertRaises(ValueError) as ctx:
+                mod.neutral_brief(root, "US0001", "qa",
+                                  prior="VERDICT: REJECT\nISSUES: it felt wrong\nBLOCKING: yes\n")
+            self.assertRegex(str(ctx.exception), r"(?i)probe")
+
+    def test_neutral_text_reports_no_violations(self) -> None:
+        mod = _load()
+        clean = "Review the diff for US0001. Return the contract below."
+        self.assertEqual(mod.neutrality_violations(clean), [])
+
+    # BG0235 - one case per priming class, each carrying ONLY that class, asserting the exact
+    # violation list. A single test tripping all four at once and asserting truthiness stays
+    # green when any one class regexp is neutered; these fail one test per broken class.
+
+    def test_a_verdict_word_alone_is_flagged(self) -> None:
+        mod = _load()
+        self.assertEqual(mod.neutrality_violations("The prior outcome was REJECT."),
+                         ["a prior verdict word"])
+        self.assertEqual(mod.neutrality_violations("The prior outcome was APPROVE."),
+                         ["a prior verdict word"])
+
+    def test_a_severity_label_alone_is_flagged(self) -> None:
+        mod = _load()
+        for label in ("MAJOR", "MINOR", "BLOCKING"):
+            self.assertEqual(mod.neutrality_violations(f"The finding was a {label} one."),
+                             ["a severity label that pre-grades the finding"], label)
+
+    def test_a_round_number_alone_is_flagged(self) -> None:
+        mod = _load()
+        self.assertEqual(mod.neutrality_violations("This is round 3 of the pass."),
+                         ["a round number"])
+
+    def test_an_asserted_conclusion_alone_is_flagged(self) -> None:
+        mod = _load()
+        for phrase in ("the pattern will continue", "you will find the same shape",
+                       "expect to find the same shape", "as in the previous round"):
+            self.assertEqual(mod.neutrality_violations(f"Note that {phrase}."),
+                             ["an asserted conclusion"], phrase)
+
+    def test_a_brief_with_no_prior_is_still_neutral(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            mod = _load()
+            self.assertEqual(mod.neutrality_violations(
+                mod.neutral_brief(root, "US0001", "qa")), [])
+
+
+REFERENCE_REVIEW = Path(__file__).resolve().parents[2] / "reference-review.md"
+
+
+def _norm(text: str) -> str:
+    """Collapse whitespace so a phrase wrapped across doc/brief lines still matches."""
+    return " ".join(text.split())
+
+
+class BriefStatesTheIsolatedCheckoutRuleTests(unittest.TestCase):
+    """BG0440. The isolated-checkout rule was enforced author-side only: `mutation.run` refuses
+    a target with uncommitted changes, protecting the AUTHOR, and nothing protected the tree
+    from the REVIEWER. The brief is the one artefact guaranteed to reach a delegated reviewer,
+    so a practice absent from it is held only by the dispatcher's memory - and four reviewers
+    dispatched over one shared tree left a live mutant behind in it."""
+
+    def _brief(self, mod, root: Path) -> str:
+        _workspace(root)
+        return mod.brief(root, "US0001", "qa")
+
+    def test_the_brief_demands_an_isolated_checkout_and_says_why(self) -> None:
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            text = self._brief(mod, Path(d))
+            self.assertIn("ISOLATED CHECKOUT", text)
+            self.assertIn("never the author", text)
+            self.assertNotIn("isolated checkout for mutation", mod.missing_practices(text))
+
+    def test_the_brief_names_the_MECHANISM_not_only_the_requirement(self) -> None:
+        """A reviewer told an abstract requirement improvises; one told `isolation: 'worktree'`
+        does the thing. The rule already existed in reference-review.md and was still bypassed."""
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIn("worktree", self._brief(mod, Path(d)))
+
+    def test_the_brief_FORBIDS_the_tree_wide_cleanups_by_name(self) -> None:
+        """`git stash` is what a reviewer told only to 'revert afterwards' reaches for, and it
+        is tree-wide: it reverts a concurrent reviewer's mutant, so a SURVIVED verdict may
+        describe a mutant that was never on disk when its test ran."""
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            text = self._brief(mod, Path(d))
+            self.assertIn("git stash", text)
+            self.assertIn("tree-wide", text)
+
+    def test_the_practice_is_refused_when_its_reason_is_stripped(self) -> None:
+        """The discriminating half. An instruction with no reason is the part a fresh reviewer
+        drops first, so presence of the words alone must not satisfy the guard."""
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            text = self._brief(mod, Path(d))
+            reasonless = re.sub(r"tree-wide[^.]*silently reverts a concurrent reviewer'?s mutant",
+                                "REDACTED", _norm(text), flags=re.I)
+            self.assertIn("isolated checkout for mutation", mod.missing_practices(reasonless))
+            with self.assertRaises(ValueError):
+                mod.assert_brief_practices(reasonless)
+
+
+class OneIndependenceAuthorityTests(unittest.TestCase):
+    """BG0443 + BG0444. There were FOUR independence predicates - `is_independent`,
+    `sprint_covers_independently`, a sign-off predicate since retired, and a fourth inline in
+    sprint.py reaching into critic's private `_id`. Correctness depended on each caller
+    remembering which combination to AND, nothing checked the four agreed, and twice they did
+    not: one required a non-empty reviewer and one did not, and one refused PRE_GATE while the
+    module that actually gates Done accepted it."""
+
+    def test_an_empty_reviewer_is_NOT_independent(self) -> None:
+        """BG0443. `bool(author) and reviewer != author` is True for an empty reviewer, because
+        '' != 'alice'. A guard that fails OPEN is the direction this project says it must never
+        fail, and four gate consumers used that predicate alone."""
+        mod = _load()
+        self.assertFalse(mod.is_independent(
+            {"verdict": "APPROVE", "reviewer": "", "author": "alice"}))
+        ok, why = mod.independence("", "alice")
+        self.assertFalse(ok)
+        self.assertIn("no reviewer", why)
+
+    def test_an_empty_reviewer_is_refused_by_EVERY_predicate(self) -> None:
+        """BG0443's own discriminating case, distinct from the caller sweep: the hole was in
+        `is_independent`, and the question is whether its SIBLINGS ever shared it. They must all
+        refuse the same row, or the fix has closed one door in a corridor of four."""
+        mod = _load()
+        row = {"verdict": "APPROVE", "reviewer": "", "author": "alice"}
+        self.assertFalse(mod.is_independent(row))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(mod.sprint_covers_independently(Path(d), "US0001", row))
+
+    def test_the_PRE_GATE_sentinel_is_refused_by_EVERY_predicate(self) -> None:
+        """BG0444. `sprint_covers_independently` tested only non-empty-and-distinct, so it
+        accepted the migration sentinel. sprint.py compensated by AND-ing a second predicate on;
+        conformance.py did not, so the same row cleared Done in one module and not the other."""
+        mod = _load()
+        row = {"verdict": "APPROVE", "reviewer": "bob", "author": mod.PRE_GATE}
+        self.assertFalse(mod.is_independent(row))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(mod.sprint_covers_independently(Path(d), "US0001", row))
+
+    def test_the_predicates_AGREE_across_every_pair(self) -> None:
+        """The property the four never had. Whatever the authority says, each predicate says -
+        so a caller can no longer be wrong by picking one."""
+        mod = _load()
+        cases = [("", ""), ("", "alice"), ("alice", ""), ("alice", "alice"),
+                 ("alice", "bob"), ("bob", mod.PRE_GATE), (mod.PRE_GATE, "bob"),
+                 ("Dani\\_Okafor", "dani_okafor"), ("-", "alice"), ("alice", "-")]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for reviewer, author in cases:
+                want = mod.independence(reviewer, author)[0]
+                with self.subTest(reviewer=reviewer, author=author):
+                    self.assertIs(mod.is_independent(
+                        {"verdict": "APPROVE", "reviewer": reviewer, "author": author}), want)
+                    self.assertIs(mod.sprint_covers_independently(
+                        root, "US0001", {"verdict": "APPROVE", "reviewer": reviewer,
+                                         "author": author}), want)
+
+    def test_the_writer_FLOORS_an_empty_reviewer_so_it_cannot_reach_the_ledger(self) -> None:
+        """The predicate alone is not enough: the writer is what made the bad row reachable.
+        `record_verdict` floored the author to `-` and gave the reviewer no such floor."""
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod.record_verdict(root, "US0001", "APPROVE", reviewer="", author="alice")
+            # The PARSED REVIEWER CELL, not a substring of the row. `assertIn("| - |", ...)` was
+            # satisfied by the trailing ISSUES cell whatever the reviewer held, so dropping the
+            # floor left the test green and the mutant survived the entire skill suite - the one
+            # writer-side behaviour this bug shipped was pinned by nothing.
+            rows = mod.read_verdicts(root)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["reviewer"], "-",
+                             "the empty reviewer cell was not floored - it reached the ledger "
+                             f"as {rows[0]['reviewer']!r}")
+            self.assertFalse(mod.is_independent(mod.verdict_for(root, "US0001")))
+
+    def test_NO_module_hand_rolls_the_independence_comparison(self) -> None:
+        """The shape that produced both bugs, pinned. A module comparing reviewer to author
+        itself is a fifth predicate nobody is checking against the other four."""
+        import ast
+        scripts = Path(__file__).resolve().parents[1]
+        offenders = []
+        # `scripts/lib/` TOO. The first version globbed `scripts/*.py` only, so the same
+        # hand-rolled predicate placed one directory down was invisible - a sweep that names its
+        # scope narrower than its claim reports the narrow answer as the broad one, which is the
+        # class this repo's own carried lessons name twice.
+        for path in sorted([*scripts.glob("*.py"), *(scripts / "lib").glob("*.py")]):
+            if path.name == "critic.py":
+                continue                      # the authority itself
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except (OSError, SyntaxError):
+                continue
+            # An ALIASED import evades an Attribute-only match: `from critic import _id as _n`
+            # binds a plain Name, so `_n(a) == _n(b)` is the same hand-rolled predicate wearing a
+            # different shape. Collect the local names any such import binds, then flag calls to
+            # them as well as `critic._id(...)`.
+            aliases = {a.asname or a.name
+                       for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                       and (node.module or "").split(".")[-1] == "critic"
+                       for a in node.names if a.name.startswith("_")}
+            for node in ast.walk(tree):
+                # `critic._id(...)` - reaching into the authority's private normaliser is how a
+                # caller builds its own comparison out of the authority's parts.
+                if (isinstance(node, ast.Attribute) and node.attr == "_id"
+                        and isinstance(node.value, ast.Name) and node.value.id == "critic"):
+                    offenders.append(f"{path.name}:{node.lineno}")
+                elif isinstance(node, ast.Name) and node.id in aliases:
+                    offenders.append(f"{path.name}:{node.lineno} (aliased {node.id})")
+        offenders = sorted(set(offenders))
+        self.assertEqual(
+            offenders, [],
+            "these lines rebuild the independence test from critic's private parts instead of "
+            f"calling `critic.independence`: {offenders}")
+
+
+class ReviewerBriefTests(unittest.TestCase):
+    """US0318 (EP0108): the shipped reviewer brief carries every standing practice, each
+    with its reason, and a brief missing any is refused; reference-review.md documents them.
+
+    The set has since grown (US0505 added regression cover for a repair), so nothing here
+    hardcodes how many there are - the count comes from `_BRIEF_PRACTICES` itself. The method
+    name is kept because a shipped Verify line resolves to it."""
+
+    def _brief(self, mod, root: Path) -> str:
+        _workspace(root)
+        return mod.brief(root, "US0001", "qa")
+
+    def test_a_brief_missing_any_of_the_three_practices_is_refused(self) -> None:
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            text = self._brief(mod, root)
+            # the shipped brief carries every practice, each with its reason
+            self.assertEqual(mod.missing_practices(text), [])
+            mod.assert_brief_practices(text)  # does not raise
+            # strip each practice's instruction in turn: the guard names it missing and refuses
+            for name, instruction, _reason in mod._BRIEF_PRACTICES:
+                gutted = re.sub(instruction, "REDACTED", _norm(text), flags=re.I)
+                self.assertIn(name, mod.missing_practices(gutted))
+                with self.assertRaises(ValueError):
+                    mod.assert_brief_practices(gutted)
+            # a practice named WITHOUT its reason still counts as missing - the reason is the
+            # half a fresh reviewer drops first, so presence of the instruction alone is not enough
+            reasonless = ("On a REPAIR review, rule each previous finding CLOSED, OVER-CLAIMED "
+                          "or MOVED. Mutate the author's TESTS, not only the code. When a mutant "
+                          "SURVIVES, re-test its branch in ISOLATION before drawing any "
+                          "conclusion from it. A repair that changes behaviour carries a test "
+                          "asserting that behaviour; where it does not, report the missing "
+                          "regression cover as a finding.")
+            self.assertEqual(len(mod.missing_practices(reasonless)), len(mod._BRIEF_PRACTICES),
+                             "instructions with no reasons must all count as missing")
+            # reference-review.md documents every one, so the shipped doc and the code agree
+            doc = _norm(REFERENCE_REVIEW.read_text(encoding="utf-8"))
+            for token in ("CLOSED", "OVER-CLAIMED", "MOVED", "author's TESTS", "isolation",
+                          "regression cover"):
+                self.assertIn(token, doc)
+
+    def test_the_survivor_instruction_requires_isolation_before_a_conclusion(self) -> None:
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            text = self._brief(mod, root)
+            self.assertNotIn("isolation re-test of a survivor", mod.missing_practices(text))
+            body = _norm(text)
+            # reorder so the conclusion is drawn BEFORE the isolation re-test: no longer carried
+            reordered = body.replace(
+                "re-test its branch in ISOLATION before drawing any conclusion from it",
+                "draw your conclusion first and then re-test its branch in ISOLATION")
+            self.assertIn("isolation re-test of a survivor", mod.missing_practices(reordered))
+            # the reason (a sibling guard masking the branch) is required, not just the word
+            self.assertIn("sibling guard", body)
+
+
+class RepairVerdictTests(unittest.TestCase):
+    """US0319 (EP0108): a repair review is briefed with each previous finding enumerated and
+    returns a CLOSED / OVER-CLAIMED / MOVED verdict per item; MOVED is not counted closed."""
+
+    def test_a_repair_brief_enumerates_every_previous_finding(self) -> None:
+        mod = _load()
+        findings = ["readiness.py:88 grep verb takes no flag",
+                    "mutation.py reuses the cached pyc",
+                    "the brief leaks the round number",
+                    "the resolution claims mutation-proven"]
+        out = mod.enumerate_repair_findings(findings)
+        for f in findings:
+            self.assertIn(f, out)                       # every finding shown item by item
+        for i in range(1, len(findings) + 1):
+            self.assertIn(f"{i}.", out)                 # each enumerated as its own item
+        with self.assertRaises(ValueError):            # an empty prior set is refused
+            mod.enumerate_repair_findings([])
+
+    def test_a_verdict_leaving_a_finding_unruled_is_refused(self) -> None:
+        mod = _load()
+        findings = ["f1", "f2", "f3", "f4"]
+        rulings = {"f1": "CLOSED", "f2": "OVER-CLAIMED", "f3": "MOVED"}  # f4 unruled
+        with self.assertRaises(ValueError) as ctx:
+            mod.validate_repair_verdict(findings, rulings)
+        self.assertIn("f4", str(ctx.exception))         # the unruled finding is named
+        with self.assertRaises(ValueError):            # a ruling off the vocabulary is refused
+            mod.validate_repair_verdict(["f1"], {"f1": "fixed"})
+        self.assertTrue(mod.validate_repair_verdict(findings, {**rulings, "f4": "CLOSED"}))
+
+    def test_a_moved_finding_is_not_counted_as_closed(self) -> None:
+        mod = _load()
+        rulings = {"f1": "MOVED", "f2": "CLOSED", "f3": "OVER-CLAIMED"}
+        open_findings = mod.repair_open_findings(rulings)
+        self.assertIn("f1", open_findings)              # MOVED survived
+        self.assertIn("f3", open_findings)              # OVER-CLAIMED survived
+        self.assertNotIn("f2", open_findings)           # only CLOSED is closed
+
+
+class ClaimInventoryTests(unittest.TestCase):
+    """US0320/US0321 (EP0109): the brief directs a first pass over all four prose surfaces, and
+    each claim is ruled TRUE / FALSE / UNVERIFIABLE - unverifiable counted apart from true."""
+
+    def test_the_brief_names_all_four_prose_surfaces(self) -> None:
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _workspace(root)
+            text = mod.brief(root, "US0001", "qa")
+            self.assertEqual(mod.missing_claim_surfaces(text), [])
+            mod.assert_brief_claim_pass(text)          # does not raise
+            # dropping any one surface exempts it - the guard names it and refuses
+            for surface in mod.CLAIM_SURFACES:
+                gutted = _norm(text).replace(surface, "SOMETHING")
+                self.assertIn(surface, mod.missing_claim_surfaces(gutted))
+                with self.assertRaises(ValueError):
+                    mod.assert_brief_claim_pass(gutted)
+            # reference-review.md names all four surfaces too
+            doc = _norm(REFERENCE_REVIEW.read_text(encoding="utf-8"))
+            for surface in mod.CLAIM_SURFACES:
+                self.assertIn(surface, doc)
+
+    def test_a_claim_left_unruled_is_refused(self) -> None:
+        mod = _load()
+        claims = ["c1", "c2", "c3", "c4", "c5", "c6"]
+        rulings = {"c1": "TRUE", "c2": "FALSE", "c3": "UNVERIFIABLE",
+                   "c4": "TRUE", "c5": "FALSE"}         # six claims, five rulings - c6 unruled
+        with self.assertRaises(ValueError) as ctx:
+            mod.validate_claim_inventory(claims, rulings)
+        self.assertIn("c6", str(ctx.exception))
+        with self.assertRaises(ValueError):            # a ruling off the vocabulary is refused
+            mod.validate_claim_inventory(["c1"], {"c1": "probably"})
+        self.assertTrue(mod.validate_claim_inventory(claims, {**rulings, "c6": "UNVERIFIABLE"}))
+
+    def test_an_unverifiable_claim_is_counted_separately_from_true(self) -> None:
+        mod = _load()
+        s = mod.summarise_claim_pass({"c1": "UNVERIFIABLE"})
+        self.assertEqual(s["unverifiable"], 1)
+        self.assertEqual(s["true"], 0)                  # not folded into TRUE
+        self.assertEqual(s["on_trust"], 1)              # reported as resting on trust
+        self.assertEqual(s["checked"], 0)
+        s2 = mod.summarise_claim_pass(["TRUE", "UNVERIFIABLE", "UNVERIFIABLE"])
+        self.assertEqual((s2["true"], s2["unverifiable"], s2["on_trust"]), (1, 2, 2))
+
+    def test_an_all_unverifiable_pass_does_not_render_as_verified(self) -> None:
+        mod = _load()
+        all_unv = {"c1": "UNVERIFIABLE", "c2": "UNVERIFIABLE"}
+        s = mod.summarise_claim_pass(all_unv)
+        self.assertFalse(s["verified"])                 # nothing settled
+        self.assertIn("NOT VERIFIED", mod.render_claim_pass(all_unv))
+        # a pass with even one settled claim reads differently - no NOT VERIFIED
+        self.assertNotIn("NOT VERIFIED", mod.render_claim_pass({"c1": "FALSE", "c2": "UNVERIFIABLE"}))
+        self.assertTrue(mod.summarise_claim_pass({"c1": "FALSE"})["verified"])
+
+
+class CriticFieldsFileTests(unittest.TestCase):
+    """US0391: critic's free prose reaches the ledger through the shared fields-file loader, so
+    prose carrying shell metacharacters is stored verbatim (Python never runs it) rather than
+    swallowed by a shell. The sign-off note that first carried it is retired (US0919); the
+    supersession reason is the prose critic still takes."""
+
+    def _repo(self):
+        d = Path(tempfile.mkdtemp(prefix="critic_ff_"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "sdlc-studio" / "reviews").mkdir(parents=True)
+        mod = _load()
+        mod.record_verdict(d, "US0001", "approve", reviewer="operator", author="builder")
+        return mod, d, mod.read_verdicts(d)[0]["date"]
+
+    def _run(self, mod, argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = mod.main(argv)
+        return rc, buf.getvalue()
+
+    def _supersede(self, d, date, fields):
+        return ["supersede", "--unit", "US0001", "--date", date, "--authorised-by", "operator",
+                "--boundary", "operator console", "--fields-file", str(fields), "--root", str(d)]
+
+    def test_fields_file_note_is_stored_verbatim_with_shell_metacharacters(self) -> None:
+        mod, d, date = self._repo()
+        hazard = "run `git status` and $(whoami) - dangerous on the flag path"
+        (d / "fields.json").write_text(json.dumps({"reason": hazard}))
+        rc, out = self._run(mod, self._supersede(d, date, d / "fields.json"))
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("metacharacters", out, "the fields-file path crossed no shell")
+        recorded = mod.verdicts_path(d).read_text(encoding="utf-8")
+        self.assertIn("`git status`", recorded)     # backtick survived - not executed
+        self.assertIn("$(whoami)", recorded)          # command substitution stored verbatim
+
+    def test_unknown_field_is_refused_by_the_shared_loader(self) -> None:
+        mod, d, date = self._repo()
+        before = mod.verdicts_path(d).read_text(encoding="utf-8")
+        (d / "bad.json").write_text(json.dumps({"reasn": "typo key nobody reads"}))
+        rc, out = self._run(mod, self._supersede(d, date, d / "bad.json"))
+        self.assertEqual(rc, 2, out)                   # refused, not silently ignored
+        self.assertIn("reasn", out)
+        self.assertEqual(before, mod.verdicts_path(d).read_text(encoding="utf-8"))
+
+
+class SupersedeTests(unittest.TestCase):
+    """US0374: a verdict row that records an event which did not happen is retired through
+    the tool - an appended supersession record naming the row, the reason and an authoriser
+    who is not the row's own author. The row itself is never deleted."""
+
+    def _row(self, mod, root: Path, unit: str) -> str:
+        prefix = f"| {unit} "
+        return next(ln for ln in mod.verdicts_path(root).read_text(encoding="utf-8").splitlines()
+                    if ln.startswith(prefix))
+
+    def test_supersession_records_reason_and_authoriser_and_leaves_the_row(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0276", "approve",
+                               reviewer="Darren Benson (operator)",
+                               author="sdlc-studio; agent; v1")
+            row = self._row(mod, root, "US0276")
+            date = mod.read_verdicts(root)[0]["date"]
+            reason = ("the operator was the reviewer of record, not the adversarial critic, "
+                      "so the pass this row states never ran")
+            mod.record_supersession(root, "US0276", date=date, reason=reason,
+                                    authorised_by="Darren Benson (operator)",
+                                    boundary="operator console")
+            after = mod.verdicts_path(root).read_text(encoding="utf-8")
+            self.assertIn(row + "\n", after)     # byte-for-byte: corrected by addition
+            recs = mod.read_supersessions(root)
+            self.assertEqual(len(recs), 1)
+            rec = recs[0]
+            self.assertEqual(rec["unit"], "US0276")
+            self.assertEqual(rec["row_date"], date)
+            self.assertEqual(rec["row_verdict"], "APPROVE")
+            self.assertEqual(rec["row_reviewer"], "Darren Benson (operator)")
+            self.assertEqual(rec["row_author"], "sdlc-studio; agent; v1")
+            self.assertEqual(rec["reason"], reason)
+            self.assertEqual(rec["authorised_by"], "Darren Benson (operator)")
+            # a later verdict still lands inside the table, so the log stays one block
+            mod.record_verdict(root, "US0277", "approve", reviewer="critic-a", author="builder")
+            lines = mod.verdicts_path(root).read_text(encoding="utf-8").splitlines()
+            self.assertLess(lines.index(self._row(mod, root, "US0277")),
+                            lines.index(mod.SUPERSEDE_HEADING))
+            self.assertEqual(mod.verdict_for(root, "US0277")["verdict"], "APPROVE")
+
+    def test_row_author_alone_is_refused_as_the_authoriser(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0276", "approve",
+                               reviewer="Darren Benson (operator)",
+                               author="sdlc-studio; agent; v1")
+            date = mod.read_verdicts(root)[0]["date"]
+            before = mod.verdicts_path(root).read_text(encoding="utf-8")
+            for authoriser in ("sdlc-studio; agent; v1",     # the row's own author
+                               "SDLC-Studio; Agent; V1",     # ...however it is cased
+                               "",                           # nobody named at all
+                               "   "):
+                with self.assertRaises(ValueError):
+                    mod.record_supersession(root, "US0276", date=date, reason="wrong row",
+                                            authorised_by=authoriser, boundary="operator console")
+            self.assertEqual(mod.read_supersessions(root), [])
+            self.assertEqual(mod.verdicts_path(root).read_text(encoding="utf-8"), before)
+            self.assertFalse(mod.read_verdicts(root)[0]["superseded"])
+
+    def test_unmatched_row_refused_and_nothing_written(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0276", "approve", reviewer="critic-a",
+                               author="sdlc-studio; agent; v1")
+            date = mod.read_verdicts(root)[0]["date"]
+            before = mod.verdicts_path(root).read_text(encoding="utf-8")
+            with self.assertRaises(ValueError):     # no row for the unit at all
+                mod.record_supersession(root, "US9999", date=date, reason="no such row",
+                                        authorised_by="Darren Benson (operator)",
+                                        boundary="operator console")
+            with self.assertRaises(ValueError):     # right unit, a date it never carried
+                mod.record_supersession(root, "US0276", date="2020-01-01",
+                                        reason="wrong date", authorised_by="Darren Benson",
+                                        boundary="operator console")
+            self.assertEqual(mod.read_supersessions(root), [])
+            self.assertEqual(mod.verdicts_path(root).read_text(encoding="utf-8"), before)
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = mod.main(["supersede", "--unit", "US9999", "--date", date,
+                               "--reason", "no such row", "--authorised-by", "operator",
+                               "--boundary", "operator console", "--root", str(root)])
+            self.assertEqual(rc, 2)
+            self.assertIn("US9999", err.getvalue())
+            self.assertEqual(mod.read_supersessions(root), [])
+
+    def test_ambiguous_row_refused_until_narrowed(self) -> None:
+        # Two rows for one unit on one date: retiring "the row" is undefined, so it is
+        # refused rather than resolved by guessing which one was meant.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0300", "reject", reviewer="critic-a", author="builder")
+            with _before_the_round_rules(mod):
+                mod.record_verdict(root, "US0300", "approve", reviewer="critic-b",
+                                   author="builder")
+            date = mod.read_verdicts(root)[0]["date"]
+            with self.assertRaises(ValueError):
+                mod.record_supersession(root, "US0300", date=date, reason="dup",
+                                        authorised_by="operator", boundary="operator console")
+            self.assertEqual(mod.read_supersessions(root), [])
+            mod.record_supersession(root, "US0300", date=date, reviewer="critic-b",
+                                    reason="the approve was filed against the wrong unit",
+                                    authorised_by="operator", boundary="operator console")
+            self.assertEqual(mod.read_supersessions(root)[0]["row_reviewer"], "critic-b")
+            self.assertEqual(mod.verdict_for(root, "US0300")["reviewer"], "critic-a")
+
+    def test_cli_correct_is_the_same_verb(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0276", "approve", reviewer="critic-a", author="builder")
+            date = mod.read_verdicts(root)[0]["date"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = mod.main(["correct", "--unit", "US0276", "--date", date,
+                               "--reason", "the pass it records never ran",
+                               "--authorised-by", "Darren Benson (operator)",
+                               "--boundary", "operator console",
+                               "--root", str(root)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(mod.read_supersessions(root)[0]["authorised_by"],
+                             "Darren Benson (operator)")
+            self.assertIsNone(mod.verdict_for(root, "US0276"))
+
+
+class SupersededGateTests(unittest.TestCase):
+    """US0375: a superseded row is retired for every gate that reads it, while staying
+    in the file and printing as superseded - the audit trail keeps the record that it
+    happened, and the gate stops acting on it."""
+
+    def test_an_author_superseding_its_own_seats_verdict_is_refused(self) -> None:
+        """A supersession retires a VERDICT; whether it retires the ATTRIBUTION turns on the
+        authoriser (see PrincipalAuthorisedSupersessionTests). The bypass this closes: an author
+        blocked by a REJECT superseded it - the only guard being that the authoriser was not the
+        row's own author, met by any other string - the reviewer dropped out of the session set,
+        and the author's own subagent was accepted as reviewer of record. Refused end to end now:
+        the seat that filed the blocking verdict also reviewed an earlier round, so it is not an
+        independent authoriser and the correction is refused before it can move the gate."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            _earlier_round(mod, root, "qa-seat")
+            mod.record_verdict(root, "US0001", "reject",
+                               reviewer="qa-seat", author="builder")
+            date = mod.read_verdicts(root)[-1]["date"]
+            with self.assertRaises(ValueError):
+                mod.record_supersession(root, "US0001", date=date, reason="mis-filed",
+                                        authorised_by="qa-seat", boundary="same session")
+            # nothing retired: the verdict still stands and the seat still counts as a session
+            # reviewer, so `sprint sign` still refuses it as principal
+            self.assertIsNotNone(mod.verdict_for(root, "US0001"))
+            self.assertIn("qa-seat", mod.session_reviewer_ids(root, "US0001"))
+
+    def test_a_HAND_APPENDED_author_supersession_cannot_retire_a_blocking_REJECT(self) -> None:
+        """The fail-open in the honesty gate itself. `record_supersession` refuses to WRITE an
+        author-authorised, boundary-less correction, but the log is a text file and a hand
+        append walks round the tool - which is precisely why `_is_principal_superseded` exists
+        as the read-time backstop. Only the sign-off gate consulted it. `verdict_for` tested the
+        flag for plain truthiness, so one appended line naming the row's own author as
+        authoriser and `-` as boundary deleted the REJECT from every reader downstream, and the
+        close then reported the unit "covered by an independent pass".
+
+        The grade required now scales with the direction the mistake fails: retiring an APPROVE
+        weakly costs an approval and the gate refuses, but retiring a REJECT weakly removes the
+        only record that blocks the unit.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0001", "reject", reviewer="independent-qa",
+                               author="the-author", issues="a real defect")
+            row = mod.read_verdicts(root)[-1]
+            path = mod.verdicts_path(root)
+            path.write_text(
+                path.read_text(encoding="utf-8") + "\n" + mod._SUPERSEDE_PREFIX
+                + f"unit=US0001 row-date={row['date']} row-verdict=REJECT "
+                  "row-reviewer=independent-qa row-author=the-author "
+                  "authorised-by=the-author boundary=- reason=inconvenient "
+                  "recorded=2026-07-31\n", encoding="utf-8")
+            marked = mod.read_verdicts(root)[-1]
+            self.assertTrue(marked["superseded"], "the hand append did parse - if this fails "
+                                                  "the test proves nothing about the gate")
+            self.assertFalse(mod._is_principal_superseded(root, "US0001", marked),
+                             "the backstop must judge this correction non-principal")
+            live = mod.verdict_for(root, "US0001")
+            self.assertIsNotNone(live, "an author retired the REJECT blocking their own work")
+            self.assertEqual("REJECT", live["verdict"])
+
+    def test_a_PRINCIPAL_supersession_still_retires_a_reject(self) -> None:
+        """The other half, or the repair is just a refusal to correct anything. A genuine
+        principal - not the author, and having done no review work on the unit - retires the
+        row exactly as before."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0002", "reject", reviewer="independent-qa",
+                               author="the-author", issues="filed against the wrong unit")
+            date = mod.read_verdicts(root)[-1]["date"]
+            mod.record_supersession(root, "US0002", date=date, reviewer="independent-qa",
+                                    reason="filed against the wrong unit",
+                                    authorised_by="Darren Benson (operator)",
+                                    boundary="operator console")
+            self.assertIsNone(mod.verdict_for(root, "US0002"))
+
+    def test_verdict_for_skips_the_superseded_row_and_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0300", "approve", reviewer="critic-a", author="builder")
+            mod.record_verdict(root, "US0300", "reject", reviewer="critic-b", author="builder",
+                               issues="found a hole")
+            date = mod.read_verdicts(root)[-1]["date"]
+            mod.record_supersession(root, "US0300", date=date, reviewer="critic-b",
+                                    reason="the reject was filed against the wrong unit",
+                                    authorised_by="Darren Benson (operator)",
+                                    boundary="operator console")
+            live = mod.verdict_for(root, "US0300")
+            self.assertEqual(live["verdict"], "APPROVE")     # the earlier LIVE row
+            self.assertEqual(live["reviewer"], "critic-a")
+            # a unit whose only row is superseded has NO verdict - never a silent approval
+            mod.record_verdict(root, "US0301", "approve", reviewer="critic-a", author="builder")
+            mod.record_supersession(root, "US0301", date=date, reason="never ran",
+                                    authorised_by="Darren Benson (operator)",
+                                    boundary="operator console")
+            self.assertIsNone(mod.verdict_for(root, "US0301"))
+
+    def test_superseded_row_stays_visible_and_flagged_in_show(self) -> None:
+        import json as _json
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0276", "approve", reviewer="critic-a", author="builder")
+            date = mod.read_verdicts(root)[0]["date"]
+            reason = "the adversarial pass it records never ran"
+            mod.record_supersession(root, "US0276", date=date, reason=reason,
+                                    authorised_by="Darren Benson (operator)",
+                                    boundary="operator console")
+            mod.record_verdict(root, "US0277", "approve", reviewer="critic-a", author="builder")
+            rows = mod.read_verdicts(root)
+            self.assertEqual([r["unit"] for r in rows], ["US0276", "US0277"])  # nothing dropped
+            self.assertTrue(rows[0]["superseded"])
+            self.assertEqual(rows[0]["superseded_reason"], reason)
+            self.assertEqual(rows[0]["superseded_by"], "Darren Benson (operator)")
+            self.assertFalse(rows[1]["superseded"])          # the live row is not flagged
+            self.assertEqual(rows[1]["superseded_reason"], "")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = mod.main(["show", "--root", str(root)])
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn("US0276", text)
+            self.assertIn(reason, text)
+            self.assertIn("Darren Benson (operator)", text)
+            self.assertEqual(len([ln for ln in text.splitlines() if "US0277" in ln]), 1)
+            self.assertNotIn(reason, [ln for ln in text.splitlines() if "US0277" in ln][0])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = mod.main(["show", "--format", "json", "--root", str(root)])
+            self.assertEqual(rc, 0)
+            payload = _json.loads(out.getvalue())
+            self.assertEqual(len(payload), 2)
+            self.assertEqual(payload[0]["superseded_reason"], reason)
+            self.assertEqual(payload[0]["superseded_by"], "Darren Benson (operator)")
+            self.assertFalse(payload[1]["superseded"])
+
+
+def _earlier_round(mod, root, reviewer: str) -> None:
+    """In-session review work by `reviewer` on US0001: a REJECT at an earlier round, re-dated a
+    day the row under correction is not, so a supersession names one row unambiguously. The
+    evidence ledger that once carried this is retired; the verdict ledger says who reviewed."""
+    mod.record_verdict(root, "US0001", "reject", reviewer=reviewer, author="builder",
+                       issues="[new] a real defect")
+    path = mod.verdicts_path(root)
+    text = path.read_text(encoding="utf-8")
+    today = mod.read_verdicts(root)[-1]["date"]
+    assert text.count(f"| {today} |") == 1, text
+    path.write_text(text.replace(f"| {today} |", "| 2026-09-01 |"), encoding="utf-8")
+
+
+class PrincipalAuthorisedSupersessionTests(unittest.TestCase):
+    """BG0284. Superseding retires a verdict; whether it also retires the ATTRIBUTION (so the
+    named reviewer stops counting toward independence) turns on WHO authorised it. The bypass
+    and the mis-attribution incident are mechanically identical in the row under correction -
+    the recordable distinction is that a working session reviewer left ANOTHER verdict row on the
+    unit (the evidence ledger that once carried it is retired), while a principal wrongly named on
+    a verdict row did not, and authorised the correction from a separate trust boundary. That
+    distinction is what the guard tests."""
+
+    def test_an_authoring_session_authoriser_is_refused(self) -> None:
+        """AC1. A supersession authorised by a party who did in-session review work on the unit -
+        or by the row's own author - is refused, on the sign-off's own independence rule."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            # qa-seat reviewed an earlier round and files a blocking REJECT.
+            _earlier_round(mod, root, "qa-seat")
+            mod.record_verdict(root, "US0001", "reject", reviewer="qa-seat", author="builder")
+            date = mod.read_verdicts(root)[-1]["date"]
+            before = mod.verdicts_path(root).read_text(encoding="utf-8")
+            for authoriser in ("qa-seat",        # the author's own seat - it reviewed before
+                               "QA-Seat",         # ...however cased
+                               "builder"):        # the row's own author
+                with self.assertRaises(ValueError) as cm:
+                    mod.record_supersession(root, "US0001", date=date, reason="inconvenient",
+                                            authorised_by=authoriser, boundary="same session")
+                self.assertTrue(
+                    "independen" in str(cm.exception).lower()
+                    or "author" in str(cm.exception).lower())
+            # nothing written: the verdict still stands and still blocks
+            self.assertEqual(mod.read_supersessions(root), [])
+            self.assertEqual(mod.verdicts_path(root).read_text(encoding="utf-8"), before)
+            self.assertIn("qa-seat", mod.session_reviewer_ids(root, "US0001"))
+
+    def test_a_principal_authorised_supersession_clears_the_strand(self) -> None:
+        """AC2. A verdict row wrongly names the operator as REVIEWER; the operator never reviewed
+        (no other verdict row). That strands the unit - the operator reads as a session reviewer and so
+        cannot be its reviewer of record. A supersession the operator authorises from a separate,
+        recorded boundary retires the attribution, and the strand clears."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0001", "approve", reviewer="operator", author="builder")
+            date = mod.read_verdicts(root)[0]["date"]
+            # stranded: the operator reads as an authoring-session reviewer, cannot sign off
+            self.assertIn("operator", mod.session_reviewer_ids(root, "US0001"))
+            mod.record_supersession(
+                root, "US0001", date=date,
+                reason="the operator was reviewer of record, not the adversarial critic; "
+                       "the pass this row states never ran",
+                authorised_by="operator", boundary="operator console")
+            # the attribution is retired for the gate: the strand is cleared, so the legitimate
+            # reviewer of record can now sign
+            self.assertNotIn("operator", mod.session_reviewer_ids(root, "US0001"))
+            # the boundary is recorded on the correction
+            self.assertEqual(mod.read_supersessions(root)[0]["boundary"], "operator console")
+
+    def test_no_author_only_sequence_clears_the_gate(self) -> None:
+        """AC3. On a unit the author built, with a genuine review over two rounds,
+        no supersession the author can author ALONE - itself or its own seat, any boundary string
+        it can assert - retires the reviewer from the gate. A reviewer with another verdict row on
+        the unit is refused as an authoriser however the boundary is dressed up."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            _earlier_round(mod, root, "qa-seat")
+            mod.record_verdict(root, "US0001", "reject", reviewer="qa-seat", author="builder")
+            date = mod.read_verdicts(root)[-1]["date"]
+            for authoriser, boundary in (("builder", "console"),      # the author
+                                         ("qa-seat", "another session"),  # its seat (reviewed before)
+                                         ("qa-seat", "CI")):           # relabel the boundary
+                with self.assertRaises(ValueError):
+                    mod.record_supersession(root, "US0001", date=date, reason="retire it",
+                                            authorised_by=authoriser, boundary=boundary)
+            self.assertEqual(mod.read_supersessions(root), [])
+            # the gate is unmoved and a self-sign-off stays refused
+            self.assertIn("qa-seat", mod.session_reviewer_ids(root, "US0001"))
+
+    def test_a_boundaryless_correction_is_refused(self) -> None:
+        """The boundary is mandatory - superseding is held to the sign-off's rule, and a
+        correction with no recorded trust boundary is a hand edit with extra steps."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            mod.record_verdict(root, "US0001", "approve", reviewer="operator", author="builder")
+            date = mod.read_verdicts(root)[0]["date"]
+            for boundary in ("", "   "):
+                with self.assertRaises(ValueError) as cm:
+                    mod.record_supersession(root, "US0001", date=date, reason="mis-filed",
+                                            authorised_by="operator", boundary=boundary)
+                self.assertIn("boundary", str(cm.exception).lower())
+            self.assertEqual(mod.read_supersessions(root), [])
+
+    def _forge(self, mod, root: Path, row: dict, authorised_by: str, boundary: str) -> None:
+        """Hand-append a supersession record straight to the log, bypassing record_supersession -
+        the walk-round-the-tool a read-time backstop exists to catch."""
+        fields = (f"unit={row['unit']} row-date={row['date']} "
+                  f"row-verdict={row['verdict'].upper()} row-reviewer={row['reviewer']} "
+                  f"row-author={row['author']} authorised-by={authorised_by} "
+                  f"boundary={boundary} reason=inconvenient recorded=2026-07-25")
+        path = mod.verdicts_path(root)
+        path.write_text(path.read_text(encoding="utf-8")
+                        + "\n" + mod.SUPERSEDE_HEADING + "\n\n" + mod._SUPERSEDE_PREFIX
+                        + fields + "\n", encoding="utf-8")
+
+    def test_a_hand_forged_worker_correction_does_not_clear_the_gate(self) -> None:
+        """Read-time backstop, worker leg: a hand-appended record authorised by an in-session
+        seat - even with a boundary claim - retires the VERDICT but not the attribution, so the
+        reviewer keeps counting and no self-sign-off clears the gate."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            _earlier_round(mod, root, "qa-seat")
+            mod.record_verdict(root, "US0001", "reject", reviewer="qa-seat", author="builder")
+            self._forge(mod, root, mod.read_verdicts(root)[-1],
+                        authorised_by="qa-seat", boundary="another session")
+            self.assertTrue(mod.read_verdicts(root)[-1]["superseded"])   # the forge parsed
+            self.assertIn("qa-seat", mod.session_reviewer_ids(root, "US0001"))
+
+    def test_a_hand_forged_boundaryless_correction_does_not_clear_the_gate(self) -> None:
+        """Read-time backstop, boundary leg: the authoriser here is independent (not the author,
+        not a worker), so ONLY the missing boundary stops it - a correction with no recorded trust
+        boundary retires the verdict but not the attribution, and the reviewer keeps counting. This
+        isolates the boundary check: an otherwise-clearing correction fails purely for want of a
+        recorded boundary (AC2 shows the same shape WITH a boundary does clear)."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            # a verdict row wrongly names the operator; the operator did no other reviewing work
+            mod.record_verdict(root, "US0001", "approve", reviewer="operator", author="builder")
+            row = mod.read_verdicts(root)[0]
+            self._forge(mod, root, row, authorised_by="operator", boundary="")   # no boundary
+            self.assertTrue(mod.read_verdicts(root)[0]["superseded"])            # the forge parsed
+            # boundaryless: the attribution is NOT retired, so the operator keeps counting
+            self.assertIn("operator", mod.session_reviewer_ids(root, "US0001"))
+
+
+class PlanCriticTests(unittest.TestCase):
+    """D0061 / RFC0050 option B. Every adversarial surface in this project ran AFTER code
+    existed, so the cheapest finding available - "this unit does not need to be built" - could
+    only be reached by building it."""
+
+    def test_three_lenses_run_before_the_plan_is_written(self) -> None:
+        """AC1. A critique delivered after `--write` is a critique of a decision already
+        taken."""
+        mod = _load()
+        rep = mod.plan_critique(["US0001"], {"scope": [], "risk": [], "efficiency": []})
+        self.assertEqual(sorted(rep["lenses"]), sorted(mod.PLAN_LENSES))
+        for lens in mod.PLAN_LENSES:
+            self.assertTrue(rep["lenses"][lens]["ran"])
+
+    def test_a_lens_with_no_finding_is_distinct_from_a_lens_that_did_not_run(self) -> None:
+        """AC2, and the distinction the whole report rests on. A lens silent because it found
+        nothing and one that never ran are otherwise indistinguishable - which is how a partial
+        pass gets read as a clean one."""
+        mod = _load()
+        rep = mod.plan_critique(["US0001"], {"scope": []})   # risk/efficiency absent
+        self.assertTrue(rep["lenses"]["scope"]["ran"])
+        self.assertFalse(rep["lenses"]["risk"]["ran"])
+        text = "\n".join(mod.render_plan_critique(rep))
+        self.assertIn("found nothing", text)
+        self.assertIn("NOT RUN", text)
+
+    def test_a_failed_pass_leaves_no_run_and_no_plan_file(self) -> None:
+        """AC3. Both the ordering defect this project shipped and its mirror image came from a
+        write that outlived its refusal, so the refusal must be computable before anything is
+        written."""
+        mod = _load()
+        rep = mod.plan_critique(["US0001"], {"scope": [{"title": "unneeded", "disposition": ""}]})
+        self.assertTrue(mod.undispositioned_plan_findings(rep),
+                        "an undispositioned finding must be detectable without writing anything")
+
+
+class PlanCriticIntensityTests(unittest.TestCase):
+    """The pass spends tokens BEFORE any value is delivered, on a sprint length already under
+    complaint, so a two-unit batch must not pay for a forty-unit review."""
+
+    def test_a_larger_batch_receives_more_scrutiny(self) -> None:
+        """AC1. The rule is stated rather than emergent, so a reader can predict it."""
+        mod = _load()
+        self.assertEqual(mod.plan_intensity(3), "lite")
+        self.assertEqual(mod.plan_intensity(12), "full")
+        self.assertEqual(mod.plan_intensity(45), "ultra")
+        small = mod.plan_critique([f"US{i:04d}" for i in range(1, 4)], {})
+        large = mod.plan_critique([f"US{i:04d}" for i in range(1, 46)], {})
+        self.assertGreater(len(large["examined"]), len(small["examined"]))
+
+    def test_the_pass_names_what_the_intensity_cap_skipped(self) -> None:
+        """AC2. A bounded pass that reports only what it found reads as complete coverage, and
+        a silent cap is how a partial sweep is mistaken for a full one."""
+        mod = _load()
+        rep = mod.plan_critique([f"US{i:04d}" for i in range(1, 61)], {})
+        self.assertTrue(rep["skipped"], "an over-cap batch must record what it skipped")
+        text = "\n".join(mod.render_plan_critique(rep))
+        self.assertIn("NOT examined individually", text)
+
+    def test_a_batch_inside_the_cap_reports_nothing_skipped(self) -> None:
+        """The control: a skipped-list that appears when nothing was skipped is noise."""
+        mod = _load()
+        rep = mod.plan_critique(["US0001", "US0002"], {})
+        self.assertEqual(rep["skipped"], [])
+        self.assertNotIn("NOT examined", "\n".join(mod.render_plan_critique(rep)))
+
+
+class AcDefectTests(unittest.TestCase):
+    """US0370 / CR0365: an acceptance criterion CORRECTED during delivery is recorded as an AC
+    DEFECT, distinct from an ordinary revision. Counting it as a normal edit hides the most
+    expensive class of defect this project has found (US0375's AC specified the independence-gate
+    bypass, and a passing test defended it)."""
+
+    def _story(self, root: Path, rows: str) -> Path:
+        p = root / "US0375.md"
+        p.write_text(
+            "# US0375: the sign-off gate ignores a superseded row\n\n"
+            "## Acceptance Criteria\n\n### AC1\n\n- **Then** ...\n\n"
+            "## Revision History\n\n| Date | Author | Change |\n| --- | --- | --- |\n"
+            + rows, encoding="utf-8")
+        return p
+
+    def test_an_amended_criterion_is_recorded_as_an_ac_defect(self):
+        mod = _load()
+        # the amendment US0375 actually carried: the criterion was found wrong and corrected
+        self.assertEqual(
+            mod.classify_revision("AC1 corrected: it specified the wrong behaviour "
+                                  "(ignoring a superseded row is the gate bypass)"),
+            mod.AC_DEFECT)
+        # an explicit tag is honoured directly
+        self.assertEqual(mod.classify_revision("AC-DEFECT: amended criterion AC2"), mod.AC_DEFECT)
+        # an ordinary revision touching a criterion is NOT an AC defect
+        self.assertEqual(mod.classify_revision("Reworded AC1 for clarity"),
+                         mod.ORDINARY_REVISION)
+        self.assertEqual(mod.classify_revision("Added AC3 for the empty case"),
+                         mod.ORDINARY_REVISION)
+        self.assertEqual(mod.classify_revision("Created via `new` (deterministic)"),
+                         mod.ORDINARY_REVISION)
+        # a trivial correction is not the expensive class
+        self.assertEqual(mod.classify_revision("Corrected a typo in AC1"),
+                         mod.ORDINARY_REVISION)
+        # the two classes are distinct labels, so a caller cannot conflate them
+        self.assertNotEqual(mod.AC_DEFECT, mod.ORDINARY_REVISION)
+
+        # and the story-level reader separates the AC defect from the ordinary rows beside it
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            story = self._story(root, (
+                "| 2026-07-23 | sdlc-studio | Created via `new` (deterministic) |\n"
+                "| 2026-07-23 | builder | Reworded AC1 for clarity |\n"
+                "| 2026-07-24 | builder | AC1 corrected: it specified the wrong behaviour, "
+                "amended the criterion |\n"))
+            defects = mod.ac_defects(story)
+            self.assertEqual(len(defects), 1)
+            self.assertEqual(defects[0]["class"], mod.AC_DEFECT)
+            self.assertEqual(defects[0]["author"], "builder")
+            self.assertIn("wrong behaviour", defects[0]["change"])
+            # the same via text is equivalent to the path
+            self.assertEqual(mod.ac_defects(story.read_text()), defects)
+
+    def test_a_story_with_no_amendment_has_no_ac_defect(self):
+        # an absence is a different fact from a negative result: no amendment != a defect found
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            story = self._story(root, "| 2026-07-23 | sdlc-studio | Created via `new` |\n")
+            self.assertEqual(mod.ac_defects(story), [])
+
+    def test_rows_outside_the_revision_history_are_ignored(self):
+        # a correction phrase in the body (not the history table) must not be counted
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "US0001.md"
+            p.write_text(
+                "# US0001\n\n## Acceptance Criteria\n\n"
+                "| Date | Author | Change |\n| --- | --- | --- |\n"
+                "| 2026-07-24 | x | AC1 corrected: specified the wrong behaviour |\n\n"
+                "## Revision History\n\n| Date | Author | Change |\n| --- | --- | --- |\n"
+                "| 2026-07-23 | sdlc | Created via `new` |\n", encoding="utf-8")
+            self.assertEqual(mod.ac_defects(p), [])
+
+
+class CallerNamedTests(unittest.TestCase):
+    """A criterion for a mechanism names the CALLER that consumes it.
+
+    Four mechanisms shipped in one sprint reaching nothing - a hash whose digest could never
+    match, a selection computed by one hook and ignored by the one that runs the tests, a
+    consumer whose producer did not exist. Each had passing tests and a green gate, because
+    every criterion described the function's own behaviour and nothing asked what would call
+    it. The check reads the criteria at authoring time, when the answer is a sentence.
+    """
+
+    def _unit(self, root: Path, num: int, affects: str, acs: str) -> Path:
+        d = root / "sdlc-studio" / "stories"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"US{num:04d}-x.md"
+        p.write_text(f"# US{num:04d}: a unit\n\n> **Status:** Ready\n"
+                     f"> **Affects:** {affects}\n> **Points:** 3\n\n"
+                     f"## Acceptance Criteria\n\n{acs}", encoding="utf-8")
+        return p
+
+    def _file(self, root: Path, rel: str) -> None:
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("# marker\n", encoding="utf-8")
+
+    def test_a_mechanism_with_no_named_caller_is_reported(self) -> None:
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._file(root, "src/thing.py")
+            self._file(root, "tests/test_thing.py")
+            self._unit(root, 1, "src/thing.py, tests/test_thing.py",
+                       "### AC1: the helper returns the digest\n\n"
+                       "- **Given** a payload\n- **When** the helper runs\n"
+                       "- **Then** it returns the digest\n"
+                       "- **Verify:** pytest tests/test_thing.py::T::t\n")
+            findings = mod.caller_findings(root, ["US0001"])
+            self.assertEqual([f["unit"] for f in findings], ["US0001"])
+            self.assertEqual(findings[0]["kind"], mod.CALLER_UNNAMED)
+            self.assertIn("AC1", findings[0]["criteria"],
+                          "the finding must NAME the criterion that describes a function with "
+                          "no consumer, not just the unit")
+            self.assertIn("AC1", findings[0]["detail"])
+            # the negative control: a check that fires on everything is not a check. A unit
+            # whose declared surface is documentation adds no mechanism, so it is not asked
+            # for a consumer.
+            self._file(root, "reference-x.md")
+            self._unit(root, 2, "reference-x.md",
+                       "### AC1: the reference states it\n\n- **Then** it is stated\n"
+                       "- **Verify:** file reference-x.md\n")
+            self.assertEqual(mod.caller_findings(root, ["US0002"]), [])
+
+    def test_the_named_caller_must_resolve(self) -> None:
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._file(root, "src/thing.py")
+            self._file(root, "tests/test_thing.py")
+            self._file(root, "tools/hooks/pre-commit")
+            resolving = ("### AC1: the pre-commit hook consumes the digest\n\n"
+                         "- **Then** the hook refuses a stale digest\n"
+                         "- **Verify:** pytest tests/test_thing.py::T::t\n"
+                         "- **Caller:** the commit gate (tools/hooks/pre-commit)\n")
+            self._unit(root, 3, "src/thing.py, tests/test_thing.py", resolving)
+            self.assertEqual(mod.caller_findings(root, ["US0003"]), [],
+                             "a criterion naming a caller that exists satisfies the check")
+            # naming a caller that is nowhere in the tree is not a way past it: the whole
+            # failure being caught is a mechanism whose consumer does not exist
+            self._unit(root, 4, "src/thing.py, tests/test_thing.py",
+                       resolving.replace("tools/hooks/pre-commit", "tools/hooks/nightly-sweep"))
+            findings = mod.caller_findings(root, ["US0004"])
+            self.assertEqual([f["kind"] for f in findings], [mod.CALLER_UNRESOLVED])
+            self.assertIn("nightly-sweep", findings[0]["detail"])
+            self.assertIn("AC1", findings[0]["criteria"])
+            # an unreadable tree is not a tree in which nothing resolves: a scan that answered
+            # nothing must say so rather than fail every caller it was asked about
+            empty = root / "nothing-here"
+            empty.mkdir()
+            with self.assertRaises(ValueError):
+                mod.tree_index(empty)
+
+
+class CallerResolverAtScaleTests(unittest.TestCase):
+    """A negative control on a four-file tree cannot judge a resolver whose failure mode is a
+    LARGE tree. Against this repository the original accepted `unknown`, `nothing at all` and
+    `the main loop` - the rule was satisfiable by a word naming no consumer at all."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.critic = _load()
+        cls.index = cls.critic.tree_index(REPO_ROOT)
+
+    def test_nonsense_declarations_do_not_resolve_against_this_repo(self):
+        for junk in ("unknown", "n/a", "nothing at all", "the main loop", "the gate",
+                     "the review", "the index", "the story", "none", "tbd"):
+            self.assertFalse(self.critic.caller_resolves(self.index, junk),
+                             f"{junk!r} names no consumer and must not satisfy the rule")
+
+    def test_real_callers_still_resolve_against_this_repo(self):
+        for real in (".githooks/pre-commit", "scripts/sprint.py", "gate.py",
+                     ".claude/skills/sdlc-studio/scripts/verify_ac.py"):
+            self.assertTrue(self.critic.caller_resolves(self.index, real),
+                            f"{real!r} is a real caller and must resolve")
+
+    def test_the_index_holds_only_tracked_files(self):
+        self.assertFalse([p for p in self.index["paths"] if p.startswith("node_modules/")],
+                         "a vendored tree turns the index into an English vocabulary")
+
+    def test_an_index_that_found_nothing_refuses_rather_than_failing_everything(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = _load()
+            with self.assertRaises(ValueError):
+                c.tree_index(d)
+
+    def test_a_caller_named_as_a_symbol_resolves(self):
+        """The repair that killed the nonsense-word hole required a path-shaped token, which
+        made a caller named as a FUNCTION unverifiable. Every declaration in the lane stories
+        names its consumer that way - `cmd_lane -> lane_dispatch` - and each passed only
+        because an unrelated documentation filename sat on the same line. A rule satisfied by
+        a token nobody meant as the caller is the theatre this class exists to refuse."""
+        for sym in ("cmd_lane", "lane_dispatch", "lane_contract", "lane_verify", "build_plan"):
+            self.assertTrue(self.critic.caller_resolves(self.index, sym),
+                            f"{sym!r} is a real function in a tracked file and must resolve")
+
+    def test_a_symbol_declaration_resolves_without_an_incidental_path_token(self):
+        decl = "`sprint lane brief` (cmd_lane -> lane_dispatch -> lane_contract)"
+        self.assertTrue(self.critic.caller_resolves(self.index, decl),
+                        "the declaration names a real call chain and must resolve on it")
+
+    def test_prose_words_are_not_rescued_by_the_symbol_index(self):
+        """Widening to symbols must not reopen the hole it sits beside."""
+        for junk in ("unknown", "nothing at all", "the main loop", "none", "tbd",
+                     "future work", "to be decided", "see above"):
+            self.assertFalse(self.critic.caller_resolves(self.index, junk),
+                             f"{junk!r} names no consumer and must not satisfy the rule")
+
+
+class CallerIndeterminateTests(unittest.TestCase):
+    """BG0379. `mechanism_files` subtracts every Affects path a unit's own verifiers name, so a
+    unit whose criterion points at a shell verifier INVOKING its only code file has an empty
+    surface - and `caller_findings` then skipped it entirely. The check exited 0 whether the
+    Caller declaration said something, said nothing, or was deleted: vacuous, which is the
+    exact defect the check was built to remove, reintroduced by a repair to it."""
+
+    def _unit(self, root: Path, ident: str, affects: str, verify: str, caller: str = "") -> None:
+        d = root / "sdlc-studio" / "stories"
+        d.mkdir(parents=True, exist_ok=True)
+        line = f"- **Caller:** {caller}\n" if caller else ""
+        (d / f"{ident}-x.md").write_text(
+            f"# {ident}: x\n\n> **Status:** Review\n> **Affects:** {affects}\n\n"
+            f"## Acceptance Criteria\n\n### AC1: it works\n\n{line}"
+            f"- **Verify:** {verify}\n", encoding="utf-8")
+
+    def test_a_surface_emptied_by_its_own_verifier_is_reported_not_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root, "US0001", "src/thing.py", "shell python3 src/thing.py --check")
+            kinds = [f["kind"] for f in _load().caller_findings(root, ["US0001"])]
+            self.assertIn(_load().CALLER_INDETERMINATE, kinds)
+
+    def test_a_documentation_only_unit_is_still_not_asked_for_a_caller(self) -> None:
+        """The carve-out must not widen: a unit whose declared surface is markdown adds no
+        mechanism and a check that fires on everything is not a check."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root, "US0002", "docs/guide.md", "grep -n x docs/guide.md")
+            self.assertEqual(_load().caller_findings(root, ["US0002"]), [])
+
+    def test_a_unit_with_a_real_surface_is_judged_as_before(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root, "US0003", "src/thing.py, tests/test_thing.py",
+                       "pytest tests/test_thing.py::T::t")
+            kinds = [f["kind"] for f in _load().caller_findings(root, ["US0003"])]
+            self.assertIn(_load().CALLER_UNNAMED, kinds)
+            self.assertNotIn(_load().CALLER_INDETERMINATE, kinds)
+
+    def test_the_verdict_changes_when_the_declaration_does(self) -> None:
+        """The property that was missing. Before the fix, deleting the Caller declaration left
+        the check at exit 0 - so its greenness said nothing about the unit."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root, "US0004", "src/thing.py, tests/test_thing.py",
+                       "pytest tests/test_thing.py::T::t", caller="src/consumer.py")
+            with_decl = _load().caller_findings(root, ["US0004"])
+            self._unit(root, "US0004", "src/thing.py, tests/test_thing.py",
+                       "pytest tests/test_thing.py::T::t")
+            without = _load().caller_findings(root, ["US0004"])
+            self.assertNotEqual([f["kind"] for f in with_decl], [f["kind"] for f in without])
+
+
+class ReviewDurationTests(unittest.TestCase):
+    """US0534. An elapsed span nobody can read is UNMEASURED, never an invented 0."""
+
+    def test_an_unparseable_stamp_is_unmeasured_rather_than_invented(self) -> None:
+        self.assertIsNone(_load().run_state._elapsed_seconds("nonsense", "2026-07-28T10:00:00Z"))
+        self.assertIsNone(_load().run_state._elapsed_seconds("2026-07-28T10:00:00Z", None))
+
+class GoalPanelTests(unittest.TestCase):
+    """US0542. The Sprint Goal verdict was recorded by whoever ran the close - which, on an
+    author-run sprint, is the author. The two-role rule protects every unit's sign-off and
+    left the goal judgement itself unprotected."""
+
+    CLAUSES = ["seams have owners", "the goal is judged clause by clause"]
+
+    def test_a_panel_including_the_author_is_refused(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            _load().goal_panel(".", self.CLAUSES, ["qa", "builder"], "builder")
+        self.assertIn("author", str(caught.exception))
+
+    def test_a_panel_excluding_the_author_returns_a_verdict_per_clause(self) -> None:
+        r = _load().goal_panel(".", self.CLAUSES, ["qa", "product"], "builder",
+                              {"seams have owners": {"qa": {"verdict": "achieved",
+                                                            "evidence": "US0538 passes"},
+                                                     "product": "achieved"},
+                               "the goal is judged clause by clause":
+                                   {"qa": "missed", "product": "missed"}})
+        self.assertEqual([c["verdict"] for c in r["clauses"]], ["achieved", "missed"])
+        self.assertEqual(r["verdict"], "partial")
+
+    def test_a_clause_carries_the_evidence_the_panel_relied_on(self) -> None:
+        r = _load().goal_panel(".", ["one clause"], ["qa"], "builder",
+                              {"one clause": {"qa": {"verdict": "achieved",
+                                                     "evidence": "the fixture reproduces"}}})
+        self.assertEqual(r["clauses"][0]["evidence"], ["the fixture reproduces"])
+
+    def test_disagreement_is_partial_rather_than_the_majority_word(self) -> None:
+        """A clause one seat says was missed is not achieved because two others disagree -
+        reporting the majority would let a dissent vanish into a number."""
+        r = _load().goal_panel(".", ["one clause"], ["a", "b", "c"], "builder",
+                              {"one clause": {"a": "achieved", "b": "achieved", "c": "missed"}})
+        self.assertEqual(r["clauses"][0]["verdict"], "partial")
+
+    def test_an_unknown_verdict_word_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            _load().goal_panel(".", ["one clause"], ["qa"], "builder",
+                              {"one clause": {"qa": "mostly"}})
+
+    def test_an_empty_panel_or_no_clauses_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            _load().goal_panel(".", ["one clause"], [], "builder")
+        with self.assertRaises(ValueError):
+            _load().goal_panel(".", [], ["qa"], "builder")
+
+
+class _BatchBase(unittest.TestCase):
+    """A workspace with an open run, so `--from-run` has a batch to read."""
+
+    UNITS = ("US0001", "US0002", "US0003")
+
+    def setUp(self) -> None:
+        self.mod = _load()
+        self.root = Path(tempfile.mkdtemp(prefix="critic_batch_"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        (self.root / "sdlc-studio" / ".local").mkdir(parents=True)
+        (self.root / "sdlc-studio" / "reviews").mkdir(parents=True)
+        (self.root / "sdlc-studio" / ".local" / "run-state.json").write_text(
+            json.dumps({"run_id": "RUN-BATCH", "batch": list(self.UNITS), "outcome": "running"}),
+            encoding="utf-8")
+
+    def _run(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.mod.main([*argv, "--root", str(self.root)])
+        return rc, out.getvalue(), err.getvalue()
+
+
+class BatchFormTests(_BatchBase):
+    """US0556. Recording the evidence, the verdict and the sign-off for nineteen units took
+    fifty-seven invocations of this script - each paying interpreter start, imports and a
+    read-modify-write to record one line. Thirty-eight of them were spent discovering a
+    required argument, one unit at a time."""
+
+    def test_each_verb_records_every_named_unit_in_one_invocation(self) -> None:
+        """`record` is the one batch verb left: `evidence` and `signoff` are retired."""
+        rc, _, err = self._run(["record", "--brief", "abcdef123456",
+                                "--units", "US0001,US0002,US0003",
+                                "--verdict", "approve", "--reviewer", "qa", "--author", "builder"])
+        self.assertEqual(0, rc, err)
+        for unit in self.UNITS:
+            self.assertEqual("APPROVE", self.mod.verdict_for(self.root, unit)["verdict"])
+
+    def test_the_open_run_is_the_default_scope_and_an_absent_batch_is_refused(self) -> None:
+        rc, _, err = self._run(["record", "--brief", "abcdef123456",
+                                "--from-run", "--verdict", "approve",
+                                "--reviewer", "qa", "--author", "builder"])
+        self.assertEqual(0, rc, err)
+        for unit in self.UNITS:
+            self.assertEqual("APPROVE", self.mod.verdict_for(self.root, unit)["verdict"])
+        (self.root / "sdlc-studio" / ".local" / "run-state.json").unlink()
+        rc, _, err = self._run(["record", "--brief", "abcdef123456",
+                                "--from-run", "--verdict", "approve",
+                                "--reviewer", "qa", "--author", "builder"])
+        self.assertEqual(2, rc, "no open batch must refuse, never default to acting on nothing")
+        self.assertIn("no open run", err.lower())
+
+    def test_every_supplied_id_is_acted_on_and_the_count_is_reported(self) -> None:
+        """BG0386's class: a repeated flag that silently keeps the last value reports a clean
+        batch having looked at one unit. Both spellings must accumulate, and the count the
+        command reports is the count it acted on."""
+        rc, out, err = self._run(["record", "--brief", "abcdef123456",
+                                  "--unit", "US0001", "--unit", "US0002",
+                                  "--units", "US0003", "--verdict", "approve",
+                                  "--reviewer", "qa", "--author", "builder"])
+        self.assertEqual(0, rc, err)
+        for unit in self.UNITS:
+            self.assertIsNotNone(self.mod.verdict_for(self.root, unit),
+                                 f"{unit} was supplied and silently dropped")
+        self.assertIn("3", out, "the count acted on is reported, not assumed")
+
+    def test_a_partial_failure_names_the_units_written_and_exits_non_zero(self) -> None:
+        """A batch that half-succeeded and reported success is worse than one that never ran:
+        the caller reruns nothing and the gap is invisible."""
+        real = self.mod._record          # the writer `record` calls, as `record_verdict` does
+
+        def explode(root, unit, *a, **kw):
+            if sdlc_md_norm(unit) == "US0002":
+                raise ValueError("US0002 is unwritable")
+            return real(root, unit, *a, **kw)
+
+        self.mod._record = explode
+        self.addCleanup(setattr, self.mod, "_record", real)
+        rc, out, err = self._run(["record", "--brief", "abcdef123456",
+                                  "--units", "US0001,US0002,US0003",
+                                  "--verdict", "approve", "--reviewer", "qa",
+                                  "--author", "builder"])
+        self.assertNotEqual(0, rc, "a partial batch must never exit zero")
+        combined = out + err
+        self.assertIn("US0002", combined, "the failing unit is named")
+        self.assertIn("US0001", combined, "so is what WAS written")
+
+    def test_the_single_unit_form_is_unchanged(self) -> None:
+        rc, out, err = self._run(["record", "--brief", "abcdef123456",
+                                  "--unit", "US0001", "--verdict", "approve",
+                                  "--reviewer", "qa", "--author", "builder"])
+        self.assertEqual(0, rc, err)
+        self.assertEqual("APPROVE", self.mod.verdict_for(self.root, "US0001")["verdict"])
+        self.assertIsNone(self.mod.verdict_for(self.root, "US0002"),
+                          "one named unit means one unit")
+
+
+class UnansweredPanelTests(unittest.TestCase):
+    """BG0393. `goal_panel` raises on an empty seat list precisely because "an empty panel
+    returns a verdict nobody gave" - and then returned `partial` for a panel where no seat
+    answered a single clause, which is the same verdict nobody gave by a different route.
+    Worse, verdicts were keyed by the stripped clause text, so a key differing by case or a
+    trailing space dropped a seat's `missed` without a word and it became `partial`."""
+
+    def test_a_panel_nobody_answered_returns_no_verdict(self) -> None:
+        mod = _load()
+        panel = mod.goal_panel(".", ["c1", "c2"], ["qa", "arch"], "author")
+        self.assertIsNone(panel["verdict"], "a verdict nobody gave was reported as partial")
+        self.assertTrue(all(c["verdict"] is None for c in panel["clauses"]))
+        self.assertEqual(["qa", "arch"], panel["clauses"][0]["unanswered"])
+
+    def test_a_partly_answered_panel_still_reports(self) -> None:
+        """The discriminating half: silence on one clause must not blank a real verdict."""
+        mod = _load()
+        panel = mod.goal_panel(".", ["c1", "c2"], ["qa"], "author",
+                               verdicts={"c1": {"qa": "achieved"}})
+        self.assertEqual("partial", panel["verdict"])
+        self.assertEqual("achieved", panel["clauses"][0]["verdict"])
+        self.assertIsNone(panel["clauses"][1]["verdict"])
+
+    def test_a_verdict_key_matching_no_clause_is_refused(self) -> None:
+        mod = _load()
+        with self.assertRaises(ValueError) as caught:
+            mod.goal_panel(".", ["c1"], ["qa"], "author", verdicts={"C1 ": {"qa": "missed"}})
+        self.assertIn("match no clause", str(caught.exception))
+
+    def test_a_unanimous_panel_still_reports_its_verdict(self) -> None:
+        mod = _load()
+        panel = mod.goal_panel(".", ["c1"], ["qa", "arch"], "author",
+                               verdicts={"c1": {"qa": "missed", "arch": "missed"}})
+        self.assertEqual("missed", panel["verdict"])
+
+
+class BlockingPriorityFloorTests(unittest.TestCase):
+    """BG0387. The floor was the literal tuple `p0/p1/critical/blocker`. This corpus files 104
+    `Severity: High` bugs and 168 `Priority: High` CRs against 2 Critical and 13 P1, and an
+    adversarial reviewer writes `major` - so the floor that exists to block a close on a defect
+    a release cannot carry never fired once on the words this project uses."""
+
+    def test_a_high_severity_defect_blocks_against_this_repos_own_vocabulary(self) -> None:
+        mod = _load()
+        ruling = mod.judge_defects_against_goal(
+            [{"id": "BG0370", "severity": "High"}], ["every seam has an owner"])
+        self.assertEqual(["BG0370"], [d["id"] for d in ruling["blocking"]])
+
+    def test_major_is_the_same_tier_as_high(self) -> None:
+        """The reviewer's word and the filer's word are one severity. An ordering that ranks
+        them makes the cut depend on which one somebody happened to type."""
+        mod = _load()
+        ruling = mod.judge_defects_against_goal([{"id": "X", "priority": "Major"}], ["a clause"])
+        self.assertEqual(["X"], [d["id"] for d in ruling["blocking"]])
+
+    def test_a_decorated_value_is_normalised_before_comparing(self) -> None:
+        """`**High**` compared raw is a value that never matches - half of why it never fired."""
+        mod = _load()
+        for raw in ("**High**", " High (severity) ", "P1", "Sev-1", "high"):
+            with self.subTest(raw=raw):
+                ruling = mod.judge_defects_against_goal([{"id": "X", "severity": raw}], ["c"])
+                self.assertEqual(["X"], [d["id"] for d in ruling["blocking"]], raw)
+
+    def test_below_the_cut_is_still_leavable_and_recorded(self) -> None:
+        """The discriminating half - a floor that blocks everything is not a floor, and a
+        leavable defect must still be recorded rather than dropped."""
+        mod = _load()
+        ruling = mod.judge_defects_against_goal(
+            [{"id": "Y", "severity": "Low"}, {"id": "Z", "severity": "Medium"}], ["c"])
+        self.assertEqual([], ruling["blocking"])
+        self.assertEqual(["Y", "Z"], [d["id"] for d in ruling["leavable"]])
+        self.assertTrue(all(d["why"] for d in ruling["leavable"]), "each records its reasoning")
+
+    def test_the_floor_is_derived_from_one_cut_not_an_enumerated_list(self) -> None:
+        """AC2. Every blocking word comes from the tiers at or above the cut, so a project
+        changes ONE value rather than keeping a list in step with its own vocabulary."""
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sdlc-studio").mkdir()
+            (root / "sdlc-studio" / ".config.yaml").write_text(
+                "review:\n  blocking_priority: critical\n", encoding="utf-8")
+            strict = mod.blocking_priorities(root)
+        self.assertIn("critical", strict)
+        self.assertNotIn("high", strict, "raising the cut must narrow the floor")
+        default = mod.blocking_priorities(None)
+        self.assertIn("high", default)
+        self.assertTrue(set(strict) < set(default), "the cut orders the tiers")
+
+    def test_an_unrecognised_cut_falls_back_rather_than_emptying_the_floor(self) -> None:
+        """A floor nobody configured must not silently become no floor at all."""
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sdlc-studio").mkdir()
+            (root / "sdlc-studio" / ".config.yaml").write_text(
+                "review:\n  blocking_priority: urgent-ish\n", encoding="utf-8")
+            self.assertEqual(mod.blocking_priorities(None), mod.blocking_priorities(root))
+
+    def test_every_tier_word_is_reachable_by_some_cut(self) -> None:
+        """The tiers ARE the vocabulary, so a word nobody can select is a word that silently
+        means nothing - the enumeration failure this replaced, in a new shape."""
+        mod = _load()
+        for tier in mod.PRIORITY_TIERS:
+            for word in tier:
+                with self.subTest(word=word):
+                    self.assertIn(word, mod.PRIORITY_ORDER)
+
+
+class CallerCheckBatchTests(_BatchBase):
+    """BG0386. `caller-check` declared `--unit` with a bare `nargs="+"`, so a REPEATED
+    `--unit A --unit B` kept only B and argparse said nothing: the command answered about one
+    unit while the caller believed it had answered about the batch. That is not hypothetical -
+    it produced a `caller-unnamed 5 -> 0` that reached a retro and two commit messages before
+    the library call was checked and showed 17 of 23."""
+
+    def _units_with_findings(self) -> None:
+        (self.root / "sdlc-studio" / "stories").mkdir(parents=True, exist_ok=True)
+        for uid in self.UNITS:
+            (self.root / "sdlc-studio" / "stories" / f"{uid}-mechanism.md").write_text(
+                f"# {uid}: adds a mechanism\n\n> **Status:** Review\n"
+                f"> **Affects:** .claude/skills/sdlc-studio/scripts/critic.py\n\n"
+                "## Acceptance Criteria\n\n### AC1: the function behaves\n\n"
+                "- **Then** the function returns the right value\n", encoding="utf-8")
+
+    def test_a_repeated_unit_flag_checks_every_named_unit(self) -> None:
+        self._units_with_findings()
+        rc, out, err = self._run(["caller-check", "--unit", "US0001", "--unit", "US0002"])
+        self.assertEqual(1, rc, "findings mean a non-zero exit")
+        for uid in ("US0001", "US0002"):
+            self.assertIn(uid, out + err,
+                          f"{uid} was named on the command line and silently dropped")
+
+    def test_the_command_states_how_many_units_it_checked(self) -> None:
+        """A clean result must name the scope it is clean over. The count is the one thing that
+        would have shown, at the moment it was read, that the answer covered a single unit."""
+        self._units_with_findings()
+        _rc, out, _err = self._run(["caller-check", "--unit", "US0001", "--unit", "US0002"])
+        self.assertIn("over 2 unit(s)", out)
+
+    def test_the_open_run_is_available_as_a_batch_form(self) -> None:
+        self._units_with_findings()
+        rc, out, err = self._run(["caller-check", "--from-run"])
+        self.assertIn(f"over {len(self.UNITS)} unit(s)", out,
+                      f"the open run's batch was not read: {err}")
+        self.assertNotEqual(2, rc)
+
+    def test_several_ids_after_one_flag_still_work(self) -> None:
+        """The spelling the bare `nargs="+"` supported. Fixing the repeat must not break it."""
+        self._units_with_findings()
+        _rc, out, _err = self._run(["caller-check", "--unit", "US0001", "US0002", "US0003"])
+        self.assertIn("over 3 unit(s)", out)
+
+
+class GhostIdsAreRefusedTests(_BatchBase):
+    """A verdict may not be written against an id nothing resolves.
+
+    `caller-check` and `refine seams` both refuse an unresolvable id, for the stated reason
+    that a silent skip ships a smaller tranche than approved. The verb that writes the
+    COMMITTED REVIEW LEDGER did not: `critic record --units US9998,US9999` wrote two verdicts
+    for artefacts that do not exist and exited 0."""
+
+    def _with_tree(self) -> None:
+        d = self.root / "sdlc-studio" / "stories"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "US0001-real.md").write_text("# US0001: real\n\n> **Status:** Review\n",
+                                          encoding="utf-8")
+
+    def test_a_verdict_for_a_nonexistent_id_is_refused(self) -> None:
+        self._with_tree()
+        rc, out, err = self._run(["record", "--brief", "abcdef123456",
+                                  "--units", "US9998,US9999", "--verdict", "approve",
+                                  "--reviewer", "qa", "--author", "builder"])
+        self.assertEqual(2, rc, "two verdicts were written for artefacts that do not exist")
+        self.assertIn("US9998", err)
+        self.assertIsNone(self.mod.verdict_for(self.root, "US9998"))
+
+    def test_one_bad_id_refuses_the_whole_batch_before_any_write(self) -> None:
+        """A partial batch is the state the exit codes exist to distinguish; here nothing
+        should be written at all, because the caller's list is wrong."""
+        self._with_tree()
+        rc, _out, err = self._run(["record", "--brief", "abcdef123456",
+                                   "--units", "US0001,US9999", "--verdict", "approve",
+                                   "--reviewer", "qa", "--author", "builder"])
+        self.assertEqual(2, rc)
+        self.assertIn("US9999", err)
+        self.assertIsNone(self.mod.verdict_for(self.root, "US0001"),
+                          "a good id in a bad batch was written anyway")
+
+    def test_a_resolvable_id_is_still_recorded(self) -> None:
+        self._with_tree()
+        rc, _out, err = self._run(["record", "--brief", "abcdef123456",
+                                   "--unit", "US0001", "--verdict", "approve",
+                                   "--reviewer", "qa", "--author", "builder"])
+        self.assertEqual(0, rc, err)
+        self.assertEqual("APPROVE", self.mod.verdict_for(self.root, "US0001")["verdict"])
+
+    def test_a_workspace_that_cannot_resolve_is_not_refused(self) -> None:
+        """Fail-open only on an UNANSWERABLE question. A root with no artefact tree resolves
+        nothing, so refusing there would fail on the absence of a workspace rather than on a
+        wrong id - the distinction `close_owed` draws between an absent and a corrupt
+        baseline."""
+        rc, _out, err = self._run(["record", "--brief", "abcdef123456",
+                                   "--unit", "US0001", "--verdict", "approve",
+                                   "--reviewer", "qa", "--author", "builder"])
+        self.assertEqual(0, rc, err)
+
+
+class ArgumentCompletenessTests(_BatchBase):
+    """US0557. A batch verb's required arguments were learned from a refusal, one flag per
+    round-trip, and the first cost nineteen spawns before the message was read. A refusal has
+    to arrive once, before anything is written, naming everything the command needs. Driven
+    through `record`, the one batch verb left (`evidence` and `signoff` are retired); the
+    two-argument case widens its requirement for the test, since `record` needs only one."""
+
+    _RECORD = ["record", "--brief", "abcdef123456", "--units", "US0001,US0002,US0003",
+               "--verdict", "approve", "--reviewer", "qa"]
+
+    def test_a_missing_argument_refuses_before_any_unit_is_written(self) -> None:
+        rc, _, err = self._run(self._RECORD)
+        self.assertEqual(2, rc, err)
+        for unit in self.UNITS:
+            self.assertIsNone(self.mod.verdict_for(self.root, unit),
+                              f"{unit} was written despite the refusal")
+
+    def test_no_write_is_attempted_not_merely_that_none_landed(self) -> None:
+        """BG0419 AC3. Its siblings assert the POSTCONDITION - `verdict_for(...) is None` - and
+        that holds equally when every write is ATTEMPTED and every write fails. The claim the
+        story makes is about ORDERING: the refusal arrives before anything is written, once,
+        naming everything missing. A postcondition cannot express an ordering.
+
+        So the write path is observed directly: `_record` is replaced with a counter,
+        and the assertion is that it was never REACHED. That is the difference between "nothing
+        landed" and "nothing was tried", and it is the whole content of the story.
+
+        MUTANT: remove the up-front `missing_arguments` refusal from `_run_batch`, so the
+        missing argument is discovered per unit instead. This test must redden."""
+        calls: list[str] = []
+        real = self.mod._record
+
+        def counting(root, unit, *a, **kw):
+            calls.append(str(unit))
+            return real(root, unit, *a, **kw)
+
+        self.mod._record = counting
+        try:
+            rc, _out, err = self._run(self._RECORD)
+        finally:
+            self.mod._record = real
+        self.assertEqual(2, rc, err)
+        self.assertEqual(calls, [],
+                         f"the write path was REACHED {len(calls)} time(s) before the refusal - "
+                         f"nothing landed, but the refusal did not arrive first")
+
+    def test_the_refusal_names_every_missing_argument(self) -> None:
+        two = {"record": (("reviewer", "--reviewer"), ("author", "--author"))}
+        with unittest.mock.patch.dict(self.mod.BATCH_REQUIRED, two):
+            rc, _, err = self._run(["record", "--brief", "abcdef123456", "--units",
+                                    "US0001,US0002", "--verdict", "approve", "--reviewer", ""])
+        self.assertEqual(2, rc)
+        self.assertIn("--reviewer", err)
+        self.assertIn("--author", err,
+                      "naming only the first missing argument costs a second round-trip")
+
+    def test_every_named_argument_is_one_the_parser_accepts(self) -> None:
+        """A message that sends a caller to a flag the command does not have is a round-trip
+        that ends in a second refusal. Checked against the parser, not against a list."""
+        import argparse
+        import re as _re
+        parser = self.mod.build_parser() if hasattr(self.mod, "build_parser") else None
+        self.assertIsNotNone(parser, "the parser must be reachable to be held to its messages")
+        accepted: dict[str, set[str]] = {}
+        for action in parser._subparsers._group_actions:      # noqa: SLF001 - the only route in
+            for verb, sub in action.choices.items():
+                accepted[verb] = {opt for a in sub._actions for opt in a.option_strings}  # noqa: SLF001
+        for verb in ("record",):
+            for missing in ([], ["--units", "US0001"]):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                        contextlib.suppress(SystemExit):
+                    self.mod.main([verb, *missing, "--root", str(self.root)])
+                for flag in set(_re.findall(r"--[a-z][a-z-]*", out.getvalue() + err.getvalue())):
+                    with self.subTest(verb=verb, flag=flag):
+                        self.assertIn(flag, accepted[verb],
+                                      f"{verb} names {flag}, which its parser does not accept")
+
+
+class BriefProvenanceTests(unittest.TestCase):
+    """US0577: a verdict carries the provenance of the brief the seat was given.
+
+    RUN-01KYX375 measured both ends of this. Four review prompts were hand-written while
+    `critic.py brief` ships the bounded diff scope, the criteria as law and the claim-inventory
+    pass; they returned eight sprawling repo-wide findings. The same units re-reviewed from the
+    shipped brief returned one precise finding each with zero pre-existing noise. Nothing in the
+    record distinguished the two, so the sprint could not tell a properly briefed review from an
+    invented one.
+
+    Each test names the mutant it must fail on, per LL0050.
+    """
+
+    def _unit(self, root: Path, uid: str = "US0001") -> None:
+        d = root / "sdlc-studio" / "stories"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{uid}-x.md").write_text(
+            f"# {uid}: a unit\n\n> **Status:** Review\n> **Points:** 3\n"
+            f"> **Affects:** src/a.py\n\n## Acceptance Criteria\n\n"
+            f"### AC1: it behaves\n\n- **Then** it behaves\n", encoding="utf-8")
+        # `brief` resolves a seat CARD, so a fixture without one cannot exercise it at all.
+        seats = root / "sdlc-studio" / "personas" / "seats"
+        seats.mkdir(parents=True, exist_ok=True)
+        for role in ("engineering", "qa", "product"):
+            (seats / f"{role}.md").write_text(
+                f"<!-- role: {role} -->\n# A {role} seat\n\n## Lens\n\nJudge as {role}.\n",
+                encoding="utf-8")
+
+    def test_a_verdict_records_the_brief_it_was_given(self) -> None:
+        """MUTANT: drop the fingerprint from the recorded row. This must go red - without it a
+        hand-written prompt and a tool-issued brief are indistinguishable in the record."""
+        critic = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root)
+            fp = critic.brief_fingerprint(critic.brief(root, "US0001", "engineering"))
+            critic.record_verdict(root, "US0001", "APPROVE", reviewer="a seat",
+                                  author="the author", brief=fp)
+            row = critic.verdict_for(root, "US0001")
+        self.assertTrue(row, "no verdict was recorded")
+        self.assertEqual(fp, row.get("brief"), "the verdict does not carry its brief")
+
+    def test_the_fingerprint_identifies_the_brief(self) -> None:
+        """MUTANT: return a constant fingerprint. This must go red, or the field records that
+        SOME brief existed rather than WHICH, and a stale or wrong brief passes as the right one."""
+        critic = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root)
+            eng = critic.brief_fingerprint(critic.brief(root, "US0001", "engineering"))
+            qa = critic.brief_fingerprint(critic.brief(root, "US0001", "qa"))
+        self.assertNotEqual(eng, qa, "two different briefs share one fingerprint")
+        self.assertTrue(eng and qa, "a brief fingerprints to nothing")
+
+    def test_a_hand_written_prompt_records_no_provenance(self) -> None:
+        """MUTANT: default the field to a plausible-looking value. This must go red.
+
+        An absent brief must be visibly absent. A field filled in for a caller that never asked
+        the tool is worse than an empty one, because it asserts a discipline nobody followed."""
+        critic = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root)
+            critic.record_verdict(root, "US0001", "APPROVE", reviewer="a seat",
+                                  author="the author")
+            row = critic.verdict_for(root, "US0001")
+        self.assertFalse(row.get("brief") and row["brief"] != "-",
+                         "an unbriefed verdict records a fingerprint it never had")
+
+    def test_the_fingerprint_is_stable_across_calls(self) -> None:
+        """MUTANT: seed the fingerprint with the clock or a random value. This must go red - a
+        fingerprint that changes between two identical briefs can never be compared, so the
+        field would be decorative."""
+        critic = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root)
+            a = critic.brief_fingerprint(critic.brief(root, "US0001", "engineering"))
+            b = critic.brief_fingerprint(critic.brief(root, "US0001", "engineering"))
+        self.assertEqual(a, b)
+
+    def test_a_pre_brief_log_is_widened_rather_than_broken(self) -> None:
+        """MUTANT: drop the `_ensure_brief_column` call from record_verdict.
+
+        The header is written once, at creation, so an existing log keeps six columns while new
+        rows carry seven - not a valid markdown table, and markdownlint MD056 then refuses the
+        commit. This is the defect that actually blocked a commit, so it is pinned on the SHAPE
+        of the file rather than on the exception: every row must have the same cell count as the
+        header, and the pre-existing verdict must still read back with its recorded values.
+        """
+        critic = _load()
+        from lib.sdlc_md import table_cells
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root, "US0001")
+            path = root / "sdlc-studio" / "reviews" / "critic-verdicts.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "# Critic verdicts\n\n"
+                "| Unit | Verdict | Reviewer | Author | Date | Issues |\n"
+                "| --- | --- | --- | --- | --- | --- |\n"
+                "| US0001 | APPROVE | ada | grace | 2026-01-01 | none |\n",
+                encoding="utf-8")
+            critic.record_verdict(root, "US0002", "REJECT", "ada", "grace",
+                                  issues="one", brief="abc123def456")
+            lines = [l for l in path.read_text(encoding="utf-8").splitlines()
+                     if l.startswith("| ") and not set(l.strip()) <= set("|-: ")]
+        header = table_cells(lines[0])
+        self.assertIn("Brief", header, "the header was not widened for the new column")
+        for row in lines[1:]:
+            self.assertEqual(
+                len(header), len(table_cells(row)),
+                f"row has a different cell count from the header, which is an invalid table:\n{row}")
+        old_row = next(r for r in lines if r.startswith("| US0001 "))
+        cells = table_cells(old_row)
+        self.assertEqual(["US0001", "APPROVE", "ada", "grace", "2026-01-01"], cells[:5],
+                         "the pre-existing verdict's recorded values did not survive widening")
+        self.assertEqual("-", cells[5],
+                         "a verdict predating the column should record an ABSENT brief")
+
+    def _record(self, root, extra=()):
+        critic = _load()
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            rc = critic.main(["record", "--unit", "US0001", "--verdict", "approve",
+                              "--reviewer", "ada", "--author", "grace",
+                              "--root", str(root), *extra])
+        return rc, buf_out.getvalue() + buf_err.getvalue()
+
+    def test_a_briefed_verdict_records_cleanly(self) -> None:
+        """MUTANT: refuse, or drop, a fingerprint the reviewer supplied. The value is stored as
+        given, never judged."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root, "US0001")
+            rc, out = self._record(root, ("--brief", "abc123def456"))
+            recorded = (root / "sdlc-studio" / "reviews" / "critic-verdicts.md").read_text(
+                encoding="utf-8")
+        self.assertEqual(0, rc, f"a briefed verdict was refused:\n{out}")
+        self.assertIn("abc123def456", recorded,
+                      "the fingerprint the reviewer supplied was not recorded")
+
+class FindingClassTests(unittest.TestCase):
+    """The ORIGIN axis: did THIS unit's diff cause the finding?"""
+
+    def _unit(self, root: Path, uid: str = "US0001") -> None:
+        d = root / "sdlc-studio" / "stories"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{uid}-x.md").write_text(
+            f"# {uid}: a unit\n\n> **Status:** Review\n> **Points:** 3\n"
+            f"> **Affects:** src/a.py\n\n## Acceptance Criteria\n\n"
+            f"### AC1: it behaves\n\n- **Then** it behaves\n", encoding="utf-8")
+
+    def _record(self, root, issues):
+        critic = _load()
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            rc = critic.main(["record", "--unit", "US0001", "--verdict", "reject",
+                              "--brief", "abcdef123456", "--reviewer", "ada",
+                              "--author", "grace", "--issues", issues, "--root", str(root)])
+        return rc, buf_out.getvalue() + buf_err.getvalue()
+
+    def test_a_classification_survives_the_round_trip(self) -> None:
+        """MUTANT: drop the origin tag when parsing, or fold it into the text.
+
+        Also asserts the `class` axis is untouched, because merging the two is the specific
+        mistake an engineering seat flagged at goal review."""
+        critic = _load()
+        issues = ("[regression] verify_ac crashes on an empty Affects; "
+                  "[pre-existing] BG0123 the gate is slow")
+        parsed = critic.parse_findings(issues)
+        self.assertEqual([critic.ORIGIN_REGRESSION, critic.ORIGIN_PRE_EXISTING],
+                         [f["origin"] for f in parsed],
+                         "the declared origins did not survive parsing")
+        self.assertEqual("verify_ac crashes on an empty Affects", parsed[0]["text"],
+                         "the tag was left in the finding text")
+        self.assertNotIn("class", parsed[0],
+                         "the origin axis wrote onto the `class` axis - they answer different "
+                         "questions and merging them was the flagged mistake")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root)
+            rc, out = self._record(root, issues)
+            recorded = (root / "sdlc-studio" / "reviews" / "critic-verdicts.md").read_text(
+                encoding="utf-8")
+        self.assertEqual(0, rc, f"a fully classified verdict was refused:\n{out}")
+        self.assertIn("[regression]", recorded, "the origin was not recorded")
+        self.assertIn("[pre-existing]", recorded, "the origin was not recorded")
+
+    def test_an_unclassified_finding_is_refused(self) -> None:
+        """MUTANT: delete the `unclassified_findings` refusal from cmd_record."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root)
+            rc, out = self._record(root, "[regression] a real one; the gate feels slow")
+        self.assertEqual(2, rc, "a verdict carrying an unsorted finding was recorded")
+        self.assertIn("the gate feels slow", out,
+                      "the refusal does not name WHICH finding is unclassified")
+
+    def test_a_clean_pass_needs_no_classification(self) -> None:
+        """The control. MUTANT: refuse whenever there are no classified findings.
+
+        A rule satisfiable by refusing every clean APPROVE discriminates nothing."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root)
+            rc, out = self._record(root, "none blocking")
+        self.assertEqual(0, rc, f"a clean pass was refused for carrying no findings:\n{out}")
+
+
+class ReviewRepairTests(unittest.TestCase):
+    """The five findings an independent seat raised against EP0194's own delivery.
+
+    Four of them were prose or provenance defects rather than broken logic, which is the shape
+    this whole epic exists to catch - and one of them, F1, was a false claim shipped inside it.
+    """
+
+    def _unit(self, root: Path, uid: str = "US0001") -> None:
+        d = root / "sdlc-studio" / "stories"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{uid}-x.md").write_text(
+            f"# {uid}: a unit\n\n> **Status:** Review\n> **Points:** 3\n"
+            f"> **Affects:** src/a.py\n\n## Acceptance Criteria\n\n"
+            f"### AC1: it behaves\n\n- **Then** it behaves\n", encoding="utf-8")
+        seats = root / "sdlc-studio" / "personas" / "seats"
+        seats.mkdir(parents=True, exist_ok=True)
+        for role in ("engineering", "qa", "product"):
+            (seats / f"{role}.md").write_text(
+                f"<!-- role: {role} -->\n# A {role} seat\n\n## Lens\n\nJudge as {role}.\n",
+                encoding="utf-8")
+
+    def test_the_brief_command_emits_the_fingerprint(self) -> None:
+        """F1. MUTANT: stop printing the fingerprint from cmd_brief.
+
+        `brief_fingerprint` was called from ONE site - the `--brief-file` branch of record -
+        and never from the command that ISSUES a brief. So the fingerprint was reachable only
+        from the library, while the changelog and the commit message both said `critic.py
+        brief` emitted it. AC1's own test computed it in-process, which is a library test and
+        cannot see that the LANE is missing. This runs the CLI.
+        """
+        critic = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root)
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                rc = critic.main(["brief", "--unit", "US0001", "--seat", "engineering",
+                                  "--root", str(root)])
+            err, out = buf_err.getvalue(), buf_out.getvalue()
+        self.assertEqual(0, rc, f"brief refused:\n{err}")
+        expected = critic.brief_fingerprint(out.rstrip("\n"))
+        self.assertIn(expected, err,
+                      "the command that issues a brief does not emit its fingerprint, so "
+                      "nothing a reviewer can run produces the value `record` demands")
+        self.assertIn("--brief", err,
+                      "the fingerprint is printed without saying what to do with it")
+
+    def test_an_untagged_finding_does_not_cover_a_unit(self) -> None:
+        """F4. MUTANT: delete the `any(f["origin"] != ORIGIN_PRE_EXISTING)` guard.
+
+        Deleting that one line left the ENTIRE suite green, and every historical REJECT row in
+        the shipped log carries untagged findings (they predate US0579). So the mutant would
+        have started covering real units at the Done gate with nothing going red. The
+        behaviour was correct and the cover was absent, which is the same risk as a defect
+        one edit away.
+        """
+        critic = _load()
+        untagged = {"verdict": "REJECT", "reviewer": "ada", "author": "grace",
+                    "issues": "FAIL-OPEN IN THE COVERAGE GATE ITSELF; a second untagged note"}
+        mixed = {"verdict": "REJECT", "reviewer": "ada", "author": "grace",
+                 "issues": "[pre-existing] BG0123 slow gate; an untagged one"}
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self.assertFalse(
+                critic.sprint_covers_independently(root, "US0001", untagged),
+                "a REJECT whose findings are all UNTAGGED covered the unit - untagged is not "
+                "the same as pre-existing, and treating it so is a fail-open")
+            self.assertFalse(
+                critic.sprint_covers_independently(root, "US0001", mixed),
+                "one untagged finding beside a pre-existing one still covered the unit")
+            self.assertTrue(
+                critic.sprint_covers_independently(
+                    root, "US0001", {**mixed, "issues": "[pre-existing] BG0123 slow gate"}),
+                "the control failed: an all-pre-existing REJECT must still cover")
+
+    def test_the_coverage_docstring_states_both_shapes(self) -> None:
+        """F5. MUTANT: revert the docstring to "an APPROVE whose reviewer and author...".
+
+        The docstring was TRUE at the base ref and this diff falsified it, inside the unit's
+        own declared Affects. The claim-drift lane shipped in the sibling epic fired on
+        neither this nor the parallel comment in sprint.py, so a guard is warranted rather
+        than a promise to remember.
+        """
+        critic = _load()
+        doc = critic.sprint_covers_independently.__doc__ or ""
+        self.assertIn("pre-existing", doc,
+                      "the docstring does not mention the REJECT shape that now also covers")
+        self.assertIn("UNTAGGED", doc.upper(),
+                      "the docstring does not say an untagged finding never qualifies")
+        # Every site, not just the one this test started with. The rule was restated in two
+        # other modules (carry_forward.py is deleted, so sprint.py remains), and pinning only the
+        # canonical copy leaves the same drift free to recur in the places it actually recurred -
+        # which is the whole reason a second copy of a rule is a liability.
+        scripts = Path(__file__).resolve().parent.parent
+        for rel, needle in (("sprint.py", "sprint_covers_independently` is THE predicate"),):
+            text = (scripts / rel).read_text(encoding="utf-8")
+            i = text.find(needle)
+            self.assertGreater(i, 0, f"{rel} no longer restates the coverage rule - if the "
+                                     f"restatement was removed, remove it from this list too")
+            passage = text[i:i + 600]
+            self.assertIn("pre-existing", passage,
+                          f"{rel} still describes coverage as APPROVE-only, which this diff "
+                          f"falsified - the same drift the canonical docstring carried")
+
+
+def _rejected(mod, root, unit="US0017", issues="[new] alpha broke; [new] beta broke"):
+    """A unit carrying a live REJECT with two itemised findings."""
+    mod.record_verdict(root, unit, "REJECT", "qa-seat", "builder", issues, "delivery",
+                       "abcdef123456")
+
+
+class ClosureChannelTests(unittest.TestCase):
+    """The verdict channel, and the module that carries it. The repair ledger's closure
+    channel was deleted by US0914; the two tests that pin what survives stay here, so the
+    criteria stamping them still select them."""
+
+    def test_the_module_parses_on_the_declared_python_floor(self) -> None:
+        """MUTANT: in `critic.py`, move an escape back inside an f-string expression.
+
+        A backslash inside an f-string EXPRESSION is legal only from Python 3.12 (PEP 701), and
+        this project's floor is 3.10 in six shipped places including SKILL.md's machine-readable
+        `compatibility` field. It is not a degraded feature: `import critic` raises, and the
+        conformance lane, `sprint` and `transition` all import it - so the review gate dies at
+        import on the interpreter Ubuntu 22.04 ships. CI pins 3.12, so nothing else sees it."""
+        import ast  # noqa: PLC0415 - deferred; only this test needs it
+        src = (Path(__file__).resolve().parent.parent / "critic.py").read_text(encoding="utf-8")
+        # `ast.parse(..., feature_version=(3, 10))` does NOT catch this: feature_version gates
+        # grammar, not f-string TOKENISATION, so on a 3.12+ interpreter it accepts the very
+        # syntax 3.10 rejects. A first cut used it and the mutant walked straight through.
+        # Scanning the expression source segments is what actually discriminates.
+        offenders = []
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.FormattedValue):
+                continue
+            seg = ast.get_source_segment(src, node.value) or ""
+            if chr(92) in seg:
+                offenders.append(f"line {node.lineno}: {seg[:60]}")
+        self.assertEqual([], offenders,
+                         "a backslash inside an f-string EXPRESSION is legal only from Python "
+                         "3.12 (PEP 701); this project's floor is 3.10, and `import critic` "
+                         "raising takes the conformance lane, `sprint` and `transition` with "
+                         "it:\n  " + "\n  ".join(offenders))
+
+    def test_the_issues_channel_carries_a_semicolon_too(self) -> None:
+        """MUTANT: in `critic.py`, split `parse_findings` on a bare `;` again.
+
+        The docstring says both channels share one shape, so a fix to the repair path alone
+        leaves a verdict's findings truncating exactly as before."""
+        mod = _load()
+        found = mod.parse_findings(
+            r"[new] the guard fires on the wrong branch\; and the message names the other one; "
+            r"[pre-existing] beta")
+        self.assertEqual(2, len(found))
+        self.assertIn("and the message names the other one", found[0]["text"])
+
+
+class LedgerRollupTests(unittest.TestCase):
+    """BG0611, BG0607, BG0604 - what the verdict ledger says when it is read as a whole.
+    The repair-ledger roll-up (BG0605) was deleted by US0914."""
+
+    def test_one_seats_approve_does_not_retire_anothers_reject(self) -> None:
+        """MUTANT: in `critic.py`, return the last live row from `verdict_for` instead of the
+        latest unanswered REJECT.
+
+        A panel is several seats recorded one after another, so taking the last row written made
+        a unit's standing verdict a fact about the ORDER the recorder was invoked in. Measured
+        on three units of RUN-01M0JD1W before this shipped."""
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod.record_verdict(root, "US0017", "REJECT", "engineering", "builder",
+                               "[new] alpha broke", "delivery", "aaaaaaaaaaaa")
+            with _before_the_round_rules(mod):
+                mod.record_verdict(root, "US0017", "APPROVE", "product", "builder",
+                                   "none", "delivery", "bbbbbbbbbbbb")
+            self.assertEqual("REJECT", mod.verdict_for(root, "US0017")["verdict"],
+                             "a different seat's approval retired an unanswered rejection")
+
+    def test_a_seat_may_retire_its_own_reject(self) -> None:
+        """The paired control AND the boundary. A seat must be able to change its mind, or every
+        REJECT is permanent and a round-two approval is unrecordable.
+
+        The key is the BRIEF FINGERPRINT, not the reviewer string: this repository names seats
+        per round - `qa-seat-ep0171` against `qa-seat-close-r2` - so keying on the name made a
+        legitimate second-round approval by the same seat read as a different seat. That version
+        shipped and was withdrawn at 579/690 conformant."""
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod.record_verdict(root, "US0017", "REJECT", "qa-seat-round-1", "builder",
+                               "[new] alpha broke", "delivery", "aaaaaaaaaaaa")
+            with _before_the_round_rules(mod):   # seats named per round, as they then were
+                mod.record_verdict(root, "US0017", "APPROVE", "qa-seat-round-2", "builder",
+                                   "none", "delivery", "aaaaaaaaaaaa")   # same brief, later
+            # read as that ledger: the fingerprint pairs rounds only before the round rule
+            with unittest.mock.patch.object(mod, "ROUND_RULE_SHIPPED", "9999-12-31"):
+                self.assertEqual("APPROVE", mod.verdict_for(root, "US0017")["verdict"],
+                                 "a seat could not retire its own rejection in a later round")
+
+    def test_the_latest_unanswered_reject_is_the_one_reported(self) -> None:
+        """MUTANT: in `critic.py`, report the EARLIEST unanswered REJECT rather than the latest.
+
+        The tie-break is load-bearing rather than incidental: on this corpus the earliest
+        reading leaves 18 units non-conformant and the latest leaves 19, and the unit it drops
+        is US0671 - the first one BG0607's own Steps to Reproduce name as masked. The reading
+        that gives the tidier number is the one that hides the example."""
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with _before_the_round_rules(mod):
+                mod.record_verdict(root, "US0017", "REJECT", "engineering", "builder",
+                                   "[new] the first round finding", "delivery", "aaaaaaaaaaaa")
+                mod.record_verdict(root, "US0017", "REJECT", "qa", "builder",
+                                   "[new] the second round finding", "delivery", "bbbbbbbbbbbb")
+                mod.record_verdict(root, "US0017", "APPROVE", "product", "builder",
+                                   "none", "delivery", "cccccccccccc")
+            standing = mod.verdict_for(root, "US0017")
+            self.assertEqual("REJECT", standing["verdict"])
+            self.assertIn("second round", standing["issues"],
+                          "the EARLIEST unanswered rejection was reported, which is the reading "
+                          "that drops US0671 from the non-conformant set")
+
+    def test_annotating_the_ledger_normalises_each_row_and_record_once(self) -> None:
+        """MUTANT: in `critic._annotate_superseded`, scan the records per row again instead of
+        building the index once.
+
+        The join was a cross-product and it ran on EVERY lookup: 848 rows against 32 records is
+        27,136 comparisons per annotation, and one whole-workspace conformance run made 16.8
+        million of them with 37 million id normalisations. Counted here, never timed - a
+        wall-clock assertion is a flake on a shared machine."""
+        mod = _load()
+        rows = [{"unit": f"US{i:04d}", "date": "2026-01-01", "verdict": "APPROVE",
+                 "reviewer": "seat"} for i in range(800)]
+        records = [{"unit": f"US{i:04d}", "row_date": "2026-01-01", "row_verdict": "APPROVE",
+                    "row_reviewer": "seat", "reason": "r", "authorised_by": "a",
+                    "recorded": "2026-01-02"} for i in range(32)]
+        calls = {"n": 0}
+        real = mod.sdlc_md.norm_id
+
+        def counted(value):
+            calls["n"] += 1
+            return real(value)
+
+        with unittest.mock.patch.object(mod.sdlc_md, "norm_id", side_effect=counted):
+            mod._annotate_superseded(rows, records)
+        self.assertLess(calls["n"], 2000,
+                        f"{calls['n']} id normalisations for 800 rows and 32 records - a "
+                        f"cross-product costs 25,600 and an indexed join costs one per row and "
+                        f"one per record")
+
+    def test_the_annotation_still_marks_exactly_the_retired_rows(self) -> None:
+        """The paired control. An index that is fast and wrong is worse than the scan it
+        replaced, so the verdicts it produces are asserted beside its cost."""
+        mod = _load()
+        rows = [{"unit": "US0001", "date": "2026-01-01", "verdict": "REJECT", "reviewer": "a"},
+                {"unit": "US0002", "date": "2026-01-01", "verdict": "REJECT", "reviewer": "a"}]
+        records = [{"unit": "US0001", "row_date": "2026-01-01", "row_verdict": "REJECT",
+                    "row_reviewer": "a", "reason": "why", "authorised_by": "op",
+                    "recorded": "2026-01-02"}]
+        out = mod._annotate_superseded(rows, records)
+        self.assertTrue(out[0]["superseded"], "the retired row was not marked")
+        self.assertEqual("why", out[0]["superseded_reason"])
+        self.assertFalse(out[1]["superseded"], "a row no record names was marked retired")
+
+    def test_the_brief_names_the_restore_obligation_not_only_the_worktree(self) -> None:
+        """MUTANT: in `critic.py`, drop the snapshot-and-restore paragraph from the brief.
+
+        D0149 already said 'in an isolated worktree' and a reviewer reverted in the author's
+        tree anyway, destroying roughly four hundred uncommitted lines (BG0604). What was
+        missing is not the rule but its presence in the surface a reviewer reads."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod = _load()
+            bugs = root / "sdlc-studio" / "bugs"
+            bugs.mkdir(parents=True)
+            seats = root / "sdlc-studio" / "personas" / "seats"
+            seats.mkdir(parents=True)
+            # The SHIPPED seat card, from the skill's own templates - so the fixture carries a
+            # real charter rather than a stub the brief would render differently.
+            src = (Path(__file__).resolve().parents[2] / "templates" / "personas"
+                   / "amigos" / "qa.md")
+            (seats / "qa.md").write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            (bugs / "BG9001-fixture.md").write_text(
+                "# BG9001: fixture\n\n> **Status:** Open\n"
+                "> **Affects:** scripts/x.py\n\n## Acceptance Criteria\n\n"
+                "- [ ] **AC1** a claim\n  - **Verify:** pytest tests/test_x.py\n",
+                encoding="utf-8")
+            text = mod.brief(root, "BG9001", "qa")
+        self.assertIn("SNAPSHOT THE BYTES FIRST", text,
+                      "the brief warns about the worktree and never states what to do if a "
+                      "reviewer reverts in place anyway")
+        self.assertIn("restores the COMMITTED state", text,
+                      "the brief does not say why `git checkout --` is the wrong restore")
+
+
+class ThreeStateCoverageTests(unittest.TestCase):
+    """US0621 / CR0506, narrowed by US0914: a REJECT is answered only by a round-2 APPROVE, so
+    coverage has two states and a repair ledger moves neither."""
+
+    def test_an_unrepaired_or_partly_repaired_reject_stays_uncovered(self) -> None:
+        """MUTANT: let a repair row answer the REJECT. A repair ledger written before US0914,
+        closing one finding and then both, leaves the unit unreviewed; the rejecting reviewer's
+        round-2 APPROVE, the control, covers it."""
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _rejected(mod, root, "US0002")
+            when = mod.read_verdicts(root)[-1]["date"]
+            self.assertEqual(mod.coverage_state(root, "US0002"), mod.COVERAGE_UNREVIEWED)
+            ledger = root / "sdlc-studio" / "reviews" / "repair-record.md"
+            for closed in ("alpha broke -> fixed: killed",
+                           "alpha broke -> fixed: killed; beta broke -> fixed: killed"):
+                ledger.write_text(
+                    "| Unit | Verdict date | Author | Date | Closed | Outstanding |\n"
+                    "| --- | --- | --- | --- | --- | --- |\n"
+                    f"| US0002 | {when} | builder | {when} | {closed} | - |\n", encoding="utf-8")
+                self.assertEqual(mod.coverage_state(root, "US0002"), mod.COVERAGE_UNREVIEWED,
+                                 f"a repair row reached the covered state: {closed}")
+            mod.record_verdict(root, "US0002", "APPROVE", "qa-seat", "builder", "none",
+                               "delivery", "abcdef123456")
+            self.assertEqual(mod.coverage_state(root, "US0002"), mod.COVERAGE_APPROVED)
+
+    def test_the_three_counts_partition_the_batch(self) -> None:
+        """MUTANT: let a unit fall through the classification into no count.
+
+        Every unit falls in exactly one state and the total equals the batch size.
+        """
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod.record_verdict(root, "US0001", "APPROVE", "qa", "b", "none", "delivery",
+                               "abcdef123456")
+            _rejected(mod, root, "US0002")
+            units = ["US0001", "US0002", "US0003", "US0004"]
+            counts = mod.coverage_counts(root, units)
+        total = sum(len(v) for v in counts.values())
+        self.assertEqual(total, len(units))
+        self.assertEqual(sorted(sum(counts.values(), [])), sorted(units))
+
+
+class PanelConvergenceTests(unittest.TestCase):
+    """BG0549/BG0539: the escalation read the whole history and never asked whether the panel
+    had since converged, so the ordinary reject-fix-approve loop announced non-convergence at
+    the moment it demonstrably had."""
+
+    def test_a_converged_panel_does_not_escalate(self) -> None:
+        """MUTANT: delete the `verdicts[-1] == APPROVE` early return."""
+        mod = _load()
+        escalate, _why = mod.panel_escalation(["REJECT", "REJECT", "APPROVE"], {})
+        self.assertFalse(escalate, "an APPROVE after two REJECTs is the loop working")
+
+    def test_a_stalled_panel_still_escalates(self) -> None:
+        """The control. Convergence must END the notice without disarming it."""
+        mod = _load()
+        escalate, why = mod.panel_escalation(["REJECT", "REJECT"], {})
+        self.assertTrue(escalate, "two REJECTs with no approval after them is a stall")
+        self.assertIn("not converging", why)
+
+
+class RoundVersusSplitTests(unittest.TestCase):
+    """BG0539: a second ROUND was mistaken for a panel SPLIT."""
+
+    def test_a_second_round_is_not_a_panel_split(self) -> None:
+        """MUTANT: delete the convergence check, so seat verdicts from different ROUNDS are
+        compared as though they came from one.
+
+        A panel split is disagreement INSIDE a round. A second round is a different context
+        reviewing a revised unit - the reject-fix-approve loop working. Six of eight units in
+        one run escalated as splits for having done exactly that.
+        """
+        mod = _load()
+        escalate, _why = mod.panel_escalation(
+            ["REJECT", "APPROVE"], {"engineering": "REJECT", "qa": "APPROVE"})
+        self.assertFalse(escalate,
+                         "a REJECT in round 1 and an APPROVE in round 2 is convergence")
+
+
+class AbsentBriefTests(unittest.TestCase):
+    """BG0625: an ABSENT brief fingerprint must match nothing, not every other absent one.
+
+    The ledger writes `-` for an absent brief, so two rows that both lack one compared EQUAL and
+    a different seat's approval retired a rejection - the behaviour BG0607 exists to prevent.
+    Measured on this repository before the fix: 556 of 856 delivery rows carry the placeholder
+    and nine rejections had been retired that way, four of them cross-seat.
+    """
+
+    _HEAD = ("# Critic Verdicts\n\n"
+             "| Unit | Verdict | Reviewer | Author | Date | Brief | Tier | Issues |\n"
+             "| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+
+    def _root(self, d):
+        root = Path(d)
+        (root / "sdlc-studio" / "reviews").mkdir(parents=True)
+        return root
+
+    def _rows(self, root, *rows):
+        (root / "sdlc-studio" / "reviews" / "critic-verdicts.md").write_text(
+            self._HEAD + "".join(rows), encoding="utf-8")
+
+    def _row(self, verdict, reviewer, brief, *, unit="US0017", date="2026-08-27"):
+        return (f"| {unit} | {verdict} | {reviewer} | eng; session | {date} | {brief} "
+                f"| full | some finding |\n")
+
+    def test_a_placeholder_brief_does_not_retire_a_cross_seat_reject(self) -> None:
+        # AC1. The absent value is `-`, not the empty string: `"-"` is truthy, so the predicate
+        # this bug was FILED with never fired and its own criteria would not have caught that.
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            mod = _load()
+            self._rows(root,
+                       self._row("REJECT", "qa seat (independent)", "-"),
+                       self._row("APPROVE", "engineering seat (independent)", "-"))
+            self.assertEqual("REJECT", mod.verdict_for(root, "US0017")["verdict"])
+
+    def test_a_placeholder_brief_does_not_retire_a_same_seat_reject_either(self) -> None:
+        # AC2. Identity does not retire a rejection - a repair does (BG0629). This row exists
+        # because reviewer identity WAS proposed as the fallback, measured against all nine real
+        # pairs, and falsified at 0 of 9 matching: the corpus names seats per round, so every
+        # approval carries different free text from its rejection.
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            mod = _load()
+            self._rows(root,
+                       self._row("REJECT", "engineering seat (independent, worktree)", "-"),
+                       self._row("APPROVE", "engineering seat (independent, rejoinder)", "-"))
+            self.assertEqual("REJECT", mod.verdict_for(root, "US0017")["verdict"])
+
+    def test_a_real_fingerprint_still_retires_after_normalisation(self) -> None:
+        # AC3. The unchanged path: normalising the absent case must not break the matched one.
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            mod = _load()
+            self._rows(root,
+                       self._row("REJECT", "qa seat (independent)", "abc123def456"),
+                       self._row("APPROVE", "qa seat (independent)", "abc123def456"))
+            self.assertEqual("APPROVE", mod.verdict_for(root, "US0017")["verdict"])
+
+    def test_the_cli_stands_an_unbriefed_cross_seat_reject(self) -> None:
+        # AC4. Through the SHIPPED command. `show`'s text branch prints a raw dict, so the
+        # oracle is the json payload rather than a substring of it.
+        import subprocess  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as d:
+            root = self._root(d)
+            (root / "sdlc-studio" / ".config.yaml").write_text(
+                "schema_version: 3\n", encoding="utf-8")
+            for verdict, seat in (("reject", "qa-seat"), ("approve", "engineering-seat")):
+                subprocess.run(
+                    [sys.executable, str(SCRIPT), "--root", str(root), "record",
+                     "--unit", "US0017", "--verdict", verdict, "--reviewer", seat,
+                     "--author", "eng; session", "--issues", "[regression] some finding"],
+                    capture_output=True, text=True, timeout=300, check=False)
+            r = subprocess.run(
+                [sys.executable, str(SCRIPT), "--root", str(root), "show",
+                 "--unit", "US0017", "--format", "json"],
+                capture_output=True, text=True, timeout=300, check=False)
+            self.assertEqual("REJECT", json.loads(r.stdout)["verdict"]["verdict"], r.stdout)
+            # BOTH branches. `show` has two, and only the json one was pinned - a mutant that
+            # made the TEXT branch read `rows[-1]` directly survived the whole suite, which is
+            # the same roll-up bypass this row exists to refuse, reachable by the command a
+            # reader actually types.
+            plain = subprocess.run(
+                [sys.executable, str(SCRIPT), "--root", str(root), "show", "--unit", "US0017"],
+                capture_output=True, text=True, timeout=300, check=False)
+            self.assertIn("REJECT", plain.stdout,
+                          f"the text branch bypassed the roll-up:\n{plain.stdout}")
+            self.assertNotIn("'verdict': 'APPROVE'", plain.stdout, plain.stdout)
+
+    def test_every_placeholder_brief_retirement_in_the_corpus_stands(self) -> None:
+        # AC5. The corpus is where this defect is live. All NINE stand, because none carries a
+        # repair record - so none was answered. Seven of the nine are at Done, and the criterion
+        # states that consequence rather than discovering it at the close.
+        mod = _load()
+        nine = ["US0570", "US0571", "US0575", "US0576",
+                "US0569", "US0572", "US0574", "BG0442", "BG0452"]
+        standing = {u: (mod.verdict_for(REPO_ROOT, u) or {}).get("verdict") for u in nine}
+        self.assertEqual({u: "REJECT" for u in nine}, standing)
+
+
+class CleanEscapesForContextTests(unittest.TestCase):
+    """BG0637: `_clean` escaped every underscore in the value, span interiors included, so an
+    identifier a reviewer named came out of the ledger with a literal backslash in it - and it
+    was not idempotent, so a value passing through twice was escaped twice. This function serves
+    the verdict, evidence and repair writers, which is every record this project keeps of what
+    review found."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.critic = _load()
+
+    IDENT = "the reader `_read_rows` and a bare _name"
+
+    def test_an_underscore_inside_a_code_span_is_not_escaped(self) -> None:
+        """MUTANT: revert to a single unconditional escape over the whole value."""
+        got = self.critic._clean(self.IDENT)
+        self.assertIn("`_read_rows`", got,
+                      f"the span's interior was escaped, so it renders with a backslash:\n{got}")
+
+    def test_an_underscore_outside_a_span_is_still_escaped(self) -> None:
+        """MUTANT: delete the underscore escape altogether.
+
+        Without this row the one-token implementation - dropping the escape - satisfies the
+        row above, and every underscored identifier in free prose pairs into emphasis again."""
+        got = self.critic._clean(self.IDENT)
+        self.assertIn(r"\_name", got,
+                      f"an underscore outside any span was left bare:\n{got}")
+
+    def test_cleaning_an_already_cleaned_value_changes_nothing(self) -> None:
+        """MUTANT: remove the already-escaped lookbehind so a backslash-underscore is escaped
+        a second time.
+
+        The largest measured half of the defect: the repair record carried hundreds of doubled
+        escapes, because a value re-recorded or quoted into a closure went through twice."""
+        once = self.critic._clean(self.IDENT)
+        self.assertEqual(once, self.critic._clean(once))
+
+    def test_a_pipe_or_newline_inside_a_span_is_still_neutralised(self) -> None:
+        """MUTANT: delete the pipe substitution so a pipe inside a code span survives.
+
+        These rows are built by f-string, not by a row joiner, so this function is the only
+        thing standing between a reviewer's piped shell command and a forged column."""
+        got = self.critic._clean("see `grep x | wc -l` and\na second line")
+        self.assertNotIn("|", got, f"a pipe survived inside a code span:\n{got}")
+        self.assertNotIn("\n", got, f"a newline survived:\n{got}")
+
+    def test_an_odd_backtick_count_is_refused_at_the_write(self) -> None:
+        """MUTANT: replace the refusal with an appended backtick that balances it silently.
+
+        Balancing rewrites a reviewer's words and swallows the row's tail into a code span.
+        Refusing tells the author while they can still edit - and catches the caller that
+        truncated a quotation mid-span, which balancing would have papered over."""
+        value = "a value with one ` stray backtick"
+        with self.assertRaises(ValueError) as ctx:
+            self.critic._clean(value)
+        message = str(ctx.exception)
+        self.assertIn("backtick", message)
+        # NAMING THE VALUE is the half of this criterion that carries its product value, and
+        # asserting only the word "backtick" left it revertible with the suite green: a
+        # refusal that does not quote what it refused sends the author looking through a row
+        # they cannot see.
+        self.assertIn(value, message,
+                      f"the refusal does not name the value it refused:\n{message}")
+
+    def test_an_even_backtick_count_is_written_through_unchanged(self) -> None:
+        """MUTANT: strip every backtick from the value before writing it.
+
+        The paired control: a writer that removes or appends backticks satisfies the refusal
+        row above while destroying every code span in the record."""
+        got = self.critic._clean("a `span` and `another` here")
+        self.assertEqual(4, got.count("`"), f"backticks were rewritten:\n{got}")
+        self.assertIn("`span`", got)
+
+
+
+class CleanSpanWidthAndRefusalTests(unittest.TestCase):
+    """BG0637 round two. Three seats found the first fix incomplete in the same place: it knew
+    what a code span was only for a SINGLE pair of backticks, and its refusal fired from inside
+    a write loop, so a repair answering two rejections appended one row and then refused."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.critic = _load()
+
+    def test_a_double_backtick_span_interior_is_left_alone(self) -> None:
+        """MUTANT: narrow the delimiter pattern back to a single backtick.
+
+        Markdown pairs a run of N backticks with the next run of exactly N. Reading the two
+        that OPEN a ``double`` span as a complete empty span escaped the span's own contents -
+        the artefact's own first reproduction, still live after the first fix."""
+        got = self.critic._clean("the reader ``_read_rows`` and a bare _name")
+        self.assertIn("``_read_rows``", got,
+                      f"a double-backtick span's interior was escaped:\n{got}")
+        self.assertIn(r"\_name", got,
+                      f"the underscore OUTSIDE the span was left bare:\n{got}")
+
+    def test_an_escaped_backtick_is_not_a_delimiter(self) -> None:
+        """MUTANT: drop the not-a-backslash lookbehind from the delimiter pattern.
+
+        `\\`` is a literal backtick and needs no partner. Counting it as one refused values
+        markdown holds perfectly well, and told the author to close a span that was never open."""
+        got = self.critic._clean(r"a literal \` backtick and a _name")
+        self.assertIn(r"\`", got, f"the escaped backtick did not survive:\n{got}")
+        self.assertIn(r"\_name", got, f"the underscore was not escaped:\n{got}")
+
+    def test_the_refusal_quotes_the_stray_backtick_and_the_value(self) -> None:
+        """MUTANT: quote the value's first 120 characters instead of the text around the stray.
+
+        Seventy-one per cent of this repo's review-ledger findings cells run past 120
+        characters, and in every corpus row this rule refuses, the first 120 hold no backtick
+        at all - so the message quoted text that could not be the fault and named a remedy for
+        it, which is the complaint this bug's own Impact section makes about the OLD failure."""
+        value = "prose that says nothing about backticks. " * 6 + "and then a ` stray one"
+        with self.assertRaises(ValueError) as ctx:
+            self.critic._clean(value)
+        message = str(ctx.exception)
+        self.assertIn("` stray one", message,
+                      f"the excerpt does not reach the stray backtick:\n{message}")
+        self.assertIn(str(len(value)), message,
+                      f"the refusal does not say how long the value is:\n{message}")
+
+class CodeSpanEdgeSpaceTests(unittest.TestCase):
+    """BG0659: a code span whose rendered interior begins or ends in whitespace was written into
+    the ledger verbatim, and markdownlint's MD038 then refused the NEXT commit touching the file -
+    blocked by a row its committer did not write. Padding the span is no remedy (one space each
+    side is stripped on render, two still raise MD038), so the shared `_clean` refuses it."""
+
+    _HEAD = ("# Critic Verdicts\n\n"
+             "| Unit | Verdict | Reviewer | Author | Date | Brief | Tier | Issues |\n"
+             "| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+    _SEEDED = "| US0002 | APPROVE | qa seat | author | 2026-09-14 | - | full | an earlier row |\n"
+    BIN = REPO_ROOT / "node_modules" / ".bin" / "markdownlint"
+    CONFIG = REPO_ROOT / ".markdownlint.json"
+
+    def _workspace(self, d: str) -> tuple[Path, Path]:
+        root = Path(d)
+        (root / "sdlc-studio" / "stories").mkdir(parents=True)
+        (root / "sdlc-studio" / "stories" / "US0001-x.md").write_text(
+            "# US0001: a unit\n\n> **Status:** Review\n> **Points:** 3\n", encoding="utf-8")
+        (root / "sdlc-studio" / ".config.yaml").write_text(
+            "schema_version: 3\n", encoding="utf-8")
+        ledger = root / "sdlc-studio" / "reviews" / "critic-verdicts.md"
+        ledger.parent.mkdir(parents=True)
+        # SEEDED, header and one row: `record_verdict` writes the header before `_clean` runs,
+        # so an absent ledger cannot tell a refusal that wrote nothing from one that wrote it.
+        ledger.write_text(self._HEAD + self._SEEDED, encoding="utf-8")
+        return root, ledger
+
+    def _cli(self, root: Path, *argv: str):
+        import subprocess  # noqa: PLC0415
+        return subprocess.run([sys.executable, "-B", str(SCRIPT), *argv, "--root", str(root)],
+                              capture_output=True, text=True, check=False, timeout=300)
+
+    def _record(self, root: Path, issues: str):
+        return self._cli(root, "record", "--unit", "US0001", "--verdict", "REJECT",
+                         "--reviewer", "qa seat", "--author", "author", "--tier", "full",
+                         "--issues", issues)
+
+    def _md038_lines(self, path: Path) -> list[int]:
+        import subprocess  # noqa: PLC0415
+        proc = subprocess.run(  # noqa: S603 - fixed local binary, generated fixture path
+            [str(self.BIN), "--config", str(self.CONFIG), "--json", str(path)],
+            capture_output=True, text=True, check=False, timeout=300)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        try:
+            findings = json.loads(out or "[]")
+        except json.JSONDecodeError:
+            self.fail(f"markdownlint gave no JSON:\n{out}")
+        return sorted(f["lineNumber"] for f in findings if "MD038" in f["ruleNames"])
+
+    def test_a_trailing_space_span_is_refused_by_the_cli(self) -> None:
+        """MUTANTS: pad the span to CommonMark's form and write the row; drop the span from the
+        refusal so it names the edge alone; hard-code the edge word to `leading`; call
+        `_write_verdict_row` with the raw issues before `_clean` runs.
+
+        An ADMITTED span sits before the offending one, so a check that judges only the first
+        span in the value records this finding and fails."""
+        with tempfile.TemporaryDirectory() as d:
+            root, ledger = self._workspace(d)
+            before = ledger.read_bytes()
+            r = self._record(root, "[new] the reader `_read_rows` is admitted, but "
+                                   "`budget: ` ends in a space")
+            self.assertEqual(2, r.returncode, r.stdout + r.stderr)
+            self.assertIn("`budget: `", r.stderr,
+                          f"the refusal does not quote the span it refused:\n{r.stderr}")
+            self.assertIn("trailing edge", r.stderr, r.stderr)
+            self.assertNotIn("leading", r.stderr.lower(),
+                             f"the refusal names an edge that carries no space:\n{r.stderr}")
+            self.assertEqual(before, ledger.read_bytes(),
+                             "the refused verdict changed the ledger")
+
+    def test_a_leading_space_span_is_refused_by_the_cli(self) -> None:
+        """MUTANTS: test only the LAST character of each interior, so a leading space is
+        written; make every refusal say `leading and trailing edge`."""
+        with tempfile.TemporaryDirectory() as d:
+            root, ledger = self._workspace(d)
+            before = ledger.read_bytes()
+            r = self._record(root, "[new] the reader `_read_rows` is admitted, but "
+                                   "` budget:` opens with a space")
+            self.assertEqual(2, r.returncode, r.stdout + r.stderr)
+            self.assertIn("` budget:`", r.stderr,
+                          f"the refusal does not quote the span it refused:\n{r.stderr}")
+            self.assertIn("leading edge", r.stderr, r.stderr)
+            self.assertNotIn("trailing", r.stderr.lower(),
+                             f"the refusal names an edge that carries no space:\n{r.stderr}")
+            self.assertEqual(before, ledger.read_bytes(),
+                             "the refused verdict changed the ledger")
+
+    def test_a_clean_span_records_unchanged(self) -> None:
+        """MUTANTS: replace the per-interior check with a regex over the whole value (a backtick
+        beside a space), refusing prose round a span; refuse any interior that begins with a
+        space, refusing ` x `; strip the padding from single-backtick spans only, so the padded
+        double-backtick span is judged raw and refused.
+
+        The Issues cell is pinned to the literal HEAD writes for this finding. All-space spans
+        are held out: MD038 admits them and CommonMark keeps their spaces, so either answer is
+        lint-safe and none is pinned."""
+        with tempfile.TemporaryDirectory() as d:
+            root, ledger = self._workspace(d)
+            r = self._record(root, "[new] a bare _name beside `_read_rows`, ` x ` and "
+                                   "`` a `` all lint clean")
+            self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+            text = ledger.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith(self._HEAD + self._SEEDED), text)
+            added = text[len(self._HEAD + self._SEEDED):].splitlines()
+            self.assertEqual(1, len(added), f"expected one new row:\n{text}")
+            issues = added[0].rstrip().removesuffix("|").rstrip().rsplit(" | ", 1)[1]
+            self.assertEqual(
+                "[new] a bare \\_name beside `_read_rows`, ` x ` and `` a `` all lint clean",
+                issues)
+
+    def test_every_admitted_span_passes_md038(self) -> None:
+        """MUTANTS: exempt every interior that both begins and ends with a space, rather than
+        exactly one space round a non-space interior, so two-space and asymmetric paddings are
+        written; compare each edge with U+0020 instead of `str.isspace`, so a tab-edged span is
+        written.
+
+        Three halves, each closing a way this could pass without judging anything: the ledger
+        lints clean of MD038; the two admitted spans are IN it, so a writer refusing everything
+        fails; and every refused member, written raw past the writer, raises MD038 - so the
+        harness can see what it judges. MD010 on the tab rows is pre-existing and not read."""
+        if not self.BIN.is_file() or shutil.which("node") is None:
+            self.skipTest(f"markdownlint not installed at {self.BIN} (run `npm install`)")
+        refused = ["`budget: `", "` budget:`", "`  x  `", "`  x `", "` x  `",
+                   "`\tx`", "`x\t`", "`\tx\t`", "``budget: ``", "`` budget:``"]
+        admitted = ["` x `", "`` a ``"]
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            written = []
+            for member in refused + admitted:
+                try:
+                    mod.record_verdict(root, "US0001", "REJECT", reviewer="qa seat",
+                                       author="author", issues=f"[new] quoted {member} here",
+                                       tier="full")
+                except ValueError:
+                    continue
+                written.append(member)
+            ledger = mod.verdicts_path(root)
+            text = ledger.read_text(encoding="utf-8")
+            self.assertEqual([], self._md038_lines(ledger),
+                             f"the writer wrote a row MD038 refuses:\n{text}")
+            for member in admitted:
+                self.assertIn(f"quoted {member} here", text, f"{member!r} is not in the ledger")
+            self.assertEqual(admitted, written, "the writer admitted or refused the wrong spans")
+            raw = Path(d) / "raw.md"
+            raw.write_text(self._HEAD + "".join(
+                f"| US0001 | REJECT | qa seat | author | 2026-09-15 | - | full | "
+                f"[new] quoted {m} here |\n" for m in refused), encoding="utf-8")
+            first = self._HEAD.count("\n") + 1
+            self.assertEqual(set(range(first, first + len(refused))),
+                             set(self._md038_lines(raw)),
+                             "a refused member does not raise MD038 when written raw, so the "
+                             "harness cannot see what it judges")
+
+
+class BriefRefusesMissingPracticeTests(unittest.TestCase):
+    """BG0671: `assert_brief_practices` and `assert_brief_claim_pass` were called by no production
+    path while reference-review.md said the brief verb refused a brief failing them.
+
+    The seam: patch the module's `_REVIEW_PRACTICES_BLOCK` or `_CLAIM_INVENTORY_BLOCK` and drive
+    `critic.main` in-process, on a fixture whose own text - unit, seat path, templates and the
+    quoted prior verdict alike - names no practice, no surface and no ruling word, so nothing but
+    the patched block can satisfy a check. `_assert_inert` proves that per render rather than
+    trusting it."""
+
+    PRIOR = "VERDICT: REJECT\nISSUES: the fix is incomplete\nBLOCKING: the fix is incomplete\n"
+    RULINGS = ("TRUE", "FALSE", "UNVERIFIABLE")
+
+    def _fixture(self, root: Path):
+        d = root / "sdlc-studio" / "stories"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "US0001-x.md").write_text(
+            "# US0001: the thing\n\n> **Status:** In Progress\n"
+            "> **Affects:** src/a.py, src/b.py\n> **Points:** 3\n\n"
+            "## Acceptance Criteria\n\n### AC1: works\n\n- **Given** x\n- **When** y\n"
+            "- **Then** z\n- **Verify:** shell exit 0\n", encoding="utf-8")
+        seats = root / "sdlc-studio" / "personas" / "seats"
+        seats.mkdir(parents=True, exist_ok=True)
+        (seats / "qa.md").write_text("<!-- role: qa -->\n# Sam - QA seat\n\ncharter text\n",
+                                     encoding="utf-8")
+        prior = root / "prior.txt"
+        prior.write_text(self.PRIOR, encoding="utf-8")
+        mod = _load()
+        # the derived tier is the default invocation, and the cases run without --tier rely on
+        # this fixture deriving full
+        self.assertEqual(mod.tier_for(root, "US0001"), "full")
+        self._assert_inert(mod, root)
+        return mod, str(prior)
+
+    def _assert_inert(self, mod, root: Path) -> None:
+        with unittest.mock.patch.object(mod, "_REVIEW_PRACTICES_BLOCK", ""), \
+                unittest.mock.patch.object(mod, "_CLAIM_INVENTORY_BLOCK", ""):
+            for text in (mod.brief(root, "US0001", "qa", "full"),
+                         mod.rejoinder_brief(root, "US0001", "qa", self.PRIOR, "full")):
+                self.assertEqual(mod.missing_practices(text),
+                                 [name for name, _i, _r in mod._BRIEF_PRACTICES])
+                self.assertEqual(mod.missing_claim_surfaces(text), list(mod.CLAIM_SURFACES))
+                for word in self.RULINGS:   # case-sensitive, as the check reads them
+                    self.assertIsNone(re.search(rf"\b{word}\b", text), word)
+
+    def _run(self, mod, root: Path, *argv: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = mod.main(["brief", "--unit", "US0001", "--seat", "qa", *argv,
+                           "--root", str(root)])
+        return rc, out.getvalue(), err.getvalue()
+
+    def _assert_refused(self, rc: int, out: str, err: str, label: str) -> None:
+        self.assertEqual(rc, 2, f"{label}: {err}")
+        self.assertEqual(out, "", f"{label}: a refused brief reached stdout")
+        self.assertNotIn("brief fingerprint:", err, f"{label}: a refused brief printed a footer")
+        self.assertTrue(err.startswith("brief refused: "), f"{label}: {err}")
+
+    def _without_isolation(self, mod) -> str:
+        return self._without(mod, "When a mutant SURVIVES", "isolation re-test of a survivor")
+
+    def _without(self, mod, lead: str, name: str) -> str:
+        """The practices block less the one paragraph starting `lead`, which states `name`."""
+        paras = mod._REVIEW_PRACTICES_BLOCK.split("\n\n")
+        kept = [p for p in paras if not p.startswith(lead)]
+        self.assertEqual(len(kept), len(paras) - 1)
+        block = "\n\n".join(kept)
+        self.assertEqual(mod.missing_practices(mod._REVIEW_PRACTICES_BLOCK), [])
+        self.assertEqual(mod.missing_practices(block), [name])
+        return block
+
+    def _assert_names_practice(self, mod, err: str, label: str,
+                               name: str = "isolation re-test of a survivor",
+                               tier: str = "full") -> None:
+        m = re.search(r"missing standing practice\(s\): (.*?) - each of (.*?) is a standing", err)
+        self.assertIsNotNone(m, f"{label}: {err}")
+        self.assertEqual(m.group(1).split("; "), [name], label)
+        # the roll-call follows the tier's list
+        self.assertEqual(", ".join(mod.TIER_PRACTICES[tier]), m.group(2), label)
+
+    def _assert_names_surface(self, mod, err: str, label: str) -> None:
+        m = re.search(r"omits prose surface\(s\): (.*?) - all four \((.*?)\)", err)
+        self.assertIsNotNone(m, f"{label}: {err}")
+        self.assertEqual(m.group(1).split(", "), ["comments"], label)
+        self.assertEqual(m.group(2).split(", "), list(mod.CLAIM_SURFACES), label)
+
+    def test_a_brief_missing_a_practice_is_refused_by_the_cli(self) -> None:
+        """MUTANTS: call `assert_brief_practices` after `print(text)`, so the deficient brief
+        reaches stdout before the exit; name the whole roll-call as the missing list, so every
+        practice is reported absent whichever one is."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod, _prior = self._fixture(root)
+            with unittest.mock.patch.object(mod, "_REVIEW_PRACTICES_BLOCK",
+                                            self._without_isolation(mod)):
+                rc, out, err = self._run(mod, root, "--tier", "full")
+            self._assert_refused(rc, out, err, "--tier full")
+            self._assert_names_practice(mod, err, "--tier full")
+
+    def test_the_practice_check_binds_at_every_delivery_tier_and_on_a_rejoinder(self) -> None:
+        """MUTANTS: gate the practices check on the full tier; leave the rejoinder branch
+        unchecked; check the rejoinder after printing it; check the rejoinder's practices only
+        at full; demand every practice at light, which refuses a light brief for the mutation
+        practices its tier omits. The light rejoinder is the case only the fourth mutant fails,
+        because at full the fixture refuses whichever branch guards it."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod, prior = self._fixture(root)
+            light = (("--tier", "light"), ("--rejoinder", prior, "--tier", "light"))
+            # A practice light carries: refused at light, first round and rejoinder alike.
+            name = "regression cover for a repair"
+            self.assertIn(name, mod.TIER_PRACTICES["light"])
+            with unittest.mock.patch.object(mod, "_REVIEW_PRACTICES_BLOCK",
+                                            self._without(mod, "A repair that changes", name)):
+                for argv in light:
+                    rc, out, err = self._run(mod, root, *argv)
+                    self._assert_refused(rc, out, err, " ".join(argv))
+                    self._assert_names_practice(mod, err, " ".join(argv), name, "light")
+            with unittest.mock.patch.object(mod, "_REVIEW_PRACTICES_BLOCK",
+                                            self._without_isolation(mod)):
+                rc, out, err = self._run(mod, root, "--rejoinder", prior, "--tier", "full")
+                self._assert_refused(rc, out, err, "--rejoinder --tier full")
+                self._assert_names_practice(mod, err, "--rejoinder --tier full")
+                # A practice light does not carry is never demanded of it.
+                self.assertNotIn("isolation re-test of a survivor", mod.TIER_PRACTICES["light"])
+                for argv in light:
+                    rc, out, err = self._run(mod, root, *argv)
+                    self.assertEqual(0, rc, f"{' '.join(argv)}: {err}")
+                    self.assertTrue(out.startswith("You are the qa review seat."), argv)
+
+    def test_a_brief_missing_a_surface_is_refused_by_the_cli(self) -> None:
+        """MUTANTS: print the claim-pass refusal as a NOTE and return 0; name all four surfaces
+        as the omitted list; call `missing_claim_surfaces` in its place, so the ruling vocabulary
+        is never checked; restore the roll-call of all three ruling words to the vocabulary
+        refusal. Each refusal also runs with no --tier, the default invocation, which derives
+        full on this fixture: a check gated on the flag rather than the resolved tier passes
+        every explicit case and still prints this brief."""
+        block = _load()._CLAIM_INVENTORY_BLOCK
+        self.assertEqual(len(re.findall("comments", block, re.I)), 1)
+        no_comments = block.replace("docstrings, comments and CHANGELOG",
+                                    "docstrings and CHANGELOG")
+        self.assertEqual(len(re.findall(r"\bUNVERIFIABLE\b", block)), 2)
+        no_unverifiable = re.sub(r"\s*\bor UNVERIFIABLE\b", "", block).replace(
+            "is UNVERIFIABLE, reported", "is reported")
+        self.assertNotIn("UNVERIFIABLE", no_unverifiable)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod, prior = self._fixture(root)
+            self.assertEqual(mod.missing_claim_surfaces(no_comments), ["comments"])
+            self.assertEqual(mod.missing_claim_surfaces(no_unverifiable), [])
+            runs = (("--tier", "full"), (),
+                    ("--rejoinder", prior, "--tier", "full"), ("--rejoinder", prior))
+            with unittest.mock.patch.object(mod, "_CLAIM_INVENTORY_BLOCK", no_comments):
+                for argv in runs:
+                    label = "comments dropped: " + (" ".join(argv) or "(derived tier)")
+                    rc, out, err = self._run(mod, root, *argv)
+                    self._assert_refused(rc, out, err, label)
+                    self._assert_names_surface(mod, err, label)
+            with unittest.mock.patch.object(mod, "_CLAIM_INVENTORY_BLOCK", no_unverifiable):
+                for argv in runs:
+                    label = "UNVERIFIABLE dropped: " + (" ".join(argv) or "(derived tier)")
+                    rc, out, err = self._run(mod, root, *argv)
+                    self._assert_refused(rc, out, err, label)
+                    self.assertRegex(err, r"\bUNVERIFIABLE\b", label)
+                    for word in ("TRUE", "FALSE"):
+                        self.assertNotRegex(err, rf"\b{word}\b", f"{label}: names {word}")
+
+    def test_the_shipped_brief_prints(self) -> None:
+        """THE PAIRED CONTROLS, from the shipped blocks. MUTANTS: run the claim pass at every
+        tier, so a light brief is refused; return straight after the checked brief is printed,
+        dropping the footer; run the claim pass on the rejoinder whatever the tier; run it on the
+        prior verdict text rather than the rendered rejoinder, so every full-tier re-review is
+        refused."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            mod, prior = self._fixture(root)
+            full = mod.brief(root, "US0001", "qa", "full")
+            full_rejoinder = mod.rejoinder_brief(root, "US0001", "qa", self.PRIOR, "full")
+            cases = (
+                (("--tier", "full"), full),
+                (("--tier", "light"), mod.brief(root, "US0001", "qa", "light")),
+                (("--rejoinder", prior, "--tier", "light"),
+                 mod.rejoinder_brief(root, "US0001", "qa", self.PRIOR, "light")),
+                (("--rejoinder", prior, "--tier", "full"), full_rejoinder),
+            )
+            footers = {}
+            for argv, render in cases:
+                label = " ".join(argv)
+                rc, out, err = self._run(mod, root, *argv)
+                self.assertEqual(rc, 0, f"{label}: {err}")
+                self.assertEqual(out, render + "\n", label)
+                footers[label] = re.search(r"brief fingerprint: ([0-9a-f]+)", err)
+            m = footers["--tier full"]
+            self.assertIsNotNone(m, "the full-tier brief printed no fingerprint footer")
+            self.assertEqual(m.group(1), mod.brief_fingerprint(full))
+            m = footers[f"--rejoinder {prior} --tier full"]
+            self.assertIsNotNone(m, "the full-tier rejoinder printed no fingerprint footer")
+            self.assertEqual(m.group(1), mod.rejoinder_fingerprint(full_rejoinder, "delivery"))
+
+    def test_the_doctrine_states_where_each_check_binds(self) -> None:
+        """MUTANT: scope the practices refusal to full-tier briefs in the doctrine sentence, so a
+        light brief reads as unchecked while the verb refuses it for the practices it carries."""
+        doc = _norm(REFERENCE_REVIEW.read_text(encoding="utf-8"))
+        start = doc.index("`critic.py brief` refuses")
+        para = doc[start:doc.index("by the author remembering it", start)]
+        sentences = re.split(r"(?<=\.) ", para)
+
+        def one(phrase: str) -> str:
+            hits = [s for s in sentences if phrase in s]
+            self.assertEqual(len(hits), 1, f"{phrase!r} in {para!r}")
+            return hits[0]
+
+        practices = one("missing a practice its tier carries")
+        self.assertIn("delivery brief at either tier", practices)
+        self.assertNotRegex(practices, r"(?i)full[- ]tier|light")
+        claim = one("claim-inventory pass omits")
+        self.assertIn("full-tier delivery brief", claim)
+        # US0924: plan review is retired, so the doctrine no longer names a plan-review brief.
+        self.assertNotIn("plan-review", para)
+
+
+class SeatCardResolutionTests(unittest.TestCase):
+    """BG0784: a project seat card with no `<!-- role: -->` line was skipped for the shipped card
+    in silence, and the unknown-seat refusal named a fixed list rather than the project's seats.
+    Both run through `critic.main`, the verb a reviewer is briefed by."""
+
+    ROLELESS = "not a role line"
+
+    def _brief(self, root: Path, seat: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = _load().main(["brief", "--unit", "US0001", "--seat", seat, "--tier", "light",
+                               "--root", str(root)])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_a_role_less_card_is_named_on_stderr(self) -> None:
+        """AC1. MUTANTS: HEAD's silent fallback (stderr carries no warning); warn on every card,
+        which the declared-role control fails; warn without naming the card."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _workspace(root)
+            card = root / "sdlc-studio" / "personas" / "seats" / "qa.md"
+            card.write_text(f"# Sam - QA seat\n\n{self.ROLELESS}\n", encoding="utf-8")
+            rc, out, err = self._brief(root, "qa")
+            self.assertEqual(0, rc, err)
+            lines = [ln for ln in err.splitlines() if "declares no role" in ln]
+            self.assertEqual(1, len(lines), err)
+            self.assertIn(str(card), lines[0])
+            self.assertIn("shipped qa card was used", lines[0])
+            # the brief is still produced, from the shipped charter and not the role-less card
+            self.assertIn("You are the qa review seat", out)
+            self.assertIn(str(Path("templates") / "personas" / "amigos" / "qa.md"), out)
+            self.assertNotIn(str(card), out)
+            # the control: a card that declares its role is used, and nothing is said
+            card.write_text(f"<!-- role: qa -->\n# Sam - QA seat\n\n{self.ROLELESS}\n",
+                            encoding="utf-8")
+            rc, out, err = self._brief(root, "qa")
+            self.assertEqual(0, rc, err)
+            self.assertNotIn("declares no role", err)
+            self.assertIn(str(card), out)
+
+    def test_the_unknown_seat_refusal_names_the_project_s_seats(self) -> None:
+        """AC2. MUTANTS: HEAD's fixed `engineering, qa, product` list; list the declared roles
+        but not the role-less card; list every card file as a seat, role-less ones included."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _workspace(root)
+            seats = root / "sdlc-studio" / "personas" / "seats"
+            (seats / "kim.md").write_text("<!-- role: security -->\n# Kim - security seat\n",
+                                          encoding="utf-8")
+            (seats / "lee.md").write_text("# Lee - a card with no role line\n", encoding="utf-8")
+            rc, out, err = self._brief(root, "wizard")
+            self.assertEqual(2, rc, err)
+            self.assertEqual("", out)
+            m = re.search(r"\(seats: ([^;)]*)", err)
+            self.assertIsNotNone(m, err)
+            named = m.group(1).split(", ")
+            for seat in ("engineering", "product", "qa", "security"):
+                self.assertIn(seat, named, err)
+            self.assertNotIn("lee", named, err)
+            self.assertIn(str(seats / "lee.md"), err)
+            self.assertIn("declares no role", err)
+
+
+if __name__ == "__main__":
+    unittest.main()

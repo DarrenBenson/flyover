@@ -1,0 +1,904 @@
+#!/usr/bin/env python3
+"""Deterministic project initialiser.
+
+`init` is the executable greenfield bootstrap - previously a manual checklist. It:
+  1. creates the full `sdlc-studio/` directory tree,
+  2. pre-creates every per-type `_index.md` (reusing the index helper),
+  3. seeds the config, a `.gitignore` for the runtime-state dir, and the agent-instructions files,
+  4. with `--scaffold`, seeds the singleton docs (prd/trd/tsd/personas).
+
+Idempotent: never overwrites an existing file (reported and skipped) unless `--force`, and
+never `sdlc-studio/.version` even then - it records the version the project was created at.
+Config is load-bearing and stack detection is a guess on greenfield, so `--dry-run`
+previews every write (the workflow shows it and confirms once) before a real run - the
+non-judgement steps (tree, indexes, agent-instructions) need no confirmation. Pure stdlib.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import sdlc_md  # noqa: E402
+import file_finding  # noqa: E402  (reuse ensure_index - the index helper)
+
+SKILL = Path(__file__).resolve().parent.parent
+SDLC = "sdlc-studio"
+#: The runtime-state ignore file `init` seeds at `sdlc-studio/.gitignore`. One definition: project
+#: upgrade seeds an existing project with the same bytes, so the two can never disagree.
+RUNTIME_STATE_GITIGNORE = ("# SDLC Studio runtime state (caches, verify reports, lessons) - "
+                           "derived, not source\n.local/\n")
+# The cross-cutting workspaces: not numbered artefact types, so they cannot be derived from
+# the type table and are named here. Every NUMBERED type's directory comes from the table.
+WORKSPACE_DIRS = ["retros", "handoffs", "decisions", "reviews", ".local"]
+
+
+def _dir_under_sdlc(rel: str) -> str:
+    """The path of a type's directory relative to the `sdlc-studio/` workspace root."""
+    head, sep, tail = rel.partition("/")
+    if head != SDLC or not sep:
+        raise ValueError(f"artefact directory {rel!r} does not sit under {SDLC}/")
+    return tail
+
+
+def index_types() -> list[str]:
+    """Every numbered artefact type, read from the shipped table at call time.
+
+    Derived, never typed out: a type added to the table must get its directory and index on a
+    new project without anyone remembering to edit this file. A hand-written list silently
+    exempts what it forgot, which is exactly how new projects came to have no issues
+    directory and no way to file an issue."""
+    return list(sdlc_md.ARTIFACT_TYPES)
+
+
+def tree_dirs() -> list[str]:
+    """The full tree: one directory per numbered type (derived) plus the workspaces."""
+    return [_dir_under_sdlc(sdlc_md.ARTIFACT_TYPES[t][0]) for t in index_types()] + WORKSPACE_DIRS
+
+
+# Snapshots for callers that introspect the module. `init()` calls the functions above, so a
+# type added to the table is covered even if these were bound before it existed.
+DIRS = tree_dirs()
+INDEX_TYPES = index_types()
+SINGLETONS = ["prd", "trd", "tsd", "personas"]
+# The instruction files every tool reads; the agents stage is done when these are authored.
+INSTRUCTION_FILES = [("agent-instructions.md", "AGENTS.md"),
+                     ("agent-instructions.CLAUDE.md", "CLAUDE.md")]
+# The lean subagent definitions a builder or reviewer is spawned as: a restricted tool line, so a
+# lane starts without the skill listing and deferred-tool catalogue it never uses. Drafted beside
+# the instructions; a project's edited copy is never overwritten without `force`.
+AGENT_DEFINITIONS = [("agents/sdlc-builder.md", ".claude/agents/sdlc-builder.md"),
+                     ("agents/sdlc-reviewer.md", ".claude/agents/sdlc-reviewer.md")]
+AGENT_FILES = INSTRUCTION_FILES + AGENT_DEFINITIONS
+# The placeholders init can derive without judgement. Everything else is left visibly
+# unfilled - see `_fill_known`, which owns the substitution and its postcondition.
+KNOWN_FIELDS = ("project_name", "language", "date", "last_updated")
+# Stack detection: marker file -> (language, framework hint).
+DETECT = [("package.json", "typescript/node"), ("pyproject.toml", "python"),
+          ("go.mod", "go"), ("Cargo.toml", "rust"), ("pom.xml", "java"),
+          ("build.gradle", "java/kotlin")]
+# DoR/DoD tailoring suggestions per detected profile key (language, test framework,
+# deploy surface). OFFERED at init, applied only on --accept-tailoring - never
+# auto-applied. Untagged (human-judged) unless a registered check id fits, so the
+# tailored result always passes the check-id registry validation.
+TAILOR_SUGGESTIONS = {
+    "python": [
+        {"kind": "done", "level": "Story",
+         "criterion": "- [ ] The Python test suite is green for the touched modules"},
+        {"kind": "ready", "level": "Story",
+         "criterion": "- [ ] A Verify line names the exact test command (pytest/unittest selector)"},
+    ],
+    "typescript/node": [
+        {"kind": "done", "level": "Story",
+         "criterion": "- [ ] The JS/TS test suite is green for the touched modules"},
+        {"kind": "done", "level": "Story",
+         "criterion": "- [ ] Type checks pass (tsc/linter) on the touched files"},
+    ],
+    "go": [{"kind": "done", "level": "Story",
+            "criterion": "- [ ] go test ./... is green and go vet reports nothing"}],
+    "rust": [{"kind": "done", "level": "Story",
+              "criterion": "- [ ] cargo test is green and clippy reports nothing new"}],
+    "java": [{"kind": "done", "level": "Story",
+              "criterion": "- [ ] The JVM test suite is green for the touched modules"}],
+    "java/kotlin": [{"kind": "done", "level": "Story",
+                     "criterion": "- [ ] The JVM test suite is green for the touched modules"}],
+    "csharp/dotnet": [{"kind": "done", "level": "Story",
+                       "criterion": "- [ ] dotnet test is green for the touched projects"}],
+    "docker": [{"kind": "done", "level": "Release",
+                "criterion": "- [ ] The container image builds cleanly and the deploy-readiness "
+                             "checks (cold-spawn, smoke, rollback) are satisfied"}],
+}
+
+
+
+# Source-file extensions the brownfield census recognises. Deliberately WIDER than the DETECT
+# manifest list: the question here is only "does this repo already contain code", not "which
+# stack is it", so a language the tailoring pass knows nothing about still counts.
+SOURCE_EXTS = frozenset({
+    ".c", ".cc", ".clj", ".cpp", ".cs", ".cxx", ".dart", ".ex", ".exs", ".erl", ".fs", ".go",
+    ".h", ".hpp", ".hs", ".hxx", ".java", ".jl", ".js", ".jsx", ".kt", ".kts", ".lua", ".m",
+    ".mjs", ".ml", ".mm", ".php", ".pl", ".py", ".r", ".rb", ".rs", ".scala", ".sh", ".sql",
+    ".svelte", ".swift", ".ts", ".tsx", ".vb", ".vue", ".zig",
+})
+# Directories the census never descends: version control, dependency and build output. A
+# vendored dependency or a build artefact is not THIS project's source, and a greenfield repo
+# with a populated node_modules must not read as brownfield on somebody else's code.
+_CENSUS_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".idea", ".vscode", ".tox", ".nox", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", ".gradle", ".terraform", "__pycache__", "node_modules", "bower_components",
+    "vendor", "venv", ".venv", "env", ".env", "dist", "build", "out", "target", "bin", "obj",
+    "coverage", ".next", ".nuxt", ".svelte-kit", "site-packages",
+    # Agent-tooling directories hold INSTALLED skill payload, not this project's source. An
+    # otherwise-empty repo carrying a locally-installed copy of this very skill classified
+    # brownfield, which sent guided onboarding down the reverse-engineer-the-PRD fork and would
+    # have generated a PRD from the skill's own scripts - the wrong-fork harm this census was
+    # written to fix, inverted. `install.sh --local` writes exactly this layout.
+    ".claude", ".agents", ".gemini", ".opencode", ".github", ".cursor", ".windsurf",
+})
+# Bound the walk. The classifier runs on the orientation path and returns on the FIRST source
+# file, so this ceiling only bites on a large repo that genuinely has none - where the answer is
+# greenfield anyway. A census is not worth an unbounded filesystem walk.
+_CENSUS_MAX_ENTRIES = 20_000
+
+
+def detect_stack(root: Path) -> str | None:
+    for marker, lang in DETECT:
+        if (root / marker).exists():
+            return lang
+    if list(root.glob("*.csproj")):
+        return "csharp/dotnet"
+    return None
+
+
+def has_source(root: Path | str) -> bool:
+    """True when the tree holds at least one source file of its own - the manifest-free evidence
+    that a repo already contains code. Returns on the first hit, prunes dependency/build/VCS
+    directories, and is bounded, so it stays cheap on the orientation path."""
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _CENSUS_SKIP_DIRS]
+        for name in filenames:
+            seen += 1
+            if os.path.splitext(name)[1].lower() in SOURCE_EXTS:
+                return True
+        if seen >= _CENSUS_MAX_ENTRIES:
+            return False
+    return False
+
+
+def tailor_suggestions(root: Path, lang: str | None) -> list[dict]:
+    """Stack/profile-derived DoR/DoD criteria to OFFER (language, plus the deploy
+    surface when a Dockerfile is present). Deterministic; the operator accepts or
+    edits - nothing here writes."""
+    out = list(TAILOR_SUGGESTIONS.get(lang or "", []))
+    if (root / "Dockerfile").exists():
+        out += TAILOR_SUGGESTIONS["docker"]
+    return out
+
+
+def _append_to_level(text: str, level: str, criterion: str) -> str:
+    """Insert a criterion at the end of the document's `## <level>` section (word-exact
+    heading match, same rule as the gates' resolver)."""
+    lines = text.splitlines()
+    head_re = re.compile(rf"^##\s+{re.escape(level)}(?:\s|$)", re.IGNORECASE)
+    start = next((i for i, ln in enumerate(lines) if head_re.match(ln)), None)
+    if start is None:  # no such level: append a new section - never drop an accepted edit
+        return text.rstrip("\n") + f"\n\n## {level}\n\n{criterion}\n"
+    end = next((j for j in range(start + 1, len(lines)) if lines[j].startswith("## ")),
+               len(lines))
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1  # insert before the section's trailing blank(s)
+    lines.insert(end, criterion)
+    return "\n".join(lines) + "\n"
+
+
+def _strip_comment(text: str) -> str:
+    return re.sub(r"^<!--.*?-->\n+", "", text, count=1, flags=re.DOTALL)
+
+
+def _placeholder_re(key: str) -> str:
+    """The `{{key}}` pattern, tolerant of inner whitespace. Compiled with IGNORECASE by
+    both users, so one spelling of the key covers every case a template may use."""
+    return r"\{\{\s*" + re.escape(key) + r"\s*\}\}"
+
+
+def unfilled_known(text: str, fields: dict) -> list[str]:
+    """The placeholders the filler CLAIMS to know - a `KNOWN_FIELDS` key the caller
+    supplied a value for - that are still in `text`. Always empty after `_fill_known`;
+    a non-empty result means a substitution silently did nothing."""
+    return [k for k in KNOWN_FIELDS
+            if k in fields and re.search(_placeholder_re(k), text, re.IGNORECASE)]
+
+
+def _fill_known(text: str, fields: dict) -> str:
+    """Fill only the placeholders init can know; leave high-judgement fields (e.g.
+    {{problem_description}}) visibly empty so a default is never mistaken for a decision.
+
+    Matching is case-INSENSITIVE: a template author reaches for
+    `{{PROJECT_NAME}}` as readily as `{{project_name}}`, and a case-sensitive filler
+    silently shipped the unfilled placeholder into every seeded AGENTS.md. The
+    postcondition is checked rather than assumed - a known placeholder that survives
+    raises, because the defect was not the mismatch but that nothing noticed it."""
+    for key in KNOWN_FIELDS:
+        if key in fields:
+            value = fields[key]
+            text = re.sub(_placeholder_re(key), lambda _m: value, text, flags=re.IGNORECASE)
+    survived = unfilled_known(text, fields)
+    if survived:
+        raise RuntimeError(
+            "init: substitution did nothing for " + ", ".join(survived)
+            + " - the placeholder is still in the text. Fix the filler or the value; "
+              "a seeded file must never ship a placeholder the tool claims to fill.")
+    return text
+
+
+def seed_text(template: Path, fields: dict) -> str:
+    """The body a template-seeded file gets: guidance comment stripped, derivable
+    placeholders filled, judgement fields left visibly unfilled. The one seeding path -
+    the upgrade route into a brownfield project calls it too, so a file seeded there
+    cannot drift from one seeded here."""
+    return _fill_known(_strip_comment(template.read_text(encoding="utf-8")), fields)
+
+
+def seed_fields(root: Path | str, today: str) -> dict:
+    """The placeholder values derivable from a project root alone (no stack detection)."""
+    return {"project_name": Path(root).resolve().name, "date": today, "last_updated": today}
+
+
+# ---- Guided onboarding: resumable state + stage runner ----
+# The spine every onboarding walks. D4: always all of them - the profile tunes each stage's
+# DEPTH, never whether it runs. This skeleton owns the resumable state, the greenfield/brownfield
+# classification, and the confirm/skip/reset machinery; the per-stage ACTIONS are later stories
+# that plug into this runner.
+ONBOARDING_STAGES = ["agents", "prd", "trd", "tsd", "personas", "decompose", "plan"]
+_ONBOARDING_REL = f"{SDLC}/.local/onboarding.json"
+_STAGE_STATUSES = ("pending", "done", "skipped")
+
+
+def onboarding_path(root: Path | str) -> Path:
+    return Path(root) / _ONBOARDING_REL
+
+
+def classify_path(root: Path | str) -> str:
+    """`greenfield` (empty/near-empty repo) or `brownfield` (existing source).
+
+    Two signals, in order: a recognised stack marker (the DETECT set `init` already uses), then a
+    census of the source files themselves. The second is what makes the classification match what
+    it claims to answer - "does this repo already contain source" - rather than "does it carry one
+    of six manifests this skill happens to recognise". Manifest-only, a C/C++, Ruby or PHP tree, or
+    a Python project with only a setup.py, read as an empty repo and got sent down the greenfield
+    INTERVIEW instead of having its PRD generated from its code: the exact wrong fork the guided
+    flow exists to avoid. 'Meets your code where it is' keys off real evidence, not a guess."""
+    root = Path(root)
+    return "brownfield" if (detect_stack(root) or has_source(root)) else "greenfield"
+
+
+def read_onboarding(root: Path | str) -> dict | None:
+    """The checkpoint, or None when there is none. A corrupt or shape-invalid file is treated as
+    absent rather than raised: this is read on the hot orientation path (`status`/`hint`), and a
+    hand-mangled `.local` runtime file must never crash that read. `cmd_guided` then self-heals by
+    starting fresh (or the operator runs `--reset`)."""
+    p = onboarding_path(root)
+    if not p.is_file():
+        return None
+    try:
+        state = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(state, dict) or not isinstance(state.get("stages"), list):
+        return None
+    return state
+
+
+def write_onboarding(root: Path | str, state: dict) -> dict:
+    p = onboarding_path(root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    sdlc_md.atomic_write(p, json.dumps(state, indent=2))
+    return state
+
+
+def _fresh_stages() -> list[dict]:
+    return [{"name": s, "status": "pending"} for s in ONBOARDING_STAGES]
+
+
+def start_onboarding(root: Path | str, path: str | None = None) -> dict:
+    """Create the onboarding state (classified path + every stage pending), or RETURN the
+    existing one unchanged - so re-running resumes rather than restarting. That idempotence is
+    the whole point of a checkpoint: a session can end mid-flow and pick up where it left off."""
+    existing = read_onboarding(root)
+    if existing:
+        return existing
+    return write_onboarding(root, {"path": path or classify_path(root), "stages": _fresh_stages()})
+
+
+def stage_status(state: dict, name: str) -> str | None:
+    return next((s["status"] for s in state.get("stages", []) if s["name"] == name), None)
+
+
+#: The SINGLETON stages and where each one's output lives: (template under `templates/`, path
+#: under `sdlc-studio/`). ONE table that `_seed_singleton`, the stage-done test, `_is_seed` and
+#: `--scaffold` all read, so they cannot disagree about what a stage produces. Personas seed the
+#: registry `sdlc_md.persona_registry` reads (`personas/index.md`), never the legacy flat
+#: `personas.md` that nothing in v6 reads as the registry.
+_SINGLETON_FILES = {"prd": ("core/prd.md", "prd.md"), "trd": ("core/trd.md", "trd.md"),
+                    "tsd": ("core/tsd.md", "tsd.md"),
+                    "personas": ("personas/persona-index-template.md", "personas/index.md")}
+_SINGLETON_STAGES = tuple(_SINGLETON_FILES)
+
+
+def _singleton(name: str) -> tuple[Path, str]:
+    """(template path, `sdlc-studio/`-relative output path) for a singleton stage."""
+    tmpl, rel = _SINGLETON_FILES[name]
+    return SKILL / "templates" / tmpl, f"{SDLC}/{rel}"
+_PLACEHOLDER = re.compile(r"\{\{[^{}]*\}\}")
+# Where an authored document QUOTES a placeholder rather than leaving one unfilled: a fenced block,
+# or a code span holding nothing but the placeholder (`{{version}}`).
+_QUOTED = re.compile(r"^(```|~~~).*?^\1|`\{\{[^{}`]*\}\}`", re.MULTILINE | re.DOTALL)
+
+
+def _read(path: Path) -> str | None:
+    """A stage output's text for the draft and doctrine tests, or None when it cannot be read.
+    Decoded leniently: the tokens and markers they look for are ASCII. A project file in another
+    encoding, or one the process may not read, must never crash the orientation path that reads
+    it (`status`, `hint`, `init guided`); an unreadable output is simply not authored."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _unreadable(path: Path) -> str | None:
+    """Why `path` cannot be read as a UTF-8 text file, or None when it can (or is absent)."""
+    try:
+        path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError:
+        return "not valid UTF-8"
+    except OSError as exc:
+        return exc.strerror or type(exc).__name__
+    return None
+
+
+def _seeded(root: Path, template: Path) -> str:
+    """The body seeding writes from `template` for this project, as `_seed_singleton` and
+    `stage_agents` write it."""
+    return seed_text(template, seed_fields(root, date.today().isoformat()))
+
+
+def _draft_tokens(root: Path, template: Path) -> set[str]:
+    """The placeholders a freshly seeded file still carries: those `seed_text` leaves unfilled.
+    Derived from the seeded body, not the raw template, so a field seeding always fills
+    (`{{date}}`, the project name) or a token only in the guidance comment never marks a draft."""
+    return set(_PLACEHOLDER.findall(_seeded(root, template)))
+
+
+def _authored(root: Path, path: Path, template: Path) -> bool:
+    """Whether `path` exists and is no longer the draft `template` seeds: outside quoted code it
+    carries none of the placeholders a seeded copy still holds. A written document that quotes
+    `{{version}}` in a code span or a fenced example is authored, not unfilled."""
+    if not path.is_file():
+        return False
+    if not template.is_file():
+        return True
+    text = _read(path)
+    if text is None:
+        return False
+    text = _QUOTED.sub("", text)
+    return not any(tok in text for tok in _draft_tokens(root, template))
+
+
+def carries_doctrine(root: Path | str) -> bool:
+    """Whether AGENTS.md points at the lifecycle doctrine, asked of the same check `validate
+    instructions` makes (`no-doctrine-pointer`), so onboarding and the hygiene check cannot
+    disagree about what an instructions file must carry. A file that check cannot read leaves
+    the answer False - the stage stays open and says why - rather than crashing onboarding."""
+    import validate  # noqa: PLC0415 - deferred: only the agents stage needs it
+    root = Path(root)
+    if not (root / "AGENTS.md").is_file():
+        return False
+    try:
+        findings = validate.check_instructions(root)
+    except (OSError, UnicodeDecodeError):
+        return False
+    return not any(f["rule"] == "no-doctrine-pointer" for f in findings)
+
+
+def stage_output_exists(root: Path | str, stage: str) -> bool:
+    """Whether this stage's OUTPUT is already on disk, AUTHORED rather than merely seeded.
+
+    A marker records what somebody last clicked, not what the project contains, and until this
+    existed nothing compared the two: a marker written once and abandoned outranked the whole
+    hint ladder for ever, because `first_incomplete` read only its own `status` field. So a
+    project holding a PRD, a TRD, a TSD, personas and 218 epics was told to go and onboard
+    itself, and no state of the tree could dislodge it. A claim nothing can contradict is not a
+    claim - and this is the orientation command, read before a reader knows enough to doubt it.
+
+    Existence alone was the opposite error: every file stage seeds its own output, so the run
+    that drafted the PRD named the TRD as next and the following run ticked the PRD from its
+    unfilled template. A file still carrying its template's placeholders is a draft awaiting
+    review, not the stage's output.
+    """
+    root = Path(root)
+    if stage == "agents":
+        # BOTH files the stage writes. Testing AGENTS.md alone declared the stage done for the
+        # ordinary brownfield repo that has one and no CLAUDE.md, so the stage was skipped and
+        # CLAUDE.md never drafted - the fail-OPEN direction this fix opened and has to close.
+        # And an AGENTS.md of framework boilerplate is not this stage's output: without the
+        # doctrine the project's agents never learn the process. The subagent definitions are
+        # drafted by the stage but do not hold it open: they carry no placeholders to fill.
+        return (all(_authored(root, root / dst, SKILL / "templates" / src)
+                    for src, dst in INSTRUCTION_FILES)
+                and carries_doctrine(root))
+    if stage in _SINGLETON_STAGES:
+        tmpl, rel = _singleton(stage)
+        return _authored(root, root / rel, tmpl)
+    if stage == "decompose":
+        # `epic`, THEN `story` - the stage directs both, so epics alone is half done.
+        return (any((root / SDLC / "epics").glob("EP*.md"))
+                and any((root / SDLC / "stories").glob("US*.md")))
+    if stage == "plan":
+        # `sprint plan` writes the RUN STATE, not a retro - a retro is minted by the close chain,
+        # so testing for one told a project that had planned but never closed to go and onboard
+        # itself, which is this bug arriving from the other side. `.local/` is gitignored and
+        # therefore not durable evidence, so this stage is deliberately NOT satisfiable from the
+        # tree: it stays pending until the operator confirms it, which is what `init guided` is.
+        return False
+    return False          # an unknown stage is never assumed done - the fail-closed direction
+
+
+def superseded_stages(root: Path | str, state: dict) -> list[str]:
+    """PENDING stages whose output already exists, oldest first.
+
+    Reported rather than silently skipped: a stale marker that is quietly stepped over is one
+    nobody ever cleans up, and the operator is entitled to know the tool disagreed with the file.
+    """
+    return [s["name"] for s in state.get("stages", [])
+            if s["status"] == "pending" and stage_output_exists(root, s["name"])]
+
+
+def first_incomplete(state: dict, root: Path | str | None = None) -> str | None:
+    """The first stage still PENDING and NOT already satisfied by the tree.
+
+    Done and skipped are both handled (a skip is a deliberate, recorded decision, not unfinished
+    work), so neither is incomplete. A stage whose output exists is not incomplete either, which
+    is what makes the marker falsifiable by the project it describes. `root` is optional so
+    every existing caller keeps working; without it the answer is the marker's alone.
+    """
+    for s in state.get("stages", []):
+        if s["status"] != "pending":
+            continue
+        if root is not None and stage_output_exists(root, s["name"]):
+            continue
+        return s["name"]
+    return None
+
+
+def set_stage(root: Path | str, name: str, status: str) -> dict:
+    """Mark a stage `done` or `skipped` and persist. A skip is RECORDED, never silently dropped,
+    so the checklist always shows what was deliberately passed over. Refuses an unknown stage or
+    a status outside the vocabulary rather than writing a lie the next reader inherits."""
+    if name not in ONBOARDING_STAGES:
+        raise ValueError(f"unknown onboarding stage {name!r} (known: {', '.join(ONBOARDING_STAGES)})")
+    if status not in _STAGE_STATUSES:
+        raise ValueError(f"invalid stage status {status!r} (one of {', '.join(_STAGE_STATUSES)})")
+    state = read_onboarding(root) or start_onboarding(root)
+    for s in state["stages"]:
+        if s["name"] == name:
+            s["status"] = status
+    return write_onboarding(root, state)
+
+
+def reset_onboarding(root: Path | str) -> dict:
+    """Restart the flow: every stage back to pending, the path re-classified from the repo as it
+    is now."""
+    return write_onboarding(root, {"path": classify_path(root), "stages": _fresh_stages()})
+
+
+def stage_agents(root: Path | str, force: bool = False) -> dict:
+    """The agents stage: draft the tool-neutral agent instructions (`AGENTS.md` + the `CLAUDE.md`
+    import) and the `sdlc-builder` / `sdlc-reviewer` subagent definitions (`.claude/agents/`) from
+    the shipped starters, so every agent that touches the repo inherits the discipline.
+    Idempotent per file - an existing file is left for the operator to edit, never overwritten
+    unless `force`, and a missing one is drafted beside it. Returns what was drafted vs left in
+    place."""
+    root = Path(root)
+    starters = [(SKILL / "templates" / src, dst) for src, dst in AGENT_FILES]
+    # A starter missing from the installed skill was skipped with a bare `continue`: the file
+    # appeared in neither `created` nor `skipped`, so the first stage of onboarding drafted
+    # nothing, said nothing, and the operator confirmed it. Refuse instead, and refuse BEFORE
+    # writing anything, so there is never a half-drafted stage to confirm. Same reasoning as
+    # `_fill_known`: the defect was not the missing file, it was that nothing noticed.
+    missing = [src for (st, _), (src, _) in zip(starters, AGENT_FILES) if not st.exists()]
+    if missing:
+        raise RuntimeError(
+            "init: the agent starter(s) " + ", ".join(missing)
+            + " are missing from the installed skill (templates/) - the agents stage cannot "
+              "draft what it promises. Reinstall the skill rather than onboarding a repo whose "
+              "agents would inherit no instructions.")
+    fields = seed_fields(root, date.today().isoformat())
+    created, skipped = [], []
+    for st, dst in starters:
+        p = root / dst
+        if p.exists() and not force:
+            skipped.append(dst)
+            continue
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(seed_text(st, fields), encoding="utf-8")
+        created.append(dst)
+    # A pre-existing AGENTS.md is the project's own and is never rewritten, so the stage OFFERS
+    # the doctrine it lacks rather than ticking a file the project's agents learn nothing from.
+    todo = []
+    unreadable = {dst: why for _src, dst in INSTRUCTION_FILES
+                  if (why := _unreadable(root / dst))}
+    for dst, why in unreadable.items():
+        fix = "re-save it as UTF-8" if why == "not valid UTF-8" else "make it a readable file"
+        todo.append(f"{dst} cannot be read ({why}) - {fix} so the doctrine check can read it")
+    if not unreadable and not carries_doctrine(root):
+        todo.append(f"AGENTS.md carries no lifecycle doctrine - append the `## Operating "
+                    f"doctrine` block from {starters[0][0]}, keeping your project sections")
+    if "AGENTS.md" not in unreadable and not _authored(root, root / "AGENTS.md", starters[0][0]):
+        todo.append("fill in the {{placeholders}} in AGENTS.md - the project specifics an agent "
+                    "cannot infer")
+    return {"created": created, "skipped": skipped,
+            **({"directive": "; ".join(todo)} if todo else {})}
+
+
+def _seed_singleton(root: Path | str, name: str) -> tuple[list[str], list[str]]:
+    """Seed the singleton's output (`_SINGLETON_FILES`) from its shipped template if absent
+    (returned as `created`); an existing one is left for the operator to edit (`skipped`). The
+    shared draft mechanic for the PRD/TRD/TSD/personas stages."""
+    root = Path(root)
+    tmpl, rel = _singleton(name)
+    dst = root / rel
+    if not tmpl.exists():
+        return [], []
+    if dst.exists():
+        return [], [rel]
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(seed_text(tmpl, seed_fields(root, date.today().isoformat())), encoding="utf-8")
+    return [rel], []
+
+
+def stage_prd(root: Path | str) -> dict:
+    """The PRD stage - the fork. Seed the `prd.md` scaffold for the agent to author, and DIRECT the
+    path-appropriate method: a greenfield project is interviewed (`prd create`), a brownfield one is
+    drafted from its code (`prd generate`, validated downstream by `code verify`). The classification
+    lives on the onboarding state, so the operator never chooses a command - the flow forks for them."""
+    state = read_onboarding(root) or start_onboarding(root)
+    path = state["path"]
+    created, skipped = _seed_singleton(root, "prd")
+    directive = ("greenfield - interview to fill it: `prd create`" if path == "greenfield"
+                 else "brownfield - draft it from your code: `prd generate` "
+                      "(validated downstream by `code verify`)")
+    return {"created": created, "skipped": skipped, "path": path, "directive": directive}
+
+
+def stage_trd(root: Path | str) -> dict:
+    """The TRD stage: seed the technical-design doc, generated from the PRD."""
+    created, skipped = _seed_singleton(root, "trd")
+    return {"created": created, "skipped": skipped,
+            "directive": "generate the technical design from your PRD: `trd generate`"}
+
+
+def stage_tsd(root: Path | str) -> dict:
+    """The TSD stage: seed the test-strategy doc, generated from the PRD (and, brownfield, the
+    detected stack). The test strategy the sprint plan later reads is created here, so a plan never
+    reads a document that does not exist."""
+    created, skipped = _seed_singleton(root, "tsd")
+    state = read_onboarding(root) or start_onboarding(root)
+    stack = " and detected stack" if state.get("path") == "brownfield" else ""
+    return {"created": created, "skipped": skipped,
+            "directive": f"generate the test strategy from your PRD{stack}: `tsd generate`"}
+
+
+def stage_personas(root: Path | str) -> dict:
+    """The personas stage: seed the persona registry (`personas/index.md`) and direct growing a project-specific team from
+    the PRD and risk signals (`persona generate --team`). The team that will both build and review
+    the work exists before the first sprint; the operator accepts or edits the generated seats."""
+    created, skipped = _seed_singleton(root, "personas")
+    return {"created": created, "skipped": skipped,
+            "directive": "grow your team from the PRD and risk signals (accept or edit the "
+                         "generated seats): `persona generate --team`"}
+
+
+def stage_decompose(root: Path | str) -> dict:
+    """The decompose stage: direct breaking the PRD into epics and stories. Agent-driven (no
+    artefact to seed) - the runner points at the step."""
+    return {"created": [], "skipped": [],
+            "directive": "break the PRD into epics and sized stories: `epic`, then `story`"}
+
+
+def stage_plan(root: Path | str) -> dict:
+    """The plan stage: direct the first sprint plan. The last stage - confirming it completes
+    onboarding, landing the operator exactly where delivery begins."""
+    return {"created": [], "skipped": [],
+            "directive": "plan your first sprint over the groomed backlog: `sprint plan`"}
+
+
+def _is_seed(root: Path, rel: str) -> bool:
+    """Whether the file at `rel` is still what seeding wrote (unfilled, or the seeded body as
+    written), so the runner says the tool drafted it rather than implying the user did."""
+    src = {dst: SKILL / "templates" / tmpl for tmpl, dst in AGENT_FILES}
+    src.update({_singleton(s)[1]: _singleton(s)[0] for s in _SINGLETON_STAGES})
+    tmpl, path = src.get(rel), root / rel
+    if tmpl is None or not tmpl.is_file() or not path.is_file():
+        return False
+    text = _read(path)
+    if text is None:
+        return False
+    return not _authored(root, path, tmpl) or text.strip() == _seeded(root, tmpl).strip()
+
+
+# Per-stage draft actions, keyed by stage name. Each drafts its artefact (or, for the agent-driven
+# steps, points the operator at the command); the operator confirms to advance.
+STAGE_ACTIONS = {"agents": stage_agents, "prd": stage_prd, "trd": stage_trd, "tsd": stage_tsd,
+                 "personas": stage_personas, "decompose": stage_decompose, "plan": stage_plan}
+
+
+def cmd_guided(args: argparse.Namespace) -> int:
+    """The guided-onboarding stage runner: create or resume the checkpoint, classify the repo,
+    draft the current stage's artefact for review, and advance only on `--confirm` (or record a
+    `--skip`). `--reset` restarts. The per-stage draft actions live in STAGE_ACTIONS."""
+    root = Path(getattr(args, "root", "."))
+    if getattr(args, "reset", False):
+        reset_onboarding(root)
+    state = start_onboarding(root)
+    answering = getattr(args, "confirm", False) or getattr(args, "skip", False)
+    if not answering:
+        # RECONCILE THE MARKER TO THE TREE, but only when about to DRAFT. A stage whose output
+        # already exists is done, and leaving it `pending` makes the marker drift from the
+        # project permanently - which is the whole of BG0615, one layer down.
+        for name in superseded_stages(root, state):
+            set_stage(root, name, "done")
+        state = read_onboarding(root) or state
+    # The TREE decides what to show; the MARKER decides what a confirmation answers. An operator
+    # confirming is answering about the stage they were last shown, and reconciling underneath
+    # them would mark a stage they never saw.
+    cur = first_incomplete(state) if answering else first_incomplete(state, root)
+    drafted = None
+    if getattr(args, "confirm", False) and cur:
+        set_stage(root, cur, "done")
+    elif getattr(args, "skip", False) and cur:
+        set_stage(root, cur, "skipped")
+    elif cur and cur in STAGE_ACTIONS:
+        drafted = STAGE_ACTIONS[cur](root)     # draft the current stage for review (draft-then-confirm)
+    state = read_onboarding(root)
+    cur = first_incomplete(state, root)
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps({"path": state["path"], "stages": state["stages"],
+                          "current": cur, "drafted": drafted}, indent=2))
+        return 0
+    print(f"guided onboarding ({state['path']}) - resume point: "
+          f"{cur or 'complete - ready for your first sprint plan'}")
+    marks = {"done": "x", "skipped": "-", "pending": " "}
+    for s in state["stages"]:
+        nxt = "  <- next" if s["name"] == cur else ""
+        print(f"  [{marks[s['status']]}] {s['name']}{nxt}")
+    if drafted:
+        for f in drafted.get("created", []):
+            print(f"  drafted {f} - review it, then `init guided --confirm` (or --skip)")
+        for f in drafted.get("skipped", []):
+            why = _unreadable(root / f)
+            if why:
+                print(f"  {f} cannot be read ({why}) - the stage stays open until it can")
+                continue
+            how = "seeded from its template" if _is_seed(root, f) else "already present"
+            print(f"  {f} {how} - review it, then `init guided --confirm`")
+        if drafted.get("directive"):
+            print(f"  next: {drafted['directive']}")
+    return 0
+
+
+def init(repo_root: Path | str, detect: bool = False, scaffold: bool = False,
+         force: bool = False, dry_run: bool = False,
+         accept_tailoring: bool = False) -> dict:
+    root = Path(repo_root)
+    today = date.today().isoformat()
+    lang = detect_stack(root) if detect else None
+    fields = seed_fields(root, today)
+    if lang:
+        fields["language"] = lang
+    created: list[str] = []
+    skipped: list[str] = []
+
+    def _write(rel: str, content: str) -> None:
+        p = root / rel
+        if p.exists() and not force:
+            skipped.append(rel)
+            return
+        created.append(rel)
+        if not dry_run:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+
+    # 1. directory tree
+    for d in tree_dirs():
+        rel = f"{SDLC}/{d}"
+        if (root / rel).is_dir():
+            skipped.append(rel + "/")
+        else:
+            created.append(rel + "/")
+            if not dry_run:
+                (root / rel).mkdir(parents=True, exist_ok=True)
+
+    # 2. per-type indexes (reuse the index helper; idempotent)
+    for t in index_types():
+        idx_rel = f"{sdlc_md.ARTIFACT_TYPES[t][0]}/_index.md"
+        if (root / idx_rel).exists():
+            skipped.append(idx_rel)
+        elif dry_run:
+            created.append(idx_rel)
+        elif file_finding.ensure_index(root, t, today):
+            created.append(idx_rel)
+
+    # 3. config (seeded from the template; detected stack noted as an active header)
+    cfg_tmpl = SKILL / "templates" / "config.yaml"
+    if cfg_tmpl.exists():
+        header = f"# Project: {fields['project_name']}\n"
+        if lang:
+            header += f"# Detected stack: {lang}\n"
+        _write(f"{SDLC}/.config.yaml", header + "\n" + cfg_tmpl.read_text(encoding="utf-8"))
+
+    # 3a. the project version, in the shape `project upgrade --apply` writes, so a fresh project's
+    # first migrate owes no stamp and its first upgrade digest knows the range it crossed. An
+    # unreadable install version is left unstamped, never fabricated (the upgrade's own rule).
+    import project_upgrade  # noqa: PLC0415 - it imports this module; deferred to break the cycle
+    import version_check  # noqa: PLC0415
+    installed = version_check.installed_version(version_check.skill_root())
+    if (root / SDLC / ".version").exists():
+        # The record of the version the project was created at - or last upgraded to by
+        # `project upgrade`, which owns it. `--force` re-seeds scaffolding; it never rewrites
+        # this, or the version check would compare against a version the project never ran.
+        skipped.append(f"{SDLC}/.version")
+    elif installed:
+        _write(f"{SDLC}/.version", project_upgrade._VERSION.format(
+            schema=project_upgrade._effective_schema(root), prev="null", today=today,
+            skill=installed))
+
+    # 3b. gitignore the runtime-state dir so derived caches/reports/lessons are never committed
+    #. Self-contained in sdlc-studio/ - never touches the project's own root .gitignore.
+    _write(f"{SDLC}/.gitignore", RUNTIME_STATE_GITIGNORE)
+
+    # 4. agent-instructions and the subagent definitions (shipped starters; seeded if absent)
+    for src, dst in AGENT_FILES:
+        st = SKILL / "templates" / src
+        if st.exists():
+            _write(dst, seed_text(st, fields))
+
+    # 5. decisions log (project infrastructure, always seeded empty)
+    dec_tmpl = SKILL / "templates" / "decisions.md"
+    if dec_tmpl.exists():
+        _write(f"{SDLC}/decisions.md", _strip_comment(dec_tmpl.read_text(encoding="utf-8")))
+
+    # 5b. the DoR/DoD documents (project infrastructure, like the decisions log): the
+    # shipped defaults ARE the enforced bar, so a new project starts with them named.
+    # The tailoring pass OFFERS stack-derived criteria; only --accept-tailoring writes
+    # them (offer, never auto-apply - the persona team-gen pattern).
+    for kind in ("ready", "done"):
+        tmpl = SKILL / "templates" / "core" / f"definition-of-{kind}.md"
+        if tmpl.exists():
+            _write(f"{SDLC}/definition-of-{kind}.md",
+                   _strip_comment(tmpl.read_text(encoding="utf-8")))
+    suggestions = tailor_suggestions(root, lang) if detect else []
+    written: list[dict] = []
+    if suggestions and accept_tailoring and not dry_run:
+        for s in suggestions:
+            doc = root / SDLC / f"definition-of-{s['kind']}.md"
+            if not doc.is_file():
+                continue
+            text = doc.read_text(encoding="utf-8")
+            if s["criterion"] in text:  # idempotent: a re-accept never duplicates
+                continue
+            doc.write_text(_append_to_level(text, s["level"], s["criterion"]),
+                           encoding="utf-8")
+            written.append(s)
+    applied = bool(written)  # True only when something was actually written
+
+    # 6. singleton docs (opt-in)
+    if scaffold:
+        for name in SINGLETONS:
+            st, rel = _singleton(name)
+            if st.exists():
+                _write(rel, seed_text(st, fields))
+
+    return {"created": created, "skipped": skipped, "language": lang,
+            "scaffold": scaffold, "dry_run": dry_run,
+            "tailoring": {"suggestions": suggestions, "applied": applied,
+                          "written": written,
+                          "accepted": bool(accept_tailoring and not dry_run)}}
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    r = init(args.root, detect=args.detect, scaffold=args.scaffold,
+             force=args.force, dry_run=args.dry_run,
+             accept_tailoring=getattr(args, "accept_tailoring", False))
+    if args.format == "json":
+        print(json.dumps(r, indent=2))
+        return 0
+    verb = "would create" if r["dry_run"] else "created"
+    print(f"init: {verb} {len(r['created'])}, skipped {len(r['skipped'])} existing"
+          + (f" (stack: {r['language']})" if r["language"] else ""))
+    for c in r["created"]:
+        print(f"  + {c}")
+    if r["skipped"]:
+        print(f"  ({len(r['skipped'])} existing left untouched)")
+    tailoring = r.get("tailoring") or {}
+    if tailoring.get("suggestions"):
+        if tailoring["applied"]:
+            print("tailoring accepted - appended to the DoR/DoD documents "
+                  "(the static documents remain the source of truth; edit them freely):")
+            for s in tailoring["written"]:  # only what was actually written, never a skip
+                print(f"  + definition-of-{s['kind']}.md / {s['level']}: {s['criterion']}")
+            skipped_n = len(tailoring["suggestions"]) - len(tailoring["written"])
+            if skipped_n:
+                print(f"  ({skipped_n} suggestion(s) already present - skipped)")
+        elif tailoring.get("accepted"):
+            print("tailoring: every suggested criterion is already present - "
+                  "nothing to apply")
+        else:
+            print("tailoring offer (derived from the detected stack - nothing is applied "
+                  "without acceptance):")
+            for s in tailoring["suggestions"]:
+                print(f"  ? definition-of-{s['kind']}.md / {s['level']}: {s['criterion']}")
+            print("  accept: re-run with --accept-tailoring; or edit the documents by hand")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Deterministic project initialiser.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run", help="Create the tree, indexes, config, and agent-instructions.")
+    r.add_argument("--root", default=".")
+    r.add_argument("--detect", action="store_true", help="infer the stack from project files")
+    r.add_argument("--scaffold", action="store_true", help="also seed prd/trd/tsd/personas")
+    r.add_argument("--force", action="store_true",
+                   help="overwrite existing files (never sdlc-studio/.version, the version record)")
+    r.add_argument("--dry-run", action="store_true", dest="dry_run", help="preview; write nothing")
+    r.add_argument("--accept-tailoring", action="store_true", dest="accept_tailoring",
+                   help="apply the stack-derived DoR/DoD tailoring suggestions (with "
+                        "--detect); without this flag they are only offered")
+    r.add_argument("--format", choices=("text", "json"), default="text")
+    r.set_defaults(func=cmd_run)
+
+    g = sub.add_parser("guided",
+                       help="Guided onboarding: a resumable, stage-by-stage walk (AGENTS.md -> "
+                            "PRD -> TRD -> TSD -> personas -> a first sprint plan), greenfield or "
+                            "brownfield. Re-run to resume; --reset to restart.")
+    g.add_argument("--root", default=".")
+    g.add_argument("--confirm", action="store_true",
+                   help="mark the current stage done and advance (after you have reviewed it)")
+    g.add_argument("--skip", action="store_true",
+                   help="record the current stage skipped and advance")
+    g.add_argument("--reset", action="store_true",
+                   help="restart onboarding - every stage back to pending")
+    g.add_argument("--format", choices=("text", "json"), default="text")
+    g.set_defaults(func=cmd_guided)
+
+    sdlc_md.add_global_root(p)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    # Resolve the root ONCE and write it back, so every verb below anchors on the tree the
+    # run belongs to. The family default `.` means "work it out from here", not "the cwd
+    # is the project": otherwise a run from a subdirectory acts on a stray tree and exits 0.
+    args.root = str(sdlc_md.resolve_root(args))
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        args = build_parser().parse_args()
+        sys.exit(args.func(args))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)

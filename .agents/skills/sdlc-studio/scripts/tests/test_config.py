@@ -1,0 +1,380 @@
+"""Tests for config.py - config-defaults.yaml as single source (CR0008). RED first."""
+from __future__ import annotations
+
+import importlib.util
+import re
+import sys
+import contextlib
+import io
+import tempfile
+import unittest
+from pathlib import Path
+
+import pytest
+
+SCRIPT = Path(__file__).resolve().parent.parent / "config.py"
+DEFAULTS = Path(__file__).resolve().parent.parent.parent / "templates" / "config-defaults.yaml"
+REF_DOC = Path(__file__).resolve().parent.parent.parent / "reference-config.md"
+
+try:
+    import yaml  # noqa: F401
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location("config", SCRIPT)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["config"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _flatten(d, prefix=""):
+    out = {}
+    for k, v in d.items():
+        key = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            out.update(_flatten(v, key))
+        else:
+            out[key] = v
+    return out
+
+
+@unittest.skipUnless(HAVE_YAML, "PyYAML not installed")
+class LoadTests(unittest.TestCase):
+    def test_default_resolves_from_yaml(self) -> None:
+        mod = _load()
+        self.assertEqual(mod.get(".", "coverage.unit"), 90)
+        self.assertEqual(mod.get(".", "story_quality.sizing.max_ac"), 10)
+        self.assertIsNone(mod.get(".", "no.such.key"))
+
+    def test_project_override(self) -> None:
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sdlc-studio").mkdir()
+            (root / "sdlc-studio" / ".config.yaml").write_text(
+                "coverage:\n  unit: 99\n", encoding="utf-8")
+            self.assertEqual(mod.get(root, "coverage.unit"), 99)      # overridden
+            self.assertEqual(mod.get(root, "coverage.integration"), 85)  # default kept
+
+
+@unittest.skipUnless(HAVE_YAML, "PyYAML not installed")
+class IntegrationTests(unittest.TestCase):
+    @staticmethod
+    def _status():
+        spec = importlib.util.spec_from_file_location(
+            "status", SCRIPT.parent / "status.py")
+        status = importlib.util.module_from_spec(spec)
+        sys.modules["status"] = status
+        spec.loader.exec_module(status)
+        return status
+
+    @staticmethod
+    def _workspace(d: str) -> Path:
+        """A fixture workspace (four inert directories) with no config of its own, so the defaults are what
+        `status` reads. BG0647: this test used to gather THIS repository - 72 to 113 seconds
+        over the live corpus, and whatever this clone's ledgers printed landed in the green-run
+        noise count, so a full local run read above its baseline while nothing in the diff
+        leaked. The claim is that status consumes config-defaults.yaml; a fixture proves it."""
+        root = Path(d)
+        for sub in ("stories", "bugs", "epics", "reviews"):
+            (root / "sdlc-studio" / sub).mkdir(parents=True)
+        return root
+
+    def test_status_reads_config(self) -> None:
+        # US0015 AC4: a core script (status.py) actually consumes config-defaults.yaml - over a
+        # FIXTURE since BG0647, never this repository.
+        status = self._status()
+        with tempfile.TemporaryDirectory() as d:
+            root = self._workspace(d)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                data = status.gather(root)
+        self.assertIsNotNone(data["config"])
+        self.assertEqual(data["config"]["schema_version"], 2)
+
+    # A wall-clock bound measures the load beside other work, so a commit's pytest run leaves it
+    # out and the push runs it, serially (BG0963); the hook's unittest fallback runs it (BG1144).
+    @pytest.mark.serial_only
+    @pytest.mark.boundary_only
+    def test_status_gathers_a_fixture_never_this_repository(self) -> None:
+        # BG0647 AC1: the gather reaches the fixture and nothing else - pinned three ways.
+        import time  # noqa: PLC0415
+        status = self._status()
+        with tempfile.TemporaryDirectory() as d:
+            root = self._workspace(d)
+            out, err = io.StringIO(), io.StringIO()
+            t0 = time.monotonic()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                data = status.gather(root)
+            elapsed = time.monotonic() - t0
+        self.assertEqual(data["config"]["schema_version"], 2)
+        # Timing-independent pin that the gather never reached THIS repository: the fixture
+        # holds no run, this clone may (RUN-01M1NS3C was open when the bug was found).
+        self.assertIsNone(data["run"], f"the gather reached a tree with a run open: {data['run']!r}")
+        self.assertLess(elapsed, 2.0, f"gathering the fixture took {elapsed:.1f}s")
+        # ... and the config IS consumed, not defaulted by accident: an override reads back.
+        with tempfile.TemporaryDirectory() as d:
+            root = self._workspace(d)
+            (root / "sdlc-studio" / ".config.yaml").write_text("schema_version: 3\n", encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(status.gather(root)["config"]["schema_version"], 3)
+
+    def test_the_status_gather_prints_nothing_for_a_fixture(self) -> None:
+        # AC2: nothing the gather prints for a fixture reaches the console, so the noise count
+        # of this module no longer depends on the state of whatever repository the suite runs in.
+        status = self._status()
+        with tempfile.TemporaryDirectory() as d:
+            root = self._workspace(d)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                status.gather(root)
+        self.assertEqual("", out.getvalue() + err.getvalue())
+
+    def test_a_noisy_fixture_is_captured_and_never_reaches_the_console(self) -> None:
+        # AC3: "captured" pinned separately from "silent". A workspace whose .config.yaml cannot
+        # be honoured makes the gather WARN; the warning must land in the captured text and
+        # nowhere else, or the module's noise count would once again read the tree's state.
+        # The gather warns at TWO sites - config.py's loader (once per module instance, behind
+        # a flag an earlier test may already have tripped) and sdlc_md's "not applied" line -
+        # so the loader module is re-imported fresh and BOTH warnings are asserted in the
+        # captured text: one assertion per site, or routing either past the redirect would
+        # leak a line to the console with the test green (delivery review, engineering seat).
+        sys.modules.pop("config", None)
+        status = self._status()
+        with tempfile.TemporaryDirectory() as d:
+            root = self._workspace(d)
+            (root / "sdlc-studio" / ".config.yaml").write_text("schema_version: [unclosed\n", encoding="utf-8")
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                status.gather(root)
+        captured = out.getvalue() + err.getvalue()
+        self.assertIn("could not load", captured,
+                      "the loader's warning was not captured - it went to the console")
+        self.assertIn("was not applied", captured,
+                      "the fixture's config warning was not captured - it went to the console")
+
+
+class DocTests(unittest.TestCase):
+    def test_no_duplicate_yaml_fences(self) -> None:
+        # The duplicate machine-readable blocks must be gone; the YAML lives once.
+        self.assertNotIn("```yaml", REF_DOC.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(HAVE_YAML, "PyYAML not installed")
+    def test_doc_defaults_match_yaml(self) -> None:
+        # Every numeric Default documented in reference-config.md must equal the
+        # value in config-defaults.yaml (drift-proof single source).
+        flat = _flatten(yaml.safe_load(DEFAULTS.read_text(encoding="utf-8")))
+        rows = re.findall(r"^\|\s*`([\w.]+)`\s*\|\s*(\d+)\s*\|", REF_DOC.read_text(encoding="utf-8"), re.M)
+        self.assertTrue(rows, "no documented defaults found to guard")
+        for key, val in rows:
+            matches = [v for path, v in flat.items() if path == key or path.endswith("." + key)]
+            self.assertTrue(matches, f"doc key {key} not found in config-defaults.yaml")
+            self.assertIn(int(val), [int(m) for m in matches], f"{key}={val} drifted from YAML {matches}")
+
+
+class GracefulDegradeTests(unittest.TestCase):
+    """BG0093: config.get must warn-and-default when config cannot be loaded (no PyYAML /
+    unreadable), never crash - unifying the three failure regimes into one."""
+
+    def test_get_returns_default_when_yaml_unavailable(self) -> None:
+        from unittest import mock
+        config = _load()
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(config, "_yaml",
+                                   side_effect=RuntimeError("config loading needs PyYAML")):
+                # must NOT raise - degrade to the supplied default
+                self.assertEqual(config.get(d, "quality.mutation_max", 25), 25)
+                self.assertIsNone(config.get(d, "routing", None))
+
+    def test_get_degrades_on_malformed_yaml(self) -> None:
+        # BG0160: a syntactically broken override raises yaml.YAMLError (Parser/Scanner),
+        # a subclass of Exception - NOT ValueError - so it was uncaught and tracebacked
+        # through every consumer. The BG0093 contract is warn-and-default; hold it here
+        # against the real malformed condition CR0180's AC demanded and never got.
+        config = _load()
+        with tempfile.TemporaryDirectory() as d:
+            override = Path(d) / "sdlc-studio" / ".config.yaml"
+            override.parent.mkdir(parents=True, exist_ok=True)
+            override.write_text("pricing:\n  opus: [unclosed\n", encoding="utf-8")
+            # must NOT raise - degrade to the supplied default. Captured, not printed: the
+            # warn-and-default contract means this call WARNS by design, and a warning a
+            # passing test emits into the suite is noise a real error can hide behind.
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                self.assertEqual(config.get(d, "pricing.opus", "DEFAULT"), "DEFAULT")
+            self.assertIn("could not load", buf.getvalue(),
+                          "the warn half of warn-and-default must still happen")
+
+
+class ReviewKeysAreDeclaredTests(unittest.TestCase):
+    """BG0665: `config.py` calls `templates/config-defaults.yaml` the single source of truth for
+    skill defaults, and seven of thirteen `review.*` keys the shipped code reads were absent from
+    it - two of them NAMED to the user in a refusal. A reader told which setting put their unit in
+    scope, who then looked it up, found nothing anywhere."""
+
+    #: Read by the code but deliberately NOT declared, each with the reason. An exemption with no
+    #: reason is the one the next author deletes or silently re-adds. Empty since BG0878 declared
+    #: `review.max_rounds` so `config.py show` reports the cap in force; its value is held equal
+    #: to critic.py's `DEFAULT_REVIEW_CEILING` by test_lean_config_code_defaults.
+    DELIBERATELY_ABSENT: dict = {}
+
+    def _keys_the_code_reads(self) -> set:
+        scripts = Path(__file__).resolve().parent.parent
+        found = set()
+        for path in scripts.glob("*.py"):
+            for m in re.finditer(r"""["']review\.([a-z_]+)["']""",
+                                 path.read_text(encoding="utf-8", errors="replace")):
+                found.add(m.group(1))
+        return found
+
+    def test_every_review_key_the_code_reads_is_declared_in_the_defaults(self) -> None:
+        """AC1. MUTANT: delete a `review.*` key's line from the defaults file.
+
+        DERIVED from the scripts rather than from a list here: an inventory nobody updates
+        exempts whichever key is added next, which is the shape this repository keeps meeting."""
+        keys = self._keys_the_code_reads()
+        # A floor against an empty scan, not a count to keep: EP0263 and BG0831 delete review
+        # keys, so the number falls by design. Three still proves the scan found the review block.
+        self.assertGreater(len(keys), 2,
+                           f"only {len(keys)} review keys were found - the scan is looking in the "
+                           f"wrong place and would pass on an empty defaults file")
+        declared = DEFAULTS.read_text(encoding="utf-8")
+        missing = sorted(k for k in keys
+                         if k not in self.DELIBERATELY_ABSENT
+                         and not re.search(rf"^\s*{re.escape(k)}:", declared, re.M))
+        self.assertEqual([], missing,
+                         f"the code reads these `review.*` settings and the file that calls "
+                         f"itself the single source of truth declares none of them: {missing}")
+
+    #: The readers each deliberately absent key's note must name. The reason the absence is
+    #: deliberate is WHO reads the key and owns its default, so a note naming no reader is a bare
+    #: assertion, and the next author re-adds the key.
+    ABSENT_KEY_CONSUMERS: dict = {}
+
+    @staticmethod
+    def _comment_runs(text: str) -> list:
+        """Each run of consecutive comment lines, joined into one normalised string. A note's
+        phrases wrap across lines, so a line-by-line match would miss a phrase split by a wrap."""
+        runs, current = [], []
+        for line in text.splitlines():
+            if line.strip().startswith("#"):
+                current.append(line.strip().lstrip("#"))
+            elif current:
+                runs.append(current)
+                current = []
+        if current:
+            runs.append(current)
+        return [" ".join(" ".join(run).lower().replace("-", " ").split()) for run in runs]
+
+    @staticmethod
+    def _live_paths(node, key: str, prefix: str = "") -> list:
+        """Every dotted path at which `key` is a live key of the PARSED file - quoting, spacing
+        and flow style all parse to the same mapping, so none of them slips past."""
+        found = []
+        if isinstance(node, dict):
+            for k, v in node.items():
+                path = f"{prefix}.{k}" if prefix else str(k)
+                if str(k) == key:
+                    found.append(path)
+                found += ReviewKeysAreDeclaredTests._live_paths(v, key, path)
+        elif isinstance(node, list):
+            for item in node:
+                found += ReviewKeysAreDeclaredTests._live_paths(item, key, prefix)
+        return found
+
+    def test_a_deliberately_absent_key_says_so(self) -> None:
+        """AC3. MUTANTS, each a single change the old string-presence test survived:
+        (a) delete the note explaining why `max_rounds` is absent;
+        (b) keep the note word for word and add a live `max_rounds: 3` under `review:`;
+        (c) cut the note to `# review.max_rounds is deliberately absent.`, naming no consumer.
+
+        The paired control for the row above: a key simply missing and a key deliberately withheld
+        read identically, and the obvious repair to the first is the thing a recorded decision
+        forbids for the second. Both sides are held: the note states the absence AND its reason,
+        and the parsed file declares no such key."""
+        declared = DEFAULTS.read_text(encoding="utf-8")
+        runs = self._comment_runs(declared)
+        for key in self.DELIBERATELY_ABSENT:
+            with self.subTest(key=key, side="note"):
+                consumers = self.ABSENT_KEY_CONSUMERS.get(key)
+                self.assertIsNotNone(consumers,
+                                     f"`review.{key}` is exempted with no named consumers - the "
+                                     f"test cannot tell a reasoned note from a bare one")
+                notes = [r for r in runs if re.search(rf"\b{re.escape(key)}\b", r)]
+                self.assertTrue(notes,
+                                f"`review.{key}` is read by the code and neither declared nor "
+                                f"explained - an unexplained absence is indistinguishable from "
+                                f"an oversight, and the obvious repair is the one that is forbidden")
+                wanted = ["deliberately absent"] + [" ".join(c.replace("-", " ").split())
+                                                    for c in consumers]
+                self.assertTrue(
+                    any(all(w in note for w in wanted) for note in notes),
+                    f"no comment mentioning `review.{key}` both states it is deliberately absent "
+                    f"and names the consumers that read it ({', '.join(consumers)}) - a note "
+                    f"with no reason is the one the next author overrides:\n" + "\n".join(notes))
+        if not HAVE_YAML:
+            self.skipTest("PyYAML not installed - the no-live-key side reads the parsed mapping")
+        import yaml
+        parsed = yaml.safe_load(declared) or {}
+        self.assertIsInstance(parsed.get("review"), dict,
+                              "the defaults file has no `review` mapping - the live-key side "
+                              "would pass vacuously")
+        for key in self.DELIBERATELY_ABSENT:
+            with self.subTest(key=key, side="no live key"):
+                self.assertNotIn(key, parsed["review"],
+                                 f"`review.{key}` is declared live in the defaults despite the "
+                                 f"note forbidding it - the recorded decision was overridden")
+                self.assertEqual([], self._live_paths(parsed, key),
+                                 f"`{key}` is declared as a live key elsewhere in the defaults")
+
+
+@unittest.skipUnless(HAVE_YAML, "PyYAML not installed")
+class ShowSerialisesDatesTests(unittest.TestCase):
+    """BG0670: `config.py show` printed `json.dumps(load_config())`, and PyYAML loads an unquoted
+    YAML date as `datetime.date`, so the verb crashed - on this repository's own config, whose
+    `gate_budget.baseline_date` is unquoted. The dates here are NESTED, as that one is, so a fix
+    that converts only top-level values cannot pass."""
+
+    CONFIG = ("gate_budget:\n"
+              "  baseline_date: 2026-07-26\n"
+              "  stamped_at: 2026-07-26T10:30:00\n")
+
+    def _show(self) -> tuple[int, str]:
+        mod = _load()
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "sdlc-studio").mkdir()
+            (Path(d) / "sdlc-studio" / ".config.yaml").write_text(self.CONFIG, encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = mod.main(["show", "--root", d])
+        return rc, out.getvalue()
+
+    def test_an_unquoted_date_prints_as_iso(self) -> None:
+        """AC1. MUTANT: `default=repr` in cmd_show's json.dumps - it exits 0 and prints
+        `datetime.date(2026, 7, 26)`, which the exact-value assertion refuses."""
+        import json
+        rc, out = self._show()
+        self.assertEqual(rc, 0, "show must print a config holding an unquoted date")
+        budget = json.loads(out)["gate_budget"]
+        self.assertEqual(budget["baseline_date"], "2026-07-26",
+                         "a nested date must print as its ISO-8601 string")
+        self.assertEqual(budget["stamped_at"], "2026-07-26T10:30:00",
+                         "a datetime must print in ISO-8601 form (a T, not the space str() gives)")
+
+    def test_the_output_is_valid_json(self) -> None:
+        """AC2. MUTANT: replace json.dumps with yaml.safe_dump - it exits 0 and keeps the date
+        ISO, but prints YAML, which json.loads refuses."""
+        import json
+        rc, out = self._show()
+        self.assertEqual(rc, 0)
+        parsed = json.loads(out)
+        self.assertIsInstance(parsed, dict, "show prints the merged configuration as one object")
+        self.assertIn("gate_budget", parsed)
+
+
+if __name__ == "__main__":
+    unittest.main()

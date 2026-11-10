@@ -1,0 +1,671 @@
+<!--
+Load when: /sdlc-studio sprint or /sdlc-studio sprint help
+Dependencies: SKILL.md (always loaded first)
+Related: reference-sprint.md (full workflow)
+-->
+
+# /sdlc-studio sprint - Goal-Driven Development loop
+
+## You can just ask
+
+SDLC Studio is model-invoked - say it in plain language:
+
+| Just say... | Runs |
+| --- | --- |
+| "Do a sprint to deliver all the open bugs" | `/sdlc-studio sprint --bugs Open --goal done` |
+| "Plan and break down the next sprint, but don't write code" | `/sdlc-studio sprint --crs Proposed --goal design` |
+| "Build out epic 7 from end to end" | `/sdlc-studio sprint --epic EP0007 --goal done` |
+| "Turn this PRD into epics and stories" | `/sdlc-studio sprint plan --prd prd.md --goal design` |
+| "Select and estimate a sprint, then stop for my sign-off" | `/sdlc-studio sprint --crs Proposed --goal plan` |
+| "Run the whole thing unattended" | `/sdlc-studio sprint --bugs Open --autonomous` |
+
+Run a prioritised batch of work to a goal. You set the goal and the acceptance
+criteria; the loop drives the batch to it: plan and approve -> build -> review -> close ->
+sign -> learn. Each step, and the one command that performs it, is in
+[the loop](../reference-sprint.md#the-loop), the only place the loop is described. Add
+`--autonomous` to run unattended.
+
+> **Renamed from `autosprint`.** `/sdlc-studio autosprint ...` still works as a
+> **deprecated alias** (the command is now the whole sprint lifecycle - `--goal plan` /
+> `design` / `done` - so autonomy is the `--autonomous` flag, not the name). Prefer `sprint`.
+
+## Quick Reference
+
+```bash
+/sdlc-studio sprint --crs Proposed --goal done      # deliver the proposed CRs
+/sdlc-studio sprint --bugs Open --goal done         # deliver the open bugs
+/sdlc-studio sprint --bugs Open --crs Proposed      # one mixed backlog-clear tranche
+/sdlc-studio sprint --epic EP0007 --goal done       # deliver an epic
+/sdlc-studio sprint --crs Proposed --goal design    # just the backlog (no code)
+/sdlc-studio sprint --crs Proposed --goal plan       # select+sequence+estimate a sprint, stop
+/sdlc-studio sprint plan --prd prd.md --goal design  # greenfield: the PRD into epics and stories
+/sdlc-studio sprint --worklist <file> --order wsjf   # a tranche file, WSJF order
+/sdlc-studio sprint --bugs Open --autonomous         # unattended: deterministic guardrails on
+/sdlc-studio sprint decision defer --unit US0001 --question "..." --option "a|..." --option "b|..."  # set the unit aside, batch continues
+/sdlc-studio sprint decision list                    # every accumulated decision, asked together, structured
+/sdlc-studio sprint decision resolve --index 1 --choice a   # record the operator's ruling (run state + ledger)
+/sdlc-studio sprint close                            # scaffolds the retro, then stops for you to fill it
+/sdlc-studio sprint close --retro RETRO0001          # the close ceremony as one command (retro already filled)
+/sdlc-studio sprint close --retro RETRO0001 --file-and-close  # bounded exit: file the ceremony debt, close honestly (refused while a hard gate is red or a batch unit is unanswered)
+python3 <skill>/scripts/sprint.py sign --report RPT0001 --principal "You"   # SEAL: sign the prepared run - the last thing that happens
+/sdlc-studio sprint plan --cycles 3 --goal done      # a standing policy: roll 3 cycles, regenerating the plan each time
+/sdlc-studio sprint boundary --retro RETRO0001       # close this cycle down and open the next from the live backlog
+/sdlc-studio sprint report --id RETRO0001             # the end-of-sprint report (the close draws it too)
+python3 <skill>/scripts/sprint_report.py checklist --id RETRO0001   # the compulsory checklist alone; non-zero while an item is outstanding
+```
+
+**`/sdlc-studio sprint report --id RETROxxxx`** composes the end-of-sprint report - delivered units
+and points, measured cost with rework counted, velocity, estimate-versus-actual, lessons and tickets
+raised - from the retro, `retro accuracy` and the telemetry evidence log. Run it once the retro is
+filled: after a close, or any time later to re-read what a past sprint delivered and cost. The close
+ceremony draws the same page for you, so this is for a sprint you are revisiting or a run whose page
+you want in another shape (`--format json`). The close captures an interactive sprint's
+harness-tracked token cost itself - this run's DELTA from the baseline stamped when it opened, not
+the session total, since one session can hold several sprints and the meter is cumulative. A run
+with no baseline reports not-attributable rather than a number, and it states plainly when it
+cannot attribute, so `--tokens N` is the manual override and `--elapsed-hours H` supplies the
+elapsed the run-state cannot know. Read-only.
+
+**The meter reads the harness running the session, and the headline is the priced cost.**
+It reads one harness's store. `SDLC_STUDIO_HARNESS` (`claude`, `codex`, `copilot`, `opencode`
+or `cursor`) chooses it, else the one harness the environment signals, else the one whose store
+holds this repo, else Claude. Two candidates give no reading, never a sum
+([token meters](../reference-sprint.md#token-meters)). Under Claude Code each reading counts every
+assistant message once, from the session's transcript and from each subagent transcript beside
+it (`<session-id>/subagents/agent-*.jsonl`, depth-2 agents included).
+It carries input, output, cache write at 5 minutes and at 1 hour, and cache read, and prices
+them in input-equivalent tokens from one weight table: input 1, output 5, cache write 1.25 (5
+minutes) and 2.0 (1 hour), cache read 0.1 (D0390). The report's Estimates place a `Priced
+cost` row directly before the `Tokens` row, and the close report's COST section opens on the
+same figure, each with the input + output + cache-write sum beside it as a component. A
+delegated total that the `Tokens` row adds is outside the priced figure, and both say so.
+Beside them the report states estimated US dollars (the Dollar cost and Dollars per point rows,
+and each unit's dollars), priced per model from the dated table in `templates/model-prices.json`
+([dollar cost](../reference-sprint.md#dollar-cost)). A model the table does not list is named,
+never counted as $0, and premium requests have a row of their own. A
+session whose subagents directory is absent, or holds no `agent-*.jsonl`, reads the main thread
+alone and says so, as a lower bound. Once a run holds a reading by this meter, each reading an
+earlier meter took for it, in any session, is re-derived from its transcript up to the moment
+it was taken. The report's `Tokens` and `Priced cost` rows, its cost appendix, the close
+checklist and the close report's COST section each say how many were. Where the transcript no
+longer holds those records, the total reads not attributable: never a difference, or a sum,
+across two counting rules. A run whose stamps all predate the priced meter keeps the page it
+had.
+
+**The compulsory checklist is part of that report, not a second document.** It carries one row per
+STAGE of the cycle - the pre-plan reconcile, the goal's seat review, the grooming gate, the run
+opening, the review verdicts, the ticked criteria the tree supports, the goal verdict, the retro,
+the lessons - plus the figures a close otherwise re-derives by hand: planned against
+delivered, what was dropped or held or carried over and why, scope creep as a count and a ratio, who
+reviewed what under which seat and over how many lenses, the impediments still standing, the known
+issues carried, and the cost. Every row but one is DERIVED from the tree, because a checklist that
+asks an agent to retype what the tree already holds gets filled in from memory.
+
+The exception is the carried known issues. Whether an open defect stops the ship is a judgement, so
+it is recorded in the retro's `## Known issues carried` table (`| id | ruling | ruled by | date |`,
+ruling one of `stop-ship`, `not-stop-ship`, `accepted-risk`, `deferred`) and read back here. An open
+finding with no row is reported UNRULED: "we carried it" and "nobody looked" must never read the
+same. A lesson's graduation CR is ruled by its class code (`| LC-002 | not-stop-ship | ... |`): its
+own id is minted when the close files it, so no retro can name it ahead, and the row rules the CR
+the lesson store links to that class. An unruled graduation CR names its class. A `stop-ship` ruling does not refuse the close or the seal - the signer decides - but it
+cannot be missed: the report lists every STOP-SHIP known issue first, marked, and `sprint sign`
+prints each one before it seals.
+
+`sprint close` runs once and finishes. An unanswered item, an uncovered unit, a failing gate lane or
+a report hold is recorded in run state `close_known_issues`, one row each, and handed over on the
+report; the close does not refuse over it. A checklist row the run gives nothing to measure (no
+cost meter, no run record to join) is not a known issue: the report's appendix lists it as `not
+measured` with its reason. A row that does not apply to the project is omitted. To answer an item
+instead, record a waiver -
+`decisions.py waive --subject rule:sprint-checklist:<item> --rationale "<why>" --authorised-by
+"<who>"` - so closing without an item and forgetting it are different events in the record. A
+checklist waiver with no `--authorised-by` is refused: an item set aside by nobody in
+particular is a decision with no decider. What still stops it: no sprint goal,
+no goal verdict, no retro, and an uncommitted change to a file a batch unit declares.
+
+**The close is in two halves, and the signature is the second one.** `close` is PREPARE: it runs
+every step that can change a fact - the nine-step chain, the velocity row, the
+reconcile - files the report you are going to sign, and leaves the run OPEN. What moves after that
+page is derived is only what the SIGNATURE ITSELF entails: the terminal transitions and the
+cascades they imply. Nothing else does, and the page is written so that none
+of those moves changes a figure it records - which is what makes signing a transaction rather than
+the start of another day's work.
+
+**`sign --report RPTxxxx --principal "<you>"`** is SEAL, and it is the last thing that happens.
+You sign the run once; no per-unit sign-off row is written. One command transitions each unit to
+its own terminal - `Done` for a story, `Fixed` for a bug - (AC-verify gated, cascading its parent
+and the request above it), then writes the run's one signature and its outcome, and stops. It does
+NOT run the close tail: a fact that moves after a signature is a fact the signature did not cover.
+A unit the close's retro (the one the filed page records) carries in `## Known issues carried`
+with a valid ruling keeps the status it was ruled on and is named as carried, not moved: a bug
+ruled not-stop-ship and left Open stays Open. Once the run
+is sealed, `sprint.py reopen --reason` is the only way to change a batch unit's status.
+A unit with no independent delivery APPROVE stops it before anything moves, naming the unit. The
+close names the same units first - one short of its terminal as a known issue, one already moved
+to Done in the pre-flight's blocking `review-coverage` row - so the page you sign already shows
+them. A story or bug with an independent APPROVE owes only the signature at any status short of
+its terminal, Ready included, so the close does not list it; `sign` moves no other kind, so a CR
+owes only the signature at Review and is listed anywhere else. A unit
+still rejected at the review round cap is not one of these: it was carried when its cap REJECT
+was recorded, its findings filed as a bug and the unit dropped from the batch, so neither the
+close nor the signature holds it. A batch unit with no independent APPROVE stays where it is and
+is handed over as a known issue. It is
+idempotent (a re-run resumes, skipping units already terminal), and it stops loudly at the first
+unit whose Done gate is red, leaving the completed units done. A principal the authoring session
+controls is refused BEFORE any of that, judged across the whole batch, so that refusal leaves
+nothing written at all. It never runs without an explicit `--principal`.
+
+`close --apply-signoff` no longer signs: it exits 2 and names `sign`. An alias would have kept the
+old path alive in every operator's fingers, help file and runbook row, and the split would have
+shipped with its own bypass intact.
+
+**The sealed run record is tracked, so a signed report checks in any full clone.** `sign` files
+`sdlc-studio/reports/runs/<RUN-ID>.json` beside the page, before it re-records the tree, so the
+seal commit carries it; commit it with the page. It is the run record (`.local/run-state.json`)
+as sealed - `signature`, `outcome`, `ended_at`, `reopened` and every other field - through one
+projection: an absolute path inside the repository becomes repo-relative, any other becomes
+`sha256:<12 hex>` of itself, which keeps the home directory and session transcript ids out of
+the tree and still groups a session's token stamps. A page derived since then reads its run
+record through the same projection and says so (`record_paths: portable`), so it names a
+session outside the repository exactly as the tracked record does; a page derived before is
+re-derived from the record as it stands. `sprint_report.py check --report RPTxxxx` reads the run
+from the live record when it names the run, else this tracked record, else the `.local` archive
+(a project whose earlier reports were signed before records were tracked). Once a tracked
+record is committed, the signature is read from its committed history and never from `.local`.
+A later commit whose signature differs is accepted only when it carries a fingerprint and
+records a reopen the earlier version did not (`sprint.py reopen --reason ...`, then close and
+sign again); a stripped signature, a re-pointed one with no reopen, and any signature change
+that only the working copy carries are named against the version first committed with the
+signature (exit 1). A re-signature therefore counts once it is committed. The trust root is
+committed history: a verifier sees only the commits it holds. A depth-1 clone holds neither the
+run's commits nor the signing commit, so `check` exits 2 and says the history is shallow rather
+than judging the page.
+
+Natural language works too: "do a sprint to deliver all open bugs"; "plan and break down the
+next sprint" resolves to `--goal design` (the goals are cumulative stop-points).
+
+## Flags
+
+| Flag | Description | Default |
+| --- | --- | --- |
+| `<batch>` | status queries (`--bugs`/`--crs`/`--stories <status>` - **combinable** into one mixed tranche), `--worklist <file>` (ids one per line) or `--worklist RPTxxxx` (the open items the last signed report handed over), `--epic EPxxxx`, or a **PRD path** (greenfield authoring) | required |
+| `--goal` | `triage` (plan) / `plan` (sprint plan) / `design` (Ready, estimated backlog) / `done` (delivered) | `done` |
+| `--sprint-goal TEXT` | the Sprint Goal - one sentence of user value, 20 words or fewer (a longer goal is refused at plan; a run already open is never refused over its goal), judged at the closing review (`sprint goal-verdict --verdict achieved\|partial\|missed --note "..."`) and shown on the sprint report. Prompted interactively when absent; never invented | none |
+| `--serves O-ID\|PERSONA` | (with `plan`, repeatable) the PRD outcome (from the PRD's `## Outcomes` section, `- **O1:** ...`) or persona card the Sprint Goal serves; naming one as a whole word in the goal traces it too. The plan prints `goal serves: ...`, or `goal serves: NONE` naming what the goal could serve when it serves none or only a Negative persona - advice, never a refusal. Nothing is printed when the project has no outcomes and no persona cards | none |
+| `--order` | `priority` / `wsjf` (priority over complexity) / `manual` | `priority` |
+| `--epic EPxxxx` | (with `--stories`, repeatable) scope a story plan to one or more epics, not the whole status class | all epics |
+| `--write` | (with `plan`) persist the sprint plan to `.local/sprint-plan.json` | off |
+| `--strict` | (with `plan`) refuse to plan when the index has drift (reconcile-before-plan) | off |
+| `--autonomous` | unattended mode: the deterministic guardrails (cap, repetition-breaker, completion oracle) enforce stop/stall instead of model discretion | off |
+
+## One run slot
+
+A project holds **exactly one run at a time**. What planning a second batch while a run is open
+does depends on whether it overlaps the open run:
+
+- A batch sharing **no unit** with the open run is **refused, not merged**. Folding an unrelated
+  batch into the open run would leave it with one Sprint Goal describing a fraction of the work and
+  a closing verdict that could not be given honestly, so `sprint plan --write` exits non-zero and
+  changes nothing.
+- An **overlapping re-plan** - a re-cut, or a blocker sweep pulling work in - **accumulates** into
+  the same run under its unchanged id and start time. This needs no flag; it is the normal way a
+  run's batch grows.
+
+When a disjoint batch is refused there are **two ways forward**, and the refusal prints them as
+runnable commands:
+
+- **close the open run**, then plan this batch as its own run: `sprint close`
+- **or re-plan the open run deliberately**, folding the batch in by planning a worklist that also
+  names one of its units: `sprint plan --worklist <file> --write`
+
+A run whose only close artefact is a **failed close attempt** is still open and protected, so it is
+covered by this refusal rather than absorbing the next batch silently.
+
+## One run slot, across checkouts
+
+The slot holds in every clone, not only the one that closed the run. `.local/run-state.json`
+exists only on the machine that wrote it, so `close` also files the run's record, still running,
+at `sdlc-studio/reports/runs/<RUN-ID>.json`; commit it with the close's paperwork.
+
+- In a clone that does not hold the run open, `sprint plan --write` refuses while a tracked
+  record names a report and is still running, naming the run, its report and the `sign`
+  command. The checkout that closed the run holds it open, so it gives the one-run refusal
+  above.
+- `sign --report <id>` takes the run up from that record in a clone that does not hold it. Every
+  check reads the record as it stands, and only a sign that passes them all writes it into the
+  clone. An older, closed run held there is archived first; a different run still open there is
+  refused, never discarded.
+- The tree check still holds there: the digest leaves the run records out, so a clone at the
+  close's commit matches the tree the close recorded.
+- A checkout whose copy of the run is older than its record - signed elsewhere, or reopened and
+  re-closed elsewhere (the record carries more reopens) - takes the record up at its next `plan`,
+  `sign` or `close`; the close then refuses, naming what to do next, so it never files a second
+  page for a sealed run or files its older copy over a newer record. A run reopened in that checkout since the signature is its own and is never taken
+  up. A close never strips a signature: a sealed, signed record that checkout has not
+  reopened past is left as it is, and any other signed record keeps its signature when the close
+  files over it, so only `sign` writes a new one.
+- A run ended without a signature (`stop`) updates its record the same way, so it stops awaiting
+  one, and `stop` names the record to commit. A `reopen` is not marked in the record until the
+  run is closed again.
+
+## The breakdown gate
+
+`sprint plan` **refuses** a batch whose units are not groomed: every unit must declare
+`Affects:` (the files it will touch) and `Points:` (its size on the modified Fibonacci scale -
+one size vocabulary, every unit type). A unit above the split threshold is refused too. Ungroomed,
+it exits non-zero and prints **no plan at all** - a
+plan over unsized units cannot be sized or safely parallelised, and looks authoritative anyway.
+The refusal names each unit, what it lacks, and the fix. `sprint breakdown <batch>` reports the
+same census read-only. Opt out only as a recorded decision: `sprint.breakdown: judgement` in
+`sdlc-studio/.config.yaml` makes the lane report instead of block.
+
+## What happens
+
+The steps, in order, with the command for each, are in
+[the loop](../reference-sprint.md#the-loop); this page does not restate them. What a step does
+when something goes wrong - a unit that will not go green, a question only you can answer, a
+close you exit with debt filed - is under
+[inside a run](../reference-sprint.md#inside-a-run). With `--autonomous` the guardrails there
+(the attempt cap, the repetition breaker, the completion oracle) are scripts the model cannot
+skip; without it they are model-instructed.
+
+**Model-tier routing (opt-in):** with `routing.enabled` in `.config.yaml`, the plan
+stamps each unit with an advisory `tier`/`model` recommendation (difficulty-scored by
+`route.py` from complexity, scope, novelty and spec size), so cheap units run on your
+smaller model and hard ones on your bigger one. Map tiers to your own models in
+`routing.models`; see `reference-config.md#routing`.
+
+## How big should a batch be
+
+There is a trade-off, and no number is prescribed for it. The fixed per-sprint cost - the
+ceremony, the one close, the review setup - is spread over the batch's points, so its share
+per point falls as the batch grows. Review convergence cost pulls the other way: a bigger diff
+carries more surface and more findings, so it takes more rounds to converge. Both directions
+show in this project's own measured history (the eight build sprints in `retros/VELOCITY.md`
+that carry a measured tokens/pt), but the sample is small and noisy and the arms point opposite
+ways, so it fixes no optimum. Picking a batch-size number off this few measured sprints would
+invent a target the data cannot defend. Read `retro.py velocity` and decide per batch.
+
+## The review point
+
+Each unit is reviewed by an independent seat, and its delivery verdict is recorded with
+`critic.py record`: one verdict ledger says whether a unit was reviewed. Each finding in
+`--issues` carries an origin tag, and the items are separated by semicolons:
+
+```bash
+python3 <skill>/scripts/critic.py record --unit US0001 --verdict REJECT --reviewer "<seat>" \
+  --author "<author>" --issues "[regression] the parser drops an empty line; [pre-existing] BG0123 slow gate"
+```
+
+`[regression]` (the diff broke something that worked at the base ref) and `[new]` (the diff
+introduced a defect) block; `[pre-existing]` (already true of the tree, or already recorded in
+an open Bug or CR) is reported and does not block. A finding with no tag is refused, and nothing
+is written. `sprint.py review-batch`
+is retired, and so are `critic.py evidence` and `critic.py sprint-review`. Reviewer and author
+must differ - a self-review is the context that wrote the code agreeing with itself, and it
+clears nothing.
+
+`sprint close` records each batch unit no independent verdict covers as a known issue, naming
+it: **the close asserts that coverage exists, it does not perform the review.** A rolling
+boundary halts on any known issue rather than open the next cycle over it.
+
+## In-flight controls: changing a run without lying about it
+
+A run is a controllable object, not a train you either ride or abandon. Each control below is
+RECORDED, so the close can say what the delivered batch was and why it differs from the plan.
+
+```bash
+# the goal, read by a seat BEFORE the run opens - advice printed with the plan, never a refusal
+python3 <skill>/scripts/sprint.py goal-review record \
+  --goal "<the sprint goal>" \
+  --seat "engineering|yes|what done means|one increment?|optional note"
+
+# reword the open run's goal: every verdict carries forward unless its seat asked to re-review,
+# and the close judges the new wording (refused once the goal verdict is recorded)
+python3 <skill>/scripts/sprint.py goal-review record --goal "<new wording>" \
+  --amend-from "<the run's goal>" --requested-by operator
+
+# trade units: one recorded decision, not a drop that happens to sit beside an add
+python3 <skill>/scripts/sprint.py batch swap --out US0001,US0002 --in US0003 \
+  --reason "the blocking one first"
+
+# pull a unit from the batch the done-gate reads (NOT Deferred, which leaves it gated)
+python3 <skill>/scripts/sprint.py batch drop US0001 --reason "premise unbuilt"
+
+# put one in, under the same gates as the rest
+python3 <skill>/scripts/sprint.py batch add US0004
+
+# put an EPIC's stories in as one priced set - the growth is one number, not five entries
+python3 <skill>/scripts/sprint.py batch add-epic --epic EP0010 --status Ready
+
+# raise the ceiling ON THE RECORD - the standing pair stays, so the close still reports the
+# overage rather than a run that fitted
+python3 <skill>/scripts/sprint.py appetite resize --units 16 --reason "an epic joined the batch"
+
+# end a run that will not reach its goal - the next plan names what it waived
+python3 <skill>/scripts/sprint.py stop --reason "the dependency slipped"
+
+# resume a stopped run rather than minting a fresh one over the same work
+python3 <skill>/scripts/sprint.py reopen --reason "the dependency landed"
+```
+
+### What a batch change puts on the record
+
+Every `batch` call appends one entry to the run's `batch_changes` ledger. An entry carries
+`action` (drop, add or the two halves of a swap), `id` (the unit, normalised), `at` (when), and
+`reason` where one was given. `drop` REQUIRES `--reason` and refuses without one; `add` accepts
+one and stores it. Adding a unit already in the batch is not an error and not a duplicate - it
+records a `note` saying it was already there, because the call still happened and the history
+should say so.
+
+**A drop is not `Deferred`, and the difference is the point.** Dropping removes the unit from
+the `batch` the done-gate reads and leaves its own status untouched, so it returns to the
+backlog as ordinary work. Marking it Deferred keeps it in place and still blocks the close.
+Dropping judges THIS batch; Deferred judges the work.
+
+### Stopping, and what `--force` records
+
+`stop` ends a run that will not reach its goal, and refuses while any batch unit is
+unanswered - the close's own test: unfinished and not ruled, dropped or parked on a pending
+decision, owed its adversarial pass, or carrying a standing REJECT. Stopping over live work
+would leave units nobody ruled on. `--force` overrides that refusal and
+answers nothing. It writes two lists onto the run record, and they answer different questions:
+`could_have_proceeded` is the work the stop parked, which the pending decisions did not block;
+`unanswered` is the stop-ship questions it waived, the set a close records on the report as
+known issues.
+Each is printed under its own label, and the next `sprint plan` names the waived units. Every
+route that ends a run records `unanswered` the same way - a boundary stop too - and
+`close --file-and-close`
+refuses rather than record it, because filing defers ceremony debt and a stop-ship question is
+answered, never filed.
+
+### When a unit's `Affects` contradicts its own content
+
+`sprint plan` reports any unit in ITS BATCH whose `Verify:` lines target a file the unit's
+`Affects` omits, or whose `Affects` names a path not on disk. `sprint batch add` runs the same
+check on the unit it adds, so joining a batch late is not a way past it.
+
+Scoped to the batch, never the corpus: a defect in work nobody is planning cannot block a plan.
+`validate.py check` reports only the undeclared half (a `Verify:` target the `Affects` omits), on
+open work only, as advice; it never re-judges a finished unit.
+
+`sprint.affects_check` decides what a finding does. The shipped default is `warn` - it reports
+and refuses nothing, because a declaration naming a file the unit will CREATE is legitimate.
+Set it to `block` once your tail is paid down and you want it kept at zero. An unknown value
+falls back to `warn`.
+
+### Appetite: the circuit breaker
+
+The appetite is resolved once at plan time and stamped on the run. It is set by
+`--appetite-minutes` and `--appetite-units` on `plan`, and zero on an axis means unbounded.
+
+The record keeps two pairs, not one. `units` and `minutes` are the ACCEPTED pair the breaker
+stops on. `standing_units` and `standing_minutes` are the sprint capacity it was measured
+against, and `over_appetite` flags when the accepted exceeds the standing on either axis. Both
+pairs are kept so that `appetite resize` raises the ceiling **on the record**: the standing pair
+does not move, so the close still reports the overage instead of a run that appears to have
+fitted its budget all along.
+
+### Rolling runs
+
+`--cycles N` runs N sprints back to back, and `--stop-on empty-backlog` ends the sequence early
+when nothing is left to select. The `boundary` verb is where each cycle turns over.
+
+A rolling run **regenerates the plan at each boundary** against the backlog as it stands then -
+it does not queue plans up front. If you want a queue of runs planned in advance, that is the
+charter queue below, which is a different thing: a charter is a run somebody intends, resolved
+only when its turn comes.
+
+The read-only verbs, which change nothing and are safe to run at any point:
+
+```bash
+# the census the planner reads: how many units, how many ungroomed, which share files
+python3 <skill>/scripts/sprint.py breakdown --stories Ready --bugs Open
+
+# every refusal the close would raise, in one pass, writing nothing
+python3 <skill>/scripts/sprint.py close --retro RETROxxxx --dry-run
+
+# record the Sprint Goal judgement at the close (achieved | partial | missed)
+python3 <skill>/scripts/sprint.py goal-verdict --verdict achieved --note "<why it holds>"
+
+# brief a delegated lane over the run's own batch, or over named units
+python3 <skill>/scripts/sprint.py lane brief --units US0001,US0002
+
+# resolve the head sprint charter against the backlog AS IT IS now, opening nothing
+python3 <skill>/scripts/sprint.py next --dry-run
+```
+
+## The charter queue {#charter-queue}
+
+A charter is a run that has not happened: its Sprint Goal, the rule that selects its batch, and
+its appetite. `sprint next` materialises the head of the queue **against the backlog as it
+stands at that moment**, never against the backlog as it stood when the charter was written - a
+queue of frozen batches decays, because units land and units are delivered between authoring and
+running.
+
+```bash
+# queue one, with prose for the reader and a query the tool can resolve
+python3 <skill>/scripts/artifact.py new --type charter --title "<what this run is for>" \
+  --fields-file charter.json    # {"goal": "...", "scope": "...", "scope_query": "--bugs Open"}
+
+# resolve the head of the queue against the backlog now, naming who is running it.
+# `next` REPORTS what it selects; `sprint plan --write` is what opens the run.
+python3 <skill>/scripts/sprint.py next --runner "<who>"
+
+# see the queue, and what the HEAD resolves to against the backlog right now
+python3 <skill>/scripts/sprint.py queue show
+
+# call the sprint at this point: descope the remainder BACK to the backlog, then close
+python3 <skill>/scripts/sprint.py call --reason "<why the rest is not being done>" --retro RETROxxxx
+
+# correct a plan somebody wrote: rank one to the head, withdraw one, or clear the lot
+python3 <skill>/scripts/sprint.py queue reorder --charter SC0002 --rank 1
+python3 <skill>/scripts/sprint.py queue cancel --charter SC0003 --reason "<why>"
+python3 <skill>/scripts/sprint.py queue clear --reason "<why>"
+```
+
+Only the HEAD is resolved by `queue show`. Resolving every charter would be arithmetic over a
+backlog the earlier runs will have changed before the later charters are reached - a number that
+looks precise and is not.
+
+`call` and `stop` are different acts. `stop` ABANDONS a run - it did not reach its goal and
+says so. `call` FINISHES one: the units nobody started leave the batch, and the close chain then runs
+against the Sprint Goal - so `call` completes what it starts rather than telling you to. It takes
+the close's own flags - `--retro`, `--goal-verdict`, `--note` - and forwards them, so the close's
+messages never name a flag this verb rejects. It signs nothing: signing is `sprint sign`, run on
+the report the close files, and `call` refuses `--apply-signoff` or `--principal` before it
+descopes anything. Without a
+`--retro` it scaffolds one and stops, exactly as `sprint close` does. The bounded exit
+(`--file-and-close`) is not among them: reach it with `sprint close` after the descope. The remainder returns to the
+BACKLOG, never forward to the next charter - attaching it forward would make the next run
+inherit a batch it never approved. Each descoped unit keeps its own status, because a drop
+judges THIS BATCH and not the work.
+
+A charter's goal review lives ON the charter, under `## Seat review`, not in `.local/`. Local
+state does not travel: a charter pulled into another working copy must arrive carrying the review
+that justified it, or the next operator cannot tell an examined plan from an unexamined one.
+`next --runner` records who ran it beside who reviewed it and states plainly when they are the
+same. Separation is RECORDED, never enforced - a queue is often planned and run by one person,
+and refusing that would make it unusable for the operator it was built for. What would be
+dishonest is leaving it unsaid.
+
+A charter with no `Queue rank` sits in authoring order, which its id already carries, and an
+unranked charter sorts AFTER every ranked one: absence is not rank zero, so ranking one charter
+does not silently reshuffle the rest. `cancel` and `clear` withdraw rather than delete, each
+keeping its reason, because a cancelled plan is a decision somebody made and the queue's shape
+should stay explicable.
+
+The scope is TWO fields on purpose. `Scope rule` is prose - the intent a reader judges when
+deciding whether a queued run is still worth running. `Scope query` speaks `sprint plan`'s own
+selector vocabulary (`--stories Ready`, `--bugs Open`, `--crs Proposed`, `--epic EPxxxx`), so
+there is one selector grammar in the tool rather than two that drift.
+
+`next` refuses, leaving the queue exactly as it was, when a run is already open, when the head
+charter carries no resolvable `Scope query`, or when its scope selects nothing. A charter that
+cannot be run is left Queued rather than silently spent: an empty scope usually means the work
+was delivered by another run, and that is worth seeing rather than absorbing.
+
+Each control that CHANGES the batch or the ceiling takes a `--reason` and stores it in the run
+record: `batch drop`, `batch swap`, `batch add`, `appetite resize`, `stop` and `reopen`. It is
+required on the ones where a silent change would be unexplainable - drop, swap, resize, stop -
+and optional on `add`. `goal-review record` takes no reason: its seat verdicts ARE the reasons.
+
+An earlier version of this line claimed every control took a stored reason. It did not: several
+verbs rejected the flag outright, and `batch add` accepted it and discarded it silently. Both
+are corrected - a flag that is accepted and dropped is worse than one that refuses, because
+nothing tells you it went nowhere.
+
+A change nobody recorded is a change the close cannot explain, and the difference between the
+planned batch and the delivered one is the thing a retro is actually for.
+
+## Prerequisites
+
+- A batch to run (CRs/bugs/stories on disk, or a worklist file).
+- The scripts: `sprint.py`, `conformance.py`, `ledger.py`, `loop_guard.py`,
+  plus the reused `verify_ac`, `reconcile`, `review`.
+
+## See Also
+
+- `reference-sprint.md` - full workflow and guardrails
+- `/sdlc-studio sprint report --id RETROxxxx` - the end-of-sprint report, composed from the
+  retro, the accuracy pass and telemetry (`report.enabled: false` turns the page off)
+- `/sdlc-studio status` - shows Blocked units after a run
+
+## Lanes: dispatching work and accepting it back
+
+A delivery lane is dispatched with a brief and accepted back with evidence. Both are commands, so
+the obligations travel with the work rather than with whoever wrote the prompt.
+
+```bash
+python3 <skill>/scripts/sprint.py lane brief  --units US0123 US0124     # the contract, the obligations, the proof owed, the build lessons
+python3 <skill>/scripts/sprint.py lane return --units US0123 --proof unit="<evidence>"   # runs the unit's OWN criteria and reports each
+```
+
+`lane brief` **refuses** a unit that carries no authored acceptance criteria, or criteria the
+verifier cannot read, and exits non-zero naming it. There is nothing to deliver against, and a
+contract inferred from the summary is the lane's guess rather than the unit's specification.
+
+Each brief carries the history of the unit's files, the section its reviewer's `critic.py brief`
+will show: the recent delivered units that changed them and the blocking defects their reviews
+found. It opens with the prior-art instruction - run `git log -S <symbol>` before changing a
+symbol you did not write, let the history outrank an artefact's account, and do not read the
+artefact corpus in bulk. The corpus behind it is walked once per dispatch.
+
+A brief is also a builder's whole brief for its unit. It lists the unit's Affects, one path per
+line, and names the engineering seat card `persona_resolve` resolves (the project's own seat
+before the shipped default) as the work render to adopt. It ends with the author self-check
+`critic.py brief` prints on stderr, verbatim, then the closing commands. They run the unit's
+criteria (`verify_ac.py run --id <id>`) and write the hand-in files to `sdlc-studio/.local/lane/`:
+`<unit>-claims.json` and `<unit>-mutants.json`, the two self-check passes, then
+`commit-msg.txt`, with the unit id in its subject and the rest in the project's own shape. Last,
+they stage exactly its Affects (`git add -- <its Affects>`) and stop. The builder neither commits
+nor records: `sprint lane land` commits the lane and records its self-check. A unit with no
+Affects is told to declare them, and no staging command is printed. A sized unit's brief states a
+tool-call budget of 25 plus 13 per point (38 for 1 point, 90 for 5); at it the builder writes
+`HANDOFF.md` there with what is done, the criteria left, the next step and the files touched,
+stages what it has and returns. So a fresh agent builds each unit from its brief, while the
+orchestrator holds the run state and the verdicts, waits on each builder's completion
+notification rather than polling, and accepts the work back with `lane return`. Spawn the
+builder as `sdlc-builder` and the reviewer as `sdlc-reviewer`, the definitions `init` drafts into
+`.claude/agents/`; `general-purpose` is the fallback on a harness with no agent config. In a
+parallel wave, launch the first agent alone and the rest once it has started. A harness
+without subagents starts a fresh session per unit from the same brief, with one command:
+
+```bash
+python3 <skill>/scripts/sprint.py lane run --harness codex --units US0123 --model <model>
+```
+
+`lane run` briefs the one unit and runs the brief headless in `claude`, `cursor`, `codex`,
+`copilot` or `opencode`, in the lane's worktree (`--worktree`, else
+`sdlc-studio/.local/worktrees/lane-<unit>` with the id lowercased, `lane-us0101` for US0101, on
+the branch of that name, which a lane removed without `lane land` leaves to the next run, else
+created from HEAD) under `--timeout` seconds (default 3600), passing `--model` through. The CLI
+runs in a session of its own, and at its timeout its whole process group is killed before the
+staged files are read. It writes one lane record per session to
+`sdlc-studio/.local/lane-runs/<unit>/<session>.json`, keeping every earlier session's: the
+session id, model and usage normalised by `lib/harness_usage.py`, the files staged and, for
+Claude Code, the first call's context. A later `lane return` with no `--tokens` or `--agent`
+prices the unit from each session's record, in priced input-equivalent tokens and US dollars, so
+a repair run with a second `lane run` adds its cost to its builder's and returning the unit again
+counts each session once. A CLI that exits non-zero, times out or prints no usage
+leaves the lane unmetered with the reason, never zero, and its staged work in the worktree for
+`lane land`. A Claude Code lane runs with `--tools` naming its tool set beside
+`--strict-mcp-config` and `--disable-slash-commands`: a bare `--tools` allowlist loads every MCP
+tool in full. Exit 2 is a refusal before the CLI ran, which marks no lane in flight; 1 a CLI that
+exited non-zero or timed out.
+
+`lane return` runs every executable criterion and reports each with the runner's own output and
+exit code, not a summary. It forces the outcome to `blocked` whenever a criterion did not pass,
+**whatever the lane claimed** - a lane cannot inflate its own result. An unresolvable selector is
+reported `unresolved` and blocks: an unanswerable check is not a passed one. Shell verifiers obey
+the same provenance rule the authoritative runner uses, so an externally ingested artefact cannot
+reach a shell through this path either.
+
+An orchestrator should call `lane brief` before dispatching and `lane return` before accepting a
+lane's work. Skipping them is how a unit with no contract reaches Fixed.
+
+A builder working in its own git worktree stages its Affects and stops, leaving
+`commit-msg.txt`, `<unit>-claims.json` and `<unit>-mutants.json` under
+`sdlc-studio/.local/lane/`. One command then lands it, so the commit hook's minutes are paid in
+no agent's context:
+
+```bash
+python3 <skill>/scripts/sprint.py lane land --worktree <path> --units US0123
+```
+
+`lane land` copies the hand-in files to `sdlc-studio/.local/lane/landed/<worktree>/`, commits
+through the repository's hooks (never a bypass), rebases the branch onto the one the root has
+checked out, fast-forwards that, and removes the worktree and its branch. It then records each
+unit's self-check on the root and writes its QA brief to
+`sdlc-studio/.local/briefs/<unit>-qa.txt`, one line per unit naming the review tier and brief
+fingerprint. A hook refusal prints the hook's output and the worktree to resume in, leaving the
+staged change, the worktree and the root's branch as they were; a rebase conflict is aborted
+and its files named. Exit 2 is a refusal before anything was committed, 1 a landing that
+stopped or a unit left unbriefed. Re-run it after a repair: a committed branch is not committed
+twice.
+
+Once the reviewer answers that brief, one command finishes the unit:
+
+```bash
+python3 <skill>/scripts/sprint.py lane accept --unit US0123 --verdict <file> --reviewer <name> --agent <id>
+```
+
+`lane accept` records the verdict with `critic.py record` against the saved brief's fingerprint
+and the tier `critic.py brief` noted for it, under the author of the unit's latest self-check
+unless `--author` names one. On an APPROVE it runs `verify_ac.py run`, moves a story to Done or a
+bug to Fixed, and calls `lane return`, passing `--agent`, `--tokens`, `--minutes`, `--proof` and
+`--gap` through. A REJECT moves nothing and prints the round and the BLOCKING findings, plus the
+carrying bug's id at the review cap. A red criterion leaves the unit where it was, named in the
+verifier's output. Exit 2 is a refusal before anything was recorded, 1 a unit not moved or a
+non-zero return, 0 a unit moved and returned.
+
+See where a session's tokens went, by role, and the tool outputs that cost most:
+
+```bash
+python3 <skill>/scripts/sprint.py cost --anatomy
+```
+
+`cost --anatomy` reads the transcripts the meter reads and prints, per role, the agents, calls, priced
+tokens and share, and the context per call. It reads the open run's window, the records after its
+`started_at`; `--session` reads the whole session, as it does with no run open. The header names
+the main thread's start context. A Subagent starts section flags each subagent whose first call
+carries more context than `cost.agent_start_budget` (30000 tokens by default; `off` flags none).
+`reference-sprint.md#cost-anatomy` has the detail.
+
+The pair also measures the unit. `lane brief` opens the unit's span (a unit already In Progress
+keeps the span it has) and a passing `lane return` closes it, so the sprint report states the
+unit's minutes and tokens over that span. A blocked return leaves the span open. A lane briefed
+and never returned stays open through the close and reads NOT MEASURED, never a time measured to
+the close or to the sign.
+
+`lane return --tokens N --minutes M` records the builder agent's own reported totals against the
+unit, as the delegated record `retro.py accuracy --delegated-unit` writes, so they count once in
+the run's delegated spend and the unit's row reads them as agent tokens and agent minutes. Agent
+minutes take precedence over the lane span, which is the fallback. Both are optional. `--minutes`
+with no `--tokens`, or a total given for several units at once, is not recorded and says so. The
+Estimates tokens ratio is withheld unless every live unit delivered or carrying a span (a lane
+brief or a move to In Progress during the run opens one) supplied its delegated spend: the
+main-thread meter cannot see a delegated agent, so a ratio over a partial actual understates the
+run. A meter whose readings hold the subagent transcripts already counts the builders, so over
+it a supplied `--tokens` total is kept on the record but not added, and the ratio is not
+withheld.

@@ -1,0 +1,1898 @@
+#!/usr/bin/env python3
+"""SDLC Studio status transition.
+
+`transition --id <ID> --status <new>` performs the one mechanical write-side cascade
+that was still hand-driven: set an artifact's `Status` field, sync its index row and the
+summary counts, and (for a story) tick/untick its checkbox in the parent epic's Story
+Breakdown. Deterministic once the new status is chosen - it reuses the validated
+`reconcile.apply_type` to bring the index into line with the file, so there is no
+bespoke index-row editing.
+
+Subcommand:
+  set  Transition one artifact to a new status and cascade the index/epic updates.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import sdlc_md, tiers  # noqa: E402
+import reconcile  # noqa: E402  (sibling - reuse the tested index-row + count sync)
+
+# Statuses that mean "complete" for the epic-breakdown checkbox (a story is ticked).
+_STORY_TICKED = {"Done", "Won't Implement", "Deferred", "Superseded"}
+_REPORT_REL = "sdlc-studio/.local/verify-report.json"
+#: The bug statuses that claim the fix is delivered, and so are held to its green Verify run.
+_BUG_FIX_CLAIMS = ("Fixed", "Verified")
+
+
+def _iso_to_epoch(value) -> float | None:
+    """Parse a verify-report timestamp to a UTC epoch, or None.
+
+    Any ISO-8601 stamp carrying an explicit UTC offset, via the one shared reader."""
+    if not value:
+        return None
+    # The SHARED reader. This carried its own `%Y-%m-%dT%H:%M:%SZ` pattern, so the
+    # offset-bearing stamps the standard library writes - and which are live in this tree -
+    # were refused here while telemetry accepted them. One rule, three implementations, two
+    # of them wrong.
+    parsed = sdlc_md.parse_iso8601(value)
+    return None if parsed is None else parsed.timestamp()
+
+
+def _story_has_executable_acs(text: str) -> bool:
+    """True if the story declares any non-manual `Verify:` line (an executable AC). A story
+    with only `manual` ACs (or none) has nothing the deterministic gate can check."""
+    for line in text.splitlines():
+        m = sdlc_md.VERIFY_RE.match(line)
+        if m and m.group(2).strip().split(None, 1)[0].lower() not in ("manual", "manually"):
+            return True
+    return False
+
+
+def _misplaced_criteria_block(text: str) -> str | None:
+    """Block reason when a criterion sits OUTSIDE `## Acceptance Criteria`, else None.
+
+    The runner never executes such a block and the brief never shows it, so it must not pass
+    this gate by being ignored either: it is refused by NAME, as `validate check` refuses it,
+    until it is moved into the section. Its own channel, not the evidence gate's error slot -
+    that slot means "the criteria could not be read", and a well-understood placement defect
+    told as broken tooling sends the actor to repair the wrong thing."""
+    try:
+        import verify_ac  # noqa: PLC0415 - sibling; imports only sdlc_md, no cycle
+        misplaced = verify_ac.misplaced_criteria(text)
+    except Exception:  # noqa: BLE001 - the evidence gate reports a broken parser on its own terms
+        return None
+    if not misplaced:
+        return None
+    named = ", ".join(f"{ac_id} under `## {heading or '(no heading)'}`" for ac_id, heading in misplaced)
+    return (f"criteria outside `## Acceptance Criteria`: {named} - the runner never executes them "
+            f"and the brief never shows them; move them into the section (`validate.py check` "
+            f"names them)")
+
+
+def _acs_missing_evidence(text: str) -> tuple[list[str], list[str], str | None]:
+    """The ACs no deterministic verifier can speak for, split by WHY, and carrying no recorded
+    passing human verdict: (declared manual, no `Verify:` line at all, error).
+
+    The third element is None on a healthy parse and a short description of the failure when the
+    ACs could not be read at all. It exists because the first two CANNOT express that difference:
+    two empty lists are exactly what a fully-evidenced story looks like, so returning them on an
+    import or parse failure told the caller "nothing is owed" when the truth was "nothing was
+    looked at" - and the caller waved the story to Done.
+
+    Manual ACs are the ones the deterministic gate CANNOT evaluate - a human observes the
+    outcome. The gate cannot check the outcome, but it can require the EVIDENCE that a human did:
+    a `**Verified:**` marker on each. `verify_ac` never stamps a manual AC (it counts and skips
+    it), so this marker is only ever added deliberately - it cannot be auto-satisfied by running
+    the verifier.
+
+    An AC with NO `Verify:` line is the same fact stated by omission, and it used to be the
+    cheaper one: it was waved through while the honestly-declared `manual` beside it was blocked,
+    so silence was the fastest route to Done. It is held to the same evidence, which also puts
+    this gate back in step with the release lane (`gate.py._verify_acs` already refuses an
+    unspecified AC and names it).
+    """
+    try:
+        import verify_ac  # noqa: PLC0415 - sibling; imports only sdlc_md, no cycle
+        blocks = verify_ac.criteria_blocks(text)
+    except Exception as exc:  # noqa: BLE001 - report it, never swallow it
+        # Fail LOUD. The previous `return []` was indistinguishable from a clean bill of health,
+        # so the one condition under which the gate was least able to judge - broken tooling or
+        # an unreadable story - was the one condition under which it approved everything.
+        return [], [], f"{type(exc).__name__}: {exc}"
+    bare_manual: list[str] = []
+    bare_unspecified: list[str] = []
+    for b in blocks:
+        toks = (b.verifier or "").strip().split(None, 1)
+        # Only a PASSING human verdict is evidence. `no` records the human saw it fail, `stale`
+        # that the evidence is out of date, and a missing marker that no one looked - all three are
+        # "not verified" and must block, symmetric with the executable path (which blocks a red or
+        # stale verifier result). Accepting any-marker-present would let one `Verified: no` line
+        # reopen exactly the bypass this closes.
+        if not toks:
+            # A bare AC is UNSPECIFIED, and a `Verified:` marker does not make it specified. The
+            # release lane counts it unspecified regardless of any marker and refuses on it, so
+            # exempting it here made the two gates disagree about the same file - a story closed
+            # Done all sprint and failing only at tag time, which is the defect this closes.
+            bare_unspecified.append(b.ac_id)
+            continue
+        if b.verified_state == "yes":
+            continue
+        if toks[0].lower() in ("manual", "manually"):
+            bare_manual.append(b.ac_id)
+    return bare_manual, bare_unspecified, None
+
+
+def _red_acs(entry: dict) -> str | None:
+    """The criteria a verify-report entry records red (failed or stale), named; None when green."""
+    if not (entry.get("failed", 0) or entry.get("stale", 0)):
+        return None
+    return ", ".join(f.get("ac", "?") for f in entry.get("failures", [])) or "stale AC(s)"
+
+
+def _bug_verify_gate(root: Path, path: Path, target: str) -> str | None:
+    """A bug claiming its fix while its own recorded `Verify:` run is red. A block reason, or None.
+
+    The bug's bar is its criteria alone: a red criterion refuses and is named, and no depth tier
+    is stamped beside it. Only a recorded RED refuses; a bug whose selectors were never run is
+    left to the criteria floor, which already asks that something speak for the fix."""
+    data = sdlc_md.read_json(root / _REPORT_REL, {})
+    stories = data.get("stories") if isinstance(data, dict) else None
+    entry = stories.get(path.stem) if isinstance(stories, dict) else None
+    red = _red_acs(entry) if isinstance(entry, dict) else None
+    return f"AC verification is red ({red}) - fix or re-verify before {target}" if red else None
+
+
+def _done_verify_gate(root: Path, path: Path, text: str) -> str | None:
+    """Definition-of-Done safety net on the hand-driven path. A story may not reach
+    Done with executable ACs that are red or never run - the 0/7 a hand-driving agent shipped.
+    Returns a block reason, or None to allow. A green report passes. The hard gate is the one
+    deterministic fact - the verifier result; critic semantic findings stay advisory (handled
+    elsewhere).
+
+    A manual AC is not exempt from all scrutiny: the gate cannot judge the OUTCOME a human must
+    observe, but it requires the EVIDENCE that a human did and it PASSED - a `**Verified:** yes`
+    marker. Without a passing verdict (`no`, `stale`, or nothing at all), `manual` meant "nothing
+    checks this", and the more irreversible the work the less it was gated. This runs first, so an
+    all-manual story is no longer waved through with nothing looked at.
+
+    An AC carrying no `Verify:` line at all is held to the same evidence, for the same reason and
+    with no discount for saying nothing: waving it through made omission strictly cheaper than
+    honest declaration, and it disagreed with the release lane, which refuses an unspecified AC -
+    so a story closed Done all sprint failed only at tag time."""
+    placement = _misplaced_criteria_block(text)
+    if placement is not None:
+        return placement
+    bare_manual, bare_unspecified, evidence_error = _acs_missing_evidence(text)
+    if evidence_error is not None:
+        # Broken tooling is not a passed gate. Refuse and name the failure, so the actor repairs
+        # the story or the environment rather than being handed a Done nothing checked.
+        return (f"the manual-evidence check could not run ({evidence_error}) - an unreadable "
+                f"story or a broken `verify_ac` import is not a passed gate. Fix that, then "
+                f"retry; `--force` overrides deliberately")
+    # Both are reported in ONE refusal: fixing one and being refused for the other next attempt
+    # is the round-trip-per-gate cost the ladder above already avoids.
+    parts = []
+    if bare_manual:
+        parts.append(f"manual acceptance criteria ({', '.join(bare_manual)}) reached Done with no "
+                     f"recorded PASSING verification - add a `**Verified:** yes` marker (when "
+                     f"observed, by whom) to each, or make the criterion executable. A "
+                     f"`no`/`stale` marker blocks like a red verifier does")
+    if bare_unspecified:
+        parts.append(f"acceptance criteria ({', '.join(bare_unspecified)}) carry no `Verify:` "
+                     f"line at all - an omitted verifier is not a passed one. Author one, or "
+                     f"declare `- **Verify:** manual <what a human checks>` and record a "
+                     f"`**Verified:** yes` marker; omission buys no discount over declaring it")
+    if parts:
+        return "; and ".join(parts)
+    if not _story_has_executable_acs(text):
+        return None  # nothing executable to verify; manual evidence (if any) is present
+    # The story-level Definition of Done, when the project declares one, decides whether
+    # this check enforces: a DoD whose story level does not tag `story.verify-ac` has
+    # downgraded AC verification to human judgement (a visible edit to the document, and
+    # noted here so the stand-down is never silent). Absent document = today's behaviour.
+    dod = sdlc_md.dor_dod_level_checks(root, "done", "story")
+    if dod is not None and "story.verify-ac" not in dod:
+        print("note: story.verify-ac is downgraded to human-judged by "
+              "definition-of-done.md - the AC-verify Done gate stands down", file=sys.stderr)
+        return None
+    report_path = root / _REPORT_REL
+    if not report_path.exists():
+        return "this story declares executable ACs but they were never verified - run `verify_ac`"
+    try:
+        entry = (json.loads(report_path.read_text(encoding="utf-8")).get("stories", {}) or {}).get(path.stem)
+    except (ValueError, OSError):
+        entry = None
+    if entry is None:
+        return "this story is not in the verify-report - run `verify_ac` before Done"
+    red = _red_acs(entry)
+    if red:
+        return f"AC verification is red ({red}) - fix or re-verify before Done"
+    # A green entry can still be STALE: the story may have been edited since it was verified
+    # (a changed Verify line, or a new AC). A merged report carries the old green forever, so
+    # the entry alone is not proof the CURRENT story passes.
+    # Prefer a CONTENT fingerprint over mtime. mtime answers "was the file touched", not
+    # "did what we verified change": a Status transition, a Revision History row, or
+    # verify_ac's own `**Verified:**` stamp all bump mtime while the ACs and their
+    # verifiers are untouched, so a correct green was rejected as stale. Reports written
+    # before the fingerprint existed carry none - those still fall back to mtime rather
+    # than silently passing.
+    recorded_fp = entry.get("ac_fingerprint")
+    if recorded_fp:
+        try:
+            import verify_ac  # sibling; imports only sdlc_md, no cycle
+            current_fp = verify_ac.ac_fingerprint(text)
+        except Exception:  # noqa: BLE001 - a parse hiccup must not mask the gate; fall back to mtime
+            current_fp = None
+        if current_fp is not None:
+            if current_fp != recorded_fp:
+                return ("this story's acceptance criteria changed after it was last verified "
+                        "- re-run `verify_ac` before Done")
+            return None  # ACs are byte-identical to what passed; mtime is noise
+    verified_at = _iso_to_epoch(entry.get("verified_at"))
+    try:
+        story_mtime = path.stat().st_mtime
+    except OSError:
+        story_mtime = None
+    if verified_at is not None and story_mtime is not None and story_mtime > verified_at + 2:
+        return "this story was edited after it was last verified - re-run `verify_ac` before Done"
+    reported_acs = entry.get("ac_count")
+    if reported_acs is not None:
+        try:
+            import verify_ac  # sibling; imports only sdlc_md, no cycle
+            current_acs = len(verify_ac.criteria_blocks(text))
+        except Exception:  # noqa: BLE001 - a parse hiccup must not mask the gate; skip this leg
+            current_acs = None
+        if current_acs is not None and current_acs != reported_acs:
+            return (f"the story now has {current_acs} AC(s) but the verify-report covers "
+                    f"{reported_acs} - re-run `verify_ac` before Done")
+    return None
+
+
+# The status cell is read as free text, not a closed vocabulary. Real decision rows carry
+# their reasoning inline - `Open - the mechanism detail for the blocking lane`, `Resolved:
+# option D (...)` - so a reader demanding the bare word misses a genuinely Open row and
+# reports the file clean. A false negative in the gate is worse than the prose rule it
+# replaces, because it also looks like proof.
+#
+# Every structural assumption here has been a false negative at least once, so each is now
+# as loose as it can be while still discriminating: the row may have ANY column count (the
+# status is the LAST cell), a cell may contain an escaped pipe, and the section heading may
+# be at any level. The first version fixed all three and let four real shapes through.
+_DECISION_ROW_RE = re.compile(r"^\s*\|\s*(D\d+)\s*\|(.+)\|\s*$")
+#: A cell separator is an UNESCAPED pipe; `\|` is a literal pipe inside a cell.
+_DECISION_PIPE_RE = re.compile(r"(?<!\\)\|")
+#: Leading tokens that mean "not settled". Anything else - Closed, Resolved, Superseded, a
+#: prose verdict - is a decision that was taken, because the register records what was
+#: decided rather than a fixed vocabulary.
+_UNSETTLED = ("open", "unresolved", "undecided", "tbd", "pending")
+#: An ATX heading: one to six hashes followed by whitespace. Anything else that
+#: merely begins with `#` - a shell comment, an issue reference - is not a heading.
+_ATX_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
+
+
+def _rfc_open_decisions(text: str) -> list[str]:
+    """The decision numbers still Open in an RFC's decision table (rows only).
+
+    `_rfc_open_decisions_detail` is the same reading plus WHICH path produced it. A caller
+    that reports the rows to a human wants the detail form: the two paths differ in what a
+    row means, so a message that cannot say which one ran cannot be acted on correctly.
+    """
+    return _rfc_open_decisions_detail(text)[0]
+
+
+def _rfc_open_decisions_detail(text: str) -> tuple[list[str], bool]:
+    """The rows, and True when the FAIL-CLOSED fallback produced them.
+
+    The decision numbers still Open in an RFC's decision table.
+
+    Rows are normally read only inside the decisions section: a `| D1 | ... | Open |` line in
+    a Summary or an appendix is prose, not the register the accept step is about.
+
+    ONE EXCEPTION, and it is not a corner case. If the scan ends inside an unterminated fence
+    the section boundaries could not be established, and this falls back to
+    `_rfc_open_decisions_unstructured`, which reads every unsettled row ANYWHERE in the file -
+    Summary and appendix included. So the guarantee above holds for the ordinary path only,
+    and the return value can name a row outside the register. Stated here because the previous
+    wording promised the narrow reading unconditionally while the fallback had already broken
+    it, and a caller trusting the docstring would mis-read the result.
+    """
+    open_rows: list[str] = []
+    in_section = False
+    fence = None          # (char, length) of the OPEN fence, or None
+    for line in text.splitlines():
+        # A fenced block holds no headings and no decision rows, so it is skipped. The rule
+        # is CommonMark's, not a toggle: a fence opens on 3+ of ` or ~ and closes only on the
+        # SAME character at that length or longer. A naive `not in_fence` toggle counted the
+        # inner ```bash of a ````markdown block as a delimiter and ended the file inside a
+        # fence, hiding the whole section - a wider bypass than the one it was fixing.
+        stripped = line.lstrip()
+        marker = "`" if stripped.startswith("```") else ("~" if stripped.startswith("~~~") else None)
+        if marker:
+            run = len(stripped) - len(stripped.lstrip(marker))
+            if fence is None:
+                fence = (marker, run)
+                continue
+            if marker == fence[0] and run >= fence[1]:
+                fence = None
+                continue
+            # a shorter or different fence inside an open one is CONTENT
+        if fence is not None:
+            continue
+        # An ATX heading is one to six hashes THEN whitespace. `#42` and `#!/bin/sh` are
+        # not headings, and neither ends a section.
+        if _ATX_HEADING_RE.match(line):
+            in_section = "decision" in line.lower()
+            continue
+        if not in_section:
+            continue
+        m = _DECISION_ROW_RE.match(line)
+        if not m:
+            continue
+        # The status is the LAST cell, whatever the column count, split on unescaped pipes.
+        cells = [c.strip() for c in _DECISION_PIPE_RE.split(m.group(2))]
+        status = cells[-1].lower() if cells else ""
+        # Judged on the LEADING token, so an annotated cell still counts while one that
+        # merely mentions the word ('Closed - was open until the 07-19 review') does not.
+        if any(status.startswith(word) for word in _UNSETTLED):
+            open_rows.append(m.group(1))
+    if fence is not None:
+        # The scan ended inside an unterminated fence, so anything after it was skipped and
+        # THIS READING IS INCOMPLETE - whether or not it happened to find something first.
+        # Fail CLOSED by re-reading the document with every structural rule dropped. A false
+        # positive here asks a human to look; a false negative silently accepts an RFC with
+        # open decisions, and that is the failure this gate exists for.
+        #
+        # The condition was `fence is not None and not open_rows`, which fired only on an
+        # EMPTY read. With one open row before the broken fence and another after it, the
+        # first was found, the re-scan was skipped, and the caller received a list missing
+        # every row the fence hid - reported to the operator as the complete set.
+        # The unstructured read drops both structural rules, so it is a superset of this one:
+        # re-scanning unconditionally can only add rows, never lose them.
+        return _rfc_open_decisions_unstructured(text), True
+    return open_rows, False
+
+
+def _rfc_open_decisions_unstructured(text: str) -> list[str]:
+    """Every unsettled decision row in the document, ignoring fences AND sections.
+
+    The fail-closed path, reached only when the main scan ended inside an unterminated
+    fence. It deliberately drops the section rule as well as the fence rule, because the
+    two structural signals fail together: an unterminated fence means the document's
+    structure cannot be trusted, and a `#` line inside that fence is exactly as likely to
+    be a shell comment as a heading. An earlier version dropped only the fence rule and
+    kept `in_section`, which let a `# comment` inside the broken fence end the section and
+    hide every row after it - the fallback then returned "no open decisions" for the very
+    document it existed to catch, so the gate advertised fail-closed and failed OPEN.
+
+    Reading a row outside the decisions section is the intended cost, and it is paid on VALID
+    documents, not only broken ones. CommonMark closes an open fence at end of document, so a
+    file ending inside a fence - an appendix whose last block is never closed - is well-formed
+    markdown that every parser accepts. An earlier version of this docstring claimed the
+    opposite ("on a well-formed document this function never runs") and justified the cost as
+    prompting someone to fix markdown that needed fixing; there may be nothing to fix, and the
+    honest description is that this trades a rare false POSITIVE for the impossibility of a
+    false negative. An operator facing that can record a `Decision-Override`.
+    """
+    open_rows: list[str] = []
+    for line in text.splitlines():
+        m = _DECISION_ROW_RE.match(line)
+        if not m:
+            continue
+        cells = [c.strip() for c in _DECISION_PIPE_RE.split(m.group(2))]
+        status = cells[-1].lower() if cells else ""
+        if any(status.startswith(word) for word in _UNSETTLED):
+            open_rows.append(m.group(1))
+    return open_rows
+
+
+def _rfc_accept_gate(text: str, target_canon: str | None) -> str | None:
+    """Block an RFC reaching Accepted while any decision row is Open.
+
+    `reference-rfc.md`'s accept step has always forbidden this, but only in prose, and a
+    rule with no mechanism fires when somebody remembers: six RFCs reached Accepted, were
+    decomposed and were delivered carrying nothing but the boilerplate Open row.
+
+    The sanctioned escape is a RECORDED `> **Decision-Override:**` reason, not `--force`: a
+    skip that leaves its reason in the file is auditable afterwards, a force flag is not.
+    """
+    if target_canon != "Accepted":
+        return None
+    still_open, from_fallback = _rfc_open_decisions_detail(text)
+    if not still_open:
+        return None
+    override = ""
+    for line in text.splitlines():
+        if line.startswith("> **Decision-Override:**"):
+            override = line.split("**Decision-Override:**", 1)[1].strip()
+            break
+    if override:
+        return None
+    # NAME the scan path. The fallback deliberately over-reports, and an operator who cannot
+    # tell a deliberate over-report from a real open decision does one of two things: edits
+    # valid markdown until the tool is satisfied, or stops believing the gate. The second is
+    # worse, and neither is the operator's fault when the message withholds what it knows.
+    source = (" This list came from the FAIL-CLOSED fallback: the document ends inside an "
+              "unterminated fence, which is valid CommonMark, so every unsettled row ANYWHERE "
+              "in the file was counted - fenced examples included. It trades a rare false "
+              "positive for the impossibility of a false negative (reference-rfc.md). If every "
+              "real decision is settled, close the fence or record the override."
+              if from_fallback else "")
+    return (f"RFC carries {len(still_open)} Open decision(s): {', '.join(still_open)} - close "
+            f"each row with what was decided, or record `> **Decision-Override:** <reason>` "
+            f"(--force does not bypass this: the skip must leave a reason in the file)." + source)
+
+
+def _rfc_override_reason(text: str) -> str:
+    """The recorded override reason, for reporting a sanctioned skip back to the caller."""
+    for line in text.splitlines():
+        if line.startswith("> **Decision-Override:**"):
+            return line.split("**Decision-Override:**", 1)[1].strip()
+    return ""
+
+
+def _request_terminal_gate(root: Path, type_: str, artifact_id: str,
+                           target_canon: str | None) -> str | None:
+    """A DISCOVERY item (CR/RFC/Issue) may not reach its SUCCESSFUL terminal by assertion (G2). A
+    CR is Complete only when every story and epic it produced is resolved (in a terminal state);
+    an RFC is Accepted only when every CR it produced is resolved; an Issue is Resolved only when
+    every bug it was triaged into is resolved. "Resolved" is terminal, not strictly Done: a child
+    legitimately dropped (a Won't-Implement story, a Won't-Fix bug, a Rejected child CR) does not
+    force the parent onto --force. A childless discovery item cannot be successfully terminal - it
+    produced nothing, so it delivered nothing.
+
+    Scoped to the successful terminal (Complete for a CR, Accepted for an RFC, Resolved for an
+    Issue): a discovery item the team decides NOT to build is still closable as Rejected /
+    Superseded / Withdrawn / Won't Fix / Closed without children, because that closure asserts no
+    delivery. Returns a block reason, or None to allow. Overridable with --force, like the other
+    close gates, but the sanctioned path is to finish or close the children first."""
+    if not sdlc_md.is_discovery(type_):
+        return None
+    if target_canon != sdlc_md.default_terminal_status(type_):
+        return None  # Rejected / Superseded / Withdrawn: closing without a delivery claim
+    children = sdlc_md.children_of(root, artifact_id)
+    if not children:
+        return (f"{artifact_id} has no children - a request delivers nothing until it is "
+                f"decomposed. Break it into the stories/epics that deliver it (write each "
+                f"child's `Parent:` and this request's `Decomposed-into:`), or close it as "
+                f"Rejected/Superseded if it is not going ahead")
+    unfinished: list[str] = []
+    for cid, ctype in children:
+        hit = sdlc_md.find_by_id(root, cid)
+        if not hit:
+            unfinished.append(f"{cid} (unresolvable)")
+            continue
+        cpath, real_type = hit
+        cvocab = sdlc_md.status_vocab(real_type, root)
+        cstatus = sdlc_md.canonical_status(
+            sdlc_md.extract_field(cpath.read_text(encoding="utf-8"), "Status"), cvocab)
+        if not sdlc_md.is_terminal_status(real_type, cstatus or ""):
+            unfinished.append(f"{cid} ({cstatus or 'no status'})")
+    if unfinished:
+        return (f"{artifact_id} cannot be {target_canon}: its status is DERIVED from its "
+                f"children, and {len(unfinished)} is/are not yet resolved: "
+                f"{', '.join(unfinished)}. Finish or close them first")
+    return None
+
+
+def _find(repo_root: Path, artifact_id: str):
+    """(path, type) of the artifact with this id, or (None, None). Delegates to the shared
+    alias-aware `sdlc_md.find_by_id`; normalises its None to the (None, None) this call site
+    unpacks."""
+    return sdlc_md.find_by_id(repo_root, artifact_id) or (None, None)
+
+
+def _set_field(text: str, name: str, value: str) -> tuple[str, bool]:
+    """Replace a `**Name:** value` field's value in place (blockquote or inline `·`
+    form), preserving the surrounding format. Returns (new_text, changed)."""
+    pat = re.compile(
+        rf"((?:^>?\s*|·\s*)\*\*{re.escape(name)}:\*\*\s*)(.+?)(\s*(?=·|\s\*\*[^*\n]+:\*\*|$))",
+        re.M)
+    new_text, n = pat.subn(lambda m: m.group(1) + value + m.group(3), text, count=1)
+    return new_text, n > 0
+
+
+def _insert_after_status(text: str, line: str) -> str:
+    """Insert `line` immediately after the `> **Status:**` metadata line (used to add a
+    field that does not yet exist, e.g. a first-time `Triaged-by`). No-op if no Status line."""
+    lines = text.splitlines(keepends=True)
+    for i, ln in enumerate(lines):
+        if re.match(r">?\s*\*\*Status:\*\*", ln):
+            lines.insert(i + 1, line if line.endswith("\n") else line + "\n")
+            return "".join(lines)
+    return text
+
+
+def _upsert_field(text: str, name: str, value: str) -> str:
+    """Set `**Name:** value` in place, or insert it after Status when the field is absent.
+
+    The single writer of a metadata line, and so the single place the line-break refusal
+    belongs - the analogue of the row writer's cell guard. A name or value carrying a line
+    break escapes the line it is written into, and whatever follows the break is read back as
+    a metadata field of its own; a triage stamp could therefore write any field into the
+    artefact it was closing, including one the file had no other way to acquire. Guarding the
+    writer means every caller inherits the refusal instead of each one remembering it - which
+    `annotate` did and the triage stamps did not.
+    """
+    sdlc_md.require_single_line("metadata field name", name)
+    sdlc_md.require_single_line(f"metadata field {name!r}", value)
+    new_text, changed = _set_field(text, name, value)
+    return new_text if changed else _insert_after_status(text, f"> **{name}:** {value}")
+
+
+# Fields annotate must NEVER touch: they are gate-protected, index-backed, or a cross-script
+# security control, and a stamp verb that could rewrite them would be a sanctioned, exit-0
+# bypass. `status`/`triaged-by`/`triage-severity` gate the transition ladder;
+# `provenance` is the verify_ac shell-execution boundary - annotate clearing an
+# `external` stamp would re-enable shell on untrusted content. The only
+# provenance mutation that matters (external -> non-external) is always the dangerous
+# direction, and there is no legitimate post-creation re-stamp. `template` gates the
+# promotion ladder: annotating it to `full` cleared the planning gate AND its conformance
+# backstop in one exit-0 line, with no waiver and no record - a documented skip printing
+# green over the sections the tier deferred. The tier is changed by `artifact.py promote`,
+# which ADDS those sections; there is no legitimate way to change it without them.
+# Case-insensitive.
+_ANNOTATE_DENYLIST = {"status", "triaged-by", "triage-severity", "provenance", "template"}
+
+# Fields whose VALUE is drawn from a closed vocabulary, keyed by the folded field name and
+# carrying the canonical spelling of that name. `annotate` was the third writer of a Severity
+# line and the only one that never checked: `--value major` was written verbatim, and a
+# severity outside the set is dropped by the release bar AND the disclosure page at once, so
+# the finding is absent from both and the absence reads like a clean corpus.
+#
+# The canonical NAME travels with the normaliser because the writer below matches a field name
+# case-sensitively. Keyed on the folded name alone, `--field severity` slipped past a guard
+# written for `Severity` and then inserted a SECOND metadata line beside the untouched one -
+# so the guard and the write have to agree on the same spelling, not merely on the same word.
+_ANNOTATE_VOCABULARY = {"severity": "Severity"}
+# The remedy named in the refusal, per denied field - so a refusal points somewhere.
+_ANNOTATE_REMEDY = {
+    "template": "the tier is changed by `artifact.py promote --id <id> --to full`, which adds "
+                "the deferred sections; a stamp without them is a claim, not the work",
+}
+
+
+def annotate(repo_root: Path | str, artifact_id: str, field: str, value: str) -> dict:
+    """Deterministically set/update one metadata field on an artifact (the stamp verb the
+    unit-close ceremony was missing - evidence and similar fields no longer need a
+    hand edit). Index-untouched: metadata fields are not index columns. Fails loud on an
+    unresolvable id, a gate-protected field, an injection-shaped value, or a file with no
+    metadata block to anchor to."""
+    root = Path(repo_root)
+    key = field.strip().lower()
+    if key in _ANNOTATE_DENYLIST:
+        remedy = _ANNOTATE_REMEDY.get(key, "status and triage records go through `transition "
+                                            "set` so their gates run")
+        raise ValueError(f"annotate refuses the gate-protected field {field!r}: {remedy}")
+    if key in _ANNOTATE_VOCABULARY:
+        import file_finding  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+        # `normalise_severity` RAISES naming the accepted set, which is the refusal this verb
+        # owed; it also folds case, so `high` is written `High` rather than refused. Both
+        # readers fold, and a writer stricter than its readers refuses findings they classify.
+        field = _ANNOTATE_VOCABULARY[key]
+        value = file_finding.normalise_severity(value)
+    # A line-broken field/value is refused by `_upsert_field` below - the one writer of a
+    # metadata line, and so the one place that rule lives. This verb keeps no copy of it: a
+    # caller-side copy is how the triage stamps came to be written by a writer that did not
+    # refuse them.
+    path, type_ = _find(root, artifact_id)
+    if path is None:
+        raise FileNotFoundError(f"cannot annotate {artifact_id}: artifact not found")
+    text = path.read_text(encoding="utf-8")
+    new_text = _upsert_field(text, field, value)
+    if new_text == text and sdlc_md.extract_field(text, field) != value:
+        # nothing matched AND nothing could be inserted: the file has no Status anchor
+        raise ValueError(f"cannot annotate {artifact_id}: no `> **Status:**` metadata block "
+                         "to anchor the field to - not a structured artifact")
+    if new_text != text:
+        sdlc_md.atomic_write(path, new_text)
+    return {"id": artifact_id, "type": type_, "field": field, "value": value,
+            "changed": new_text != text, "path": str(path)}
+
+
+_REVISION_HEAD_RE = re.compile(r"^##\s+Revision History\s*$", re.MULTILINE)
+
+
+def append_revision_row(text: str, date: str, author: str, note: str) -> tuple[str, bool]:
+    """`text` with one dated `| date | author | note |` row appended after the last row of
+    its `## Revision History` table, or `(text, False)` when there is no such section or the
+    section carries no table.
+
+    The shared revision-log writer the deterministic verbs use to leave an auditable trail of
+    a mechanical change (a retitle records the previous title through it), so the row shape and
+    the cell-escaping live in one place rather than being re-hand-rolled per caller. The three
+    cells go through `sdlc_md.join_row`, which escapes a literal pipe and refuses a line break,
+    so a note carrying either cannot forge a fourth column or a second row."""
+    m = _REVISION_HEAD_RE.search(text)
+    if not m:
+        return text, False
+    lines = text.splitlines()
+    head_ln = text[: m.start()].count("\n")
+    j = head_ln + 1
+    last_row = None
+    while j < len(lines):
+        s = lines[j].strip()
+        if s.startswith("|"):
+            last_row = j
+        elif s.startswith("## ") or (last_row is not None and s and not s.startswith("|")):
+            break
+        j += 1
+    if last_row is None:
+        return text, False
+    lines.insert(last_row + 1, sdlc_md.join_row([date, author, note]))
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else ""), True
+
+
+def _triage_gate(root: Path, type_: str, text: str, from_canon: str | None,
+                 target_canon: str | None, triaged_by: str | None) -> str | None:
+    """Block reason when a v3 finding is leaving the `inbox` triage lane without a valid,
+    separated `triaged_by`; None when the transition is not a triage or the gate is satisfied.
+    Leaving `inbox` by ANY exit is the triage act (accept into the workflow, or reject the
+    finding), so every such transition is gated - not only the canonical accept target - or an
+    agent could sidestep triage by moving a finding straight to another state. Enforces CR0169
+    (structured triaged_by, recorded at transition time) and CR0170 (separation of duties: the
+    triager must not be the raiser). A solo human self-triage is not blocked (a lone operator
+    must not deadlock) - it is left to the caller to warn, mirroring validate.py."""
+    if not (type_ in sdlc_md.FINDING_TYPES and sdlc_md.is_schema_v3(root)):
+        return None
+    if from_canon != sdlc_md.INBOX_STATUS:  # only transitions leaving the inbox lane are triage
+        return None
+    raw = triaged_by or sdlc_md.extract_field(text, "Triaged-by")
+    tb = sdlc_md.parse_authorship_value(raw)
+    if not tb or not tb["name"]:
+        return ('triage requires a structured `--triaged-by "Name; type; version"` '
+                "(type is human|persona|agent) - the triaging seat must be recorded")
+    if tb["type"] not in ("human", "persona", "agent"):
+        return f"triaged_by type {tb['type']!r} must be one of human|persona|agent"
+    raiser = sdlc_md.parse_authorship(text, "Raised-by")
+    if raiser and raiser["name"]:
+        same = (sdlc_md.norm_id(raiser["name"]) == sdlc_md.norm_id(tb["name"])
+                and raiser["type"] == tb["type"])
+        if same and tb["type"] != "human":
+            return (f"triaged_by {tb['name']!r} is the raiser - a different seat must triage "
+                    "(separation of duties, CR0170)")
+    return None
+
+
+def _cascade_epic(repo_root: Path, story_id: str, ticked: bool) -> str | None:
+    """Tick/untick the story's line in its parent epic's Story Breakdown (called only on
+    a real write). Returns the epic id touched, or None."""
+    spath, _ = _find(repo_root, story_id)
+    if spath is None:
+        return None
+    epic_field = sdlc_md.extract_field(spath.read_text(encoding="utf-8"), "Epic") or ""
+    m = sdlc_md.ID_SEARCH_RE.search(epic_field)
+    if not m:
+        return None
+    epath, _ = _find(repo_root, m.group(0))
+    if epath is None:
+        return None
+    norm = sdlc_md.norm_id(story_id)
+    lines = epath.read_text(encoding="utf-8").splitlines()
+    changed = False
+    box = "[x]" if ticked else "[ ]"
+    for i, ln in enumerate(lines):
+        s = ln.lstrip()
+        if s.startswith(("- [ ]", "- [x]", "- [X]")) and sdlc_md.ID_SEARCH_RE.search(ln) \
+                and sdlc_md.norm_id(sdlc_md.ID_SEARCH_RE.search(ln).group(0)) == norm:
+            new = re.sub(r"\[[ xX]\]", box, ln, count=1)
+            if new != ln:
+                lines[i] = new
+                changed = True
+            break
+    if changed:
+        sdlc_md.atomic_write(epath, "\n".join(lines) + "\n")
+    return m.group(0) if changed else None
+
+
+_IMPL_TARGETS = {"In Progress", "Review", "Done"}
+
+
+def _tier_gate(root: Path, text: str, type_: str) -> str | None:
+    """Block reason when a story or epic reaches an implementation-facing status without the
+    sections the full template carries.
+
+    Keyed on the SECTIONS, not on the tier stamp: a stamp is a claim the subject can rewrite,
+    and a gate that trusts one is defeated by rewriting it. `lib.tiers.promotion_deficit` owns
+    the judgement (fail closed on an unknown tier; a `full` claim is checked against the
+    sections; an unstamped artefact is untouched unless the project sets
+    `quality.require_full_sections`).
+
+    Fires on EVERY entry to an implementation status, not just the first: the deficit is a
+    property of the file, not a one-off event, and it persists until the sections are there.
+    Not bypassable with `--force`, because the sanctioned route ADDS the sections rather than
+    waiving them - and `transition annotate` refuses the tier field for the same reason."""
+    return tiers.promotion_deficit(text, type_, strict=tiers.require_full_sections(root))
+
+
+class GateRefusal(ValueError):
+    """A transition refused by the gate ladder, carrying the blocks as DATA.
+
+    Subclasses ValueError so every existing caller and test keeps working unchanged - the
+    message is identical. `blocks` exists so a reader does not have to re-parse that message:
+    the ladder joins with `"; AND "` but only SOME gates suffix their reason with
+    `". Override with --force"`, so splitting on the suffix merges any two adjacent gates that
+    do not carry it, and leaks the delimiter into the next item when they alternate. Rebuilding
+    a list from a sentence is guesswork about a format nothing pinned; passing the list is not.
+    """
+
+    def __init__(self, message: str, blocks: list[str]):
+        super().__init__(message)
+        self.blocks = list(blocks)
+
+
+
+# --- The line-coverage gate (US0816) ---------------------------------------------------------
+#
+# Every surviving mutant the seats found in RUN-01M1WPNV sat on a branch the unit's own
+# selectors never executed. `verify_ac run --coverage` measures that; this gate reads the
+# measurement at the terminal transition, COLLECTING it there rather than trusting a report
+# written before the last edit.
+
+LINE_COVERAGE_MODES = ("report", "block", "off")
+LINE_COVERAGE_DEFAULT = "off"        # the fallback LITERAL: `project_override` merges no defaults
+LINE_COVERAGE_ABSENT_REPORT = ("coverage: not measured - the coverage module is absent "
+                               "(pip install coverage, or review.line_coverage: off)")
+
+
+def line_coverage_mode(root) -> str:
+    """The project's `review.line_coverage`: `off` (the shipped default), `report` or `block`.
+
+    An unrecognised value is REFUSED by name, never read as `off`: a typo that switched a
+    project's bar off silently is the one outcome nobody asked for. YAML 1.1 parses a bare
+    `off` as False, so False is `off` - the only thing it can honestly mean.
+    """
+    raw = sdlc_md.project_override(root, "review.line_coverage", None)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return LINE_COVERAGE_DEFAULT
+    if raw is False:
+        return "off"
+    value = str(raw).strip().lower()
+    if value not in LINE_COVERAGE_MODES:
+        raise ValueError(f"review.line_coverage is `{raw}`, which is not one of "
+                         f"{', '.join(LINE_COVERAGE_MODES)} - refused rather than read as off")
+    return value
+
+
+def line_coverage_lane(root, unit: str, text: str, type_: str, path, *,
+                       base_ref: str | None = None, report_path: str | None = None) -> dict:
+    """`{"blocks": [...], "warning": str | None, "mode": str}` for one terminal transition.
+
+    Under `block`, an uncovered added line, a `not measured` Python file, a stale ruling, a
+    missing base ref or an absent coverage module each refuse by name. Under `report` the same
+    facts are printed and the transition proceeds. Under `off` nothing is collected.
+    """
+    out: dict = {"blocks": [], "warning": None, "mode": None}
+    mode = line_coverage_mode(root)
+    out["mode"] = mode
+    if mode == "off":
+        return out
+    try:
+        import verify_ac as _va  # noqa: PLC0415 - sibling; verify_ac imports transition back
+    except ImportError as exc:
+        # FAILS LOUD, as the manual-evidence gate beside it does: a gate whose instrument
+        # cannot be imported has measured nothing, and under `block` that is a refusal
+        msg = f"coverage: not measured - verify_ac could not be imported ({exc})"
+        if mode == "block":
+            out["blocks"].append(f"{sdlc_md.norm_id(unit)}: {msg}")
+        else:
+            out["warning"] = msg
+        return out
+    from lib import run_state as _rs  # noqa: PLC0415
+    if not base_ref and not _rs.has_state(root) and mode == "report":
+        # A project that never opened a run is not in a delivery: `report` stays silent rather
+        # than printing "no base ref" on every terminal transition of every upgrading project.
+        # `block` still refuses below, naming `--base` - a project that chose the bar is in one.
+        return out
+    uid = sdlc_md.norm_id(unit)
+    rep = None
+    notes: list = []     # every report-mode observation, joined at the end - never overwritten
+    if report_path:
+        # a reused report is accepted only when its recorded Affects hash matches the bytes now
+        data = sdlc_md.read_json(Path(root) / report_path, None) or {}
+        cov = (data.get("coverage") or {}).get(Path(path).stem) if isinstance(data, dict) else None
+        affects = [r.strip().strip("`") for r in sdlc_md.affects_files(text)]
+        if not cov or cov.get("affects_hash") != _va._affects_hash(Path(root), affects):
+            msg = (f"{uid}: the coverage report at {report_path} is STALE - its Affects hash does "
+                   f"not match the files' bytes now; re-run `verify_ac.py run --id {uid} --coverage`")
+            if mode == "block":
+                out["blocks"].append(msg)
+                return out
+            notes.append(msg)
+        else:
+            rep = cov
+    if rep is None:
+        try:
+            rep = _va.coverage_report(root, Path(path), uid, base_ref=base_ref)
+        except _va.CoverageUnavailable as exc:
+            msg = str(exc)
+            if mode == "block":
+                out["blocks"].append(f"{uid}: {msg}")
+            elif _va.COVERAGE_ABSENT in msg:
+                notes.append(LINE_COVERAGE_ABSENT_REPORT)
+            else:
+                notes.append(msg.split(": no run", 1)[0] if _va.COVERAGE_NO_BASE in msg else msg)
+            out["warning"] = " | ".join(notes)
+            return out
+    rep = _va.apply_rulings(root, text, rep)
+    uncovered_lines = []
+    not_measured = []
+    for rel, entry in rep["files"].items():
+        if entry.get("status") == "measured" and entry.get("uncovered"):
+            uncovered_lines.append(f"{rel}: {', '.join(map(str, entry['uncovered']))}")
+        elif str(entry.get("status", "")).startswith("not measured"):
+            not_measured.append(f"{rel}: not measured - no traced verifier")
+    stale = rep.get("rulings", {}).get("stale") or []
+    problems = []
+    if rep["uncovered_total"]:
+        problems.append(f"{rep['uncovered_total']} uncovered added line(s) its own verifiers never "
+                        f"executed - " + "; ".join(uncovered_lines)
+                        + f". Rule a line equivalent with `verify_ac.py coverage rule --id {uid} "
+                        f"--file <path> --line <n> --reason <why>`, or reach it with a test")
+    if not_measured:
+        problems.append("Python file(s) with added lines and no traced verifier, which is not "
+                        "covered: " + "; ".join(not_measured))
+    stale_note = ""
+    if stale:
+        # A stale ruling was made on bytes the file no longer has, so it asserts nothing about
+        # the tree in front of us: whatever it once excused is either executed now (and needs
+        # no waiver) or still uncovered (and is counted above, on its own). Blocking on the
+        # staleness ITSELF refused a unit the measurement calls clean, and the only remedy
+        # printed was to re-assert the waiver - a claim the tool's own reading contradicts.
+        stale_note = ("stale coverage ruling(s) on bytes the file no longer has, satisfying "
+                      "nothing: " + ", ".join(stale) + f" - withdraw each with `verify_ac.py "
+                      f"coverage withdraw --id {uid} --file <path> --line <n> --reason <why>`, "
+                      "or rule the line again if it is still uncovered")
+    if problems:
+        joined = " | ".join(problems + ([stale_note] if stale_note else []))
+        if mode == "block":
+            out["blocks"].append(f"{uid}: " + joined)
+        else:
+            notes.append("coverage: " + joined)
+    elif stale_note:
+        notes.append("coverage: " + stale_note)
+    if notes:
+        out["warning"] = " | ".join(notes)
+    return out
+
+
+#: The phrase every refusal and warning of the unanswered-REJECT guard carries, and no other
+#: gate emits, so a reader - or a test - can tell this refusal from its neighbours.
+UNANSWERED_REJECT = "unanswered delivery REJECT"
+#: The units a delivery REJECT is recorded against and that reach a delivered terminal.
+_REJECT_GUARDED_TYPES = ("story", "bug")
+
+
+def _reject_exits() -> str:
+    """The ways out, named in the refusal: a gate that says only "no" costs a round-trip to
+    learn what yes looks like, and the likeliest wrong move - ruling the unit in the retro's
+    carried table - is named as not being one."""
+    import critic  # noqa: PLC0415 - deferred sibling; only a refused terminal pays for it
+    return (f"A REJECT has two exits: {critic.REJECT_EXITS}. A ruling in a retro's `Known "
+            "issues carried` table does not discharge it, and a `--force` waiver is recorded in "
+            "the artefact's `Forced-override` field")
+
+
+def _unanswered_delivery_reject(root, uid: str) -> str | None:
+    """What stands against this unit's delivered close: its unanswered delivery REJECT, named by
+    reviewer and date with its findings - or None when it carries none, or carries one that is
+    answered.
+
+    ANSWERED is `critic.coverage_state` reading `approved`: a later independent APPROVE from the
+    reviewer who rejected - the one reader review-coverage and conformance already use, so a
+    unit this passes is one they count as reviewed. The DELIVERY phase only. Nothing in a
+    retro's carried table is read, because a ruling rules on the close, not on the reviewer's
+    findings.
+    """
+    import critic  # noqa: PLC0415 - deferred sibling; only a terminal transition pays for it
+    standing = critic.standing_rejects(root, uid, "delivery")
+    if not standing:
+        return None
+    if critic.coverage_state(root, uid, "delivery") == critic.COVERAGE_APPROVED:
+        return None
+    who = "; ".join(f"{r.get('reviewer') or '(no reviewer)'}'s REJECT of "
+                    f"{r.get('date') or '(undated)'}" for r in standing)
+    outstanding = [f["text"] for r in standing
+                   for f in critic.parse_findings(r.get("issues", ""))]
+    if outstanding:
+        listed = "; ".join(outstanding[:4]) + (" ..." if len(outstanding) > 4 else "")
+        detail = f"{len(outstanding)} finding(s) outstanding - {listed}"
+    else:
+        detail = ("the REJECT itemises no findings, and its reviewer has not approved a later "
+                  "round")
+    # Named in its file's spelling: `uid` is the comparison key, which drops a v3 id's dash.
+    return f"{sdlc_md.display_id(root, uid)} carries an {UNANSWERED_REJECT} ({who}): {detail}"
+
+
+def _pre_write_gates(root, artifact_id, new_status, type_, path, text,
+                     target_canon, from_canon, force, dry_run, triaged_by,
+                     coverage_opts: dict | None = None) -> str | None:
+    """Run the ordered pre-write gates (bug-verify, done-verify, tier, triage, breakdown). Raise
+    ValueError on a hard block; else return the accumulated advisory warning (or None).
+    Behaviour-preserving extraction of the interleaved gate ladder."""
+    gate_warn = None
+    # Every unmet gate is COLLECTED and reported in one refusal - refusing one requirement
+    # per attempt cost an agent a round-trip per gate (three attempts to close a v3 finding).
+    blocks: list[str] = []
+    # These gates fire on a DRY-RUN too, for the reason the tier gate below already states: an
+    # honest preflight surfaces the refusal a real run would hit. Suppressing them made the
+    # dry-run report `would set BG0001 Open -> Fixed` for a transition the real run BLOCKS, so
+    # the one pre-flight an agent has gave the opposite answer to the real thing. `force` is
+    # still honoured, because a forced dry-run must predict what a forced real run does.
+    # The criteria floor, at the VERB. BG0370 closed it at the validate layer, which the
+    # pre-commit gate enforces - so a unit could not LAND at a terminal status with no
+    # criteria, but `transition set` still performed the change and the refusal arrived later,
+    # from a different tool, phrased as a validation error. Defence at the gate rather than at
+    # the verb is weaker than the rule reads, and it leaves the working tree in the state the
+    # rule forbids. The PREDICATE is validate's own, imported rather than re-derived, so the
+    # two cannot disagree about what counts as a criterion.
+    #
+    # Only a DELIVERED-terminal status: a unit ruled `Won't Fix` or `Superseded` was never
+    # built, so it owes no contract. That distinction is `sdlc_md.is_delivered_terminal`, read
+    # here and by `close_owed`, rather than a second list of statuses to drift.
+    if (not force and sdlc_md.executes_verifiers(type_)
+            and sdlc_md.is_delivered_terminal(type_, target_canon or "")):
+        try:
+            import validate as _validate
+            has_criteria = _validate._has_criteria(text)
+        except Exception:  # noqa: BLE001 - an unimportable validator must not break the verb
+            has_criteria = True
+        if not has_criteria:
+            blocks.append(
+                f"no acceptance criteria; {target_canon} requires at least one - a unit "
+                f"reaching a terminal status with nothing stating what done looks like "
+                f"cannot be checked by anything downstream. Add a criterion (a `Verify:` "
+                f"line makes it executable), or state the absence deliberately. "
+                f"Override with --force")
+        else:
+            # HAVING criteria is not the same as anything speaking for them. A story is gated
+            # on its executable ACs at `Done`; a bug reaching `Fixed` had no equivalent, so
+            # eight terminal bugs carried 31 unticked boxes and zero `Verify:` lines and passed
+            # every check. A criterion nobody ticked and nothing runs is a sentence, not an
+            # oracle - and the artefact then declares itself unfinished while standing at a
+            # status that says otherwise.
+            #
+            # EITHER satisfies it: a ticked criterion is a human saying so, an executable one
+            # is the machine saying so. Demanding both would refuse the ordinary judgement call
+            # a bug fix often is.
+            # BUGS ONLY. A story reaching `Done` already passes the AC-verify gate, which
+            # EXECUTES its criteria - a stronger oracle than either of these, and applying this
+            # on top would refuse stories the stronger gate accepts while talking about "this
+            # fix". The hole this closes is the one bugs had: `Fixed` with no equivalent.
+            # SCOPED to the criteria. Searching the whole artefact made the gate answerable
+            # by prose it never asked about: a `- [x] I reproduced it` in Steps to Reproduce,
+            # or a `Verify:` line in Proposed Fix naming a file that does not exist, each let a
+            # bug reach Fixed while the refusal text still said "every acceptance criterion is
+            # unticked". Both reproduced through the CLI.
+            criteria = sdlc_md.criteria_section(text)
+            ticked = bool(_TICKED_RE.search(criteria))
+            executable = bool(_VERIFY_RE.search(criteria))
+            if type_ == "bug" and not ticked and not executable:
+                blocks.append(
+                    f"every acceptance criterion is unticked and none carries a `Verify:` "
+                    f"line, so nothing speaks for this fix - {target_canon} would be a status "
+                    f"the artefact's own body contradicts. Tick what you checked, or add a "
+                    f"`Verify:` line that runs. Override with --force")
+    # Open Questions, at the VERB and for EVERY type. An artefact must not reach a terminal
+    # status still asking a question nobody answered - sixteen did, and every one of them
+    # reads as settled work. Both routes out are named in the refusal, because a gate that
+    # says only "no" costs a round-trip to discover what yes looks like. One helper, shared
+    # with `validate`, so the two cannot disagree about what resolved means.
+    if (not force and target_canon
+            and sdlc_md.is_terminal_status(type_, target_canon)):
+        open_qs = sdlc_md.unresolved_questions(text, root)
+        if open_qs:
+            listed = "; ".join(open_qs[:4]) + (" ..." if len(open_qs) > 4 else "")
+            blocks.append(
+                f"{len(open_qs)} unresolved Open Question(s) - {listed}. A terminal artefact "
+                f"must not still be asking: either record the ruling by moving the item under "
+                f"a `## Resolved Questions` heading, or file the question as a follow-up "
+                f"artefact and cite its id on the item. A tick with no destination is refused, "
+                f"because that is how a question stops being visible without being answered. "
+                f"Override with --force")
+    # A bug claiming its fix is refused while its own recorded Verify run is red, and on
+    # nothing else: no depth tier is stamped.
+    if type_ == "bug" and not force and target_canon in _BUG_FIX_CLAIMS:
+        block = _bug_verify_gate(root, path, target_canon)
+        if block:
+            blocks.append(f"{block}. Override with --force")
+    # THE LINE-COVERAGE GATE (US0816): it asks "did the unit's own verifiers execute the lines the
+    # unit added", and is governed by its own setting.
+    if (not force and sdlc_md.executes_verifiers(type_)
+            and sdlc_md.is_delivered_terminal(type_, target_canon or "")):
+        try:
+            cov = line_coverage_lane(root, sdlc_md.norm_id(artifact_id), text, type_, path,
+                                     base_ref=(coverage_opts or {}).get("base"),
+                                     report_path=(coverage_opts or {}).get("report"))
+        except ValueError as exc:
+            cov = {"blocks": [str(exc)], "warning": None}
+        for block in cov["blocks"]:
+            blocks.append(f"{block}. Override with --force")
+        if cov["warning"]:
+            gate_warn = f"{gate_warn}; {cov['warning']}" if gate_warn else cov["warning"]
+    # AN UNANSWERED DELIVERY REJECT holds every DELIVERED terminal - Done, Fixed, Verified,
+    # Closed - by whatever route, and whatever status is being left: a bug reaches Verified or
+    # Closed without passing Fixed, and one already at Fixed must not walk on past a rejection
+    # nobody answered. No dated cutoff: a REJECT is outlived by the unit that earned it in the
+    # old backlog as much as the new, and forgiving it silently is what this exists to end.
+    # Forceable like its neighbours, so `_force_bypassed` re-derives it and the override is
+    # recorded. An ABANDONMENT terminal proceeds and names the REJECT instead: the code it judged
+    # will not ship, so refusing would demand filings about work nobody will do, and saying
+    # nothing would drop the rejection from view.
+    if type_ in _REJECT_GUARDED_TYPES and target_canon:
+        delivered = sdlc_md.is_delivered_terminal(type_, target_canon)
+        abandoned = sdlc_md.is_terminal_status(type_, target_canon) and not delivered
+        standing = (_unanswered_delivery_reject(root, sdlc_md.norm_id(artifact_id))
+                    if delivered or abandoned else None)
+        if standing and delivered and not force:
+            blocks.append(f"{standing}. {_reject_exits()}. Override with --force")
+        elif standing and abandoned:
+            warn = (f"{standing} - it stays unanswered on the record, and closing the unit "
+                    f"{target_canon} over it is the operator's call")
+            gate_warn = f"{gate_warn}; {warn}" if gate_warn else warn
+    if type_ == "story" and not force and target_canon == "Done":
+        block = _done_verify_gate(root, path, text)
+        if block:
+            # the gate is hard by default; `quality.done_requires_verified: false`
+            # downgrades it to advisory-warn (the project sets the policy in .config.yaml).
+            # project_override degrades to the default without PyYAML, so the block message
+            # is produced rather than a config RuntimeError.
+            if sdlc_md.project_override(root, "quality.done_requires_verified", True):
+                blocks.append(f"{block}. Override with --force")
+            else:
+                verify_warn = f"AC-verify advisory (quality.done_requires_verified=false): {block}"
+                gate_warn = f"{gate_warn}; {verify_warn}" if gate_warn else verify_warn
+    # The tier gate fires on any entry to an implementation status, dry-run included (an
+    # honest preflight surfaces the refusal a real run would hit) and force included (the
+    # remedy is promotion, not a waiver). Epics are gated too: an epic's planning template
+    # asserts its constraint chain, success metrics and risk register "arrive with
+    # promotion", and an ungated epic made that assertion false.
+    if type_ in tiers.TIERED_TYPES and target_canon in _IMPL_TARGETS:
+        block = _tier_gate(root, text, type_)
+        if block:
+            blocks.append(f"{artifact_id} is not ready for {new_status}: {block}")
+    # A request's successful terminal is DERIVED from its children, never asserted (G2): a CR is
+    # Complete only when its stories/epics are resolved, an RFC Accepted only when its CRs are.
+    # Overridable with --force, like the other close gates. Fires only when the project enforces
+    # the two-backlog workflow - an unenforced project completes a CR by assertion, as before.
+    if not force and sdlc_md.two_backlog_enforced(root):
+        block = _request_terminal_gate(root, type_, artifact_id, target_canon)
+        if block:
+            blocks.append(f"{block}. Override with --force")
+    # The RFC accept gate. Deliberately NOT guarded by `not force`: the sanctioned skip is
+    # the recorded override field, so every skip leaves its reason in the artefact. Dry-run
+    # included, so a preflight surfaces the refusal a real run would hit.
+    if type_ == "rfc":
+        block = _rfc_accept_gate(text, target_canon)
+        if block:
+            blocks.append(f"{artifact_id} -> {new_status}: {block}")
+        elif target_canon == "Accepted":
+            reason = _rfc_override_reason(text)
+            if reason and _rfc_open_decisions(text):
+                skip = f"decision-override recorded: {reason}"
+                gate_warn = f"{gate_warn}; {skip}" if gate_warn else skip
+    # The triage gate fires on any exit from `inbox` for a v3 finding, dry-run included: an
+    # honest preflight must surface the same refusal a real run would (never a false green).
+    block = _triage_gate(root, type_, text, from_canon, target_canon, triaged_by)
+    if block:
+        blocks.append(block)
+    # The epic breakdown gate. NOT entry-triggered: `In Progress` is in an epic's own vocabulary,
+    # so a gate guarded by `from_canon not in _IMPL_TARGETS` is skipped entirely on the
+    # `In Progress -> Done` route, which is the ordinary one.
+    if not force and type_ == "epic" and target_canon in _EPIC_TERMINAL:
+        block = _epic_breakdown_gate(root, sdlc_md.norm_id(artifact_id), text)
+        if block:
+            blocks.append(block)
+    if blocks:
+        joined = "; AND ".join(blocks)
+        raise GateRefusal(f"{artifact_id} -> {new_status} blocked ({len(blocks)} requirement(s), "
+                          f"all listed): {joined}.", blocks)
+    return gate_warn
+
+
+def _force_bypassed(root, artifact_id, new_status, type_, path, text,
+                    target_canon, from_canon, triaged_by) -> list[str]:
+    """What `--force` actually waived on this transition, DERIVED by re-running the same ladder
+    with force off - never an enumerated list of "the forceable gates", which would silently
+    exempt whichever gate the list forgot.
+
+    Called only after the FORCED ladder has already passed, so any block found here is one force
+    is carrying: a gate that ignores force (tier, RFC-accept, triage) would have refused the
+    forced run too and there would be nothing to record."""
+    try:
+        _pre_write_gates(root, artifact_id, new_status, type_, path, text,
+                         target_canon, from_canon, False, True, triaged_by)
+    except GateRefusal as exc:
+        return exc.blocks
+    except ValueError:
+        # Not a gate verdict (an unreadable sibling, a config fault). The transition itself is
+        # unaffected, and inventing an override record from an error would be a claim of its own.
+        return []
+    return []
+
+
+#: The suffix the ladder appends to a forceable block. Stripped from the RECORD only - the
+#: reason is what is being recorded, and "Override with --force" inside a record of an
+#: override that already happened reads as an instruction rather than history.
+_FORCE_SUFFIX = ". Override with --force"
+
+
+def _record_force_override(text: str, blocks: list[str], artifact_id: str,
+                           new_status: str) -> tuple[str, dict]:
+    """Stamp the forced bypass onto the artefact text. Returns (new_text, record).
+
+    Two places, because neither alone is enough. The `Forced-override` field always lands (the
+    metadata block is anchored on the Status line this transition just wrote), so the record can
+    never be silently dropped; the Revision History row is append-only, so an earlier forced close
+    is not overwritten by a later one - but the section is optional, and a record that lands only
+    where a section happens to exist is the silent-stand-down class. The returned record says
+    which of the two took, so a caller reports what was written rather than what was attempted.
+    """
+    when = sdlc_md.now_date()
+    reasons = "; ".join(b.removesuffix(_FORCE_SUFFIX).strip() for b in blocks)
+    summary = f"{when}: --force waived {len(blocks)} gate(s) on {new_status} - {reasons}"
+    new_text = _upsert_field(text, "Forced-override", summary)
+    new_text, row = append_revision_row(
+        new_text, when, "transition set --force",
+        f"forced {artifact_id} -> {new_status}, waiving {len(blocks)} gate(s): {reasons}")
+    return new_text, {"bypassed": list(blocks), "field": True, "revision_row": row}
+
+
+def _triage_fields(root, type_, text, from_canon, triaged_by, triage_severity,
+                   gate_warn, dry_run) -> tuple[dict, str | None]:
+    """The Triaged-by / Triage-severity fields to stamp on a satisfied v3 triage exit, plus the
+    (possibly extended) advisory warning. No-op off the (real, non-dry-run) triage path."""
+    triage_fields: dict[str, str] = {}
+    if not (not dry_run and type_ in sdlc_md.FINDING_TYPES and sdlc_md.is_schema_v3(root)
+            and from_canon == sdlc_md.INBOX_STATUS):
+        return triage_fields, gate_warn
+    # A satisfied triage transition records the triaging seat (and, when given, the
+    # triager's severity) at the moment of transition, alongside the raiser's Severity.
+    raw_tb = triaged_by or sdlc_md.extract_field(text, "Triaged-by")
+    if raw_tb:
+        triage_fields["Triaged-by"] = raw_tb
+    tb = sdlc_md.parse_authorship_value(raw_tb)
+    raiser = sdlc_md.parse_authorship(text, "Raised-by")
+    if (tb and raiser and raiser["name"] and tb["type"] == "human"
+            and sdlc_md.norm_id(raiser["name"]) == sdlc_md.norm_id(tb["name"])):
+        gate_warn = (f"{gate_warn}; solo-human self-triage: {tb['name']}"
+                     if gate_warn else f"solo-human self-triage: {tb['name']}")
+    if triage_severity:
+        triage_fields["Triage-severity"] = triage_severity
+    return triage_fields, gate_warn
+
+
+def _post_write_sync_and_record(root, type_, path, new_text, result, current, new_status,
+                                vocab, gate_warn, metrics) -> dict:
+    """Write the file, sync the index, cascade the epic (story), and record close telemetry.
+    Reports index_synced honestly against residual drift. Behaviour-preserving extraction."""
+    sdlc_md.atomic_write(path, new_text)  # truth-file stamp: atomic so a crash never truncates it
+    reconcile.apply_type(type_, root)  # sync the index row + counts
+    # index_synced is the TRUTH after the sync, not "apply did something": an archived
+    # row (apply only edits the live index) or a target status with no summary row both
+    # leave residual drift, which we must report honestly rather than claim success.
+    norm = sdlc_md.norm_id(result["id"])
+    residual = [d for d in reconcile.detect_type(type_, root)["drift"]
+                if (d.get("id") and sdlc_md.norm_id(d["id"]) == norm) or d["kind"] == "count-mismatch"]
+    result["index_synced"] = not residual
+    if residual:
+        sync_warn = ("index not fully synced (the artifact may be archived, or its "
+                     "new status has no summary row) - run reconcile")
+        result["warning"] = f"{gate_warn}; {sync_warn}" if gate_warn else sync_warn
+    if type_ == "story":
+        result["epic"] = _cascade_epic(root, result["id"],
+                                       sdlc_md.canonical_status(new_status, vocab) in _STORY_TICKED)
+    from_canon = sdlc_md.canonical_status(current, vocab)
+    to_canon = sdlc_md.canonical_status(new_status, vocab)
+    if (to_canon in sdlc_md.terminal_statuses(type_)
+            and from_canon not in sdlc_md.terminal_statuses(type_)):
+        # record on ENTERING the terminal set only: Fixed -> Verified -> Closed is
+        # one close (one event), an idempotent re-close is none, and a
+        # reopen-then-reclose is honestly a second cycle
+        import telemetry  # sibling; record() is best-effort and never raises
+        telemetry.record(root, {"id": result["id"], "type": type_, **(metrics or {})})
+        result["telemetry"] = True
+    return result
+
+
+def _invalidate_verify_report(root: Path, uid: str) -> None:
+    """Drop the unit's entry from the verify-report so its overturned green cannot be read
+    as current. Best-effort: an absent or unparseable report means there is no stale green to
+    withdraw, and a reopen must never fail because a cache could not be written."""
+    report = root / _REPORT_REL
+    data = sdlc_md.read_json(report, {})
+    # A valid-JSON report of the WRONG SHAPE (a list, a string) parses fine and then has no
+    # `.get`. Reading it defensively rather than trusting the shape: a reopen must never fail
+    # because a cache could not be read, which is what this function's docstring promises.
+    stories = data.get("stories") if isinstance(data, dict) else None
+    if not isinstance(stories, dict):
+        return
+    want = sdlc_md.norm_id(uid)
+    doomed = [k for k in stories
+              if sdlc_md.norm_id(sdlc_md.extract_record_id(str(k)) or "") == want]
+    if not doomed:
+        return
+    for k in doomed:
+        stories[k] = {**(stories[k] if isinstance(stories[k], dict) else {}),
+                      "verified": 0, "stale": 1,
+                      "invalidated_by": "reopen - re-run verify_ac"}
+    with contextlib.suppress(OSError):
+        sdlc_md.atomic_write(report, json.dumps(data, indent=2) + "\n")
+
+
+class SealedRunRefusal(ValueError):
+    """A status write refused because the unit's run is SEALED - its report has been signed.
+
+    Subclasses ValueError so every existing caller keeps working, and carries `run_id` and
+    `report` as DATA so a caller that wants to say WHICH page it broke does not re-parse the
+    sentence. Distinct from `GateRefusal` because it is not a gate: no amount of further work
+    on the unit clears it, and `--force` does not waive it. The only exit is `sprint.py reopen`,
+    which records the break beside the signature it breaks.
+    """
+
+    def __init__(self, message: str, run_id: str, report: str):
+        super().__init__(message)
+        self.run_id = run_id
+        self.report = report
+
+
+def _sealed_run_refusal(root, artifact_id: str) -> SealedRunRefusal | None:
+    """The refusal for a unit inside a SEALED run's batch, or None.
+
+    SEALED is judged by the RUN RECORD's own signature - a closed outcome plus a signature
+    written by `sprint.py sign` - and never by comparing the tree against the signed
+    fingerprint. That comparison answers a different question ("has the report gone stale"),
+    it is US0845's, and asking it here would refuse a run whose report drifted for reasons
+    nothing in this transition caused.
+
+    SCOPED TO THE BATCH. A seal freezes the facts the signed report states, and the report
+    states the batch's statuses; a repository-wide refusal would stop unrelated work for the
+    duration of somebody else's signature, which is a much worse rule than the one the
+    criterion asks for.
+
+    Reading the run state can never break a transition: an absent, unreadable or corrupt
+    record is not a sealed one, and refusing a status write because a cache would not parse
+    would make the seal a hazard rather than a guarantee.
+    """
+    try:
+        from lib import run_state  # noqa: PLC0415 - deferred, as elsewhere in this module
+        state = run_state.read(root)
+        closed = run_state.CLOSED
+    except Exception as exc:  # noqa: BLE001 - an unreadable run is not a sealed one
+        sdlc_md.debug("transition.sealed_run.unreadable", exc)
+        return None
+    if not isinstance(state, dict) or state.get("outcome") not in closed:
+        return None
+    signature = state.get("signature")
+    if not signature:
+        return None
+    want = sdlc_md.norm_id(artifact_id)
+    batch = [sdlc_md.norm_id(u) for u in (state.get("batch") or []) if u]
+    if want not in batch:
+        return None
+    run_id = str(state.get("run_id") or "the closed run")
+    report = str((signature or {}).get("report") or "its report")
+    principal = (signature or {}).get("principal") or "its principal"
+    signed_at = (signature or {}).get("signed_at") or "an unrecorded date"
+    return SealedRunRefusal(
+        f"{artifact_id} belongs to {run_id}, which is SEALED: {report} was signed by "
+        f"{principal} on {signed_at}, and that report states this unit's status. Moving it now "
+        f"would leave the signed page describing a tree that no longer exists, with nothing on "
+        f"the record saying it changed - a signature nothing refuses to write over only orders "
+        f"the work. The way back is explicit: `sprint.py reopen --reason \"<why>\"`, which "
+        f"reopens {run_id}, records the break and KEEPS the signature it breaks, so what was "
+        f"signed and when it was broken stay readable. Nothing was written.",
+        run_id, report)
+
+
+def transition(repo_root: Path | str, artifact_id: str, new_status: str,
+               dry_run: bool = False, force: bool = False,
+               metrics: dict | None = None, triaged_by: str | None = None,
+               triage_severity: str | None = None,
+               coverage_opts: dict | None = None) -> dict:
+    """Set `artifact_id`'s status to `new_status`, sync its index, and cascade the epic
+    breakdown for a story. Returns {id, type, from, to, index_synced, epic}.
+
+    A story moving to Done is gated on its AC-verify result: red or never-run
+    executable ACs block the transition unless `force=True`. A manual criterion needs a passing
+    `**Verified:**` marker, and a criterion carrying NO `Verify:` line is refused the same way -
+    the release lane counts it unspecified whatever markers sit beneath it, so exempting it here
+    would put the two gates on different answers. Manual-only / AC-less stories are never
+    blocked. A bug reaching Fixed or Verified is refused only while its recorded `Verify:`
+    run is red.
+    """
+    root = Path(repo_root)
+    if re.match(r"^(RETRO|RV|HO)-?\d+", artifact_id.strip(), re.IGNORECASE):
+        raise ValueError(
+            f"{artifact_id} is a meta-artifact (retro/review/handoff) outside the status "
+            f"machinery by design - edit the file directly; there is no status to cascade")
+    # THE SEAL, and it is asked FIRST - before the artefact is even opened, so a refusal cannot
+    # have written a byte. NOT guarded by `not force` and not collected into the gate ladder:
+    # every gate there is a bar the unit can clear by doing more work, and this is not one. The
+    # run's report has been signed; the sanctioned exit is `sprint.py reopen`, which records the
+    # break, and a `--force` that skipped it would leave the same silent drift with a flag on it.
+    # Asked on a DRY RUN too, on the ladder's own terms: a preflight that predicts a write the
+    # real run refuses is the one falsehood a preflight must never tell.
+    sealed = _sealed_run_refusal(root, artifact_id)
+    if sealed:
+        raise sealed
+    path, type_ = _find(root, artifact_id)
+    if path is None:
+        raise ValueError(f"no artifact found for id {artifact_id!r}")
+    vocab = sdlc_md.status_vocab(type_, root)
+    if sdlc_md.canonical_status(new_status, vocab) is None:
+        raise ValueError(f"{new_status!r} is not a valid {type_} status ({', '.join(vocab)})")
+    text = path.read_text(encoding="utf-8")
+    target_canon = sdlc_md.canonical_status(new_status, vocab)
+    current = sdlc_md.extract_field(text, "Status")
+    from_canon = sdlc_md.canonical_status(current, vocab)
+
+    gate_warn = _pre_write_gates(root, artifact_id, new_status, type_, path, text,
+                                 target_canon, from_canon, force, dry_run, triaged_by,
+                                 coverage_opts=coverage_opts)
+    triage_fields, gate_warn = _triage_fields(root, type_, text, from_canon, triaged_by,
+                                              triage_severity, gate_warn, dry_run)
+
+    new_text, ok = _set_field(text, "Status", new_status)
+    if not ok:
+        raise ValueError(f"{path.name} has no `Status` field to transition")
+    for fname, fval in triage_fields.items():
+        new_text = _upsert_field(new_text, fname, fval)
+    reopened = (sdlc_md.is_terminal_status(type_, from_canon or "")
+                and not sdlc_md.is_terminal_status(type_, target_canon or ""))
+    result = {"id": sdlc_md.extract_record_id(path.stem), "type": type_,
+              "from": current, "to": new_status, "index_synced": False, "epic": None,
+              "warning": gate_warn}
+    if dry_run:
+        return result
+    if reopened:
+        # A reopen is a human overturning a machine verdict. `_built_not_closed` and every other
+        # reader of "are this unit's ACs green" consult the verify-report, and the vacuous tests
+        # that earned the withdrawn green still pass. Invalidating the entry forces a re-run
+        # rather than leaving the overturned verdict readable as current.
+        _invalidate_verify_report(root, result["id"])
+    if force:
+        # `--force` advertised the bypass as recorded and recorded nothing, so a forced close of
+        # a red-AC story was byte-indistinguishable from a verified one. A force that waived
+        # NOTHING is not an override and writes nothing - claiming one would be the same
+        # dishonesty pointing the other way.
+        bypassed = _force_bypassed(root, artifact_id, new_status, type_, path, text,
+                                   target_canon, from_canon, triaged_by)
+        if bypassed:
+            new_text, result["forced_override"] = _record_force_override(
+                new_text, bypassed, result["id"], new_status)
+    out = _post_write_sync_and_record(root, type_, path, new_text, result, current,
+                                      new_status, vocab, gate_warn, metrics)
+    # The unit's measured time and tokens, for a batch unit of an open run. Never a reason for
+    # the transition to fail: it has already landed, and an unrecorded span is reported.
+    try:
+        from lib import run_state  # noqa: PLC0415
+        run_state.record_unit_actual(root, artifact_id, target_canon or "",
+                                     sdlc_md.is_terminal_status(type_, target_canon or ""))
+    except Exception as exc:  # noqa: BLE001 - the status write has landed; never fail it now
+        print(f"note: {artifact_id}'s time and tokens were not recorded ({exc})",
+              file=sys.stderr)
+    return out
+
+
+def _print_result(res: dict, dry_run: bool) -> None:
+    verb = "would set" if dry_run else "set"
+    extra = f"; epic {res['epic']} breakdown updated" if res.get("epic") else ""
+    print(f"{verb} {res['id']} {res['from']} -> {res['to']}"
+          + ("" if dry_run else f" (index synced={res['index_synced']}{extra})"))
+    if res.get("warning"):
+        print(f"  warning: {res['warning']}")
+    ov = res.get("forced_override")
+    if ov:
+        # A bypass nobody sees is the bypass that gets used. Named on the way past, as well as
+        # written to the artefact, so the operator reading the run output knows what force cost.
+        where = "artefact field" + (" + revision row" if ov.get("revision_row") else "")
+        print(f"  override: --force waived {len(ov['bypassed'])} gate(s), recorded ({where}): "
+              + "; ".join(b.removesuffix(_FORCE_SUFFIX).strip() for b in ov["bypassed"]))
+
+
+def _num(v):
+    """int when whole, float otherwise (fractional seconds are a natural unit);
+    None only when absent or unparseable - a typo'd metric is dropped visibly by
+    the telemetry record simply lacking the field."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return int(f) if f == int(f) else f
+
+
+def _report_appetite(args) -> None:
+    """Print the run's appetite verdict at a unit boundary, or nothing at all.
+
+    Silent in every uninteresting case - no run, a sealed run, no appetite, budget remaining -
+    because a line printed after every transition is one nobody reads on the day it matters.
+    A sealed run is one whose outcome is a closed one (`run_state.CLOSED`): it has no next unit
+    for its ceiling to stop, so an appetite it spent is not reported against later work. A run
+    with no outcome recorded is not sealed and still warns. Silent on failure
+    too, and that is deliberate here: this is a REPORT beside a transition that already
+    succeeded, so a breaker that could not be evaluated must not turn a good transition into a
+    traceback. `loop_guard budget` remains the verb that answers the question with an exit code.
+    """
+    try:
+        import loop_guard  # noqa: PLC0415 - deferred; only terminal transitions pay for it
+        root = sdlc_md.resolve_root(args)
+        state = loop_guard.run_state.read(root)
+        if isinstance(state, dict) and state.get("outcome") in loop_guard.run_state.CLOSED:
+            return              # a sealed run has no next unit for its ceiling to stop
+        appetite = (state.get("appetite") or {}) if isinstance(state, dict) else {}
+        minutes = float(appetite.get("minutes") or 0)
+        units = int(appetite.get("units") or 0)
+        if not (minutes or units):
+            return
+        verdict = loop_guard.budget_verdict(
+            minutes, units,
+            loop_guard.elapsed_minutes(state.get("started_at")),
+            loop_guard.units_consumed(root, state.get("batch") or []))
+    except Exception:  # noqa: BLE001 - see the docstring: never break a completed transition
+        return
+    if not verdict["exhausted"]:
+        return
+    print(f"\n  APPETITE SPENT ({verdict['reason']}) on {state.get('run_id')}: "
+          f"{verdict['elapsed_minutes']} min elapsed"
+          f"{f' of {minutes:g}' if minutes else ''}, {verdict['units_done']} unit(s) done"
+          f"{f' of {units}' if units else ''}.\n"
+          f"  This unit is finished and recorded; what the ceiling stops is the NEXT one. Stop "
+          f"cleanly and close, or move the ceiling ON THE RECORD with "
+          f"`sprint.py appetite resize --reason ...` - the appetite is a decision, and a breaker "
+          f"nobody pulls turns it into a suggestion.", file=sys.stderr)
+
+
+def _unbriefed_warning(root: Path, ids: list[str]) -> str:
+    """The one warning for a verdict given without --brief: nothing shows the reviewer was a
+    separate context briefed on the unit. Reported, never refused; a brief `critic.py brief`
+    noted here for the unit is named so the closer can pass it."""
+    import critic  # noqa: PLC0415 - deferred sibling, as in cmd_set
+    uid = ids[0] if len(ids) == 1 else "<id>"
+    noted = [f"{i} as {fp}" for i in ids if (fp := critic.noted_brief(root, i))]
+    seen = (f" A brief was printed here for {', '.join(noted)}; if that reviewer judged it, "
+            f"pass its fingerprint." if noted else "")
+    return (f"warning: this verdict carries no --brief, so nothing shows its reviewer was a "
+            f"separate context briefed on {', '.join(ids)}. Brief one with `critic.py brief "
+            f"--unit {uid} --seat qa` and close with --brief <fingerprint>.{seen} The "
+            f"transition is not refused for it.")
+
+
+def cmd_set(args: argparse.Namespace) -> int:
+    # Natural positional form `set <ID> <STATUS>` maps onto --id/--status, so the obvious first
+    # attempt works. The flags still work; giving the SAME value both ways is refused rather than
+    # silently picking one.
+    idpos, statuspos = getattr(args, "idpos", None), getattr(args, "statuspos", None)
+    if idpos:
+        if args.id or getattr(args, "ids", None):
+            print("error: give the id EITHER positionally (`set <ID> <STATUS>`) OR via "
+                  "--id/--ids, not both", file=sys.stderr)
+            return 2
+        args.id = [idpos]
+    if statuspos:
+        if args.status:
+            print("error: give the status EITHER positionally (`set <ID> <STATUS>`) OR via "
+                  "--status, not both", file=sys.stderr)
+            return 2
+        args.status = statuspos
+    ids = sdlc_md.resolve_ids(args)
+    if not ids:
+        print("specify at least one id: `set <ID> <STATUS>` (positional), or --id (repeatable) / "
+              "--ids as a comma list", file=sys.stderr)
+        return 2
+    if not args.status:
+        print("specify the target status: `set <ID> <STATUS>` (positional), or --status",
+              file=sys.stderr)
+        return 2
+    # One-call close (the three-verb ceremony was easy to half-do): --reviewer/--author record
+    # the independent verdict, then the gated transition runs. A verdict is held to `critic
+    # record`'s rules - its vocabulary, independence and the review rounds - before anything is
+    # written, and is withdrawn if the transition is refused.
+    import critic  # noqa: PLC0415 - the verdict rules, and CarryFailed below
+    reviewer, author = getattr(args, "reviewer", None), getattr(args, "author", None)
+    brief = (getattr(args, "brief", None) or "").strip()
+    if args.verdict is not None:
+        if args.verdict.upper() not in critic.VERDICTS:
+            print(f"error: --verdict {args.verdict!r} is not a verdict - expected one of "
+                  f"{', '.join(critic.VERDICTS)}. Nothing was written", file=sys.stderr)
+            return 2
+    if reviewer or author or brief:
+        if not (reviewer and author and args.verdict):
+            print("error: the one-call verdict needs --verdict, --reviewer AND --author "
+                  "together (or none, to skip recording one); --brief rides on that verdict. "
+                  "To stamp an identity alone (e.g. an acceptance author) with no verdict, use "
+                  "`transition annotate`.", file=sys.stderr)
+            return 2
+        independent, why = critic.independence(reviewer, author)
+        if not independent:
+            print(f"error: {why} - independence is the floor, so nothing was written",
+                  file=sys.stderr)
+            return 2
+    # Parse the per-attempt list ONCE, up front: a malformed --attempt is a usage error, not a
+    # per-id block, so it must fail fast (rc 2) before any id is touched, not be caught and
+    # re-reported once per id inside the loop.
+    import telemetry
+    try:
+        attempts = telemetry.parse_attempts(getattr(args, "attempt", None),
+                                            getattr(args, "attempts", None))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    results = []
+    refused = 0
+    # built ONCE, so every id in a batch is given the same options
+    coverage_opts = {"base": getattr(args, "base", None),
+                     "report": getattr(args, "coverage_report", None)}
+    for aid in ids:
+        try:
+            # The round rules are `critic.record_verdict`'s, applied as the verdict is written:
+            # a refusal raises before anything else is. The verdict is withdrawn only while the
+            # unit is still at its from-status - a raise after the status write keeps it.
+            start = _status_on_disk(args.root, aid)
+            verdict = (critic.provisional_verdict(
+                args.root, aid, args.verdict, reviewer, author, brief=brief,
+                pending=lambda a=aid, s=start: _status_on_disk(args.root, a) == s)
+                if reviewer and not args.dry_run else contextlib.nullcontext())
+            with verdict:
+                metrics = {k: v for k, v in {"iterations": _num(args.iterations),
+                                             "wall_time_s": _num(args.wall_time_s),
+                                             "tokens": _num(getattr(args, "tokens", None)),
+                                             "model": getattr(args, "model", None),
+                                             "attempts": attempts,
+                                             "critic_verdict": args.verdict}.items()
+                           if v is not None}
+                res = transition(args.root, aid, args.status, dry_run=args.dry_run,
+                                 force=args.force, metrics=metrics,
+                                 triaged_by=args.triaged_by,
+                                 triage_severity=args.triage_severity,
+                                 coverage_opts=coverage_opts)
+            results.append(res)
+            if args.format != "json":
+                _print_result(res, args.dry_run)
+        except critic.CarryFailed as exc:
+            # the verdict and the transition landed; only the carry did not, and it says so
+            refused += 1
+            results.append({"id": aid, "carry_failed": str(exc)})
+            print(f"error: {exc}", file=sys.stderr)
+        except (ValueError, FileNotFoundError) as exc:
+            # one refusal never aborts the rest - each id is individually gated
+            refused += 1
+            results.append({"id": aid, "blocked": str(exc)})
+            if args.format != "json":
+                # A SEALED-run refusal goes to STDERR; every other block keeps the stdout line it
+                # has always had. A gate refusal is part of this command's ordinary report - the
+                # actor asked for a transition and is told what it still owes. The seal is not:
+                # the run is over and signed, and the driver that reads this is a chain step
+                # scanning stdout for `set <id>` lines. On stdout the refusal reads as one more
+                # progress line in the same stream as the successes it is contradicting.
+                stream = sys.stderr if isinstance(exc, SealedRunRefusal) else sys.stdout
+                print(f"  blocked  {aid}: {exc}", file=stream)
+    if reviewer and not brief:
+        print(_unbriefed_warning(args.root, ids), file=sys.stderr)
+    if args.format == "json":
+        print(json.dumps(results if len(ids) > 1 else results[0], indent=2))
+    if len(ids) > 1:
+        out = sys.stderr if args.format == "json" else sys.stdout
+        print(f"batch: {len(ids) - refused}/{len(ids)} transitioned, {refused} blocked", file=out)
+    # THE APPETITE BREAKER, on the shipped path. `loop_guard budget` was fully wired to its data
+    # and had no caller: the only references anywhere were reference docs TELLING an agent to run
+    # it between units. So the ceiling the operator set at plan time held only if the driving
+    # agent remembered to pull it, which makes a recorded decision a suggestion. LL0027 - a gate
+    # belongs in the command people actually run.
+    #
+    # A unit reaching a terminal status IS the unit boundary the breaker was designed for, and
+    # this is the command that puts it there. Reported, never refused: the unit just finished, so
+    # blocking its own transition would punish the wrong action and leave the record wrong too.
+    # What it stops is the NEXT unit starting, which is the whole point of a boundary check.
+    if not refused:
+        _report_appetite(args)
+    return 1 if refused else 0
+
+
+def _status_on_disk(root, aid: str) -> str | None:
+    """The Status the artefact's file holds now, or None when no file resolves."""
+    found = sdlc_md.find_by_id(root, aid)
+    return sdlc_md.extract_field(sdlc_md.read_text_safe(found[0]) or "", "Status") if found \
+        else None
+
+
+def _annotate_fields(args: argparse.Namespace) -> tuple[str, str]:
+    """`(field, value)` from `--fields-file` if given, else from the flags.
+
+    THE FILE IS THE RECOMMENDED PATH, on the same terms as every sibling verb. Backticks and
+    `$(` are command substitution inside a shell argument, so on the flag path a value quoting
+    a command is RUN and whatever it printed is stored in place of the text: a
+    re-triage rationale quoting `critic.py brief` was written with the command replaced by its
+    empty output, and the annotation reported success. Every other prose-taking verb here
+    already offers a file; this was the one that was missed.
+    """
+    if not getattr(args, "fields_file", None):
+        if not (args.field and args.value is not None):
+            raise ValueError("annotate needs --field and --value, or --fields-file")
+        return args.field, args.value
+    raw = sys.stdin.read() if args.fields_file == "-" else Path(args.fields_file).read_text(
+        encoding="utf-8")
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"--fields-file is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ValueError("--fields-file must hold a JSON object of {field, value}")
+    unknown = sorted(set(doc) - {"field", "value"})
+    if unknown:
+        raise ValueError(f"--fields-file carries unknown field(s): {', '.join(unknown)} - known "
+                         f"fields are field, value. A key nobody reads is a field that silently "
+                         f"went missing, so it is refused rather than ignored")
+    field = args.field or doc.get("field")
+    value = args.value if args.value is not None else doc.get("value")
+    if not field or value is None:
+        raise ValueError("--fields-file must carry both `field` and `value` unless a flag "
+                         "supplies the other")
+    if not isinstance(value, str):
+        raise ValueError(f"--fields-file `value` must be a string, not {type(value).__name__} - "
+                         f"a scalar supplied where a string is expected is iterated rather than "
+                         f"stored")
+    return field, value
+
+
+def cmd_annotate(args: argparse.Namespace) -> int:
+    try:
+        field, value = _annotate_fields(args)
+        r = annotate(args.root, args.id, field, value)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    # The RESULT, not the request. `annotate` canonicalises a vocabulary field's name and value
+    # before writing, so printing the argv pair told the reader `severity = low` while the file
+    # gained `Severity: Low` - and the same command's `--format json` said the other thing. Two
+    # output formats of one command disagreeing about one fact is worse than either being wrong.
+    print(json.dumps(r, indent=2) if args.format == "json"
+          else f"annotated {args.id}: {r['field']} = {r['value']}"
+               + ("" if r["changed"] else " (already set)"))
+    return 0
+
+
+#: A ticked acceptance criterion (`- [x]`) and an executable one (a `Verify:` line). EITHER
+#: satisfies the terminal gate: the first is a human saying they checked it, the second is the
+#: machine saying so. Requiring both would refuse the ordinary judgement call a bug fix is.
+_TICKED_RE = re.compile(r"^\s*[-*]\s*\[[xX]\]", re.M)
+_VERIFY_RE = re.compile(r"^\s*[-*]\s*\*\*Verify:\*\*", re.M)
+
+
+def _epic_breakdown_gate(root: Path, artifact_id: str, text: str) -> str | None:
+    """An epic reaches a terminal status only when its declared breakdown is finished.
+
+    THE COUNTERPART `reconcile.epic_status_stale_drift` already names. That detector is
+    deliberately detect-only - its docstring says so, "because closing an epic is a status
+    transition and `transition.py set` is where an epic's own gates live" - and until now no such
+    gate existed. The test-plan gate was accidentally standing in for one, and badly: it asked a
+    container to name the production change its own test must fail on, which has no honest answer,
+    and it could not be forced, so an epic minted by `refine` was permanently un-closable.
+
+    Reads `reconcile.declared_breakdown_ids`, the reader the DETECTOR reads, never
+    `sdlc_md.children_of`. The two disagree on 10 of this repository's 214 epics - one enumerates
+    the Story Breakdown table, the other follows `Parent:` back-links - and a gate reading one
+    while the census reads the other would let a closed epic keep reporting stale, which is the
+    class of defect this whole unit is about.
+
+    Mirrors the detector's silences, with one deliberate inversion, and the reason they differ is
+    the point rather than an inconsistency:
+
+    - An EMPTY or id-less breakdown closes. An epic that declares no children declares no roll-up.
+    - A `Deferred` child closes. Deferred is a RECORDED HUMAN DECISION about that child; the epic
+      is not waiting on it.
+    - An UNRESOLVABLE declared id REFUSES. That is not a decision, it is an absence nobody made -
+      the detector calls it "unknown, not finished", and an epic must not close over a child
+      nothing can confirm.
+
+    FORCEABLE, and that is load-bearing rather than a concession. It sits inside the `not force`
+    ladder so `_force_bypassed` re-runs the gates with force off and `_record_force_override`
+    stamps what was waived. A gate with no override and no honest answer is the defect this
+    replaces; reintroducing one here would be the same bug in a new place.
+    """
+    import reconcile  # noqa: PLC0415 - local: the breakdown reader lives with the detector
+    declared = reconcile.declared_breakdown_ids(text)
+    if not declared:
+        return None
+    # The resolver yields the child's TYPE beside its status, so terminality is judged against the
+    # right vocabulary. Deriving the type from the id prefix instead would read a bug's `Fixed`
+    # against the story vocabulary and call a finished bug unfinished.
+    resolved = {uid: (utype, status) for _ln, _ticked, uid, utype, status
+                in reconcile._breakdown_units(root, text)}
+    unfinished: list[str] = []
+    for uid in declared:
+        row = resolved.get(uid)
+        if row is None:
+            unfinished.append(f"{uid} (declared, but nothing resolves it)")
+            continue
+        utype, status = row
+        if status == "Deferred":
+            continue
+        if not sdlc_md.is_terminal_status(utype, status):
+            unfinished.append(f"{uid} ({status})")
+    if not unfinished:
+        return None
+    return (f"{artifact_id} declares breakdown work that is not finished: "
+            f"{', '.join(unfinished)} - an epic's completion is DERIVED from its breakdown, so "
+            f"closing it over unfinished work would assert a completion no unit agreed to. "
+            f"Finish or Defer them, or Override with --force")
+
+
+#: The epic statuses that assert a completion, and so the ones the breakdown gate holds.
+_EPIC_TERMINAL = ("Done",)
+
+
+def requirements(root, artifact_id: str, target: str) -> list[str]:
+    """The unmet requirements standing between `artifact_id` and `target`. Writes nothing.
+
+    Asked BEFORE the work, so the requirement is met as part of it rather than discovered as
+    a refusal afterwards. Five close refusals in one session, each after the unit was otherwise
+    finished, is what this exists to stop.
+
+    Derived, never restated. This RUNS the real gate ladder via the dry-run path and reports
+    what it refuses, so there is no second copy of a requirement to drift from the guard that
+    enforces it. A hand-maintained list here would be a duplicate that goes stale silently -
+    the failure mode this command is supposed to remove, reintroduced one layer up.
+    """
+    try:
+        transition(root, artifact_id, target, dry_run=True)
+    except SealedRunRefusal as exc:
+        # A sealed run is not a gate - no work on the unit clears it - but `requirements` must
+        # still ANSWER. It is a read-only question, and every caller before this unit shipped
+        # got a list back; letting the refusal escape turned that list into an uncaught
+        # exception for every unit of a sealed run's batch, which is a regression in a command
+        # that reports rather than writes. The requirement is the one thing that would let the
+        # transition through, and it is named as such.
+        return [f"{artifact_id} belongs to {exc.run_id}, which is SEALED over {exc.report} - "
+                f"re-open it with `sprint.py reopen --reason \"<why>\"`, which records the "
+                f"break beside the signature it breaks"]
+    except GateRefusal as exc:
+        # The blocks come from the ladder as a LIST. An earlier version rebuilt them by
+        # splitting the message on `". Override with --force"`, which only some gates append -
+        # so two adjacent gates without it merged into one item, and an alternating pair leaked
+        # the `"; AND "` delimiter into the next. The count then disagreed with the count the
+        # gate itself had just reported.
+        # removesuffix, not rstrip: rstrip strips EVERY trailing dot, so a future reason
+        # ending "e.g." or "..." would be silently trimmed. A no-op on today's gates (none
+        # ends in a period) - latent, and cheap to close now rather than to debug later.
+        return [b.strip().removesuffix(".") for b in exc.blocks if b.strip()]
+    # Any OTHER error - an unknown id, a status outside the vocabulary - is an error, not a
+    # requirement. Reporting it as "something you must satisfy" would be the confidently wrong
+    # answer this command exists to end, so it propagates.
+    return []
+
+
+def cmd_requirements(args) -> int:
+    unmet = requirements(args.root, args.id, args.status)
+    if args.format == "json":
+        print(json.dumps({"id": args.id, "target": args.status, "unmet": unmet}, indent=2))
+        return 0
+    if not unmet:
+        print(f"{args.id} -> {args.status}: no unmet requirements")
+        return 0
+    print(f"{args.id} -> {args.status}: {len(unmet)} unmet requirement(s)")
+    for item in unmet:
+        print(f"  - {item}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Transition an artifact's status + cascade.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("set", help="Set an artifact's status and sync index + epic breakdown.")
+    # The natural form `set <ID> <STATUS>` is accepted as well as the --id/--status flags, so the
+    # obvious first attempt works instead of erroring on argparse noise (they map onto the flags in
+    # cmd_set; mixing the two forms for the same value is refused there).
+    s.add_argument("idpos", nargs="?", metavar="ID",
+                   help="artifact id, positional - the natural form `set <ID> <STATUS>`")
+    s.add_argument("statuspos", nargs="?", metavar="STATUS",
+                   help="new status, positional - the natural form `set <ID> <STATUS>`")
+    sdlc_md.add_ids_argument(s, help_="artifact id, e.g. CR0042 / US0023; repeat --id or pass "
+                                      "--ids as a comma list for a same-target batch (each id is "
+                                      "individually gated, one refusal never aborts the rest)")
+    s.add_argument("--status", help="New status (must be in the type vocabulary); or give it "
+                                    "positionally as `set <ID> <STATUS>`")
+    s.add_argument("--root", default=".")
+    s.add_argument("--iterations", help="run metric passed to the terminal-close telemetry event")
+    s.add_argument("--wall-time-s", dest="wall_time_s", help="run metric for the telemetry event")
+    s.add_argument("--tokens", help="run metric: total tokens the unit cost, on the telemetry event")
+    s.add_argument("--model", help="run metric: the model that delivered the unit (stamped on the "
+                                   "artefact and the telemetry event)")
+    s.add_argument("--attempt", action="append", metavar="MODEL:TOKENS",
+                   help="one model invocation on this unit, e.g. haiku:1000. Repeatable and "
+                        "order-preserving - a close that ESCALATED (cheap model rejected, "
+                        "re-run on a dearer one) records every attempt, so the true cost is "
+                        "their sum, not the final line. Threaded to the telemetry close event")
+    s.add_argument("--attempts", metavar="JSON",
+                   help="the per-attempt list as a JSON array of {model, tokens} - the structured "
+                        "form of --attempt for a caller that already holds the list")
+    s.add_argument("--verdict", help="critic verdict recorded on the telemetry event (and, with "
+                                     "--reviewer/--author, in the critic log)")
+    sdlc_md.retire_flag(s, "--depth", "no depth tier is stamped any more; a bug's "
+                        "criteria and its `Verify:` run are its evidence - drop the flag")
+    s.add_argument("--reviewer", help="one-call close: record the critic verdict under this "
+                                      "reviewer (must differ from --author)")
+    s.add_argument("--author", help="one-call close: the authoring seat the reviewer judged "
+                                    "(reviewer != author enforced before any write)")
+    s.add_argument("--brief", help="one-call close: the fingerprint `critic.py brief` printed "
+                                   "for the separate reviewing context, stored on the verdict "
+                                   "row as `critic.py record --brief` stores it. A --verdict "
+                                   "without it is warned, never refused")
+    s.add_argument("--force", action="store_true",
+                   help="bypass the forceable close gates (story->Done AC-verify, bug Verify, "
+                        "request-terminal). Every gate it actually waives is named in a "
+                        "`Forced-override` field on the artefact and in its Revision History; "
+                        "gates whose sanctioned skip is a recorded reason (RFC decisions) "
+                        "and the tier gate are NOT bypassed")
+    s.add_argument("--triaged-by", dest="triaged_by",
+                   help="v3 triage: the triaging seat as `Name; type; version` (type is "
+                        "human|persona|agent); required and recorded on an inbox->triaged "
+                        "transition, must differ from the raiser (separation of duties)")
+    s.add_argument("--triage-severity", dest="triage_severity",
+                   help="v3 triage: the triager's severity, recorded alongside the raiser's")
+    s.add_argument("--base", help="line-coverage gate: the base ref when no run's approved batch "
+                                  "names the unit (a closed run's ref is still that unit's)")
+    s.add_argument("--coverage-report", dest="coverage_report",
+                   help="line-coverage gate: reuse this `verify_ac run --coverage --report` file "
+                        "instead of collecting, accepted only while its Affects hash matches")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--format", choices=("text", "json"), default="text")
+    s.set_defaults(func=cmd_set)
+    r = sub.add_parser("requirements",
+                       help="What a transition will require, asked BEFORE the work. Writes "
+                            "nothing; derived by running the real gates, never a restatement.")
+    r.add_argument("--id", required=True, help="Artifact id, e.g. BG0042 / US0023")
+    r.add_argument("--status", required=True, help="The target status you intend to reach")
+    r.add_argument("--root", default=".")
+    r.add_argument("--format", choices=("text", "json"), default="text")
+    r.set_defaults(func=cmd_requirements)
+    a = sub.add_parser("annotate", help="Set/update one metadata field on an artifact "
+                                        "(deterministic stamp; index untouched).")
+    a.add_argument("--id", required=True, help="Artifact id, e.g. BG0042 / US0023")
+    a.add_argument("--field", help="Field name, e.g. 'Severity'")
+    a.add_argument("--value")
+    a.add_argument("--fields-file", metavar="FIELDS.json",
+                   help="THE RECOMMENDED PATH for prose carrying backticks or `$(`. A JSON "
+                        "object {field, value} read straight off disk so no value crosses a "
+                        "shell - on the flag path such prose is EXECUTED rather than stored. "
+                        "`-` reads the document from stdin. An explicit flag overrides the "
+                        "document; an unknown key is refused.")
+    a.add_argument("--root", default=".")
+    a.add_argument("--format", choices=("text", "json"), default="text")
+    a.set_defaults(func=cmd_annotate)
+    sdlc_md.add_global_root(p)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    # Resolve the root ONCE and write it back, so every verb below anchors on the same
+    # tree. Resolving it at only one call site let the two disagree - the resolved value
+    # guarded the run while each verb still wrote through a bare `--root .`, so a run
+    # from a subdirectory acted on a stray workspace beside the cwd and exited 0.
+    args.root = str(sdlc_md.resolve_root(args))
+    # A status change recorded through a mutated tool is a record nobody can trust
+    # afterwards, so the applied-mutant window is a refusal, not a warning.
+    refusal = sdlc_md.inflight_refusal(sdlc_md.resolve_root(args))
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001 - top-level guard
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)

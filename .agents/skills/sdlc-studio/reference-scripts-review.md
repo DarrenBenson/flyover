@@ -1,0 +1,119 @@
+# Script Catalogue - Audit, review & critic
+
+<!-- Load when: you need the full detail for a script in this group. The lean
+     index with all groups is reference-scripts.md. -->
+
+Detail pages for the **audit, review & critic** scripts. See
+[reference-scripts.md](reference-scripts.md) for the full index across all groups.
+
+## Scripts
+
+### `ac_scope.py`
+
+Authoring lint (advisory): `check` flags a story whose acceptance criteria mention a
+distinctive capability keyword owned by a **different** epic's title (e.g. an EP0001 story
+asserting an "account token" when accounts are EP0006) - such a story is un-Done-able in its
+own epic and should be split or re-scoped. Heuristic and read-only; false positives are
+expected (the operator decides); never auto-edits. Run by the authoring loop's closing
+consistency pass.
+
+### `spec_guard.py`
+
+Spec-edit guard (schema v3 only, dormant on v2). A delivery must not silently falsify the
+source of truth. `spec_edits(root, changed_files)` reports which changed files are
+requirements/spec documents (config `review.spec_paths`); `check(root, changed, story_text)`
+adds whether any AC cites a spec change and flags an `untraced` edit (a spec doc edited with no
+citing AC) - the signal the critic charter treats as a blocking finding. The
+traceability judgement stays with the critic; the pre-check only guarantees the edit is
+surfaced. `check --changed a,b,c --story <file>` on the CLI.
+
+### `constitution.py`
+
+Project-constitution principle gate. Asserts the machine-checkable
+principles declared in `sdlc-studio/constitution.md` - each `rule:` maps onto an
+existing detector (integrity/conformance/validate/reconcile). Advisory by default;
+`constitution.enforce: true` makes a violation exit non-zero.
+
+- `check`: report (and, when enforced, fail on) principle violations
+
+Full methodology: `reference-doctrine.md#constitution`.
+
+### `schema_check.py`
+
+One CI-runnable command over the schema-v3 team-schema rules, emitting STABLE rule ids so the
+output is a reference implementation the wider crew audit linter can consume:
+
+- `check`: run all rules; exit 1 on any error-severity finding, 0 on a clean repo. `--format
+  json` gives `{ok, rules, findings}` with `{rule, file, message}` per finding.
+
+Rules (all era-gated to schema v3, so a v2 project reports nothing): `authorship-structured`,
+`authorship-type`, `authorship-unresolved`, `evidence-present`, `duties-separated`,
+`id-format`, `index-derived`. These same rules are enforced in the blocking `gate` via
+`validate` and the `index-derived` check; `schema_check.py` is the focused, stable-id view.
+
+### `review_prep.py` (read-only, except `close`)
+
+- `close --rv RVxxxx [--latest-body FILE|-]`: the review close, tool-carried - stamps
+  `review-state.json` for every present leg and derives `reviews/LATEST.md` from the
+  supplied anchor body. Refuses when the dated RV record does not exist, and refuses an
+  anchor that never cites the RV id: the anchor derives from a record or not at all
+- `prep`: deterministic inputs for the five-leg review (artifact staleness,
+  persona definition-vs-PRD usage, count and AC-verification inputs, and `required_legs` -
+  for each of the four required document legs, `{present, path, waiver}` so an absent leg is
+  machine-visible and a downgrade-without-a-waiver is detectable). Gathers inputs only; the
+  verdict stays with Claude. Full workflow: `reference-review.md`.
+
+### `disclosure.py`
+
+Progressive-disclosure + Claude Code best-practice check, **advisory**. Flags reference-/
+help- files missing a `Load when:` trigger or orphaned from every index (SKILL.md / help/references.md
+/ help/help.md), plus best-practice items from `best-practices/claude-skill.md` (scripts executable +
+expose `--help`, templates use `{{placeholder}}`, SKILL.md has a When-to-Use section). Skill-dev only
+(no-op for consuming repos). Wired into the gate as NON-BLOCKING; `--strict` opts into a non-zero exit.
+The token lever: a doc with no load-trigger and no index entry gets pulled in without discipline.
+
+### `readiness.py`
+
+Tranche pre-flight readiness (deterministic). `check` grooms a batch for readiness - weak-AC, unmet-deps, already-terminal, link-integrity, **already-satisfied** (a Ready unit whose executable ACs all pass in the verify-report - a close-candidate, not work to build, unless it is carried on an unanswered delivery REJECT: `transition` refuses that close, so it stays ready for the batch with a `carried: re-review by <reviewer id>` note, to be re-reviewed by the reviewer who rejected it), **weak-verify** (a non-executable Verify line, reusing `verify_ac lint`) and **cross-epic-ac** (an AC owned by another epic, reusing `ac_scope`) - before the triage STOP, so work never starts on a unit that would pass the gates vacuously or be reverse-engineered at implement time.
+
+`profile --name <name>` resolves an adversarial lens profile: the packs under
+`templates/audit-profiles/` (`skill`, `repo`, `code`) plus the reference-declared
+`project` default, reporting the pack's lenses and its refute threshold. A name no
+profile declares is refused non-zero, naming the ones that exist, so a mistyped
+profile can never run an empty lens set; `profile --list` names them all. The repo
+pack carries the binding remediation-only security posture for its
+defensive-security leg.
+
+A `Depends on:` referent resolves through the shared cross-repo resolver (`lib/xrepo`, the same one `blocker_sweep` uses): in-repo first, then across the sibling repos a `product-manifest.yaml` names. So in a multi-repo product, a dependency **delivered in another repo meets the dependency** rather than reporting `unmet-deps`. A repo the operator has not cloned never stops the search - the remaining repos are still searched, so the verdict follows the disk state and not the manifest's ordering. The three outcomes stay distinct claims: `unmet-deps` (the referent exists and is not delivered, or is dead), **`unresolved-deps`** (no repo resolved the id AND at least one named repo was not on disk, so the dependency could not be checked either way - the repo and path are named, and the unit is never silently passed), and no finding. Single-repo projects have no manifest and are unaffected.
+
+### `backfill_audit_runs.py`
+
+Lifts the audit run id out of a finding's `Raised-by` prose into a readable `Audit-run` field, so a class recurring across runs is counted from the record rather than reconstructed with a regex over free text. `plan` reports the mapping read-only; `apply` stamps the field, records the lens as explicitly UNKNOWN, and seeds each run into the register as `backfilled`; `check` is the standing sweep and exits non-zero when any finding names a run in prose its field does not carry. It relocates a datum somebody already wrote and derives nothing: a `Raised-by` line naming two ids is resolved only where the prose says which filed it (`run <B>` against `<A> carry-over`, the shape all twelve real cases use) and REFUSED otherwise, because a coin toss between two ids is a fabricated provenance. The lens is never guessed - `detector-owed` treats the unknown sentinel as unattributable rather than as a lens of that name, or one placeholder shared across five runs would report a detector owed on every one of them. Idempotent; writes only the artefacts it stamps and its own register shard.
+
+### `audit_cost.py`
+
+Pre-flight cost estimate for an adversarial `audit` run, so a large fan-out is confirmed before it spends millions of tokens rather than flagged only after it launches. Given the lens count (and optional rounds/votes/candidates-per-lens), `estimate()` models the agent count (finders = lenses x rounds; refuters = candidates x votes; +1 merge), the token budget (agents x a calibrated per-agent rate) and the wall-time, and flags the run **large** (confirm) or **small** (runs without ceremony). Calibrated to the measured reference run (7 lenses -> ~190 agents / ~6.8M tokens / ~35 min); an order-of-magnitude guide, not a promise. Used by the audit pre-flight gate (`reference-audit.md#audit-preflight`). Pure stdlib; read-only.
+
+### `command_audit.py`
+
+Audits the skill command surface against the process spine (raise -> break down -> sprint+review; the top-level documents are the levers; reconcile/review/audit are support). Enumerates every command deterministically - the SKILL Type Reference, the `help/help.md` catalogue, and `scripts/` - and disposition each as **keep** or **review** from three structural signals: the curated SPINE category it serves (an unmapped command is a review candidate), catalogue DRIFT (a command in the help catalogue but not the Type Reference, or vice versa), and TOOLING health (with `--check-tools`, whether the backing script's `--help` runs - a script that exists and fails is a broken tool). It does not retire anything - it produces the evidence a cleanup acts on. `--write` writes `sdlc-studio/reviews/command-audit.md` (a per-spine table plus recommended actions); `--strict` exits non-zero on a broken tool. Complements `doc_coverage.py` (which gates the reverse: every Type-Reference command has a help entry, every script a reference entry).
+
+`--dead-flags` is a separate mode: it reports a **flag whose parsed destination no line acts on**, across the skill's `scripts/` and the repo's `tools/`, and exits non-zero when it finds one. The analysis follows the value rather than counting mentions - a destination read through `getattr(args, name, default)` and forwarded as a keyword argument is alive only if the receiving parameter is acted on, which is the shape a documented-but-dead flag hides in. Positionals are not judged (argparse enforces their presence whether or not a line reads the value). Three shapes are reported **not judged** with the reason, never dead: a namespace handed to a callee the analysis cannot resolve, a `getattr` whose attribute name is computed, and a module that declares flags on a parser it never parses (the shared `add_*_arg` helpers).
+
+### `critic.py`
+
+The independent-critic verdict ledger. `record` writes a committed verdict to `sdlc-studio/reviews/critic-verdicts.md` stamping both the **reviewer and the author** (the authoring seat / delegation id); `verdict_for` reads it. `is_independent` proves `reviewer != author`; `is_pre_gate` flags units closed before the gate (the visible `pre-gate` marker, grandfathered). Conformance's `critiqued` stage requires a committed APPROVE that is independent or pre-gate.
+
+The ceremony's scaffolding is deterministic too: `brief --unit USxxxx --seat qa [--tier full|light]` assembles the seat-review prompt (charter reference, the unit's canonical ACs, the Affects-derived diff scope, the review depth, and the exact VERDICT/ISSUES/BLOCKING return contract) - pipe it to the reviewing subagent verbatim; unknown unit or seat refused naming the alternatives. `record --from-verdict FILE|-` parses the returned block (a missing or non-APPROVE/REJECT verdict is refused loudly, BLOCKING content folded into the issues), so a verdict is never hand-transcribed into the ledger. The judgement stays with the seat; only the plumbing is mechanical.
+
+A REJECT has two exits, and `critic.py record` writes both: a round-2 APPROVE from the reviewer who rejected, or that reviewer's round-2 REJECT at the cap (`review.max_rounds`), which files the findings as a bug and drops the unit from the open run's batch. A carried unit is still refused Done; it is delivered again in a later run and reaches Done on an APPROVE from the same reviewer id. `repair` is retired: it exits 2 naming the two exits and writes nothing, and the old `sdlc-studio/reviews/repair-record.md` is read by nothing.
+
+`brief --rejoinder FILE|-` emits the RE-REVIEW brief after a REJECT's repairs: the prior VERDICT/ISSUES/BLOCKING quoted verbatim, then the diff scope refreshed, the demand to re-execute the previously named probes and mutants, and the delivery return contract. It prints the fingerprint footer on stderr that `record --brief` consumes, naming the record command. A malformed prior block is refused loudly.
+
+`evidence` and `sprint-review` are retired: each exits 2 naming `record`, and the old `sdlc-studio/reviews/critic-evidence.md` is read by nothing, so a unit's delivery verdict is the one record of its review. There is no per-unit sign-off: the operator signs the run once with `sprint.py sign --principal`, which refuses a principal who is a unit's author or a reviewer recorded on it. `signoff-record.md` is frozen history that nothing reads or writes.
+
+### `persona_resolve.py`
+
+Resolves the worker amigo for a delegated sub-agent, most-specific-first: a project-authored practitioner amigo (`sdlc-studio/personas/amigos/<seat>.md`), else the skill default (Dani / Sam / Lena), else generic. `resolve` prints the framing the orchestrator appends *after* the contract; `--skip-personas` emits nothing (byte-equivalent generic). The stance never overrides the concrete contract, and the worker is always a separate instance from its reviewer.
+
+The consult surface (used by `refine` and `triage`): `resolve-consult --role <role>` resolves the seat a consult critiques through (review render; a matched project seat missing it is a hard error); `panel --ceremony refine|triage [--question ...]` resolves the whole Three-Amigos panel for a ceremony, lead-first (refine engineering-led, triage QA-led), and names the seats questions go to. `consult()` and `amigo_panel()` are the library entry points refine/triage call; `record_consult()` writes the `> **Consulted:**` line and `## Amigo Consult` section onto the request/Issue as an audit trail (idempotent; a no-op without questions).

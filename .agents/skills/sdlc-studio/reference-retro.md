@@ -1,0 +1,168 @@
+# Retro Workflow Reference
+
+<!-- Load when: writing or closing a retro, or wiring the close gate. Pairs with help/retro.md -->
+
+Deep workflow for `/sdlc-studio retro`. Load with `help/retro.md`.
+
+The retro is the **adapt** half of inspect-and-adapt. Inspecting is easy and teams do it
+willingly; adapting is the half that gets skipped, because nothing forces a finding to
+become anything. This is the machinery that forces it.
+
+File: `sdlc-studio/retros/RETRO{NNNN}-{slug}.md` · Index: `sdlc-studio/retros/_index.md`
+· Template: `templates/reviews/retro.md` · Script: `scripts/retro.py`
+
+## The loop
+
+```text
+sprint closes
+  -> retro created            artifact new --type retro
+  -> findings dispositioned   filed as BG/CR, or declined with a reason
+  -> lessons extracted        retro extract   -> lessons.jsonl (classed) or the prose log
+  -> summary regenerated      lessons summary -> the digest
+  -> close gate               retro validate  (blocking)
+       |
+next sprint plan prints the classes injected at plan, unasked, in the plan the agent reads
+```
+
+The last line is the whole point. A lesson that does not reach the next plan has not been
+learned by anything except the person who wrote it, and they were not the one who needed it.
+
+For an INTERACTIVE sprint (no runner, so no per-unit telemetry), supply the harness-tracked token
+total: `retro.py accuracy --id RETROxxxx --tokens N --write`. That yields a real, descriptive sprint
+tokens-per-point over the delivered points - the token count is deterministic, so report it as
+not-yet-captured until you supply it, never as if it were unknowable. It stays descriptive,
+never a target.
+
+The close captures it itself with `--tokens-from-harness`, and the accuracy block then states the
+run's priced cost below its unit table: the priced total and its cost per delivered point on one
+line, then each component on its own line. The VELOCITY.md row carries that figure as `Priced/pt`, under a
+Source naming the meter's counting basis, such as
+`harness (main thread and subagents, once per message)`. A bare `harness` row was counted on an
+earlier basis, and earlier rows are never recomputed. The planner's tokens-per-point basis names
+every Source it pooled, so a rate taken across two bases is never read as one figure.
+
+## What the close gate checks
+
+`gate --require-retro RETROxxxx` delegates to `retro.py validate`, which reads the
+**content**:
+
+1. **Required sections present** - `Delivered`, `What went well`,
+   `What was hard / what stalled`, `Lessons`, `Actions raised`. Each is a question the
+   ceremony exists to ask; a retro that drops one did not hold the ceremony.
+2. **At least one real lesson** - an unfilled `{{placeholder}}` is not a lesson. "This
+   sprint taught us nothing" is a legitimate answer, but it must be *stated*, because it is
+   a claim and not a default.
+3. **Every finding dispositioned** - filed, or declined with a reason.
+4. **A flagged run names its cost's cause** - only when the run's close recorded a `cost` known
+   issue for this retro (the run is over 1.5 x its baseline per point,
+   [reference-sprint.md#cost-regression](reference-sprint.md#cost-regression)): a `## Cost`
+   section with at least one bullet that is not a `{{placeholder}}`. Read from the run's record,
+   so no other retro is asked for it.
+
+`retro.py cost-baseline add --retro RETROxxxx --since <iso> --until <iso>` records a past run
+in `sdlc-studio/retros/COST-BASELINE.md`, once: the window's priced cost from the harness
+transcripts by the meter's own reader, its points, cost per point and weights. It never writes
+VELOCITY.md, and a window holding no transcript record is refused with nothing written.
+
+A gate that checks a file exists is satisfied by `touch`, and the one gate worth having is
+the one an agent cannot satisfy without doing the work. Existence is not evidence.
+
+**A close is a Definition-of-Done clause, not an optional extra.** `--require-retro` only fires
+when someone runs it, so a close could silently lapse - the ceremony was mandated but had no
+detector. `close_owed.py` closes that: a delivery unit that reached terminal since the one-time
+close-owed baseline with no retro's `Batch` naming it is an **owed close**, surfaced as an
+`advisory:` line on `status`/`hint` and optionally reinforced by the `hooks/close_guard.py` Stop
+hook. It is reported, not refused: `sprint sign` seals each run. A sprint is complete only when
+the close gate is green and shown, **never at "deployed"**. See `help/gate.md`.
+
+## The disposition rule
+
+A finding is dispositioned when it is **either**:
+
+- **filed** as an artefact - the row carries a `BG` / `CR` / `US` / `RFC` id; or
+- **declined with a reason** - `declined: already tracked upstream, not ours to fix`.
+
+Both are green. This is deliberate and it is the load-bearing design decision:
+
+> Declining must cost exactly what filing costs, or the gate teaches people to file rubbish
+> to go green. If honesty is cheaper than noise, you get honesty. If it is dearer, you get
+> noise, and a backlog nobody trusts.
+
+What is refused is **silence** - a finding recorded and left undecided - and a bare
+`declined` with no reason, which is silence wearing a decision's clothes.
+
+### A caution on filing
+
+A confident false finding is not free. Under a gate that turns findings into work, a wrong
+one manufactures work for everyone downstream, and the cost of filing scales with how much
+the process trusts you. Decline generously; file deliberately.
+
+## The question, and why it is in the template
+
+The template asks it outright:
+
+> **Are there any CRs or Bugs you want to raise in this project to address any of the
+> issues found?**
+
+The template is what drives behaviour. The field evidence is unambiguous: in a consuming
+project, 8 of 9 retros carry a `## Lessons` section - **because the template prompts for
+one** - and those same 9 retros reference exactly *one* artefact id between them, because
+nothing ever asked what to file. People answer the questions they are asked. Ask the
+question, then enforce the answer. A gate on a question nobody was asked is just a wall.
+
+## Extraction: a lesson must leave the retro
+
+`retro.py extract --id RETROxxxx` lifts the Try items (an older retro's `## Lessons`
+bullets) into the lessons stores. Without it, a lesson lives only in the retro file, and the
+retro file is read by nobody after the sprint that wrote it.
+
+A Try item that names its failure class goes to the committed class store,
+`sdlc-studio/lessons.jsonl`, one row per class (`id`, `class`, `rule`, `behaviour`,
+`inject`, `hits`, `state`, `recorded_run`, `recorded_source`):
+
+| Try item | Effect |
+| --- | --- |
+| `[LC-003] it happened again on US0123` | a hit `{run, unit, source}` on LC-003; no new lesson |
+| `[new: class name] Rule. What to do differently.` | a new active class, injected at plan, build and review |
+| `[new: class name \| build, review] ...` | the same, injected at the named phases only |
+| untagged | the project lessons log, as before |
+
+`lessons.py classes` lists every code, name, state and hit count, so the author cites the
+class rather than recording it again. A `new` tag naming a class another retro recorded counts
+as a hit on it. An unknown code, an unknown phase, a new class with no behaviour sentence, an
+item that reads as a tag but does not parse (`[LC 001]`, `[LC-01]`, `(LC-001)`,
+`[new scope drift]`) and an unreadable store are refused by `validate` and `extract`, which
+then writes nothing. The plan output, each lane brief and the review brief (`critic.py brief`)
+carry the active classes injected at their phase, rule plus behaviour, at most five,
+most-repeated first, and no other lessons.
+
+A hit counts once per retro item: it is keyed on the retro and the unit, never on the run, so a
+manual `extract` followed by the close's own records one repeat. The run a hit names is
+`--run`, else the open run, else the retro id.
+
+The close then acts on the store, with no operator step:
+
+| When | The close |
+| --- | --- |
+| a REJECT this run recorded cites a class (`[new] the mutant never landed [LC-003]`) | adds a hit `{run, unit, source: critic:<run>, finding}`, once per run and unit; a hit on a retired class, cited or named again in a Try item, puts it back in force |
+| a class has recurred twice after the run that recorded it (distinct run and unit; a hit naming no unit is one of its run's unit hits) | files one CR, `Prevent or retire lesson <id> (<class>)`, stamped with the closing run, naming the class, its rule and each hit with its finding text; its first criterion asks for the code path each hit names to be fixed, and any check it proposes must name the lane, refusal, baseline or pin it retires. The row reads `graduating` with the CR id |
+| a `graduating` class's CR is at a terminal status in its own vocabulary | moves the row to `graduated` when the CR shipped (`Complete` or `Superseded`), and to `retired` when it was `Rejected`, since nothing was fixed (a later repeat puts it back in force); a CR still open, or a class with a hit recorded in this run (a cited REJECT or a Try item, on any pass of the close), leaves it `graduating` |
+| an active class was neither recorded nor hit in the last five runs this clone's archive knows (closing run last), and the archive knows more than five | retires it; a run the archive does not know, such as another clone's, is outside that window, and the class's next hit puts it back in force |
+
+A `graduating` class is still injected and is never filed again; it reads `graduated` at the
+first close after its CR ships, or `retired` if the CR is rejected. The sprint report's appendix lists each active or graduating class with its
+hits this run and in total. That section is outside the report's fingerprint, because every
+later close moves the store and a signed page must not move with it.
+
+Extraction is idempotent by content, so re-running converges rather than duplicating - a
+retro can be extracted, edited, and extracted again.
+
+Promote a lesson to the **skill tier** (`lessons add --global`) only once it clearly
+generalises beyond this project. The project tier is where a lesson goes first.
+
+## See also
+
+- `help/retro.md` - the command surface
+- `help/lessons.md` - the two tiers and the promotion rule
+- `reference-sprint.md` - the sprint close that requires the retro
+- `reference-agentic-lessons.md` - how lessons accumulate and expire

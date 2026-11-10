@@ -1,0 +1,380 @@
+# SDLC Studio Default Configuration
+# These are the skill defaults. Projects can override in sdlc-studio/.config.yaml
+# See reference-config.md for documentation
+
+# Schema version - the FALLBACK default, applied to a project that declares no
+# schema_version of its own (a legacy workspace created before the stamp). New projects are
+# seeded with the current version from templates/config.yaml, not this file. schema_version is
+# the public artefact-format contract stamp documented in reference-schema.md: a consumer reads
+# a project's own value to pin which schema its files are in. `migrate` is what changes it
+# (v2 -> v3 via migrate_v3); hand-editing it migrates nothing. Additive format changes bump the
+# minor version, renames/removals bump the major with a migrate path.
+schema_version: 2
+
+# Coverage targets for test strategy
+coverage:
+  unit: 90          # Target unit test coverage %
+  integration: 85   # Target integration coverage %
+  e2e: 100          # Target feature coverage % (100 = all features)
+
+# Story quality gates
+story_quality:
+  edge_cases:
+    api: 8          # Minimum edge cases for API stories
+    other: 5        # Minimum edge cases for non-API stories
+  test_scenarios:
+    api: 10         # Minimum test scenarios for API stories
+    ui: 8           # Minimum test scenarios for UI stories
+  sizing:
+    max_ac: 10      # Flag story if AC count exceeds this
+    max_points: 13  # Flag story if points exceed this
+    recommended_ac:
+      min: 3        # Recommended minimum AC per story
+      max: 5        # Recommended maximum AC per story
+
+# TDD trigger thresholds
+tdd:
+  edge_case_threshold: 5  # Use TDD if edge cases > this
+
+# E2E test limits
+e2e:
+  max_tests_per_spec: 50  # Split spec if tests exceed this
+
+# Epic configuration
+epic:
+  perspectives:
+    - engineering   # TRD-aligned
+    - product       # PRD-aligned
+    - test          # TSD-aligned
+
+# Review configuration
+review:
+  severity_levels:
+    - critical      # Must address before merge
+    - important     # Should address
+    - suggestion    # Consider addressing
+  # What an ADDED LINE the unit's own verifiers never executed does to a terminal transition
+  # (`verify_ac run --coverage`, measured at the transition itself, never read from a prior report):
+  #   off     (default)  collect nothing, print nothing
+  #   report             print `coverage: N uncovered added line(s)` and proceed
+  #   block              refuse, naming the file, the line and `verify_ac.py coverage rule`
+  # Coverage is opt-in: a close pays for it only in a project that asked. `block` judges every
+  # unit, with no date cutoff. `coverage` (7.10 or later) is an OPTIONAL dependency: absent,
+  # `block` refuses naming it and `report` says so and proceeds.
+  line_coverage: off
+  # The priority at or above which a finding BLOCKS. One word, not a list, and the floor is
+  # derived from the shared priority order - so a project filing High/Medium/Low and one filing
+  # P0..P3 are both covered. An unrecognised value falls back to this default rather than to an
+  # empty floor: a floor nobody configured must not silently become no floor at all.
+  blocking_priority: high
+  # `review.max_rounds` is the review-round cap. Its only reader is critic.py
+  # (`critic.review_ceiling`), which falls back to `critic.DEFAULT_REVIEW_CEILING`; the value
+  # here is declared so `config.py show` reports the cap in force, and a test holds the two
+  # equal. `critic.py record` refuses a delivery round past the cap, and a REJECT at the cap
+  # carries the unit. A project sets it in its own .config.yaml.
+  max_rounds: 2
+  # What `critic.py brief` does when the unit has no current author self-check (`critic.py
+  # self-check record`), first round or `--rejoinder`, at either tier. A row is current when
+  # its digest matches the content of its Affects as they stand or, when HEAD descends from the
+  # row's commit, that content with each file lacking an uncommitted edit read at its newest
+  # commit since then whose subject names this unit or none, else at the row's commit (an edit
+  # made in a merge can be missed). The modes:
+  #   off                say nothing of it
+  #   report  (default)  print the brief and name the missing or stale record on stderr
+  #   block              refuse: exit 2, no brief on stdout, no fingerprint noted, and the
+  #                      author self-check section printed so the author knows what to record
+  # `report` is the default so a project upgrading is not refused on its first review.
+  author_self_check: report
+  # The line cap, per review tier, on the unit's own diff that `critic.py brief` carries. Past
+  # it, one line names each file cut or left out and the command that prints it. Its only
+  # reader is critic.py, whose `BRIEF_DIFF_LINES` holds these defaults and a test holds the two
+  # equal; a value that is not a positive whole number falls back to the tier's default.
+  brief_diff_lines:
+    full: 400
+    light: 150
+
+  # Requirements/spec documents (schema v3 only). A delivery diff that edits one of these
+  # without a citing AC is an UNTRACED spec edit - the critic charter treats it as a blocking
+  # finding: falsifying the source of truth is the worst propagation of a bad
+  # plan. `scripts/spec_guard.py` surfaces the edit deterministically; the traceability
+  # judgement stays with the critic. A requested spec edit (an AC citing the spec path) is fine.
+  spec_paths:
+    - "*prd*.md"
+    - "*trd*.md"
+    - "*tsd*.md"
+    - "*spec*.md"      # foo.spec.md, SPEC.md, design-spec.md (root spec files too)
+    - "*requirements*"
+    - "*/specs/*"
+    - "specs/*"
+    - "*/spec/*"
+    - "spec/*"
+
+# Executable acceptance-criteria verification
+# When true, the Story Completion Cascade refuses to mark a story Done
+# unless every AC reports Verified: yes. Adopt incrementally: leave
+# off while seeding Verify: lines, then enable once reconcile reports
+# manual: 0 for the whole repository. See reference-verify.md.
+require_ac_verification: false
+
+# Two-backlog workflow enforcement (schema v3). Default OFF, and deliberately so: it is the one
+# gate-bearing key whose absence does NOT block. An existing project pulling a newer skill keeps
+# its old flow (plan a CR, complete it whole, size with points) until it opts in, so the release
+# does not break it. Set enforce: true to turn on the HARD gates - `plan` refuses a request as a
+# sprint unit, a request's terminal status is derived from its children, reconcile flags an
+# accepted childless request as undecomposed, and a CR may carry a T-shirt Size but filing one
+# no longer demands it (refine sizes the epic it decomposes the CR into). This repo dogfoods it
+# on via its own .config.yaml override. See reference-config.md#two-backlog.
+two_backlog:
+  enforce: false
+
+# Project constitution. When `sdlc-studio/constitution.md` exists, its
+# machine-checkable principles are asserted by `constitution check`. Advisory by
+# default - set enforce: true to make a violation fail the check (exit non-zero), the
+# same incremental-adoption pattern as require_ac_verification. See reference-doctrine.md.
+constitution:
+  enforce: false
+
+# Skill update check. On the first `status`/`hint` of a session the skill
+# compares the installed version against the latest GitHub release and prints a one-line
+# notice if newer (dismiss with `skill-update` decline; quiet until a newer release).
+# On by default; set enabled: false to disable the network check entirely. ttl_hours
+# caps it to one check per window. Silent on any network failure.
+version_check:
+  enabled: true
+  ttl_hours: 24
+
+# Code-complexity thresholds. cognitive_high flags a function as a hotspot
+# (SonarQube's 15); churn_high is the commits-touching-a-file threshold for the
+# churn-weighted composite defect-risk band (churn is weighted ~3x complexity, per the
+# 2026-06-21 calibration). See reference-test-best-practices.md#complexity-test-risk.
+complexity:
+  cognitive_high: 15
+  churn_high: 12
+
+# Per-project status vocabulary extensions. The skill ships a base vocabulary per
+# artifact type (see sdlc_md.STATUS_VOCAB). A project that uses extra statuses can
+# declare them here so reconcile/validate/conformance recognise them instead of
+# parsing the row as "Unknown". Extensions add to the base; they never replace it.
+# Example (in your project's sdlc-studio/.config.yaml):
+# status_vocab:
+#   story:
+#     - Gated
+status_vocab: {}
+
+# Lifecycle-conformance adoption cutoff. A project that turns the conformance gate
+# on partway through its life can set this to the first story id that must pass the
+# full gate; earlier stories are reported as "exempt (pre-adoption)" and never
+# counted as non-conformant. Unset (default) judges every story.
+# Example: conformance: { adopt_after: US0360 }
+conformance:
+  adopt_after: null
+
+# Skill source checkout. Where `lessons add --global` writes a promoted (cross-project)
+# lesson. The INSTALLED skill is a deployment artefact - the next skill update replaces it
+# wholesale - so a lesson authored there is destroyed. Point this at your sdlc-studio source
+# checkout and the lesson lands in a version-controlled file that `git status` shows, and
+# ships with the next release once committed. Unset, `add --global` refuses to write into an
+# untracked install and tells you why; the project tier (`sdlc-studio/retros/LESSONS.md`,
+# the default) always works and needs no config.
+# Example: skill_source_repo: ~/code/sdlc-studio
+skill_source_repo: null
+
+# Persona staleness window (in days). A persona without a consult / story / CR
+# reference older than this is flagged in the Persona Review pass of
+# `/sdlc-studio review`. See reference-review.md.
+personas:
+  staleness_days: 90
+
+# Contract-table anchors. The structured tables in PRD and TRD that
+# constitute the feature contract — they ARE the contract, the changelog
+# is the audit trail. When a `code implement` ship-impacting commit
+# touches files that imply a feature surface change but does NOT touch
+# these anchors, the workflow warns. Project-overridable.
+# See reference-config.md and reference-code.md.
+contract_tables:
+  prd: "§3 Feature Inventory"
+  trd: "§6 Data Models"
+
+# Release strategy. Determines which ship-time guidance the workflow
+# emits for `code implement` and `epic implement`. See reference-config.md
+# and reference-decisions.md.
+#
+#   trunk          - commit each unit to main when its gate passes and push
+#                    main. No branch, no PR. (default)
+#   solo-dev       - the earlier name for trunk; read as trunk.
+#   pr-required    - opt-in: every change goes through a PR. Ship via
+#                    `gh pr create` + review + merge.
+#   staged-rollout - tagged-deploy + soak gate. Ship via tag + deploy +
+#                    soak window before promoting to "live".
+release_strategy: trunk
+
+# Artifact provenance. `new` stamps tool-created artifacts; `provenance check`
+# flags un-stamped ones past adopt_after (advisory unless enforce). `remake` backfills the
+# stamp. Standalone/advisory by default - not wired into the gate.
+provenance:
+  enforce: false
+  adopt_after: 0   # per-type id cutoff; ids <= this are exempt (legacy)
+
+# Agentic triage (schema v3 only - dormant under schema_version: 2). Noise controls on
+# artefact creation, so a flood of agent-filed findings never buries the few that matter.
+triage:
+  session_cap: 20          # max findings one session may file; the N+1th is refused loudly
+                           # (start a fresh session with SDLC_TRIAGE_SESSION, or raise the cap)
+  low_consolidation: false # true folds a Low-severity finding into a themed consolidation CR
+                           # rather than minting its own bug; off by default, because a bucket
+                           # is not a change request (D0217). Medium and above are always individual
+  sample_rate: 0.20        # fraction of non-always-sampled triaged findings a human audits
+  always_sample:           # always audited regardless of sample_rate
+    - Critical             # every Critical-severity finding
+    - disagreement         # every raiser/triager severity disagreement
+
+# Difficulty-aware model-tier routing. Advisory and opt-in: with enabled: false
+# the sprint plan still carries each unit's difficulty band (useful information), but no
+# tier/model recommendation. Tiers are abstract sizes; map them to whatever model
+# identifiers your agent CLI accepts - the ids are opaque strings the orchestrator passes
+# to its own worker-spawn mechanism; the skill never calls a model API. Declare only the
+# tiers you have: an undeclared tier degrades UPWARD to the nearest declared larger tier
+# (never downward - a too-small model risks quality, a too-large one only cost); above
+# the largest declared tier, the largest is used. No gate ever reads a tier.
+routing:
+  enabled: false
+  models: {}              # e.g. {tiny: claude-haiku-4-5, medium: claude-sonnet-5, xlarge: claude-fable-5}
+  floor:                  # minimum tier per unit kind (bands below are lifted)
+    bug: small            # a bug fix is never routed tiny (repro judgement)
+    security: medium      # applied when the churn-weighted risk band is high
+  critic_tier: match      # match | above - the independent critic is never a SMALLER
+                          # tier than the author; code units floor the critic at medium
+  thresholds:             # difficulty-score cutpoints (score at which the next band starts)
+    tiny: 20
+    small: 40
+    medium: 60
+    large: 80
+  escalation:
+    max_same_tier: 2      # failed attempts at the assigned tier before escalating one
+                          # tier (within loop_guard's unchanged total attempt cap)
+
+# Deploy contract - the orchestrate-only deploy last-mile. The skill GATES before and
+# VERIFIES after a deploy; it never holds the production trigger, never auto-rolls-back, and never
+# deploys inside the autonomous loop. Secrets are never read - only the command you configure is
+# invoked, and only on an explicit, interactive `/sdlc-studio deploy`. See reference-deploy.md.
+# All keys are optional: with none set, `deploy` is a pure gate + verification harness around a
+# deploy you trigger yourself.
+deploy:
+  command: ""        # (optional) the project's own deploy command, invoked only after the gate is
+                     #  green AND only on an interactive `deploy` - never in autosprint.
+  smoke: ""          # post-deploy check (a verify_ac-style expression, e.g. `http GET /health -- ...`).
+                     #  Smoke green == "rolled out".
+  soak_minutes: 0    # soak window before a deploy is "verified" (Done). Smoke alone is not enough.
+  rollback: ""       # a documented PROCEDURE (steps, or a command an operator runs by hand). The
+                     #  agent never fires this; `deploy` only SURFACES it on a failed smoke.
+
+# Context tiering - summarised digests of closed artefacts. A long-lived repo pays a
+# growing token tax on every status / planning pass that re-reads the whole closed corpus. When
+# the number of closed artefacts reaches `min_closed`, `digest.py build` writes a mechanical
+# digest (id/title/status/outcome/refs) that `status`/`hint` read for closed artefacts instead of
+# opening every original; originals stay on disk and still resolve by id. Below the threshold the
+# feature is dormant - no digest is produced or read, so small repos see no behaviour change.
+digests:
+  min_closed: 500    # closed-artefact count at/above which digests are produced and read
+
+# Sprint capacity - how much ONE sprint may cost. The single source for both the plan-time
+# "does this batch fit?" check (`sprint plan` flags an over-budget batch while the operator can
+# still cut it) and the run-time circuit breaker's appetite, so the two cannot disagree. The
+# token axis is a FORECAST and is only ever a WARNING - a script cannot observe token spend, and
+# the forecast model is a hypothesis fitted to one sprint. The wall-clock and unit axes are the
+# real breaker. 0 on an axis = unbounded.
+#
+# PROVISIONAL: round numbers over one measured sprint (6 units, 384,278 tokens actual). The
+# velocity history (`sdlc-studio/retros/VELOCITY.md`) accumulates a row per sprint; once it has
+# enough rows a HUMAN re-reads the trend and decides whether these have earned a change. Nothing
+# recalibrates automatically - a fit to one or two sprints would fit noise.
+capacity:
+  tokens: 500000  # token forecast ceiling for the batch; warning only, never a gate
+  minutes: 240    # wall-clock ceiling for the run; feeds the appetite breaker
+  units: 8        # unit-count ceiling for the run; feeds the appetite breaker
+
+# Tokens-per-point override. Unset, the plan re-measures the rate from VELOCITY.md; set, it
+# prices the plan, and the forecast basis names it an operator override beside the measured rate.
+# estimate:
+#   tokens_per_point: 200000   # a plain integer; 1e5 reads as text and is ignored
+
+# Run appetite - the unattended-run circuit breaker (Shape Up's fixed timebox). A run declares
+# how much it may spend; the breaker (`loop_guard budget`) is evaluated at unit BOUNDARIES and
+# stops the run cleanly when the appetite is spent, distinct from a per-unit quarantine (its own
+# exit code, and units keep their true status rather than being marked Blocked). Both axes are
+# deterministic and harness-independent: wall-clock from the run's start time, units from those
+# now terminal. The appetite is RESOLVED ONCE, at plan time, most specific first: an explicit
+# `--appetite-minutes`/`--appetite-units` on `sprint plan`, then a non-zero key below, then the
+# sprint capacity above. `sprint plan --write` stamps the resolved pair on the run state, which
+# is what the breaker reads back - so the ceiling the plan sized the batch against IS the one
+# that stops the run. Leave these at 0 to inherit the capacity; set one to pin an axis
+# independently of it. Tokens are never a gate - the plan reports a token FORECAST only. The
+# appetite is never auto-extended: extending it is an explicit operator action on a new run.
+appetite:
+  minutes: 0  # 0 = inherit capacity.minutes
+  units: 0    # 0 = inherit capacity.units
+
+# Sprint breakdown gate - a plan is REFUSED over an ungroomed batch. A unit that declares no
+# `Affects` cannot be sized (the token forecast falls back to a flat floor), and the planner
+# cannot see that two units touch the same file - so it reports them as safely parallel when
+# they will collide. `enforce` (the default): `sprint plan` names each ungroomed unit, says what
+# it lacks, and exits non-zero WITHOUT printing a plan - a plan over unsized units is false
+# authority. `judgement`: the lane reports and does not block, the same shape as the engagement
+# floor and the lessons loop. Omission is not an escape: with no config at all the gate BLOCKS.
+# `sprint.py breakdown` reports the same census, read-only. See reference-sprint.md.
+sprint:
+  breakdown: enforce   # enforce | judgement
+  points_split_above: 8  # the Points: value above which the plan refuses a unit and asks for a split
+  affects_check: warn    # warn | block - what an Affects the unit's own content contradicts does
+
+# Project lessons - how long a lesson stays valid before it must be re-validated. `lessons add`
+# stamps `Review-by: {added + validity_days}`; at the sprint close the gate fails while an open
+# lesson sits past its horizon un-closed and un-extended (`lessons revalidate`). A shorter window
+# suits a fast-moving codebase where a lesson rots quickly; a longer one suits a stable domain.
+lessons:
+  validity_days: 90  # days a project lesson holds before re-validation is due
+  loop: enforce      # enforce | judgement - judgement makes the close's lessons lanes advisory
+
+# The sprint report page. `enabled: false` withholds the rendered text page; the run's data is
+# still recorded.
+report:
+  enabled: true
+
+# Mutation probe cost ceiling per run (`mutation.py run`); enumerations beyond it are counted as
+# truncated, never silently clean.
+quality:
+  mutation_max: 25
+
+# Estimate attribution. `default` names the estimator a unit with no `Estimated-by` is credited
+# to (unset: unattributed). `compulsory_after` maps an id prefix to the first id whose size was
+# demanded by the grooming gate (unset: the era of an unstamped estimate is unknown).
+estimator:
+  default: null
+  compulsory_after: null
+
+# The gate's time cost, as `sprint plan` prices it. `seconds` is the ceiling the measured cost is
+# judged against; `baseline_seconds` and `baseline_date` declare a measured run, used when no run
+# is recorded. All unset by default: an unmeasured cost reads UNKNOWN, never zero.
+gate_budget:
+  seconds: null
+  baseline_seconds: null
+  baseline_date: null
+
+# The close's cost check. A run over 1.5 times its baseline priced cost per point is a known
+# issue, whose cause the retro names. The baseline is the median of the latest priced runs once
+# three exist; until then, this. Shipped as SDLC Studio's own measure: two of its runs, priced
+# from their transcripts, cost about 2.0M and 3.0M per point. Set your own; `off` records no
+# issue until three priced runs exist.
+cost:
+  baseline_per_point: 2500000  # priced input-equivalent tokens per point
+  # `sprint cost --anatomy` flags each subagent whose FIRST call carried more context than this
+  # (input + cache write + cache read), with its start and the budget: a lean builder or reviewer
+  # starts well under it, an agent granted every tool does not. `off` flags none.
+  agent_start_budget: 30000
+
+# Flow-metrics ageing flags (US-level, advisory). Unset = the status ageing advisory is OFF
+# (a flag appearing uninvited on a live workflow is a break, not a feature - opt in). When
+# set, `status` names each In Progress unit older than this many days and every Blocked
+# unit with how long it has been stuck. `flow.py compute` is the full read, always available.
+# flow:
+#   ageing_days: 14

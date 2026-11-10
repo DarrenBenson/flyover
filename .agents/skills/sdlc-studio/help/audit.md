@@ -1,0 +1,187 @@
+<!--
+Load when: /sdlc-studio audit, "pressure-test the project", "hunt for weaknesses"
+Dependencies: SKILL.md (always loaded first)
+Related: reference-audit.md, templates/automation/audit-finder.md, templates/automation/audit-refute.md
+-->
+
+# /sdlc-studio audit - the adversarial pressure-test
+
+## You can just ask
+
+| Just say... | Runs |
+| --- | --- |
+| "Adversarially audit the whole project" | the project-profile fan-out (`reference-audit.md`) |
+| "Pressure-test just the PRD and TRD" | a scoped audit (`--scope prd,trd`) |
+| "Audit this skill itself" | the skill profile (`templates/audit-profiles/skill.md`) |
+| "What would this audit cost before I launch it?" | `audit_cost.py --lenses <n>` |
+
+A multi-agent adversarial pressure-test over the whole artifact graph. It hunts for
+**weakness and incoherence** - not just consistency - verifies every candidate with an
+independent refute panel, and files the survivors as Bugs / CRs / RFCs. It composes with
+the cheap passes (`review`, `reconcile`, `verify`); it does not replace them.
+
+`audit` is driven by agents from the portable methodology in `reference-audit.md` (Option
+A - any AGENTS.md-capable harness runs it). Read that reference before launching; this
+page is the entry point and the pre-flight gate.
+
+## The pre-flight cost gate (do this first)
+
+An audit can spend millions of tokens across hundreds of agents, and the harness only
+flags a "Large workflow" **after** it has launched. So estimate and confirm **before** the
+fan-out:
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/audit_cost.py" --lenses 8 --rounds 2 --votes 3
+```
+
+It reports `~agents · ~tokens · ~minutes` and a **large / small** verdict:
+
+- **large** (>= ~50 agents or >= ~1M tokens): show the operator the estimate and the
+  scope, and wait for an explicit go-ahead before launching.
+- **small** (a couple of lenses, one round): run without ceremony - the gate is for the
+  expensive runs, not every audit.
+
+It is a confirmation gate, not a cap; `--budget` and the round limit bound the run itself.
+
+## The pipeline
+
+```text
+find  ──►  verify  ──►  merge  ──►  file
+(lenses,   (refute     (dedup +    (Bug/CR/RFC via
+ until-dry) panel,      classify)   file_finding.py)
+            N-of-M)
+```
+
+1. **Recall first** - `scripts/lessons.py rank`; the ranked lessons ARE lenses.
+2. **Find** - one finder agent per lens (`templates/automation/audit-finder.md`), each
+   re-run until-dry (K=2 rounds with nothing new).
+3. **Verify** - N skeptics per candidate refute it; survive on >= M of N (default 3-vote,
+   >= 2/3). A vote that never arrives is not a refutation - an incomplete panel marks the
+   candidate `UNJUDGED`, never refuted (`reference-audit.md#audit-refute-quorum`).
+4. **Merge** - dedup survivors by file + claim.
+5. **File** - **triage-then-approve is the default** for the project profile (auto-file
+   produced shallow artifacts); auto-file is opt-in. File with `file_finding.py`, which
+   refuses a hollow artifact.
+
+## Profiles
+
+Six ship. The profile chooses the lenses; every one of them runs through the same refute
+panel, so the choice never changes whether a plausible-but-wrong finding gets filed.
+
+| Profile | Invocation | Lenses | Pack |
+| --- | --- | --- | --- |
+| `project` | `audit` (default) | per-artifact-type (PRD, TRD, TSD, personas, epics/stories, code, design/RFC) plus cross-artifact traceability | `reference-audit.md#audit-project-profile` |
+| `skill` | `audit --profile skill` | over-engineering, token-economy, determinism, external-benchmark | `templates/audit-profiles/skill.md` |
+| `repo` | `audit --profile repo` | architecture, code-quality, defensive-security | `templates/audit-profiles/repo.md` |
+| `code` | `audit --profile code` | correctness, security-smells, pattern-violations, ac-drift | `templates/audit-profiles/code.md` |
+| `test` | `audit --profile test` | can-it-fail, reaches-the-code, docstring-vs-assertion, incidentally-green (source and tests together) | `templates/audit-profiles/test.md` |
+| `process` | `audit --profile process` | path-from-memory, count-by-hand, accepted-without-running, repair-without-plan, skipped-preflight (each names its detector or declares none) | `templates/audit-profiles/process.md` |
+
+Resolve a pack before launching, and see its lenses and refute threshold:
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/readiness.py" profile --name repo
+```
+
+A name no profile declares is refused, naming the ones that exist - an audit never runs an
+empty lens set.
+
+Hold every lens to its signature contract - each names a detector that resolves, or declares
+`manual` with a reason:
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/readiness.py" profile --validate            # every pack
+python3 "$CLAUDE_SKILL_DIR/scripts/readiness.py" profile --name code --validate
+```
+
+Exits non-zero on any breach and names the pack and lens. Run it after appending a lens of your
+own (see `reference-audit.md#audit-extend` for what a signature must satisfy): a mechanical one
+names a target that resolves, and an absent one states why no search singles the class out. A
+path under `.claude/skills/sdlc-studio/` resolves against the installed skill, so the shipped
+detectors work from any project root.
+
+### Attributing a finding to its lens and run
+
+Record the run first - that ledger row IS the audit-run register:
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/audit_cost.py" record --run-id RUN-xxxx \
+  --lenses 5 --est-agents 50 --est-tokens 1000000 \
+  --actual-agents 55 --actual-tokens 1200000
+```
+
+Then file each finding against it:
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/file_finding.py" file --type bug \
+  --fields-file finding.json --lens accepted-without-running --audit-run RUN-xxxx
+```
+
+- **`--lens` and `--audit-run` go together or not at all.** A lens seen once is the lens working;
+  a lens seen across two runs is a detector owed. Neither half counts alone, and a finding with
+  neither stays perfectly legal.
+- **`--profile` is optional and derived**, since a lens resolves to exactly one pack. Supply it
+  only to have the pairing cross-checked: a lens/profile mismatch is refused.
+- **An unregistered run id is refused**, so a one-character typo cannot manufacture a second
+  distinct run and with it a false detector-owed verdict. Every check runs before an id is
+  minted, so a refusal costs no id.
+
+### Which lenses now want a script
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/readiness.py" detector-owed
+python3 "$CLAUDE_SKILL_DIR/scripts/readiness.py" detector-owed --format json
+```
+
+A lens filed under **two or more separate registered runs** whose signature declares no mechanical
+detector is **detector-owed**: a judgement the model has now been billed for twice, which a script
+should take over. One whose detector already ships is **detector-exists**, and the report names the
+command to run and skip on rather than re-commissioning it.
+
+Volume inside one run is not evidence - a run finding a class five times is the lens working.
+
+Three exit codes, and the third is the point:
+
+| Code | Verdict |
+| --- | --- |
+| 0 | clean - no lens survived two separate runs unconverted |
+| 1 | at least one detector is owed |
+| 3 | **cannot judge** - findings carry no attribution, or cite a run the register does not hold |
+
+File a unit for each owed class instead of describing it:
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/readiness.py" detector-owed --file
+python3 "$CLAUDE_SKILL_DIR/scripts/readiness.py" detector-owed --file --dry-run
+```
+
+Each unit names both runs and both findings as the evidence its detector must catch, and carries a
+`Detector-for-lens` field. **Idempotence matches on that field, not on the title** - so rewording
+the unit does not cause a second one to be filed. Nothing is filed for a detector-exists lens, and
+`--file` refuses outright on a cannot-judge verdict rather than minting units from a workspace it
+has just said it could not read.
+
+**Cannot-judge is not "nothing owed", and it dominates.** A workspace with three owed lenses and
+forty unreadable findings reports cannot-judge, because otherwise the forty vanish behind a verdict
+that looks like an answer. It is `3` rather than `2` so it cannot be confused with a usage error.
+Expect it on a corpus that predates attribution: unattributed findings are named, not counted.
+
+### The zero-setup path on an existing repo
+
+`audit --profile repo` is the try-before-you-adopt entry point: point it at a repository
+that has never run sdlc-studio, and it hunts the three legs, verifies each candidate
+through the refute panel, and files the survivors as Bugs or CRs with tool-allocated ids.
+Security findings are remediation-only - location, weakness class, realistic impact and a
+concrete fix, no proof-of-concept payload, and a committed secret reported by location
+plus rotation with the value left where it is. The wording is binding and lives in the
+pack (`templates/audit-profiles/repo.md`).
+
+Narrow a run with `--scope prd,trd,...`. Run on demand, never in CI, and always log what a
+cap dropped so partial coverage is not read as complete.
+
+## See Also
+
+- `reference-audit.md` - the full methodology (pipeline, lens profiles, refute panel, filing)
+- `templates/automation/audit-finder.md` - the finder-agent prompt
+- `templates/automation/audit-refute.md` - the refute-panel skeptic prompt
+- `scripts/file_finding.py` - the deterministic filer for survivors

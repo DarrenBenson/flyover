@@ -1,0 +1,327 @@
+<title>Sprint Report {{run_id}}</title>
+<!-- Rendered by `sprint_report.py render --to html`. Placeholders are filled from the
+     report JSON; every figure must arrive with a source, and a section with no data renders
+     as NOT MEASURED by name rather than being dropped. Nothing here may carry a figure of its
+     own: a literal in this file is another run's fact on every page after the first. -->
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,600&family=Source+Sans+3:wght@400;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --paper:#f2f5f4; --surface:#fbfcfb; --ink:#111a1d; --muted:#57676c; --line:#d5dedb;
+  --accent:#125f54; --accent-soft:#e2efec; --warn:#8a5605; --warn-soft:#f6ecdc; --stop:#95302a;
+  --shadow:0 1px 2px rgba(17,26,29,.06), 0 8px 24px -16px rgba(17,26,29,.4);
+  --mono:"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --body:"Source Sans 3", system-ui, -apple-system, Segoe UI, sans-serif;
+  --display:"Newsreader", Georgia, "Times New Roman", serif;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --paper:#0e1416; --surface:#151d20; --ink:#e7efec; --muted:#93a5a9; --line:#243033;
+  --accent:#4eb5a3; --accent-soft:#12312c; --warn:#d69b46; --warn-soft:#2e2517; --stop:#dc8078;
+  --shadow:0 1px 2px rgba(0,0,0,.5), 0 8px 24px -16px #000;
+} }
+:root[data-theme="dark"] {
+  --paper:#0e1416; --surface:#151d20; --ink:#e7efec; --muted:#93a5a9; --line:#243033;
+  --accent:#4eb5a3; --accent-soft:#12312c; --warn:#d69b46; --warn-soft:#2e2517; --stop:#dc8078;
+  --shadow:0 1px 2px rgba(0,0,0,.5), 0 8px 24px -16px #000;
+}
+* { box-sizing:border-box; }
+body { margin:0; background:var(--paper); color:var(--ink); font-family:var(--body);
+  font-size:16px; line-height:1.55; padding-block:clamp(24px,5vw,56px); padding-left:16px; padding-right:16px; }
+.wrap { max-width:1080px; margin:0 auto; display:flex; flex-direction:column; gap:clamp(28px,4vw,44px); }
+.eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted); }
+h1 { font-family:var(--display); font-weight:600; font-size:clamp(30px,5vw,44px); line-height:1.08;
+  margin:.25em 0 0; text-wrap:balance; letter-spacing:-.01em; }
+h2 { font-family:var(--display); font-weight:600; font-size:clamp(20px,2.6vw,26px); margin:0; text-wrap:balance; }
+h3 { font-family:var(--display); font-weight:600; font-size:18px; margin:8px 0 0; }
+p { margin:0; }
+section { display:flex; flex-direction:column; gap:14px; }
+.head { border-bottom:2px solid var(--ink); padding-bottom:18px; display:flex; flex-direction:column; gap:10px; }
+.goal { font-family:var(--display); font-size:clamp(17px,2.2vw,20px); line-height:1.45; color:var(--ink); max-width:62ch; white-space:pre-wrap; }
+.verdictline { display:flex; flex-wrap:wrap; gap:10px 18px; align-items:baseline; }
+.stamp { font-family:var(--mono); font-size:12px; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--accent); border:1px solid var(--accent); padding:3px 9px; border-radius:2px; }
+.invalid { border:1px solid var(--stop); border-left:4px solid var(--stop); background:var(--warn-soft);
+  padding:14px 17px; display:flex; flex-direction:column; gap:6px; }
+.invalid .ik { font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--stop); }
+.invalid p { font-size:14px; line-height:1.5; max-width:70ch; }
+.scroll { overflow-x:auto; border:1px solid var(--line); background:var(--surface); }
+table { border-collapse:collapse; width:100%; font-size:13.5px; }
+th, td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+thead th { font-family:var(--mono); font-size:10.5px; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--muted); font-weight:500; white-space:nowrap; background:var(--surface); position:sticky; top:0; }
+tbody tr:last-child td, tbody tr:last-child th { border-bottom:0; }
+.num { font-family:var(--mono); font-variant-numeric:tabular-nums; text-align:right; white-space:nowrap; }
+.mono { font-family:var(--mono); font-size:12.5px; }
+.sub { color:var(--muted); }
+.uid { font-family:var(--mono); font-weight:500; display:block; }
+th[scope="row"] { font-weight:600; }
+.pill { font-family:var(--mono); font-size:10.5px; letter-spacing:.06em; text-transform:uppercase;
+  padding:2px 7px; border-radius:2px; white-space:nowrap; background:var(--accent-soft); color:var(--accent); }
+.note { font-size:13px; color:var(--muted); max-width:42ch; }
+.lede { max-width:66ch; color:var(--muted); font-size:15px; }
+.unmeasured { font-family:var(--mono); font-size:13px; color:var(--warn); max-width:70ch; }
+.unmeasured b { letter-spacing:.08em; }
+footer { border-top:1px solid var(--line); padding-top:18px; color:var(--muted); font-size:13px; max-width:70ch; }
+.filing { display:flex; flex-wrap:wrap; gap:4px 20px; font-family:var(--mono); font-size:12px; color:var(--muted); }
+.signoff { border-top:2px solid var(--ink); padding-top:20px; }
+.siggrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:20px 40px; }
+.siggrid .k { font-family:var(--mono); font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); display:block; margin-bottom:6px; }
+.siggrid .val { font-family:var(--mono); font-size:14px; display:block; border-bottom:1px solid var(--ink); padding-bottom:6px; }
+.appendix { border-top:1px solid var(--line); padding-top:20px; }
+</style>
+<div class="wrap">
+<header class="head">
+  <span class="eyebrow">Sprint report &middot; for sign-off</span>
+  <h1>{{run_id}}</h1>
+</header>
+
+<!-- repeat: invalidation -->
+<section class="invalid">
+  <span class="ik">Invalidated</span>
+  <p><strong>INVALIDATED.</strong> This report was signed at fingerprint <span class="mono">{{signed_fingerprint}}</span>; re-deriving it from the tree now yields <span class="mono">{{current_fingerprint}}</span>. Moved: {{moved_figures}}. The sign-off below records what WAS signed and is left standing; re-prepare the report to sign the tree as it is.</p>
+</section>
+<!-- end -->
+
+<section>
+  <h2>Goal</h2>
+  <p class="goal">{{sprint_goal}}</p>
+  <div class="verdictline">
+    <span class="stamp">{{goal_verdict}}</span>
+    <span class="mono sub">{{goal_verdict_note}}</span>
+  </div>
+  <div class="filing">
+    <span>Run {{started_at}} &rarr; {{ended_at}} ({{duration_hours}})</span>
+    <span>Verified on {{verified_sha}}</span><span>Fingerprint {{report_fingerprint}}</span>
+  </div>
+</section>
+
+<section>
+  <h2>Estimates</h2>
+<!-- unless: minutes_measured_rule -->
+  <p class="lede">How far the plan's forecast was from what the run took. Points are compared over the delivered units; minutes and tokens over the whole run, its span and its meter. Ratio is actual over forecast.</p>
+<!-- end -->
+<!-- when: minutes_measured_rule -->
+  <p class="lede">How far the plan's forecast was from what the run took. Points are compared over the delivered units; minutes over the units' own measured minutes, summed over the units that also carry a forecast; tokens over the whole run. The run's wall-clock span stands on its own line with no ratio. Ratio is actual over forecast.</p>
+<!-- end -->
+  <div class="scroll"><table>
+    <thead><tr><th scope="col">Measure</th><th scope="col" class="num">Forecast</th><th scope="col" class="num">Actual</th><th scope="col" class="num">Ratio</th><th scope="col">Over</th></tr></thead>
+    <tbody>
+<!-- repeat: estimates -->
+      <tr><th scope="row">{{est_measure}}</th><td class="num">{{est_forecast}}</td><td class="num">{{est_actual}}</td>
+        <td class="num">{{est_ratio}}</td><td class="note">{{est_basis}}</td></tr>
+<!-- end -->
+    </tbody>
+  </table></div>
+<!-- when: estimates_units -->
+<!-- unless: minutes_measured_rule -->
+  <p class="lede">Each cell names its source. A figure labelled agent minutes or agent tokens sums the agent totals tagged to that unit; an unlabelled one is measured over the unit's own open span. Spans of units open at the same time overlap, so no per-unit figure is added up into the run's figures above.</p>
+<!-- end -->
+<!-- when: minutes_measured_rule -->
+  <p class="lede">Each cell names its source. A figure labelled agent minutes or agent tokens sums the agent totals tagged to that unit; an unlabelled one is measured over the unit's own open span. The actual on the Minutes row above sums these minutes over the units that also carry a forecast; spans of units open at the same time overlap, so that sum can exceed the wall-clock span.</p>
+<!-- end -->
+  <div class="scroll"><table>
+    <thead><tr><th scope="col">Unit</th><!-- when: usd_rule --><th scope="col" class="num">Dollars</th><!-- end --><th scope="col" class="num">Forecast minutes</th><th scope="col" class="num">Minutes</th><th scope="col" class="num">Forecast tokens</th><th scope="col" class="num">Tokens</th><!-- when: priced_unit_rule --><th scope="col" class="num">Priced</th><!-- end --></tr></thead>
+    <tbody>
+<!-- repeat: estimates_units -->
+      <tr><th scope="row"><span class="uid">{{unit_id}}</span></th><!-- when: usd_rule --><td class="num">{{eu_usd}}</td><!-- end --><td class="num">{{eu_forecast_minutes}}</td><td class="num">{{eu_minutes}}</td>
+        <td class="num">{{eu_forecast_tokens}}</td><td class="num">{{eu_tokens}}</td><!-- when: priced_unit_rule --><td class="num">{{eu_priced}}</td><!-- end --></tr>
+<!-- end -->
+    </tbody>
+  </table></div>
+<!-- end -->
+</section>
+
+<section>
+  <h2>Delivered to plan</h2>
+  <div class="scroll"><table>
+    <thead><tr><th scope="col">Measure</th><th scope="col" class="num">Units</th><th scope="col" class="num">Points</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Planned</th><td class="num">{{planned_units}}</td><td class="num">{{planned_points}}</td></tr>
+      <tr><th scope="row">Delivered of the plan</th><td class="num">{{plan_delivered_units}}</td><td class="num">{{plan_delivered_points}}</td></tr>
+      <tr><th scope="row">Added mid-run and delivered</th><td class="num">{{added_delivered_units}} of {{added_units}} added</td><td class="num">{{added_points}}</td></tr>
+      <tr><th scope="row">Dropped</th><td class="num">{{dropped_units}}</td><td class="num">{{dropped_points}}</td></tr>
+      <tr><th scope="row">Carried undelivered</th><td class="num">{{carried_units}}</td><td class="num">{{carried_points}}</td></tr>
+    </tbody>
+  </table></div>
+  <p class="lede">Points here are the sizes the plan recorded: a unit resized since keeps its planned size and shows its current size below, and an added unit is sized when it is added. Added units are work outside the plan and are never counted as delivering it. Points delivered at their current size, plan and added together: {{points_delivered}}.</p>
+  <div class="scroll"><table>
+    <thead><tr><th scope="col">Unit</th><th scope="col" class="num">Planned points</th><th scope="col" class="num">Points</th><th scope="col">Outcome</th><th scope="col" class="num">Review rounds</th></tr></thead>
+    <tbody>
+<!-- repeat: plan_units -->
+      <tr><th scope="row"><span class="uid">{{unit_id}}</span></th><td class="num">{{unit_planned_points}}</td><td class="num">{{unit_points}}</td>
+        <td>{{unit_outcome}}</td><td class="num">{{unit_rounds}}</td></tr>
+<!-- end -->
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>Known issues handed over</h2>
+  <p>{{findings_scan}}</p>
+<!-- when: known_issues_rows -->
+  <div class="scroll"><table>
+    <thead><tr><th scope="col">Issue</th><th scope="col">Priority</th><th scope="col">Detail</th></tr></thead>
+    <tbody>
+<!-- repeat: issues -->
+      <tr><th scope="row"><span class="uid">{{issue_id}}</span></th><td><span class="pill">{{issue_priority}}</span></td><td>{{issue_detail}}</td></tr>
+<!-- end -->
+    </tbody>
+  </table></div>
+<!-- end -->
+<!-- unless: known_issues_rows -->
+  <p class="lede">No open finding, close gap or carried unit is recorded.</p>
+<!-- end -->
+</section>
+
+<section class="signoff">
+  <h2>Sign-off</h2>
+  <div class="siggrid">
+    <div><span class="k">Signed by</span><span class="val">{{principal}}</span></div>
+    <div><span class="k">Date</span><span class="val">{{signed_at}}</span></div>
+    <div><span class="k">Fingerprint signed</span><span class="val">{{signed_fingerprint}}</span></div>
+  </div>
+  <p class="lede">Signing records the principal, the date and this report's fingerprint against {{run_id}}.</p>
+</section>
+
+<section class="appendix">
+  <h2>Appendix</h2>
+
+  <h3>Tokens by model</h3>
+<!-- when: cost_measured -->
+  <div class="scroll"><table>
+    <thead><tr><th scope="col">Model</th><th scope="col" class="num">Tokens</th></tr></thead>
+    <tbody>
+<!-- repeat: models -->
+      <tr><th scope="row" class="mono">{{model_name}}</th><td class="num">{{model_tokens}}</td></tr>
+<!-- end -->
+    </tbody>
+  </table></div>
+  <p class="lede">Total {{tokens_total}}, of which delegated {{tokens_delegated}}. Coverage: {{token_coverage}}; {{token_shape}}.</p>
+<!-- end -->
+<!-- unless: cost_measured -->
+  <p class="unmeasured"><b>NOT MEASURED</b> - {{cost_reason}}</p>
+  <p class="lede">Delegated: {{tokens_delegated}}.</p>
+<!-- end -->
+<!-- when: cost_roles_present -->
+<!-- when: cost_roles_measured -->
+  <p class="lede"><strong>Cost by role.</strong> The session's spend by role, each cell as <span class="mono">sprint cost --anatomy</span> prints it, from {{roles_session}}; total {{roles_total}}. Priced in input-equivalent tokens; split is each part's share of the role's priced cost; context is input + cache write + cache read per call.</p>
+  <div class="scroll"><table>
+    <thead><tr><th scope="col">Role</th><th scope="col" class="num">Agents</th><th scope="col" class="num">Calls</th><th scope="col" class="num">Priced tokens</th><th scope="col" class="num">Share</th><th scope="col" class="num">Cache read</th><th scope="col" class="num">Cache write</th><th scope="col" class="num">Output</th><th scope="col" class="num">First context</th><th scope="col" class="num">Avg context</th></tr></thead>
+    <tbody>
+<!-- repeat: cost_roles -->
+      <tr><th scope="row">{{role_name}}</th><td class="num">{{role_agents}}</td><td class="num">{{role_calls}}</td><td class="num">{{role_priced}}</td><td class="num">{{role_share}}</td>
+        <td class="num">{{role_cache_read}}</td><td class="num">{{role_cache_write}}</td><td class="num">{{role_output}}</td><td class="num">{{role_first_context}}</td><td class="num">{{role_avg_context}}</td></tr>
+<!-- end -->
+    </tbody>
+  </table></div>
+<!-- end -->
+<!-- unless: cost_roles_measured -->
+  <p class="unmeasured"><b>Cost by role: NOT MEASURED</b> - {{cost_roles_reason}}</p>
+<!-- end -->
+<!-- end -->
+
+  <h3>DORA</h3>
+<!-- when: dora_measured -->
+  <div class="scroll"><table>
+    <thead><tr><th scope="col">Key</th><th scope="col">This run</th><th scope="col">Mapping</th><th scope="col">Elite band</th><th scope="col">Derived from</th></tr></thead>
+    <tbody>
+<!-- repeat: dora -->
+      <tr><th scope="row">{{dora_key}}</th><td class="num">{{dora_value}}</td>
+        <td class="note">{{dora_mapping}}</td><td class="mono sub">{{dora_band}}</td>
+        <td class="note">{{dora_source}}</td></tr>
+<!-- end -->
+    </tbody>
+  </table></div>
+<!-- end -->
+<!-- unless: dora_measured -->
+  <p class="unmeasured"><b>NOT MEASURED</b> - {{dora_reason}}</p>
+<!-- end -->
+
+  <h3>Calibration</h3>
+  <div class="scroll"><table>
+    <thead><tr><th scope="col">Rate</th><th scope="col" class="num">Value</th><th scope="col">Source</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Tokens per point</th><td class="num">{{cal_tokens_per_point}}</td><td class="note">{{cal_tokens_source}}</td></tr>
+      <tr><th scope="row">Minutes per point</th><td class="num">{{cal_minutes_per_point}}</td><td class="note">{{cal_minutes_source}}</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Rulings</h3>
+<!-- when: rulings_measured -->
+  <p>Persona seats ruled {{persona_rulings}} time(s), {{cited_rulings}} of them by citing a precedent; the operator ruled {{operator_rulings}} time(s).</p>
+<!-- end -->
+<!-- unless: rulings_measured -->
+  <p class="unmeasured"><b>NOT MEASURED</b> - {{rulings_reason}}</p>
+<!-- end -->
+
+  <h3>Waivers in force</h3>
+<!-- when: waivers_measured -->
+  <p>{{waivers_note}}</p>
+<!-- when: waivers_rows -->
+  <ul>
+<!-- repeat: waivers -->
+    <li><strong>{{waiver_id}}</strong> - {{waiver_subject}} ({{waiver_date}}): {{waiver_reason}}</li>
+<!-- end -->
+  </ul>
+<!-- end -->
+<!-- end -->
+<!-- unless: waivers_measured -->
+  <p class="unmeasured"><b>NOT MEASURED</b> - {{waivers_reason}}</p>
+<!-- end -->
+<!-- when: lane_yield_present -->
+
+  <h3>Lane yield</h3>
+<!-- when: lane_yield_measured -->
+  <p>{{lane_yield_note}} A measure, not a gate: listing a lane for deletion refuses nothing and files nothing.</p>
+<!-- when: lane_yield_rows -->
+  <div class="scroll"><table>
+    <thead><tr><th scope="col">Lane</th><th scope="col" class="num">Refusals</th><th scope="col" class="num">Candidate catches</th><th scope="col" class="num">Paperwork</th><th scope="col">Last three runs</th></tr></thead>
+    <tbody>
+<!-- repeat: lane_yield -->
+      <tr><th scope="row" class="mono">{{yield_lane}}</th><td class="num">{{yield_refusals}}</td><td class="num">{{yield_catches}}</td><td class="num">{{yield_paperwork}}</td><td class="note">{{yield_verdict}}</td></tr>
+<!-- end -->
+    </tbody>
+  </table></div>
+<!-- end -->
+<!-- end -->
+<!-- unless: lane_yield_measured -->
+  <p class="unmeasured"><b>NOT MEASURED</b> - {{lane_yield_reason}}</p>
+<!-- end -->
+<!-- end -->
+<!-- when: lessons_present -->
+
+  <h3>Lessons</h3>
+<!-- when: lessons_measured -->
+  <p>{{lessons_note}}</p>
+<!-- when: lessons_rows -->
+  <div class="scroll"><table>
+    <thead><tr><th scope="col">Lesson</th><th scope="col">Class</th><th scope="col">State</th><th scope="col" class="num">Hits this run</th><th scope="col" class="num">Hits in total</th></tr></thead>
+    <tbody>
+<!-- repeat: lessons -->
+      <tr><th scope="row" class="mono">{{lesson_id}}</th><td>{{lesson_class}}</td><td>{{lesson_state}}</td><td class="num">{{lesson_hits_run}}</td><td class="num">{{lesson_hits_total}}</td></tr>
+<!-- end -->
+    </tbody>
+  </table></div>
+<!-- end -->
+<!-- end -->
+<!-- unless: lessons_measured -->
+  <p class="unmeasured"><b>NOT MEASURED</b> - {{lessons_reason}}</p>
+<!-- end -->
+<!-- end -->
+<!-- when: unmeasured_present -->
+
+  <h3>Not measured</h3>
+  <p>Close checklist rows this run gave nothing to measure. Nothing is known to be wrong, so none is a known issue; nothing is known to be right, so none reads as done.</p>
+  <div class="scroll"><table>
+    <thead><tr><th scope="col">Row</th><th scope="col">State</th><th scope="col">Why</th></tr></thead>
+    <tbody>
+<!-- repeat: unmeasured -->
+      <tr><th scope="row" class="mono">{{unmeasured_item}}</th><td>{{unmeasured_state}}</td><td class="note">{{unmeasured_reason}}</td></tr>
+<!-- end -->
+    </tbody>
+  </table></div>
+<!-- end -->
+</section>
+
+<footer>Every figure is derived from {{run_id}}'s own artefacts by <span class="mono">sprint_report.py</span>, and each carries its source in the JSON of record. Nothing here was typed by hand.</footer>
+</div>

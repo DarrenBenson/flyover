@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""SDLC Studio config loader.
+
+`templates/config-defaults.yaml` is the single source of truth for skill defaults.
+This loader reads it (merged with an optional project `sdlc-studio/.config.yaml`
+override) so scripts read the value instead of re-deriving it from a markdown
+table. Before this, every default lived in three places - the YAML, a duplicate
+fenced block in reference-config.md, and a prose table - and drifted.
+
+PyYAML is a soft dependency, imported lazily, so the pure-stdlib core scripts are
+unaffected and only this helper needs it.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import sdlc_md  # noqa: E402
+
+DEFAULTS_PATH = Path(__file__).resolve().parent.parent / "templates" / "config-defaults.yaml"
+
+
+def _yaml():
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - exercised only without PyYAML
+        raise RuntimeError("config loading needs PyYAML (pip install pyyaml)") from exc
+    return yaml
+
+
+def _load_errors() -> tuple[type[BaseException], ...]:
+    """The exception types `get` degrades on. BG0160: a malformed `.config.yaml` makes
+    `yaml.safe_load` raise `yaml.YAMLError` (Parser/Scanner errors) - a subclass of Exception,
+    NOT ValueError - so it slipped past the old `(RuntimeError, OSError, ValueError)` catch and
+    tracebacked through every consumer. `yaml.YAMLError` is added when PyYAML is importable (the
+    import is guarded: its absence is already covered by the RuntimeError from `_yaml`)."""
+    errors: tuple[type[BaseException], ...] = (RuntimeError, OSError, ValueError)
+    try:
+        import yaml
+        errors += (yaml.YAMLError,)
+    except ImportError:  # pragma: no cover - PyYAML absence is the RuntimeError path
+        pass
+    return errors
+
+
+def _deep_merge(base: dict, over: dict) -> dict:
+    """`over` on `base`, section by section. A section the override leaves empty (its body only
+    comments, which YAML reads as null) sets nothing, so the defaults' keys under it stand:
+    replacing them with null made `show` and `get` read every one as declared nowhere."""
+    out = dict(base)
+    for key, val in over.items():
+        if val is None and isinstance(out.get(key), dict):
+            continue
+        if isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], val)
+        else:
+            out[key] = val
+    return out
+
+
+def load_config(repo_root: Path | str = ".", defaults_path: Path | str = DEFAULTS_PATH) -> dict:
+    """Skill defaults merged with the project's `.config.yaml` override, if present."""
+    yaml = _yaml()
+    cfg = yaml.safe_load(Path(defaults_path).read_text(encoding="utf-8")) or {}
+    override = Path(repo_root) / "sdlc-studio" / ".config.yaml"
+    if override.exists():
+        cfg = _deep_merge(cfg, yaml.safe_load(override.read_text(encoding="utf-8")) or {})
+    return cfg
+
+
+_DEGRADE_WARNED = False
+
+
+def get(repo_root: Path | str, dotted: str, default=None):
+    """Resolve a dotted key (e.g. `coverage.unit`) from the config, or `default`.
+
+    BG0093: if the config cannot be loaded at all (PyYAML absent, or an unreadable/malformed
+    override), degrade to `default` with a one-line stderr warning instead of raising - so a
+    stdlib-only machine gets the built-in default, not a traceback. This unifies the former
+    three regimes (warn-degrade / silent-default / hard-crash) into warn-and-default."""
+    global _DEGRADE_WARNED
+    try:
+        cur = load_config(repo_root)
+    except _load_errors() as exc:
+        if not _DEGRADE_WARNED:
+            _DEGRADE_WARNED = True
+            print(f"warning: could not load .config.yaml ({exc}); using built-in defaults "
+                  "(config-driven behaviour needs PyYAML: pip install pyyaml)", file=sys.stderr)
+        return default
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return cur
+
+
+def feature_enabled(repo_root: Path | str, feature: str) -> bool:
+    """Is `<feature>.enabled` in force? THE one resolution of knob-then-schema, shared.
+
+    `<feature>.enabled` when the project states one, and the schema version otherwise. Two
+    reasons for a knob rather than the schema gate alone, both learned rather than designed.
+
+    The v3 gate BUNDLES. A project wanting one control had to adopt plan-review, spec-guard, the
+    inbox status and the v3 id format in a single act across every artefact it holds, so the
+    controls stayed unreachable in practice: the project that BUILT the triage session cap filed
+    801 findings in a month with that cap sitting unused, and hand-rolled the consolidation the
+    fold does automatically. And the schema version describes the shape of artefacts, which is
+    not what any of these features is about.
+
+    ONE definition, called by both adopters. Two copies of this resolution are two answers to the
+    question "is this on", and they drift the moment either is touched - which is the class of
+    defect this repository files against itself most often.
+
+    An unset knob keeps the previous behaviour exactly, so no consuming project changes.
+    """
+    try:
+        stated = get(repo_root, f"{feature}.enabled", None)
+    except Exception:  # noqa: BLE001 - config must never break a feature check
+        stated = None
+    if stated is None:
+        # `sdlc_md` is already bound at module level (line 21) and imports nothing from this
+        # module, so there is no cycle to avoid. The deferred import that used to sit here said
+        # there was: a claim in a comment, unexamined because comments are not executed. An
+        # independent seat ruled it FALSE in the claim-inventory pass.
+        return sdlc_md.is_schema_v3(repo_root)
+    return bool(stated)
+
+
+def _json_default(value):
+    """ISO-8601 for the date and datetime values PyYAML makes of an unquoted YAML date, so a
+    config holding one prints rather than crashing. Anything else is still refused, as
+    json.dumps would refuse it."""
+    import datetime
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serialisable")
+
+
+def _leaf_sources(merged: dict, override: dict, prefix: str = ""):
+    """(dotted key, value, "project" | "default") for every LEAF of the merged config.
+
+    Judged per leaf, never per section: a project setting `coverage.unit` sets that leaf, and
+    its siblings still come from the defaults. A list or a scalar is a leaf, as `_deep_merge`
+    treats it - the project's value replaces the default's whole."""
+    for key, val in merged.items():
+        dotted = f"{prefix}{key}"
+        mine = override.get(key, _ABSENT) if isinstance(override, dict) else _ABSENT
+        if isinstance(val, dict) and val:
+            yield from _leaf_sources(val, mine if isinstance(mine, dict) else {}, dotted + ".")
+        else:
+            yield dotted, val, ("default" if mine is _ABSENT else "project")
+
+
+_ABSENT = object()
+
+
+def _project_override(repo_root: Path | str) -> dict:
+    """The project's own `.config.yaml`, parsed, or {} when it has none."""
+    path = Path(repo_root) / "sdlc-studio" / ".config.yaml"
+    if not path.exists():
+        return {}
+    return _yaml().safe_load(path.read_text(encoding="utf-8")) or {}
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    """Print the resolved config, or a single dotted key. Both paths take `_json_default`, so a
+    date prints whether it is the key's value or nested under it. `--sources` prints one
+    `<source> <dotted key> = <value>` line per leaf that config-defaults.yaml or the project's
+    .config.yaml declares, under `--key` when one is given. A default that lives only in its
+    reader's code is in neither file, so it is not listed."""
+    if getattr(args, "sources", False):
+        for dotted, val, source in _leaf_sources(load_config(args.root),
+                                                 _project_override(args.root)):
+            if args.key and dotted != args.key and not dotted.startswith(args.key + "."):
+                continue
+            print(f"{source:<7} {dotted} = {json.dumps(val, default=_json_default)}")
+        return 0
+    if args.key:
+        # Walked here rather than through `get`, whose `default` cannot tell a key the config
+        # sets to null from one it never declares: printing `null` at exit 0 for a misspelt key
+        # reads as a key that is set.
+        cur = load_config(args.root)
+        for part in args.key.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                print(f"config: no key `{args.key}` - neither config-defaults.yaml nor the "
+                      f"project's .config.yaml declares it (`config.py show --sources` lists "
+                      f"the keys that are)", file=sys.stderr)
+                return 1
+            cur = cur[part]
+        print(json.dumps(cur, default=_json_default))
+    else:
+        print(json.dumps(load_config(args.root), indent=2, default=_json_default))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="SDLC Studio config loader.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("show", help="Print resolved config (or a single --key).")
+    s.add_argument("--key", help="Dotted key, e.g. coverage.unit")
+    s.add_argument("--sources", action="store_true",
+                   help="one line per key that config-defaults.yaml or the project's "
+                        ".config.yaml declares, marked `default` or `project`; a default that "
+                        "lives only in its reader's code is not listed")
+    s.add_argument("--root", default=".", help="Repo root (default: .)")
+    s.set_defaults(func=cmd_show)
+    sdlc_md.add_global_root(parser)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    # Resolve the root ONCE and write it back, so every verb below anchors on the tree the
+    # run belongs to. The family default `.` means "work it out from here", not "the cwd
+    # is the project": otherwise a run from a subdirectory acts on a stray tree and exits 0.
+    args.root = str(sdlc_md.resolve_root(args))
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,5838 @@
+"""Unit tests for verify_ac.py.
+
+Run from the repo root:
+    python3 -m unittest discover -s .claude/skills/sdlc-studio/scripts/tests
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures.thread
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import re
+import shutil
+import signal
+import stat
+import sys
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+import unittest.mock
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ dir, for the sibling helper
+import workspace  # noqa: E402 - the shared "am I in the dev repo?" check
+
+SCRIPT_PATH = Path(__file__).resolve().parent.parent / "verify_ac.py"
+_spec = importlib.util.spec_from_file_location("verify_ac", SCRIPT_PATH)
+assert _spec and _spec.loader
+verify_ac = importlib.util.module_from_spec(_spec)
+sys.modules["verify_ac"] = verify_ac
+_spec.loader.exec_module(verify_ac)
+sdlc_md = verify_ac.sdlc_md  # shared parsing helpers, via the loaded module
+from lib import run_state  # noqa: E402 - reachable once verify_ac has put scripts/ on the path
+
+
+def _quiet_main(*args, **kwargs):
+    """Run verify_ac.main with its `[APL]`/`[DRY]`/`wrote ...` progress lines suppressed, so the
+    verify tests do not leak them into the suite output."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        return verify_ac.main(*args, **kwargs)
+
+
+def _quiet_cmd_run(args):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return verify_ac.cmd_run(args)
+
+
+PASSING_STORY = """\
+# US0001: Login flow
+
+## Acceptance Criteria
+
+### AC1: Happy path email login
+- **Given** a valid account
+- **When** the user submits the form
+- **Then** they see the dashboard
+- **Verify:** file scripts/repo_map.py
+
+### AC2: Uses current password hashing
+- **Given** a stored user
+- **When** the user logs in
+- **Then** the hash matches
+- **Verify:** shell echo ok
+- **Verified:** yes (2026-01-01)
+
+### AC3: Manual check only
+- **Given** regulatory requirement
+- **When** audited
+- **Then** records exist
+"""
+
+BULLET_STORY = """\
+# US0003: Bullet-style AC
+
+## Acceptance Criteria
+
+- **AC1:** Search returns ranked results
+  - **Given** an index
+  - **When** I search
+  - **Verify:** file scripts/repo_map.py
+- **AC2:** Handles empty query
+  - **Given** no query
+  - **Then** a 422
+  - **Verify:** shell echo ok
+  - **Verified:** yes (2026-01-01)
+"""
+
+FAILING_STORY = """\
+# US0002: Broken path
+
+## Acceptance Criteria
+
+### AC1: Missing file
+- **Given** x
+- **When** y
+- **Then** z
+- **Verify:** file does-not-exist.txt
+- **Verified:** yes (2026-01-01)
+"""
+
+
+class FixtureRoot:
+    def __init__(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="verify_ac_test_"))
+        (self.tmp / "scripts").mkdir()
+        (self.tmp / "scripts" / "repo_map.py").write_text("# marker\n")
+        stories = self.tmp / "sdlc-studio" / "stories"
+        stories.mkdir(parents=True)
+        (stories / "US0001-login.md").write_text(PASSING_STORY)
+        (stories / "US0002-broken.md").write_text(FAILING_STORY)
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class ParseTests(unittest.TestCase):
+    def test_parse_extracts_three_acs(self) -> None:
+        blocks = verify_ac.parse_story(PASSING_STORY)
+        self.assertEqual(len(blocks), 3)
+        ids = [b.ac_id for b in blocks]
+        self.assertEqual(ids, ["AC1", "AC2", "AC3"])
+
+    def test_parse_extracts_bullet_style_acs(self) -> None:
+        # BG0003: bullet-style AC (- **AC1:**) must be parsed, not ignored.
+        blocks = verify_ac.parse_story(BULLET_STORY)
+        ids = [b.ac_id for b in blocks]
+        self.assertEqual(ids, ["AC1", "AC2"])
+        self.assertEqual(blocks[0].verifier, "file scripts/repo_map.py")
+        self.assertEqual(blocks[1].verified_state, "yes")
+
+    def test_verifier_captured_on_ac1(self) -> None:
+        blocks = verify_ac.parse_story(PASSING_STORY)
+        self.assertEqual(blocks[0].verifier, "file scripts/repo_map.py")
+        self.assertIsNone(blocks[0].verified_state)
+
+    def test_verified_yes_captured_on_ac2(self) -> None:
+        blocks = verify_ac.parse_story(PASSING_STORY)
+        self.assertEqual(blocks[1].verifier, "shell echo ok")
+        self.assertEqual(blocks[1].verified_state, "yes")
+
+    def test_manual_ac_has_no_verifier(self) -> None:
+        blocks = verify_ac.parse_story(PASSING_STORY)
+        self.assertIsNone(blocks[2].verifier)
+
+    def test_insert_after_prefers_verify_line_over_later_bullets(self) -> None:
+        story = (
+            "### AC1: x\n"
+            "- **Given** x\n"
+            "- **Verify:** file README.md\n"
+            "- **Note:** extra context\n"
+        )
+        blocks = verify_ac.parse_story(story)
+        self.assertEqual(blocks[0].insert_after, 2)
+        updated = verify_ac.update_verified(story.splitlines(), blocks[0], "yes")
+        # Canonical order is Given / When / Then / Verify / Verified, so the
+        # new line goes directly after Verify, not after trailing bullets
+        self.assertIn("**Verified:** yes", updated[3])
+        self.assertIn("**Note:**", updated[4])
+
+    def test_insert_after_tracks_last_bullet_without_verify_line(self) -> None:
+        story = (
+            "### AC1: x\n"
+            "- **Given** x\n"
+            "- **When** y\n"
+            "- **Then** z\n"
+        )
+        blocks = verify_ac.parse_story(story)
+        self.assertEqual(blocks[0].insert_after, 3)
+
+
+class DSLTests(unittest.TestCase):
+    def test_build_command_pytest(self) -> None:
+        kind, cmd = verify_ac._build_command("pytest tests/test_x.py::test_y")
+        self.assertEqual(kind, "pytest")
+        self.assertIn("pytest", cmd)
+        self.assertIn("tests/test_x.py::test_y", cmd)
+
+    def test_build_command_pytest_with_k_flag_splits_into_separate_args(self) -> None:
+        # BG: `pytest <path> -k <marker>` was passed as one glued argv element, so
+        # pytest saw a single nonexistent "file" (path + " -k " + marker) instead of
+        # a path arg and a -k arg - every such Verify line false-failed.
+        kind, cmd = verify_ac._build_command(
+            "pytest .claude/skills/sdlc-studio/scripts/tests/test_config.py -k override_warn")
+        self.assertEqual(kind, "pytest")
+        self.assertEqual(cmd, ["pytest", "-q",
+                                ".claude/skills/sdlc-studio/scripts/tests/test_config.py",
+                                "-k", "override_warn"])
+
+    def test_build_command_file(self) -> None:
+        kind, cmd = verify_ac._build_command("file src/auth/email.ts")
+        self.assertEqual(kind, "file")
+        self.assertEqual(cmd, ["test", "-e", "src/auth/email.ts"])
+
+    def test_build_command_http(self) -> None:
+        kind, cmd = verify_ac._build_command(
+            'http GET http://localhost/health -- .status == "ok"'
+        )
+        self.assertEqual(kind, "http")
+        self.assertIn("curl", cmd)
+        self.assertIn("jq", cmd)
+
+    def test_build_command_unknown_head_raises(self) -> None:
+        # BG0057: an unrecognised head is an invalid verifier, not a silent shell run.
+        with self.assertRaises(ValueError):
+            verify_ac._build_command("ls -la nonexistent")
+
+    def test_build_command_shell_fallback_opt_in(self) -> None:
+        # The legacy whole-expression-as-shell stays available behind the explicit opt-in.
+        kind, cmd = verify_ac._build_command("ls -la nonexistent", allow_fallback=True)
+        self.assertEqual(kind, "shell")
+        self.assertEqual(cmd, "ls -la nonexistent")
+
+    def test_build_command_shell_prefix(self) -> None:
+        kind, cmd = verify_ac._build_command("shell test -f README.md")
+        self.assertEqual(kind, "shell")
+        self.assertEqual(cmd, "test -f README.md")
+
+
+class RunTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = FixtureRoot()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def test_dry_run_passes_valid_file(self) -> None:
+        rc = _quiet_main(
+            [
+                "run",
+                "--story",
+                str(self.fixture.tmp / "sdlc-studio/stories/US0001-login.md"),
+                "--dry-run",
+                "--repo-root",
+                str(self.fixture.tmp),
+                "--report",
+                str(self.fixture.tmp / ".local/verify-report.json"),
+            ]
+        )
+        self.assertEqual(rc, 0, "expected all ACs to pass in dry run")
+
+    def test_dry_run_flags_missing_file(self) -> None:
+        rc = _quiet_main(
+            [
+                "run",
+                "--story",
+                str(self.fixture.tmp / "sdlc-studio/stories/US0002-broken.md"),
+                "--dry-run",
+                "--repo-root",
+                str(self.fixture.tmp),
+                "--report",
+                str(self.fixture.tmp / ".local/verify-report.json"),
+            ]
+        )
+        self.assertEqual(rc, 1, "expected failure exit code for broken story")
+
+    def test_apply_mode_updates_verified_state(self) -> None:
+        story = self.fixture.tmp / "sdlc-studio/stories/US0001-login.md"
+        rc = _quiet_main(
+            [
+                "run",
+                "--story",
+                str(story),
+                "--repo-root",
+                str(self.fixture.tmp),
+                "--report",
+                str(self.fixture.tmp / ".local/verify-report.json"),
+            ]
+        )
+        self.assertEqual(rc, 0)
+        # AC1 initially had no Verified line; apply mode should add one
+        updated = story.read_text()
+        self.assertIn("**Verified:** yes", updated)
+        # Report should be written
+        report_path = self.fixture.tmp / ".local/verify-report.json"
+        self.assertTrue(report_path.exists())
+        report = json.loads(report_path.read_text())
+        self.assertIn("US0001-login", report["stories"])
+
+    def test_apply_mode_downgrades_stale_yes_on_failure(self) -> None:
+        story = self.fixture.tmp / "sdlc-studio/stories/US0002-broken.md"
+        rc = _quiet_main(
+            [
+                "run",
+                "--story",
+                str(story),
+                "--repo-root",
+                str(self.fixture.tmp),
+                "--report",
+                str(self.fixture.tmp / ".local/verify-report.json"),
+            ]
+        )
+        self.assertEqual(rc, 1)
+        updated = story.read_text()
+        # AC1 was Verified: yes in fixture, verifier fails, should become no
+        self.assertIn("**Verified:** no", updated)
+        self.assertNotIn("yes (2026-01-01)", updated)
+        # The downgrade must be counted as stale in the report
+        report = json.loads(
+            (self.fixture.tmp / ".local/verify-report.json").read_text()
+        )
+        self.assertEqual(report["stories"]["US0002-broken"]["stale"], 1)
+
+    def test_passing_story_reports_zero_stale(self) -> None:
+        rc = _quiet_main(
+            [
+                "run",
+                "--story",
+                str(self.fixture.tmp / "sdlc-studio/stories/US0001-login.md"),
+                "--repo-root",
+                str(self.fixture.tmp),
+                "--report",
+                str(self.fixture.tmp / ".local/verify-report.json"),
+            ]
+        )
+        self.assertEqual(rc, 0)
+        report = json.loads(
+            (self.fixture.tmp / ".local/verify-report.json").read_text()
+        )
+        self.assertEqual(report["stories"]["US0001-login"]["stale"], 0)
+
+    def test_dry_run_counts_stale_downgrade_without_writing(self) -> None:
+        story = self.fixture.tmp / "sdlc-studio/stories/US0002-broken.md"
+        before = story.read_text()
+        report = verify_ac.verify_story(
+            story, dry_run=True, timeout=10, repo_root=self.fixture.tmp
+        )
+        self.assertEqual(report.stale, 1)
+        self.assertEqual(story.read_text(), before)
+
+
+class UpdateTests(unittest.TestCase):
+    def test_update_verified_replaces_existing_state(self) -> None:
+        story = "### AC1: x\n- **Given** x\n- **Verify:** file README.md\n- **Verified:** no (2026-01-01)\n"
+        lines = story.splitlines()
+        blocks = verify_ac.parse_story(story)
+        updated = verify_ac.update_verified(lines, blocks[0], "yes")
+        joined = "\n".join(updated)
+        self.assertIn("**Verified:** yes", joined)
+        self.assertNotIn("**Verified:** no", joined)
+
+    def test_update_verified_inserts_new_line_when_absent(self) -> None:
+        story = "### AC1: x\n- **Given** x\n- **Verify:** file README.md\n"
+        lines = story.splitlines()
+        blocks = verify_ac.parse_story(story)
+        updated = verify_ac.update_verified(lines, blocks[0], "yes")
+        joined = "\n".join(updated)
+        self.assertIn("**Verified:** yes", joined)
+
+
+class HardeningTests(unittest.TestCase):
+    def test_update_verified_clamps_out_of_bounds_insert(self) -> None:
+        lines = ["### AC1: x", "- **Verify:** file README.md"]
+        block = verify_ac.ACBlock(
+            heading_line=0,
+            ac_id="AC1",
+            title="x",
+            verifier="file README.md",
+            insert_after=99,  # past EOF
+        )
+        updated = verify_ac.update_verified(lines, block, "yes")
+        self.assertIn("**Verified:** yes", "\n".join(updated))
+
+    def test_update_verified_handles_empty_lines(self) -> None:
+        block = verify_ac.ACBlock(
+            heading_line=0, ac_id="AC1", title="x", insert_after=5
+        )
+        self.assertEqual(verify_ac.update_verified([], block, "yes"), [])
+
+    def test_run_verifier_shell_pass_and_fail(self) -> None:
+        ok = verify_ac.run_verifier("shell echo ok", timeout=10, cwd=Path("."))
+        self.assertTrue(ok.ok)
+        self.assertEqual(ok.kind, "shell")
+        bad = verify_ac.run_verifier("shell false", timeout=10, cwd=Path("."))
+        self.assertFalse(bad.ok)
+
+    def test_verify_story_preserves_non_ascii(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="verify_ac_unicode_"))
+        try:
+            (tmp / "scripts").mkdir()
+            (tmp / "scripts" / "repo_map.py").write_text("# marker\n", encoding="utf-8")
+            story = tmp / "story.md"
+            story.write_text(
+                "# US0009: Café checkout – naïve flow\n\n"
+                "## Acceptance Criteria\n\n"
+                "### AC1: Existing file\n"
+                "- **Verify:** file scripts/repo_map.py\n",
+                encoding="utf-8",
+            )
+            report = verify_ac.verify_story(
+                story, dry_run=False, timeout=10, repo_root=tmp
+            )
+            self.assertEqual(report.verified, 1)
+            text = story.read_text(encoding="utf-8")
+            self.assertIn("Café checkout", text)
+            self.assertIn("naïve", text)
+            self.assertIn("**Verified:** yes", text)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class ReportHistoryTests(unittest.TestCase):
+    """CR0005: dry-run report enumerates pending flips; runs append to history."""
+
+    def test_dry_run_records_flips_without_modifying_file(self) -> None:
+        fr = FixtureRoot()
+        try:
+            p = fr.tmp / "sdlc-studio" / "stories" / "US0001-login.md"
+            before = p.read_text()
+            report = verify_ac.verify_story(p, dry_run=True, timeout=10, repo_root=fr.tmp)
+            flips = {f["ac"]: (f["old_state"], f["new_state"]) for f in report.flips}
+            self.assertEqual(flips.get("AC1"), ("none", "yes"))  # AC1 would flip to yes
+            self.assertEqual(p.read_text(), before)              # dry-run touches nothing
+        finally:
+            fr.cleanup()
+
+    def test_write_report_has_flips_and_dry_run_flag(self) -> None:
+        fr = FixtureRoot()
+        try:
+            p = fr.tmp / "sdlc-studio" / "stories" / "US0001-login.md"
+            rep = verify_ac.verify_story(p, dry_run=True, timeout=10, repo_root=fr.tmp)
+            out = fr.tmp / "r.json"
+            verify_ac.write_report(out, [rep], dry_run=True)
+            data = json.loads(out.read_text())
+            self.assertTrue(data["dry_run"])
+            self.assertTrue(data["stories"]["US0001-login"]["flips"])
+        finally:
+            fr.cleanup()
+
+    def test_history_is_append_only(self) -> None:
+        fr = FixtureRoot()
+        try:
+            p = fr.tmp / "sdlc-studio" / "stories" / "US0001-login.md"
+            rep = verify_ac.verify_story(p, dry_run=True, timeout=10, repo_root=fr.tmp)
+            hist = fr.tmp / "sdlc-studio" / ".local" / "verify-history.jsonl"
+            verify_ac.append_history(hist, [rep], True)
+            verify_ac.append_history(hist, [rep], True)
+            lines = hist.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lines), 2)
+            rec = json.loads(lines[0])
+            self.assertEqual(rec["story"], "US0001-login")
+            self.assertIn("verified", rec)
+        finally:
+            fr.cleanup()
+
+
+class EvalVerbTests(unittest.TestCase):
+    """CR0006: graded `eval <cmd> --threshold X` verifier (pluggable, stubbed)."""
+
+    def _eval(self, expr):
+        return verify_ac.run_verifier(expr, timeout=10, cwd=Path("."))
+
+    def test_passes_at_or_above_threshold(self) -> None:
+        r = self._eval("eval echo '{\"score\": 0.9}' --threshold 0.8")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.score, 0.9)
+        self.assertEqual(r.kind, "eval")
+
+    def test_fails_below_threshold(self) -> None:
+        r = self._eval("eval echo '{\"score\": 0.5}' --threshold 0.8")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.score, 0.5)
+
+    def test_missing_threshold_errors(self) -> None:
+        r = self._eval("eval echo '{\"score\": 0.9}'")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.kind, "eval")
+
+    def test_non_numeric_score_fails(self) -> None:
+        r = self._eval("eval echo 'not json' --threshold 0.5")
+        self.assertFalse(r.ok)
+        self.assertIsNone(r.score)
+
+    def test_exact_threshold_passes(self) -> None:
+        # score == threshold must pass (>=, not >).
+        r = self._eval("eval echo '{\"score\": 0.8}' --threshold 0.8")
+        self.assertTrue(r.ok)
+
+    def test_non_numeric_threshold_fails_cleanly(self) -> None:
+        # A malformed threshold must fail as kind eval, not crash.
+        r = self._eval("eval echo '{\"score\": 0.9}' --threshold 1.2.3")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.kind, "eval")
+
+    def test_manual_verify_line_counted_not_shelled(self) -> None:
+        # BG0028: `Verify: manual ...` is counted manual, never executed (shelling timed out -> failed)
+        tmp = Path(tempfile.mkdtemp(prefix="verify_ac_manual_"))
+        try:
+            story = tmp / "US0001-x.md"
+            story.write_text(
+                "# US0001: x\n\n> **Status:** Done\n\n## Acceptance Criteria\n\n"
+                "### AC1: human check\n- **Given** a thing\n- **Verify:** manual confirm the dashboard loads\n\n"
+                "### AC2: mixed\n- **Given** y\n- **Verify:** manual + `pnpm test`\n", encoding="utf-8")
+            rep = verify_ac.verify_story(story, dry_run=True, timeout=5, repo_root=tmp)
+            self.assertEqual(rep.manual, 2)
+            self.assertEqual(rep.failed, 0)   # not shelled, not failed
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_real_command_not_treated_as_manual(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="verify_ac_cmd_"))
+        try:
+            story = tmp / "US0002-y.md"
+            story.write_text(
+                "# US0002: y\n\n> **Status:** Done\n\n## Acceptance Criteria\n\n"
+                "### AC1: runs\n- **Given** y\n- **Verify:** shell echo ok\n", encoding="utf-8")
+            rep = verify_ac.verify_story(story, dry_run=True, timeout=5, repo_root=tmp)
+            self.assertEqual(rep.manual, 0)   # a real command is not manual
+            self.assertEqual(rep.verified, 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class CanonicalPlacementTests(unittest.TestCase):
+    """BG0051: multiple insertions in one run must not shift later blocks - every
+    new Verified line lands directly after its own AC's Verify line."""
+
+    STORY = (
+        "# US0009: multi\n\n## Acceptance Criteria\n\n"
+        "### AC1: a\n- **Given** g\n- **When** w\n- **Then** t\n"
+        "- **Verify:** shell true\n\n"
+        "### AC2: b\n- **Given** g\n- **When** w\n- **Then** t\n"
+        "- **Verify:** shell true\n\n"
+        "### AC3: c\n- **Given** g\n- **When** w\n- **Then** t\n"
+        "- **Verify:** shell true\n"
+    )
+
+    def test_all_inserted_verified_lines_follow_their_verify_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sd = root / "sdlc-studio" / "stories"
+            sd.mkdir(parents=True)
+            story = sd / "US0009-multi.md"
+            story.write_text(self.STORY, encoding="utf-8")
+            rc = _quiet_main(["run", "--story", str(story), "--repo-root", str(root),
+                                 "--report", str(root / ".local" / "r.json")])
+            self.assertEqual(rc, 0)
+            lines = story.read_text(encoding="utf-8").splitlines()
+            verified_idx = [i for i, l in enumerate(lines) if "**Verified:**" in l]
+            self.assertEqual(len(verified_idx), 3)
+            for i in verified_idx:
+                self.assertIn("**Verify:**", lines[i - 1],
+                              f"Verified at line {i} does not follow its Verify:\n" +
+                              "\n".join(lines))
+
+
+class RunnerAvailabilityTests(unittest.TestCase):
+    """CR0145: a Verify runner absent from THIS machine's PATH draws an advisory
+    note that owns the author-vs-CI ambiguity - never a block."""
+
+    def test_missing_runner_flagged_with_path_ambiguity_wording(self) -> None:
+        msg = verify_ac.lint_runner_available("pytest tests/test_x.py::T::t",
+                                              _which=lambda tok: None)
+        self.assertIsNotNone(msg)
+        self.assertIn("this machine's PATH", msg)
+        self.assertIn("runs elsewhere", msg)
+
+    def test_present_runner_not_flagged(self) -> None:
+        self.assertIsNone(verify_ac.lint_runner_available(
+            "pytest tests/test_x.py", _which=lambda tok: "/usr/bin/pytest"))
+
+    def test_manual_and_shell_exempt(self) -> None:
+        self.assertIsNone(verify_ac.lint_runner_available("manual check the dashboard",
+                                                          _which=lambda tok: None))
+        self.assertIsNone(verify_ac.lint_runner_available("shell echo ok",
+                                                          _which=lambda tok: None))
+
+    def test_http_checks_curl_and_jq(self) -> None:
+        msg = verify_ac.lint_runner_available("http GET /health -- .ok",
+                                              _which=lambda tok: None if tok == "jq" else "/bin/x")
+        self.assertIsNotNone(msg)
+        self.assertIn("jq", msg)
+
+
+class LintVerifierTests(unittest.TestCase):
+    """CR0085: flag Verify lines that fall through to shell as mis-written runner calls."""
+
+    def test_dsl_verbs_pass(self) -> None:
+        for ok in ('jest "login happy path"', "pytest tests/test_x.py::test_y",
+                   'http GET /health -- .status == "ok"', "manual check the dashboard",
+                   "shell test -f dist/bundle.js"):
+            self.assertIsNone(verify_ac.lint_verifier(ok), ok)
+
+    def test_miswritten_forms_flagged(self) -> None:
+        self.assertIsNotNone(verify_ac.lint_verifier('npm test -- api/test/x.test.ts -t "json"'))
+        self.assertIsNotNone(verify_ac.lint_verifier("curl http://localhost:3000/health returns 200"))
+        self.assertIsNotNone(verify_ac.lint_verifier("psql -c 'select 1'"))
+
+
+class LintCliTests(unittest.TestCase):
+    """The lint CLI over a stories DIRECTORY must work - the no-story path crashed
+    with a NameError (repo_root undefined) until a benchmark delivery agent hit it."""
+
+    def test_lint_over_a_directory_does_not_crash(self) -> None:
+        import contextlib, io, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            sdir = Path(d) / "sdlc-studio" / "stories"
+            sdir.mkdir(parents=True)
+            (sdir / "US0001-x.md").write_text(
+                "# US0001: x\n\n- **AC1:** works\n  - Verify: `pytest tests/test_x.py`\n",
+                encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = verify_ac.main(["lint", "--root", d])
+            self.assertEqual(rc, 0)
+
+    def test_lint_single_story_still_works(self) -> None:
+        import contextlib, io, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "US0001-x.md"
+            p.write_text("# US0001: x\n\n- **AC1:** works\n  - Verify: `pytest tests/t.py`\n",
+                         encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = verify_ac.main(["lint", "--story", str(p)])
+            self.assertEqual(rc, 0)
+
+
+class TsCheckTests(unittest.TestCase):
+    """CR0085: the AC Coverage Matrix must not be decorative."""
+
+    def _spec(self, root: Path, body: str) -> Path:
+        p = root / "ts.md"
+        p.write_text("# TS0001\n\n### AC Coverage Matrix\n\n"
+                     "| Story | AC | Description | Test Cases | Status |\n"
+                     "| --- | --- | --- | --- | --- |\n" + body, encoding="utf-8")
+        return p
+
+    def test_complete_matrix_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = self._spec(Path(d), '| US0001 | AC1 | login | jest "login" | pass |\n')
+            self.assertEqual(verify_ac.ts_check(p), [])
+
+    def test_unmapped_and_unpassing_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = self._spec(Path(d),
+                           "| US0001 | AC1 | login | -- | pass |\n"
+                           '| US0001 | AC2 | logout | jest "logout" | TODO |\n')
+            issues = {i["ac"]: i["issue"] for i in verify_ac.ts_check(p)}
+            self.assertIn("AC1", issues)   # no test case mapped
+            self.assertIn("AC2", issues)   # status not passing
+
+    def test_placeholder_row_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = self._spec(Path(d), "| {{story}} | {{ac}} | {{desc}} | {{tc}} | {{status}} |\n")
+            self.assertTrue(verify_ac.ts_check(p))
+
+    def test_later_tables_do_not_bleed_into_the_matrix(self) -> None:
+        # BG0049: the canonical spec shape puts References + Revision History AFTER
+        # the matrix; their rows are not AC rows.
+        with tempfile.TemporaryDirectory() as d:
+            p = self._spec(Path(d),
+                           '| US0001 | AC1 | login | jest "login" | pass |\n\n'
+                           "## References\n\n"
+                           "| Doc | Link |\n| --- | --- |\n| TSD | [tsd](../tsd.md) |\n\n"
+                           "## Revision History\n\n"
+                           "| Date | Author | Change |\n| --- | --- | --- |\n"
+                           "| 2026-07-04 | Sam | Initial spec |\n")
+            self.assertEqual(verify_ac.ts_check(p), [])
+
+    def test_unmapped_ac_after_later_tables_still_true_positive(self) -> None:
+        # The boundary must not weaken the check: a second matrix section with a
+        # genuinely unmapped AC row still fails.
+        with tempfile.TemporaryDirectory() as d:
+            p = self._spec(Path(d),
+                           "| US0001 | AC1 | login | -- | pass |\n\n"
+                           "## Revision History\n\n"
+                           "| Date | Author | Change |\n| --- | --- | --- |\n"
+                           "| 2026-07-04 | Sam | Initial spec |\n")
+            issues = {i["ac"]: i["issue"] for i in verify_ac.ts_check(p)}
+            self.assertEqual(list(issues), ["AC1"])   # only the real AC row flags
+
+
+class TsCheckCrossReportTests(unittest.TestCase):
+    """BG0055: the verify-report cross-check must be story-qualified, not bare-AC."""
+
+    def _spec(self, root: Path, body: str) -> Path:
+        p = root / "ts.md"
+        p.write_text("# TS0001\n\n### AC Coverage Matrix\n\n"
+                     "| Story | AC | Description | Test Cases | Status |\n"
+                     "| --- | --- | --- | --- | --- |\n" + body, encoding="utf-8")
+        return p
+
+    def _report(self, root: Path) -> Path:
+        import json
+        # A MERGED report: story A's AC1 failed; story B's AC1 passed (no failure entry).
+        rep = {"stories": {
+            "US0001-a": {"failed": 1, "failures": [{"ac": "AC1"}]},
+            "US0002-b": {"failed": 0, "failures": []},
+        }}
+        p = root / "verify-report.json"
+        p.write_text(json.dumps(rep), encoding="utf-8")
+        return p
+
+    def test_unrelated_story_same_ac_not_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            # B.AC1 passes in the report; the matrix marks it pass. It must NOT be flagged
+            # just because a *different* story's AC1 failed.
+            spec = self._spec(root, '| US0002 | AC1 | logout | jest "logout" | pass |\n')
+            issues = verify_ac.ts_check(spec, self._report(root))
+            self.assertEqual(issues, [])
+
+    def test_own_story_failing_ac_still_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            spec = self._spec(root, '| US0001 | AC1 | login | jest "login" | pass |\n')
+            issues = verify_ac.ts_check(spec, self._report(root))
+            self.assertEqual([i["ac"] for i in issues], ["AC1"])  # A.AC1 genuinely red
+
+
+class TsCheckAbsentSpecTests(unittest.TestCase):
+    """BG0229: a spec that could not be read is a REFUSAL, never a clean matrix.
+
+    `ts_check` read a missing file as empty text, found no matrix rows, and reported
+    'every AC is mapped to a passing test case' with exit 0 - so a moved, renamed or
+    typo'd `--spec` passed a gate that had read nothing at all. Every assertion below
+    therefore pins a NON-zero exit or a raised error; an rc-0 assertion here would be
+    satisfied by the defect itself.
+    """
+
+    NOT_UTF8 = b"\xff\xfe\x00\x00# TS0001\n"
+
+    def _run(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = verify_ac.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_a_missing_spec_exits_2_and_names_the_path_tried(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            missing = Path(d) / "TS-DOES-NOT-EXIST.md"
+            rc, out, err = self._run(["ts-check", "--spec", str(missing)])
+            self.assertEqual(rc, 2, f"a missing spec passed as green: {out!r}")
+            self.assertIn(str(missing), err, "the refusal did not name the path it tried")
+            self.assertNotIn("ts-check:", out, "a summary line was printed over a spec "
+                                               "that was never read")
+
+    def test_the_refusal_names_the_resolved_path_not_the_bare_argument(self) -> None:
+        """A relative --spec is anchored on the root, so the refusal must print where it
+        actually looked - the whole point is telling the caller which path was wrong."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sdlc-studio" / "stories").mkdir(parents=True)
+            rc, _out, err = self._run(["--root", str(root), "ts-check",
+                                       "--spec", "test-specs/nope.md"])
+            self.assertEqual(rc, 2)
+            self.assertIn(str(root / "test-specs" / "nope.md"), err)
+
+    def test_json_format_refuses_rather_than_printing_an_empty_finding_list(self) -> None:
+        """`--format json` is what a gate parses. An empty array plus exit 0 reads as
+        'no findings'; the file was never opened."""
+        with tempfile.TemporaryDirectory() as d:
+            missing = Path(d) / "nope.md"
+            rc, out, _err = self._run(["ts-check", "--spec", str(missing), "--format", "json"])
+            self.assertEqual(rc, 2)
+            self.assertNotEqual(out.strip(), "[]", "a gate would read this as a clean matrix")
+
+    def test_a_directory_given_as_spec_is_refused(self) -> None:
+        """A directory reads back as empty text exactly as a missing file does."""
+        with tempfile.TemporaryDirectory() as d:
+            rc, _out, err = self._run(["ts-check", "--spec", d])
+            self.assertEqual(rc, 2)
+            self.assertIn(d, err)
+
+    def test_ts_check_itself_raises_on_an_absent_spec(self) -> None:
+        """The refusal lives in the library, so no caller can obtain [] from a spec that
+        is not there - the CLI is not the only entry point."""
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(FileNotFoundError):
+                verify_ac.ts_check(Path(d) / "nope.md")
+
+    def test_an_unreadable_spec_is_flagged_and_exits_non_zero(self) -> None:
+        """Present but not valid UTF-8: the bytes exist, so a scanner walking a tree must
+        survive it (it stays a returned finding, not an exception), but it must never be
+        counted as a matrix with nothing wrong in it."""
+        with tempfile.TemporaryDirectory() as d:
+            spec = Path(d) / "ts.md"
+            spec.write_bytes(self.NOT_UTF8)
+            # Captured, not silenced: the warning naming the file is the wanted behaviour and
+            # is asserted, but a green suite must say nothing or a real error hides in it.
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                issues = verify_ac.ts_check(spec)
+            self.assertIn("ts.md", buf.getvalue(),
+                          "the unreadable spec was not named in the warning")
+            self.assertTrue(issues, "an unreadable spec reported a clean matrix")
+            self.assertIn("unreadable", issues[0]["issue"])
+            rc, _out, _err = self._run(["ts-check", "--spec", str(spec)])
+            self.assertNotEqual(rc, 0)
+
+    def test_a_present_empty_spec_does_not_share_the_absent_exit_code(self) -> None:
+        """'Absent' and 'present but empty' are different facts. The zero-byte file is
+        readable, so it is not the refusal path - only that distinction is pinned here,
+        not any claim that an empty spec is a good one."""
+        with tempfile.TemporaryDirectory() as d:
+            spec = Path(d) / "ts.md"
+            spec.write_text("", encoding="utf-8")
+            rc, _out, _err = self._run(["ts-check", "--spec", str(spec)])
+            self.assertNotEqual(rc, 2)
+
+
+class TsCheckAbsentMatrixTests(unittest.TestCase):
+    """A spec with NO AC Coverage Matrix asserts no coverage, and must not read as complete.
+
+    One step further in than the absent-FILE refusal: the file is present, readable and valid
+    UTF-8, but it holds no matrix. That produced zero rows, zero findings and exit 0 - the same
+    output a fully mapped matrix produces, so the two states were indistinguishable from the
+    command. Silence is not an assertion of coverage. Every test below therefore pins a
+    NON-zero exit or a non-empty finding list where the defect produced 0 and [].
+
+    Absence is read as NOT YET WRITTEN, never as a deliberate exemption: an exemption is a
+    decision somebody made, and nothing distinguishes a decision from an omission by looking
+    at what is not there.
+    """
+
+    HEADER = ("| Story | AC | Description | Test Cases | Status |\n"
+              "| --- | --- | --- | --- | --- |\n")
+
+    def _run(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = verify_ac.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def _spec(self, d: str, body: str) -> Path:
+        p = Path(d) / "TS0001-x.md"
+        p.write_text(body, encoding="utf-8")
+        return p
+
+    def test_a_spec_with_no_matrix_section_reports_a_finding(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            spec = self._spec(d, "# TS0001: x\n\n## Scope\n\nProse, and no matrix.\n")
+            issues = verify_ac.ts_check(spec)
+            self.assertTrue(issues, "a spec with no matrix reported a clean matrix")
+            self.assertEqual(len(issues), 1, "one absent matrix reported as two findings")
+
+    def test_a_spec_with_no_matrix_section_exits_non_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            spec = self._spec(d, "# TS0001: x\n\n## Scope\n\nProse, and no matrix.\n")
+            rc, out, _err = self._run(["ts-check", "--spec", str(spec)])
+            self.assertEqual(rc, 1, f"a matrix-less spec passed as green: {out!r}")
+
+    def test_the_missing_section_does_not_borrow_the_broken_invocation_exit(self) -> None:
+        """Exit 2 means "the path was wrong". This spec was found and read; its CONTENT is
+        the finding, so it must sit with the other content findings on exit 1."""
+        with tempfile.TemporaryDirectory() as d:
+            spec = self._spec(d, "# TS0001: x\n\nno matrix\n")
+            self.assertNotEqual(self._run(["ts-check", "--spec", str(spec)])[0], 2)
+
+    def test_its_output_differs_from_a_complete_matrix(self) -> None:
+        """The whole complaint: the two states printed the same line. Compare the real
+        outputs rather than asserting a wording nobody re-runs."""
+        with tempfile.TemporaryDirectory() as d:
+            bare = self._spec(d, "# TS0001: x\n\nno matrix\n")
+            full = Path(d) / "TS0002-x.md"
+            full.write_text("# TS0002: x\n\n### AC Coverage Matrix\n\n" + self.HEADER
+                            + "| US0001 | AC1 | x | jest \"x\" | pass |\n", encoding="utf-8")
+            _rc_a, out_a, _ = self._run(["ts-check", "--spec", str(bare)])
+            rc_b, out_b, _ = self._run(["ts-check", "--spec", str(full)])
+            self.assertEqual(rc_b, 0, "a complete matrix must stay green")
+            self.assertNotEqual(out_a.replace(bare.name, ""), out_b.replace(full.name, ""),
+                                "the two states are still indistinguishable from the output")
+
+    def test_a_complete_matrix_is_not_flagged(self) -> None:
+        """The guard must not fire on the case it exists to tell apart."""
+        with tempfile.TemporaryDirectory() as d:
+            spec = self._spec(d, "# TS0001: x\n\n### AC Coverage Matrix\n\n" + self.HEADER
+                              + "| US0001 | AC1 | x | jest \"x\" | pass |\n")
+            self.assertEqual(verify_ac.ts_check(spec), [])
+
+    def test_a_heading_with_no_table_under_it_is_named_as_malformed(self) -> None:
+        """Three readings of "no matrix" want three repairs. A heading with nothing
+        parseable under it is a BROKEN section, not an unwritten one, and saying which
+        is the difference between "write the matrix" and "fix the columns"."""
+        with tempfile.TemporaryDirectory() as d:
+            spec = self._spec(d, "# TS0001: x\n\n### AC Coverage Matrix\n\nTBD.\n")
+            issues = verify_ac.ts_check(spec)
+            self.assertTrue(issues)
+            bare = Path(d) / "TS0002-x.md"
+            bare.write_text("# TS0002: x\n\nno heading at all\n", encoding="utf-8")
+            self.assertNotEqual(issues[0]["issue"], verify_ac.ts_check(bare)[0]["issue"],
+                                "a malformed section and an unwritten one report identically")
+
+    def test_prose_naming_the_section_is_not_a_heading(self) -> None:
+        """The heading test must stay a HEADING test. A spec that merely mentions the
+        matrix in a sentence has not got one, and telling its author to fix the columns
+        of a table that does not exist sends them looking for nothing."""
+        with tempfile.TemporaryDirectory() as d:
+            mentions = self._spec(d, "# TS0001: x\n\nAn AC Coverage Matrix will follow.\n")
+            issue = verify_ac.ts_check(mentions)[0]["issue"]
+            bare = Path(d) / "TS0002-x.md"
+            bare.write_text("# TS0002: x\n\nnothing at all\n", encoding="utf-8")
+            self.assertEqual(issue, verify_ac.ts_check(bare)[0]["issue"],
+                             "a prose mention was read as a malformed section")
+
+    def test_a_matrix_with_a_header_and_no_rows_is_a_finding(self) -> None:
+        """The escape hatch the fix must close: if an empty header table were clean, an
+        author could silence the new finding by pasting two lines that assert nothing."""
+        with tempfile.TemporaryDirectory() as d:
+            spec = self._spec(d, "# TS0001: x\n\n### AC Coverage Matrix\n\n" + self.HEADER)
+            self.assertTrue(verify_ac.ts_check(spec),
+                            "an AC-less matrix table reported a clean matrix")
+
+    def test_a_non_matrix_table_does_not_count_as_a_matrix(self) -> None:
+        """Kills a counter that credits any table. A Revision History is not coverage.
+
+        The CLASSIFICATION is what is pinned, not merely that something was reported: a
+        counter crediting any table still produces a finding, just the wrong one ("the
+        matrix has no rows" over a table that is not the matrix), and that sends the
+        author to fix the columns of a Revision History. Asserting only that the list is
+        non-empty leaves that mutant alive - it did, first time round.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            spec = self._spec(d, "# TS0001: x\n\n## Revision History\n\n"
+                                 "| Date | Author | Change |\n| --- | --- | --- |\n"
+                                 "| 2026-07-21 | a | Filed |\n")
+            issues = verify_ac.ts_check(spec)
+            self.assertTrue(issues,
+                            "a Revision History table was counted as an AC Coverage Matrix")
+            bare = Path(d) / "TS0002-x.md"
+            bare.write_text("# TS0002: x\n\nno tables at all\n", encoding="utf-8")
+            self.assertEqual(issues[0]["issue"], verify_ac.ts_check(bare)[0]["issue"],
+                             "a Revision History table was counted as an AC Coverage Matrix")
+
+    def test_an_absent_spec_still_refuses_with_exit_2(self) -> None:
+        """The new finding must not swallow the older refusal: a path that is not there is
+        still a broken invocation, not a spec whose matrix is missing."""
+        with tempfile.TemporaryDirectory() as d:
+            rc, _out, err = self._run(["ts-check", "--spec", str(Path(d) / "nope.md")])
+            self.assertEqual(rc, 2)
+            self.assertIn("nope.md", err)
+
+    def test_epic_ts_fails_when_the_epic_s_only_spec_has_no_matrix(self) -> None:
+        """The semantics change this bug is really about: an epic whose test-spec asserts
+        no coverage no longer passes the epic-scope requirement."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sd = root / "sdlc-studio" / "test-specs"
+            sd.mkdir(parents=True)
+            (sd / "TS0001-x.md").write_text(
+                "# TS0001: x\n\n> **Epic:** [EP0001](EP0001-x.md)\n\n## Scope\n\nNo matrix.\n",
+                encoding="utf-8")
+            r = verify_ac.epic_test_spec_check(root, "EP0001")
+            self.assertFalse(r["ok"], "an epic passed on a spec with no coverage matrix")
+            self.assertEqual(r["specs"], ["TS0001-x.md"])
+
+    def test_a_present_but_unreadable_spec_keeps_its_own_finding(self) -> None:
+        """A non-UTF-8 spec must report as unreadable, not as one with no matrix - the
+        repair for each is different and the wrong one wastes the reader's time."""
+        with tempfile.TemporaryDirectory() as d:
+            spec = Path(d) / "TS0001-x.md"
+            spec.write_bytes(b"\xff\xfe\x00\x00# TS0001\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                issues = verify_ac.ts_check(spec)
+            self.assertEqual(len(issues), 1)
+            self.assertIn("unreadable", issues[0]["issue"])
+
+
+class ShellExecutionPolicyTests(unittest.TestCase):
+    """BG0056/BG0057: shell execution is gated by provenance / --no-shell, and an
+    unrecognised verifier does not silently fall through to shell."""
+
+    def test_unknown_head_is_invalid_not_shell(self) -> None:
+        # BG0057: a line whose head is not a DSL verb must be an invalid verifier
+        # (exit 2), not executed as a shell command.
+        res = verify_ac.run_verifier("frobnicate the widget", timeout=5, cwd=Path("."))
+        self.assertEqual(res.kind, "invalid")
+        self.assertEqual(res.exit_code, 2)
+
+    def test_explicit_shell_fallback_opt_in_still_runs(self) -> None:
+        # Back-compat: the old behaviour is available behind an explicit opt-in.
+        res = verify_ac.run_verifier("true", timeout=5, cwd=Path("."), allow_fallback=True)
+        self.assertEqual(res.kind, "shell")
+        self.assertTrue(res.ok)
+
+    def test_no_shell_blocks_shell_verb(self) -> None:
+        # BG0056: with shell disabled, an explicit shell verb is blocked, not run.
+        res = verify_ac.run_verifier("shell true", timeout=5, cwd=Path("."), allow_shell=False)
+        self.assertEqual(res.kind, "blocked")
+        self.assertFalse(res.ok)
+
+    def test_no_shell_still_allows_structured_verbs(self) -> None:
+        # A structured DSL verb (argv, no shell) still runs under --no-shell.
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "f.txt").write_text("x", encoding="utf-8")
+            res = verify_ac.run_verifier("file f.txt", timeout=5, cwd=Path(d), allow_shell=False)
+            self.assertEqual(res.kind, "file")
+            self.assertTrue(res.ok)
+
+    def test_external_provenance_story_blocks_shell(self) -> None:
+        # BG0056: a story stamped `Provenance: external` must not have its shell verbs run.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            story = root / "US0001-ext.md"
+            story.write_text(
+                "# US0001: ext\n\n> **Provenance:** external\n\n## Acceptance Criteria\n\n"
+                "### AC1: x\n\n- **Then** done\n- **Verify:** shell touch /tmp/pwn_bg0056\n",
+                encoding="utf-8")
+            rep = verify_ac.verify_story(story, dry_run=True, timeout=5, repo_root=root)
+            self.assertEqual(rep.failed, 1)
+            self.assertEqual(rep.failures[0]["kind"], "blocked")
+
+
+class EpicTestSpecTests(unittest.TestCase):
+    """CR0096: an epic must have a test-spec whose AC Coverage Matrix passes ts-check."""
+
+    def _ts(self, root: Path, epic: str, matrix_row: str) -> None:
+        d = root / "sdlc-studio" / "test-specs"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "TS0001-x.md").write_text(
+            f"# TS0001: x\n\n> **Epic:** [{epic}]({epic}-x.md)\n\n### AC Coverage Matrix\n\n"
+            "| Story | AC | Description | Test Cases | Status |\n| --- | --- | --- | --- | --- |\n"
+            + matrix_row, encoding="utf-8")
+
+    def test_missing_test_spec_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            r = verify_ac.epic_test_spec_check(Path(d), "EP0001")
+            self.assertFalse(r["ok"])
+
+    def test_passing_matrix_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._ts(root, "EP0001", '| US0001 | AC1 | x | jest "x" | pass |\n')
+            self.assertTrue(verify_ac.epic_test_spec_check(root, "EP0001")["ok"])
+
+    def test_failing_matrix_not_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._ts(root, "EP0001", "| US0001 | AC1 | x | -- | pass |\n")  # no test case mapped
+            self.assertFalse(verify_ac.epic_test_spec_check(root, "EP0001")["ok"])
+
+
+class EpicTestSpecOptOutTests(unittest.TestCase):
+    """BG0250: `quality.epic_requires_test_spec` is documented in four places as the
+    caller's opt-out from the epic-scope test-spec requirement, and was read by no code.
+    These pin the read, so the documentation cannot silently become false again."""
+
+    def _project(self, d: str, matrix_row: str, config: str | None = None) -> Path:
+        root = Path(d)
+        sd = root / "sdlc-studio"
+        (sd / "test-specs").mkdir(parents=True, exist_ok=True)
+        (sd / "test-specs" / "TS0001-x.md").write_text(
+            "# TS0001: x\n\n> **Epic:** [EP0001](EP0001-x.md)\n\n### AC Coverage Matrix\n\n"
+            "| Story | AC | Description | Test Cases | Status |\n| --- | --- | --- | --- | --- |\n"
+            + matrix_row, encoding="utf-8")
+        if config is not None:
+            (sd / ".config.yaml").write_text(config, encoding="utf-8")
+        return root
+
+    def _epic_ts(self, root: Path) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = verify_ac.main(["epic-ts", "--epic", "EP0001", "--root", str(root)])
+        return rc, out.getvalue(), err.getvalue()
+
+    FAILING = "| US0001 | AC1 | x | -- | pass |\n"          # no test case mapped
+    PASSING = '| US0001 | AC1 | x | jest "x" | pass |\n'
+
+    def test_the_key_set_false_downgrades_the_failure_to_advisory(self) -> None:
+        """The documented opt-out must actually change the outcome: a failing epic exits 0
+        instead of 1. Red before the config read existed - the run exited 1 regardless."""
+        with tempfile.TemporaryDirectory() as d:
+            root = self._project(d, self.FAILING,
+                                 "quality:\n  epic_requires_test_spec: false\n")
+            self.assertFalse(verify_ac.epic_test_spec_check(root, "EP0001")["enforced"],
+                             "epic_requires_test_spec: false was not read")
+            rc, out, _err = self._epic_ts(root)
+            self.assertEqual(rc, 0, f"the documented opt-out did not lift the gate: {out!r}")
+
+    def test_the_opt_out_still_reports_the_findings_it_stops_enforcing(self) -> None:
+        """An opt-out that hides the findings is a different, worse feature: the project
+        staging a migration must still see which specs it owes."""
+        with tempfile.TemporaryDirectory() as d:
+            root = self._project(d, self.FAILING,
+                                 "quality:\n  epic_requires_test_spec: false\n")
+            r = verify_ac.epic_test_spec_check(root, "EP0001")
+            self.assertFalse(r["ok"], "the opt-out silenced the check's own verdict")
+            self.assertTrue(r["issues"], "the opt-out discarded the findings")
+            _rc, out, _err = self._epic_ts(root)
+            self.assertIn("no test case mapped", out, "the findings were not printed")
+            self.assertIn("epic_requires_test_spec", out,
+                          "the run did not say why a FAIL exited 0")
+
+    def test_the_default_with_no_config_at_all_still_enforces(self) -> None:
+        """The default is unchanged for a project that sets nothing: still exit 1."""
+        with tempfile.TemporaryDirectory() as d:
+            root = self._project(d, self.FAILING)
+            self.assertTrue(verify_ac.epic_test_spec_check(root, "EP0001")["enforced"])
+            rc, out, _err = self._epic_ts(root)
+            self.assertEqual(rc, 1, f"the default stopped enforcing: {out!r}")
+
+    def test_the_key_set_true_enforces(self) -> None:
+        """Kills a read that treats the key's mere PRESENCE as the opt-out."""
+        with tempfile.TemporaryDirectory() as d:
+            root = self._project(d, self.FAILING,
+                                 "quality:\n  epic_requires_test_spec: true\n")
+            self.assertTrue(verify_ac.epic_test_spec_check(root, "EP0001")["enforced"])
+            self.assertEqual(self._epic_ts(root)[0], 1)
+
+    def test_an_unrelated_quality_key_does_not_lift_the_gate(self) -> None:
+        """Kills a read of the wrong key: another `quality.*` setting must not disable
+        this one."""
+        with tempfile.TemporaryDirectory() as d:
+            root = self._project(d, self.FAILING,
+                                 "quality:\n  done_requires_verified: false\n")
+            self.assertTrue(verify_ac.epic_test_spec_check(root, "EP0001")["enforced"])
+            self.assertEqual(self._epic_ts(root)[0], 1)
+
+    def test_a_passing_epic_exits_0_whichever_way_the_key_is_set(self) -> None:
+        """The opt-out governs the FAILURE only; it must not turn a green run amber."""
+        with tempfile.TemporaryDirectory() as d:
+            root = self._project(d, self.PASSING,
+                                 "quality:\n  epic_requires_test_spec: false\n")
+            rc, out, _err = self._epic_ts(root)
+            self.assertEqual(rc, 0)
+            self.assertIn("OK", out)
+            self.assertNotIn("advisory", out, "a passing run was reported as advisory")
+
+    def test_a_non_boolean_value_warns_and_keeps_enforcing(self) -> None:
+        """A value the reader cannot honour is the same defect this bug is: a setting
+        acted on in good faith with no effect and no warning. It must say so, and it must
+        fail safe (still enforce) rather than guess the project meant off."""
+        with tempfile.TemporaryDirectory() as d:
+            root = self._project(d, self.FAILING,
+                                 "quality:\n  epic_requires_test_spec: maybe\n")
+            rc, _out, err = self._epic_ts(root)
+            self.assertEqual(rc, 1, "a value that is not a boolean silently lifted the gate")
+            self.assertIn("epic_requires_test_spec", err, "the unhonoured value was silent")
+            self.assertIn("maybe", err, "the warning did not name the value it could not honour")
+
+    def test_json_output_carries_the_enforcement_state(self) -> None:
+        """A programmatic caller must be able to tell "the check failed" from "the check
+        failed and the project gates on it" without re-reading the config itself."""
+        with tempfile.TemporaryDirectory() as d:
+            root = self._project(d, self.FAILING,
+                                 "quality:\n  epic_requires_test_spec: false\n")
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                verify_ac.main(["epic-ts", "--epic", "EP0001", "--root", str(root),
+                                "--format", "json"])
+            payload = json.loads(out.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertFalse(payload["enforced"])
+
+
+class JestBatchTests(unittest.TestCase):
+    """CR0111: resolve jest verifiers from one cached --json run."""
+
+    SAMPLE = json.dumps({"testResults": [{"assertionResults": [
+        {"fullName": "US0011: adds a valid item", "title": "adds a valid item", "status": "passed"},
+        {"fullName": "US0016: equal positions resolve deterministically", "status": "failed"},
+    ]}]})
+
+    def test_parse_flattens_assertions(self):
+        asserts = verify_ac._parse_jest_json("noise\n" + self.SAMPLE)
+        self.assertEqual(len(asserts), 2)
+        self.assertTrue(asserts[0]["ok"])
+        self.assertFalse(asserts[1]["ok"])
+
+    def test_parse_bad_json_is_empty(self):
+        self.assertEqual(verify_ac._parse_jest_json("not json"), [])
+
+    def test_resolve_pass(self):
+        asserts = verify_ac._parse_jest_json(self.SAMPLE)
+        r = verify_ac.resolve_jest_from_cache('jest "US0011: adds a valid item"', asserts)
+        self.assertIsNotNone(r)
+        self.assertTrue(r.ok)
+
+    def test_resolve_fail(self):
+        asserts = verify_ac._parse_jest_json(self.SAMPLE)
+        r = verify_ac.resolve_jest_from_cache('jest "equal positions resolve deterministically"', asserts)
+        self.assertFalse(r.ok)
+
+    def test_resolve_no_match_falls_through(self):
+        asserts = verify_ac._parse_jest_json(self.SAMPLE)
+        self.assertIsNone(verify_ac.resolve_jest_from_cache('jest "nonexistent title"', asserts))
+
+    def test_resolve_non_jest_verb_is_none(self):
+        self.assertIsNone(verify_ac.resolve_jest_from_cache("pytest tests/x.py", [{"name": "x", "ok": True}]))
+
+    # --- BG0337: the cache must select the SAME tests jest -t would -------------------
+    def test_a_pattern_is_a_regex_not_a_literal_substring(self):
+        """`jest -t` is a testNamePattern regex. Selecting by substring computes the verdict
+        over a different test set, and under --release the cache stands in for the
+        authoritative run in a blocking lane."""
+        asserts = [
+            {"name": "renders the total", "ok": False},
+            {"name": "renders the totals", "ok": True},
+        ]
+        # `renders the total$` anchors: jest selects only the FAILING one.
+        r = verify_ac.resolve_jest_from_cache('jest "renders the total$"', asserts)
+        self.assertIsNotNone(r, "the pattern matches an assertion, so the cache can answer")
+        self.assertFalse(r.ok, "jest -t would select the red test; the cache said green")
+
+    def test_a_metacharacter_pattern_matching_nothing_falls_through(self):
+        # Literal containment finds `a.b` inside `a.b passes`; as a regex the `.` still
+        # matches, so use a pattern where the two disagree the other way.
+        asserts = [{"name": "adds a valid item", "ok": True}]
+        self.assertIsNone(
+            verify_ac.resolve_jest_from_cache('jest "^valid item"', asserts),
+            "jest -t '^valid item' selects nothing here - the cache must not claim a pass")
+
+    def test_an_invalid_regex_falls_back_to_the_authoritative_run(self):
+        asserts = [{"name": "counts (1 items", "ok": True}]
+        self.assertIsNone(
+            verify_ac.resolve_jest_from_cache('jest "counts (1 items"', asserts),
+            "an unparseable pattern is not a verdict - the subprocess must own it")
+
+    def test_a_plain_pattern_still_resolves(self):
+        asserts = verify_ac._parse_jest_json(self.SAMPLE)
+        r = verify_ac.resolve_jest_from_cache('jest "adds a valid item"', asserts)
+        self.assertTrue(r.ok)
+
+
+class WriteReportMergeTests(unittest.TestCase):
+    """BG0037: per-story runs merge into the report instead of clobbering it."""
+
+    def _keys(self, p):
+        return set(json.loads(p.read_text(encoding="utf-8"))["stories"].keys())
+
+    def test_sequential_runs_accumulate(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "verify-report.json"
+            verify_ac.write_report(p, [verify_ac.StoryReport(path="US0011-x.md", ac_count=1, verified=1)])
+            verify_ac.write_report(p, [verify_ac.StoryReport(path="US0012-x.md", ac_count=1, verified=1)])
+            self.assertEqual(self._keys(p), {"US0011-x", "US0012-x"})  # both present, not clobbered
+
+    def test_rerun_updates_in_place(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "verify-report.json"
+            verify_ac.write_report(p, [verify_ac.StoryReport(path="US0011-x.md", ac_count=1, failed=1)])
+            verify_ac.write_report(p, [verify_ac.StoryReport(path="US0011-x.md", ac_count=1, verified=1)])
+            stories = json.loads(p.read_text(encoding="utf-8"))["stories"]
+            self.assertEqual(stories["US0011-x"]["verified"], 1)  # latest result wins
+            self.assertEqual(stories["US0011-x"]["failed"], 0)
+
+    def test_fresh_rebuilds(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "verify-report.json"
+            verify_ac.write_report(p, [verify_ac.StoryReport(path="US0011-x.md", ac_count=1, verified=1)])
+            verify_ac.write_report(p, [verify_ac.StoryReport(path="US0012-x.md", ac_count=1, verified=1)], merge=False)
+            self.assertEqual(self._keys(p), {"US0012-x"})  # --fresh path drops the prior entry
+
+
+REPORT_REL = Path("sdlc-studio") / ".local" / "verify-report.json"
+HISTORY_REL = Path("sdlc-studio") / ".local" / "verify-history.jsonl"
+
+
+def _run_quiet(argv: list[str]) -> tuple[int, str, str]:
+    """(exit, stdout, stderr) with BOTH streams captured, so a scoping run's progress and
+    diagnostic lines are asserted on rather than leaked into the suite output."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = verify_ac.main(argv)
+    return rc, out.getvalue(), err.getvalue()
+
+
+def _scope_workspace(root: Path) -> Path:
+    """Four stories - three passing, one failing - so a scope can be shown to exclude both a
+    passing story and the failing one that decides the exit code."""
+    (root / "scripts").mkdir(parents=True, exist_ok=True)
+    (root / "scripts" / "repo_map.py").write_text("# marker\n", encoding="utf-8")
+    d = root / "sdlc-studio" / "stories"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "US0001-login.md").write_text(PASSING_STORY, encoding="utf-8")
+    (d / "US0002-broken.md").write_text(FAILING_STORY, encoding="utf-8")
+    (d / "US0003-search.md").write_text(BULLET_STORY, encoding="utf-8")
+    (d / "US0004-extra.md").write_text(
+        PASSING_STORY.replace("US0001", "US0004"), encoding="utf-8")
+    return root
+
+
+class _ScopeCase(unittest.TestCase):
+    """Shared fixture: one workspace of four stories per test, plus report accessors."""
+
+    def setUp(self) -> None:
+        self._td = tempfile.TemporaryDirectory(prefix="verify_ac_scope_")
+        self.root = _scope_workspace(Path(self._td.name) / "proj")
+        self.report = self.root / REPORT_REL
+
+    def tearDown(self) -> None:
+        self._td.cleanup()
+
+    def _stories(self, report: Path | None = None) -> dict:
+        p = report or self.report
+        return json.loads(p.read_text(encoding="utf-8"))["stories"]
+
+    def _keys(self, report: Path | None = None) -> set:
+        return set(self._stories(report))
+
+
+class IdListScopeTests(_ScopeCase):
+    """US0394 AC1: `--ids` scopes the run to exactly the stories named."""
+
+    def test_only_the_named_ids_run_and_an_unresolvable_id_exits_2(self) -> None:
+        # comma-separated and case-insensitive: two of four stories judged and written,
+        # and the failing story left out of scope does not decide the exit code
+        rc, _, err = _run_quiet(["run", "--root", str(self.root), "--ids", "us0001,US0003"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._keys(), {"US0001-login", "US0003-search"})
+
+        # the repeated form names the same scope
+        self.report.unlink()
+        rc, _, err = _run_quiet(["run", "--root", str(self.root),
+                                 "--ids", "US0001", "--ids", "US0003"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._keys(), {"US0001-login", "US0003-search"})
+
+        # a scope that DOES hold the failing story fails - so the exit above is a verdict
+        # over the scope, not a constant
+        rc, _, err = _run_quiet(["run", "--root", str(self.root), "--ids", "US0002"])
+        self.assertEqual(rc, 1, err)
+
+        # an id resolving to no story file is an ERROR naming it, before anything is written
+        before = self.report.read_bytes()
+        rc, _, err = _run_quiet(["run", "--root", str(self.root), "--ids", "US0001,US9999"])
+        self.assertEqual(rc, 2)
+        self.assertIn("US9999", err)
+        self.assertEqual(self.report.read_bytes(), before,
+                         "a refused scope still rewrote the report")
+
+
+class WorklistScopeTests(_ScopeCase):
+    """US0394 AC2: a tranche file is a batch source, on the planner's own tolerances."""
+
+    def test_bullets_comments_and_duplicates_resolve_to_the_named_stories(self) -> None:
+        wl = self.root / "tranche.md"
+        wl.write_text(
+            "# tranche 1 - the approved batch\n"
+            "- US0001\n"
+            "* US0003\n"
+            "US0001\n"
+            "  # US0002 was cut from this tranche\n"
+            "- US0003\n", encoding="utf-8")
+        rc, _, err = _run_quiet(["run", "--root", str(self.root), "--worklist", str(wl)])
+        self.assertEqual(rc, 0, err)
+        # the commented id is not read as a member, and the bullet forms are
+        self.assertEqual(self._keys(), {"US0001-login", "US0003-search"})
+        # de-duplicated: each story was verified ONCE, not once per mention
+        lines = [json.loads(ln) for ln
+                 in (self.root / HISTORY_REL).read_text(encoding="utf-8").splitlines() if ln]
+        self.assertEqual([ln["story"] for ln in lines], ["US0001-login", "US0003-search"])
+
+
+class RunStateScopeTests(_ScopeCase):
+    """US0394 AC3: the open run's approved batch is the scope, and no run is a refusal."""
+
+    def _bug(self, ident: str = "BG0007") -> None:
+        """A real bug file for the batch to resolve. BG0360: a bug is a DELIVERY unit and its
+        criteria are executed, so an id in the batch names a file that must exist - it is no
+        longer quietly skipped as "not a story"."""
+        bugs = self.root / "sdlc-studio" / "bugs"
+        bugs.mkdir(parents=True, exist_ok=True)
+        (bugs / f"{ident}-scoped.md").write_text(
+            f"# {ident}: a scoped bug\n\n> **Status:** Open\n> **Severity:** Low\n"
+            "> **Points:** 1\n\n## Acceptance Criteria\n\n"
+            "### AC1: it is verifiable\n\n- **Verify:** manual verified at delivery\n",
+            encoding="utf-8")
+
+    def test_batch_units_run_including_bugs(self) -> None:
+        self._bug()
+        run_state.open_run(self.root, batch=["US0001", "BG0007", "US0003"], goal="scope test")
+        rc, _, err = _run_quiet(["run", "--root", str(self.root), "--from-run"])
+        self.assertEqual(rc, 0, err)
+        # BG0360: the bug is verified alongside the stories rather than skipped. A lane's
+        # return rule - verify your unit before returning - was unrunnable for every bug in a
+        # batch while this walked stories alone.
+        self.assertEqual(self._keys(),
+                         {"US0001-login", "US0003-search", "BG0007-scoped"})
+
+    def test_a_batch_id_with_no_unit_file_refuses(self) -> None:
+        """The carve-out must not become a silent skip: an id resolving to nothing is read by
+        the completion gate as "that unit had nothing to fail"."""
+        run_state.open_run(self.root, batch=["US0001", "BG0007"], goal="dangling")
+        rc, _, err = _run_quiet(["run", "--root", str(self.root), "--from-run"])
+        self.assertEqual(rc, 2)
+        self.assertIn("BG0007", err)
+
+    def test_batch_stories_run_and_no_open_run_exits_2(self) -> None:
+        run_state.open_run(self.root, batch=["US0001", "US0003"], goal="scope test")
+        rc, _, err = _run_quiet(["run", "--root", str(self.root), "--from-run"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._keys(), {"US0001-login", "US0003-search"})
+
+        before = self.report.read_bytes()
+
+        # an OPEN run whose batch resolves to nothing at all - the fallback is the same nine
+        # minutes whichever way the scope comes out empty
+        run_state.path(self.root).unlink()
+        run_state.open_run(self.root, batch=["CR0007"], goal="requests only")
+        rc, _, err = _run_quiet(["run", "--root", str(self.root), "--from-run"])
+        self.assertEqual(rc, 2, err)
+        self.assertEqual(self.report.read_bytes(), before,
+                         "an empty batch fell back to a whole-workspace run")
+
+        # with no run open there is no batch, and a whole-workspace fallback is exactly the
+        # cost the flag exists to avoid - so it refuses instead
+        run_state.path(self.root).unlink()
+        rc, _, err = _run_quiet(["run", "--root", str(self.root), "--from-run"])
+        self.assertEqual(rc, 2)
+        self.assertIn("no run", err.lower())
+        self.assertEqual(self.report.read_bytes(), before,
+                         "a refused --from-run fell back to a whole-workspace run")
+
+
+class ScopedReportMergeTests(_ScopeCase):
+    """US0395 AC1: a scoped run leaves every out-of-scope entry exactly as it found it."""
+
+    def test_out_of_scope_entries_including_verified_at_are_untouched(self) -> None:
+        rc, _, err = _run_quiet(["run", "--root", str(self.root)])
+        self.assertEqual(rc, 1, err)  # the whole workspace, including the failing story
+
+        # Stamp every entry with its OWN distinguishable freshness fields. Re-running inside
+        # the same second would otherwise produce an identical `verified_at`, and a run that
+        # re-stamped the whole merged report would pass unnoticed.
+        data = json.loads(self.report.read_text(encoding="utf-8"))
+        for key, entry in data["stories"].items():
+            entry["verified_at"] = "2020-01-01T00:00:00Z"
+            entry["ac_fingerprint"] = f"sentinel-{key}"
+        self.report.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        before = json.loads(self.report.read_text(encoding="utf-8"))["stories"]
+
+        rc, _, err = _run_quiet(["run", "--root", str(self.root), "--ids", "US0001,US0003"])
+        self.assertEqual(rc, 0, err)
+        after = self._stories()
+
+        self.assertEqual(set(after), set(before), "a scoped run dropped an entry")
+        for key in ("US0002-broken", "US0004-extra"):
+            self.assertEqual(after[key], before[key],
+                             f"the out-of-scope entry {key} was rewritten")
+            self.assertEqual(after[key]["verified_at"], "2020-01-01T00:00:00Z",
+                             f"{key} was re-stamped fresh without being verified")
+            self.assertEqual(after[key]["ac_fingerprint"], f"sentinel-{key}")
+        # and the in-scope entries DID move on, so the assertions above are not vacuous
+        for key in ("US0001-login", "US0003-search"):
+            self.assertNotEqual(after[key]["verified_at"], "2020-01-01T00:00:00Z",
+                                f"{key} was in scope but kept the stale stamp")
+            self.assertNotEqual(after[key]["ac_fingerprint"], f"sentinel-{key}")
+
+
+class ScopedUnscopedEquivalenceTests(unittest.TestCase):
+    """US0395 AC2: the scope decides WHICH stories are judged, never HOW one is judged."""
+
+    @staticmethod
+    def _timeless(entry: dict) -> dict:
+        """The entry with its two WALL-CLOCK fields dropped and everything else kept.
+
+        `verified_at` is when the run happened and `duration_ms` is how long a verifier
+        took; neither is part of the verdict, and both differ between two runs of identical
+        work. Every judgement field - the counts, the passed list, the failure records with
+        their exit codes and stderr, the flips, the fingerprint - is compared.
+        """
+        out = {k: v for k, v in entry.items() if k != "verified_at"}
+        out["failures"] = [{k: v for k, v in f.items() if k != "duration_ms"}
+                           for f in out.get("failures", [])]
+        return out
+
+    def test_shared_story_entries_and_exit_are_identical_under_both_scopes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="verify_ac_equiv_") as d:
+            # three identical copies - each run must start from the same story state, since
+            # an apply run rewrites the Verified: lines it flips
+            wide = _scope_workspace(Path(d) / "wide")
+            narrow = _scope_workspace(Path(d) / "narrow")
+            passing = _scope_workspace(Path(d) / "passing")
+
+            rc_wide, _, err = _run_quiet(["run", "--root", str(wide)])
+            self.assertEqual(rc_wide, 1, err)
+            rc_narrow, _, err = _run_quiet(["run", "--root", str(narrow),
+                                            "--ids", "US0001,US0002"])
+            w = json.loads((wide / REPORT_REL).read_text(encoding="utf-8"))["stories"]
+            n = json.loads((narrow / REPORT_REL).read_text(encoding="utf-8"))["stories"]
+
+            self.assertEqual(set(n), {"US0001-login", "US0002-broken"})
+            for key in n:
+                self.assertEqual(self._timeless(n[key]), self._timeless(w[key]),
+                                 f"the scope changed how {key} was judged")
+
+            # the exit is the verdict over the stories in scope - derived from the values the
+            # wide run recorded for them, not from a status string
+            expected = 1 if any(w[k]["failed"] for k in n) else 0
+            self.assertEqual(rc_narrow, expected)
+
+            # a scope holding no failing story exits 0 while the wide run over the same
+            # workspace exits 1, so the equality above cannot be met by a constant
+            rc_pass, _, err = _run_quiet(["run", "--root", str(passing),
+                                          "--ids", "US0001,US0003"])
+            p = json.loads((passing / REPORT_REL).read_text(encoding="utf-8"))["stories"]
+            self.assertEqual(rc_pass, 0 if not any(w[k]["failed"] for k in p) else 1, err)
+            self.assertEqual(rc_pass, 0)
+            for key in p:
+                self.assertEqual(self._timeless(p[key]), self._timeless(w[key]),
+                                 f"the scope changed how {key} was judged")
+
+
+class ScopedFreshRefusalTests(_ScopeCase):
+    """US0395 AC3: a rebuild combined with a scope would blank every out-of-scope verdict."""
+
+    def test_fresh_with_a_scope_exits_2_and_writes_nothing(self) -> None:
+        rc, _, err = _run_quiet(["run", "--root", str(self.root)])
+        self.assertEqual(rc, 1, err)
+        # an entry only a rebuild can remove, so "the report is unchanged" has teeth and the
+        # unscoped --fresh below is proved still to rebuild
+        data = json.loads(self.report.read_text(encoding="utf-8"))
+        data["stories"]["US9999-retired"] = {"ac_count": 1, "verified": 1, "failed": 0,
+                                             "verified_at": "2020-01-01T00:00:00Z",
+                                             "ac_fingerprint": "sentinel-retired"}
+        self.report.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        before = self.report.read_bytes()
+
+        wl = self.root / "tranche.md"
+        wl.write_text("- US0001\n", encoding="utf-8")
+        run_state.open_run(self.root, batch=["US0001"], goal="scope test")
+
+        for scope in (["--ids", "US0001"], ["--worklist", str(wl)], ["--from-run"]):
+            rc, out, err = _run_quiet(["run", "--root", str(self.root), "--fresh", *scope])
+            self.assertEqual(rc, 2, f"{scope} + --fresh was not refused")
+            self.assertIn("--fresh", err)
+            self.assertIn(scope[0], err, "the refusal did not name the scope flag passed")
+            # both ways forward, named
+            self.assertIn("drop the scope", err.lower())
+            self.assertIn("drop --fresh", err.lower())
+            self.assertEqual(self.report.read_bytes(), before,
+                             f"{scope} + --fresh wrote the report anyway")
+
+        # the guard is scoped, not a blanket ban: an UNSCOPED --fresh still rebuilds
+        rc, _, err = _run_quiet(["run", "--root", str(self.root), "--fresh"])
+        self.assertEqual(rc, 1, err)
+        self.assertNotIn("US9999-retired", self._keys())
+
+
+class ScaffoldMatrixTests(unittest.TestCase):
+    """CR0115: scaffold the AC Coverage Matrix from an epic's stories' ACs at design time."""
+
+    def _story(self, root: Path, story_id: str, epic: str, acs: list[tuple[str, str]]) -> None:
+        d = root / "sdlc-studio" / "stories"
+        d.mkdir(parents=True, exist_ok=True)
+        body = [f"# {story_id}: x", "", f"> **Epic:** [{epic}]({epic}-x.md)", "",
+                "## Acceptance Criteria", ""]
+        for ac_id, title in acs:
+            body += [f"### {ac_id}: {title}", "- **Given** x", "- **Then** y", ""]
+        (d / f"{story_id}-x.md").write_text("\n".join(body), encoding="utf-8")
+
+    def test_one_row_per_ac_across_n_stories(self) -> None:
+        # 3 stories totalling 6 ACs -> a matrix with exactly 6 data rows.
+        with tempfile.TemporaryDirectory() as dd:
+            root = Path(dd)
+            self._story(root, "US0001", "EP0001", [("AC1", "login"), ("AC2", "logout")])
+            self._story(root, "US0002", "EP0001", [("AC1", "search"), ("AC2", "page"), ("AC3", "empty")])
+            self._story(root, "US0003", "EP0001", [("AC1", "rate limit")])
+            matrix = verify_ac.scaffold_ac_matrix(root, "EP0001")
+            data_rows = [c for ln in matrix.splitlines()
+                         if (c := sdlc_md.table_cells(ln)) and c[0] != "Story"]
+            self.assertEqual(len(data_rows), 6)
+            pairs = {(r[0], r[1]) for r in data_rows}
+            self.assertEqual(pairs, {
+                ("US0001", "AC1"), ("US0001", "AC2"),
+                ("US0002", "AC1"), ("US0002", "AC2"), ("US0002", "AC3"),
+                ("US0003", "AC1"),
+            })
+
+    def test_every_ac_appears_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as dd:
+            root = Path(dd)
+            self._story(root, "US0001", "EP0001", [("AC1", "a"), ("AC2", "b"), ("AC3", "c")])
+            matrix = verify_ac.scaffold_ac_matrix(root, "EP0001")
+            keys = [(c[0], c[1]) for ln in matrix.splitlines()
+                    if (c := sdlc_md.table_cells(ln)) and c[0] != "Story"]
+            self.assertEqual(len(keys), len(set(keys)))  # no AC duplicated, none dropped
+            self.assertEqual(set(keys), {("US0001", "AC1"), ("US0001", "AC2"), ("US0001", "AC3")})
+
+    def test_description_carries_the_ac_title(self) -> None:
+        with tempfile.TemporaryDirectory() as dd:
+            root = Path(dd)
+            self._story(root, "US0001", "EP0001", [("AC1", "valid email login")])
+            row = next(c for ln in verify_ac.scaffold_ac_matrix(root, "EP0001").splitlines()
+                       if (c := sdlc_md.table_cells(ln)) and c[0] == "US0001")
+            self.assertEqual(row[2], "valid email login")  # Description column
+
+    def test_test_cases_and_status_left_blank_so_ts_check_flags_them(self) -> None:
+        # The two judgement columns must ship blank - proven by ts-check rejecting the
+        # un-filled scaffold (a no-test-case finding per AC). If the scaffold pre-filled
+        # them, ts-check would pass and the coverage guard would be defeated.
+        with tempfile.TemporaryDirectory() as dd:
+            root = Path(dd)
+            self._story(root, "US0001", "EP0001", [("AC1", "a"), ("AC2", "b")])
+            spec = root / "ts.md"
+            spec.write_text("# TS0001\n\n" + verify_ac.scaffold_ac_matrix(root, "EP0001"),
+                            encoding="utf-8")
+            issues = {i["ac"]: i["issue"] for i in verify_ac.ts_check(spec)}
+            self.assertEqual(set(issues), {"AC1", "AC2"})
+            self.assertTrue(all("no test case mapped" in v for v in issues.values()))
+
+    def test_other_epics_stories_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as dd:
+            root = Path(dd)
+            self._story(root, "US0001", "EP0001", [("AC1", "in scope")])
+            self._story(root, "US0002", "EP0002", [("AC1", "other epic")])
+            keys = {(c[0], c[1]) for ln in verify_ac.scaffold_ac_matrix(root, "EP0001").splitlines()
+                    if (c := sdlc_md.table_cells(ln)) and c[0] != "Story"}
+            self.assertEqual(keys, {("US0001", "AC1")})
+
+    def test_bullet_form_acs_are_not_silently_dropped(self) -> None:
+        # The compact bullet AC (`- **AC1:** ...`) is a real story shape `parse_story`
+        # handles explicitly; without that branch bullet-AC stories parse to zero ACs.
+        # The scaffold must surface them too, else a whole story's ACs vanish from the
+        # matrix - the exact silent coverage gap this CR exists to close. Boundary case
+        # for the parse-form the other tests (heading ACs) never exercise.
+        with tempfile.TemporaryDirectory() as dd:
+            root = Path(dd)
+            d = root / "sdlc-studio" / "stories"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "US0001-x.md").write_text(
+                "# US0001: x\n\n> **Epic:** [EP0001](EP0001-x.md)\n\n"
+                "## Acceptance Criteria\n\n"
+                "- **AC1:** first criterion\n- **AC2:** second criterion\n",
+                encoding="utf-8")
+            keys = [(c[0], c[1]) for ln in verify_ac.scaffold_ac_matrix(root, "EP0001").splitlines()
+                    if (c := sdlc_md.table_cells(ln)) and c[0] != "Story"]
+            self.assertEqual(keys, [("US0001", "AC1"), ("US0001", "AC2")])
+
+    def test_epic_with_no_stories_yields_header_only(self) -> None:
+        # Boundary: an epic with no member stories must not crash and must emit a
+        # well-formed header-only matrix (zero data rows), not a placeholder row.
+        with tempfile.TemporaryDirectory() as dd:
+            root = Path(dd)
+            self._story(root, "US0001", "EP0002", [("AC1", "elsewhere")])
+            matrix = verify_ac.scaffold_ac_matrix(root, "EP0001")
+            data_rows = [c for ln in matrix.splitlines()
+                         if (c := sdlc_md.table_cells(ln)) and c[0] != "Story"]
+            self.assertEqual(data_rows, [])
+            self.assertIn("| Story | AC | Description | Test Cases | Status |", matrix)
+
+class SharedDiscoveryTests(unittest.TestCase):
+    """US0097/CR0181: verify_ac discovers lowercase-named stories too (case-insensitive)."""
+
+    def _story(self, sd, name):
+        (sd).mkdir(parents=True, exist_ok=True)
+        (sd / name).write_text(
+            "# US0099: s\n\n> **Status:** Ready\n\n## Acceptance Criteria\n\n"
+            "### AC1: a\n- **Then** x\n- **Verify:** manual check\n", encoding="utf-8")
+
+    def test_walk_stories_finds_lowercase(self):
+        with tempfile.TemporaryDirectory() as d:
+            sd = Path(d) / "sdlc-studio" / "stories"
+            self._story(sd, "us0099-lower.md")                     # lowercase filename
+            found = list(verify_ac.walk_stories(sd))
+            self.assertEqual([p.name for p in found], ["us0099-lower.md"])
+
+    def test_run_by_id_resolves_lowercase(self):
+        with tempfile.TemporaryDirectory() as d:
+            sd = Path(d) / "sdlc-studio" / "stories"
+            self._story(sd, "us0099-lower.md")
+            args = verify_ac.build_parser().parse_args(
+                ["run", "--dir", str(sd), "--id", "US0099", "--dry-run", "--root", d])
+            self.assertEqual(_quiet_cmd_run(args), 0)           # found, not "no story file"
+
+    def test_root_and_repo_root_bind_the_standard_dest(self):
+        # flag grammar parity: `--root` is the family-standard spelling and `--repo-root`
+        # is a legacy alias; BOTH bind the standard `root` dest, so a global --root before
+        # the verb and the flag after it resolve to one root (never diverge to `repo_root`).
+        args = verify_ac.build_parser().parse_args(["run", "--root", "/x"])
+        self.assertEqual(args.root, "/x")
+        args2 = verify_ac.build_parser().parse_args(["run", "--repo-root", "/y"])
+        self.assertEqual(args2.root, "/y")
+        before = verify_ac.build_parser().parse_args(["--root", "/z", "run"])
+        self.assertEqual(before.root, "/z")
+
+
+class RestrictedHttpTests(unittest.TestCase):
+    """US0101/CR0186: the http verb has a scheme floor in every mode and a host allow-list
+    (restricted mode via SDLC_VERIFY_HTTP_HOSTS)."""
+
+    def setUp(self):
+        import os
+        self._prev = os.environ.get("SDLC_VERIFY_HTTP_HOSTS")
+
+    def tearDown(self):
+        import os
+        if self._prev is None:
+            os.environ.pop("SDLC_VERIFY_HTTP_HOSTS", None)
+        else:
+            os.environ["SDLC_VERIFY_HTTP_HOSTS"] = self._prev
+
+    def _set(self, val):
+        import os
+        if val is None:
+            os.environ.pop("SDLC_VERIFY_HTTP_HOSTS", None)
+        else:
+            os.environ["SDLC_VERIFY_HTTP_HOSTS"] = val
+
+    def test_scheme_floor_blocks_ssrf_scheme_even_unrestricted(self):
+        self._set(None)  # unrestricted
+        for bad in ("file:///etc/passwd", "gopher://x/1", "ftp://h/f"):
+            with self.assertRaises(ValueError):
+                verify_ac._build_http(f'GET {bad} -- .x == 1')
+
+    def test_unrestricted_allows_any_host(self):
+        self._set(None)
+        cmd = verify_ac._build_http('GET https://anything.example/health -- .ok == true')
+        self.assertIn("anything.example", cmd)
+
+    def test_restricted_refuses_offlist_host(self):
+        self._set("localhost,127.0.0.1")
+        with self.assertRaises(ValueError):
+            verify_ac._build_http('GET https://evil.example/x -- .x == 1')
+
+    def test_restricted_allows_onlist_host(self):
+        self._set("localhost,127.0.0.1")
+        cmd = verify_ac._build_http('GET http://localhost:8080/health -- .ok == true')
+        self.assertIn("localhost", cmd)
+
+    def test_restricted_refuses_relative_url(self):
+        self._set("localhost")
+        with self.assertRaises(ValueError):
+            verify_ac._build_http('GET /health -- .ok == true')
+
+    def test_run_verifier_reports_invalid_on_refused_target(self):
+        self._set("localhost")
+        r = verify_ac.run_verifier('http GET https://evil.example/x -- .x == 1',
+                                   timeout=5, cwd=Path("."))
+        self.assertFalse(r.ok)
+        self.assertEqual(r.kind, "invalid")
+
+
+class DebugTraceTests(unittest.TestCase):
+    """CR0187 items 5/7: SDLC_DEBUG=1 emits one stderr line from a swallowed-advisory site;
+    the append-only history log is bounded (rolls)."""
+
+    def setUp(self):
+        import os
+        self._prev = os.environ.get("SDLC_DEBUG")
+
+    def tearDown(self):
+        import os
+        if self._prev is None:
+            os.environ.pop("SDLC_DEBUG", None)
+        else:
+            os.environ["SDLC_DEBUG"] = self._prev
+
+    def _set(self, v):
+        import os
+        if v is None:
+            os.environ.pop("SDLC_DEBUG", None)
+        else:
+            os.environ["SDLC_DEBUG"] = v
+
+    def test_debug_silent_by_default(self):
+        self._set(None)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            sdlc_md.debug("somewhere", "detail")
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_debug_emits_one_line_when_enabled(self):
+        self._set("1")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            sdlc_md.debug("somewhere", "boom")
+        out = buf.getvalue()
+        self.assertEqual(out.count("\n"), 1)             # exactly one line
+        self.assertIn("somewhere", out)
+        self.assertIn("boom", out)
+
+    def test_swallowed_site_traces_under_debug(self):
+        # jest_batch_cache swallows a subprocess failure; under SDLC_DEBUG it must leave a trace.
+        import subprocess
+        from unittest import mock
+        self._set("1")
+        buf = io.StringIO()
+        with mock.patch.object(verify_ac.subprocess, "run",
+                               side_effect=FileNotFoundError("no npx")):
+            with contextlib.redirect_stderr(buf):
+                res = verify_ac.jest_batch_cache(Path("."), timeout=1)
+        self.assertEqual(res, [])                         # still degrades to []
+        self.assertIn("jest_batch_cache", buf.getvalue())  # but traced
+
+    def test_swallowed_site_silent_without_debug(self):
+        import subprocess
+        from unittest import mock
+        self._set(None)
+        buf = io.StringIO()
+        with mock.patch.object(verify_ac.subprocess, "run",
+                               side_effect=FileNotFoundError("no npx")):
+            with contextlib.redirect_stderr(buf):
+                verify_ac.jest_batch_cache(Path("."), timeout=1)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_history_log_rolls_when_over_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "hist.jsonl"
+            p.write_text("\n".join(f'{{"n": {i}}}' for i in range(10)) + "\n", encoding="utf-8")
+            rolled = sdlc_md.roll_jsonl(p, max_lines=4)
+            self.assertTrue(rolled)
+            lines = p.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 4)
+            self.assertEqual(lines[-1], '{"n": 9}')       # keeps the most recent
+            # within-cap is a no-op
+            self.assertFalse(sdlc_md.roll_jsonl(p, max_lines=4))
+
+
+class MissingStoryExitCodeTests(unittest.TestCase):
+    """BG0084: an explicitly-named --story that does not exist must exit 2, not 0 - a typo'd
+    path was silently read as 'all ACs green'."""
+
+    def test_missing_story_path_exits_2(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "sdlc-studio").mkdir()
+            rc = verify_ac.main(["run", "--story", str(Path(d) / "sdlc-studio" / "US9999-x.md"),
+                                 "--root", d])
+            self.assertEqual(rc, 2)
+
+
+class CompanionExclusionTests(unittest.TestCase):
+    """BG0083: walk_stories must exclude companion docs - a consultations note under a
+    story's id must not be verified (its quoted example Verify lines run arbitrary shell)."""
+
+    def test_companion_and_non_us_files_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            sd = Path(d)
+            (sd / "US0001-login.md").write_text("# US0001: x\n", encoding="utf-8")
+            (sd / "US0001-login-consultations.md").write_text("# note\n", encoding="utf-8")
+            (sd / "_index.md").write_text("# idx\n", encoding="utf-8")
+            (sd / "usage-guide.md").write_text("# not a story\n", encoding="utf-8")
+            found = [p.name for p in verify_ac.walk_stories(sd)]
+            self.assertEqual(found, ["US0001-login.md"])
+
+
+class RootRelativePathsTests(unittest.TestCase):
+    """BG0089: run from any cwd with --root, discovery and report resolve against the repo
+    root - not the cwd - so the Done gate reads the report the run actually wrote."""
+
+    def test_dir_and_report_resolve_against_root_not_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "proj"
+            sd = root / "sdlc-studio" / "stories"
+            sd.mkdir(parents=True)
+            (sd / "US0001-x.md").write_text(
+                "# US0001: x\n\n## Acceptance Criteria\n\n### AC1: a\n"
+                "- **Given** a\n- **When** b\n- **Then** c\n- **Verify:** file "
+                + str((root / "marker.txt")) + "\n", encoding="utf-8")
+            (root / "marker.txt").write_text("x\n", encoding="utf-8")
+            other = Path(d) / "elsewhere"
+            other.mkdir()
+            import os
+            cwd = os.getcwd()
+            os.chdir(other)  # run from a DIFFERENT cwd
+            try:
+                rc = _quiet_main(["run", "--root", str(root)])
+            finally:
+                os.chdir(cwd)
+            # the run found the story under root (not "no stories found" from cwd) and wrote
+            # the report where the Done gate reads it: root/sdlc-studio/.local/
+            self.assertEqual(rc, 0)
+            self.assertTrue((root / "sdlc-studio" / ".local" / "verify-report.json").exists())
+
+    def test_root_BEFORE_verb_is_honoured_not_silently_dropped(self) -> None:
+        # A --root given BEFORE the verb must run verifiers against THAT tree. The global
+        # --root and the --repo-root alias must resolve to one root, never diverge - a
+        # dropped root would compute the pass/fail verdict against the cwd, silently wrong.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "proj"
+            sd = root / "sdlc-studio" / "stories"
+            sd.mkdir(parents=True)
+            (sd / "US0001-x.md").write_text(
+                "# US0001: x\n\n## Acceptance Criteria\n\n### AC1: a\n"
+                "- **Given** a\n- **When** b\n- **Then** c\n- **Verify:** file "
+                + str((root / "marker.txt")) + "\n", encoding="utf-8")
+            (root / "marker.txt").write_text("x\n", encoding="utf-8")
+            other = Path(d) / "elsewhere"
+            other.mkdir()
+            import os
+            cwd = os.getcwd()
+            os.chdir(other)  # a cwd with NO stories: a dropped root finds nothing here
+            try:
+                rc = _quiet_main(["--root", str(root), "run"])   # root BEFORE the verb
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(rc, 0)
+            self.assertTrue((root / "sdlc-studio" / ".local" / "verify-report.json").exists())
+
+
+class FencedVerifyTests(unittest.TestCase):
+    """A `- **Verify:**` line shown as an example inside a ``` fence must NOT be picked up as
+    the AC's real verifier - otherwise a documentation example reaches shell execution."""
+
+    def test_fenced_verify_line_is_ignored(self) -> None:
+        story = (
+            "### AC1: real\n\n"
+            "- **Verify:** shell true\n\n"
+            "Example of a dangerous verifier:\n\n"
+            "```\n- **Verify:** shell rm -rf /\n```\n"
+        )
+        blocks = verify_ac.parse_story(story)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].verifier, "shell true")
+
+    def test_real_verify_after_a_fence_still_parses(self) -> None:
+        story = (
+            "### AC1: real\n\n"
+            "```\n- **Verify:** shell echo example\n```\n\n"
+            "- **Verify:** shell true\n"
+        )
+        blocks = verify_ac.parse_story(story)
+        self.assertEqual(blocks[0].verifier, "shell true")
+
+    def test_inner_fence_inside_a_longer_fence_does_not_release_the_block(self) -> None:
+        # BG0305: a naive toggle closed on any leading ```, so the inner ```text opener of a
+        # ````markdown block ended the fence and the illustration below it became a LIVE
+        # shell verifier. CommonMark closes only on the same character at the opening length
+        # or longer.
+        story = (
+            "### AC1: real\n\n"
+            "````markdown\n"
+            "```text\n"
+            "- **Verify:** shell echo INJECTED; exit 1\n"
+            "```\n"
+            "````\n"
+        )
+        blocks = verify_ac.parse_story(story)
+        self.assertEqual(len(blocks), 1)
+        self.assertIsNone(blocks[0].verifier)
+        self.assertEqual(blocks[0].extra_verifiers, [])
+
+    def test_a_tilde_fence_is_not_closed_by_a_backtick_run(self) -> None:
+        story = (
+            "### AC1: real\n\n"
+            "~~~markdown\n"
+            "```\n"
+            "- **Verify:** shell echo INJECTED; exit 1\n"
+            "```\n"
+            "~~~\n"
+        )
+        blocks = verify_ac.parse_story(story)
+        self.assertIsNone(blocks[0].verifier)
+
+    def test_a_real_verify_after_the_long_fence_closes_still_parses(self) -> None:
+        story = (
+            "### AC1: real\n\n"
+            "````markdown\n"
+            "```text\n"
+            "- **Verify:** shell echo example\n"
+            "```\n"
+            "````\n\n"
+            "- **Verify:** shell true\n"
+        )
+        blocks = verify_ac.parse_story(story)
+        self.assertEqual(blocks[0].verifier, "shell true")
+
+
+class GrepVerbTests(unittest.TestCase):
+    """The grep verb had zero coverage, which is why BG0125/BG0128 survived. These fail against
+    the pre-fix builder (which passed a glob to rg/grep literally)."""
+
+    def test_documented_glob_matches_present_code(self) -> None:
+        """BG0125: `grep <re> src/**/*.ts` false-RED'd on present code. It must now PASS."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "src" / "auth").mkdir(parents=True)
+            (root / "src" / "auth" / "client.ts").write_text("export class AuthClient {}\n")
+            res = verify_ac.run_verifier('grep "export class AuthClient" src/**/*.ts',
+                                         timeout=30, cwd=root, allow_shell=False)
+            self.assertTrue(res.ok, f"{res.kind} exit={res.exit_code} {res.stderr}")
+
+    def test_glob_matching_nothing_fails_honestly(self) -> None:
+        """An unmatched glob must FAIL (not vacuously pass) - it is a real missing target."""
+        with tempfile.TemporaryDirectory() as d:
+            res = verify_ac.run_verifier('grep "x" src/**/*.ts',
+                                         timeout=30, cwd=Path(d), allow_shell=False)
+            self.assertFalse(res.ok)
+
+    def test_expand_globs_passes_plain_paths_through(self) -> None:
+        self.assertEqual(verify_ac._expand_globs(["src/a.ts"], None), ["src/a.ts"])
+
+    def test_expand_globs_unmatched_glob_is_literal(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(verify_ac._expand_globs(["nope/**/*.zz"], Path(d)), ["nope/**/*.zz"])
+
+
+class RunFileAliasTests(unittest.TestCase):
+    """CR0251: --file is the flag an agent reaches for; it aliases --story."""
+
+    def test_run_accepts_file_as_alias_for_story(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            story = Path(d) / "US0001-x.md"
+            # AC checks an absolute path so it passes regardless of the verifier's cwd - the
+            # test isolates the flag alias (rc 0 = parsed + ran), not path resolution.
+            story.write_text(f"# US0001: x\n\n### AC1: t\n\n- **Verify:** file {story}\n")
+            # --root pins the run to the tempdir: without it the report and history landed
+            # in whatever project sat above the cwd, so the suite appended to the live
+            # workspace's verify-history.jsonl every time it ran.
+            rc = _quiet_main(["run", "--file", str(story), "--dry-run", "--root", d])
+            self.assertEqual(rc, 0)
+
+
+class StoryIdTests(unittest.TestCase):
+    """US0192: `run --story` accepts a story ID where a story is meant - the natural
+    first invocation must work, and a value that is neither fails naming both."""
+
+    def setUp(self) -> None:
+        self.fixture = FixtureRoot()
+
+    def tearDown(self) -> None:
+        self.fixture.cleanup()
+
+    def _run(self, story_value: str) -> tuple[int, str]:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = _quiet_main(["run", "--story", story_value, "--dry-run",
+                              "--repo-root", str(self.fixture.tmp),
+                              "--dir", str(self.fixture.tmp / "sdlc-studio/stories"),
+                              "--report",
+                              str(self.fixture.tmp / ".local/verify-report.json")])
+        return rc, err.getvalue()
+
+    def test_story_id_resolves_when_no_such_path_exists(self) -> None:
+        rc, err = self._run("US0001")
+        self.assertEqual(rc, 0, err)
+
+    def test_existing_path_behaviour_unchanged(self) -> None:
+        rc, _ = self._run(str(self.fixture.tmp / "sdlc-studio/stories/US0001-login.md"))
+        self.assertEqual(rc, 0)
+
+    def test_story_id_neither_path_nor_id_fails_naming_both(self) -> None:
+        rc, err = self._run("US9999")
+        self.assertEqual(rc, 2)
+        self.assertIn("no story file at", err)   # the path lookup failed
+        self.assertIn("US9999", err)
+        self.assertIn("id", err.lower())         # ...and the id resolution failed
+
+    def test_non_id_missing_path_still_plain_error(self) -> None:
+        rc, err = self._run("does/not/exist.md")
+        self.assertEqual(rc, 2)
+        self.assertIn("no story file at", err)
+
+
+class VacuousVerifierTests(unittest.TestCase):
+    """A runner that exits 0 having run nothing must not count as proof (BG0193)."""
+
+    def _run(self, script: str, kind_expr: str | None = None):
+        """Execute a shell verifier that emits `script` on stdout and exits 0."""
+        expr = kind_expr or f"shell printf '%s\\n' {shlex_quote(script)}"
+        return verify_ac.run_verifier(expr, 30, Path.cwd())
+
+    def test_unittest_ran_zero_tests_is_not_a_pass(self):
+        r = self._run("Ran 0 tests in 0.000s")
+        self.assertFalse(r.ok)
+        self.assertTrue(r.vacuous)
+        self.assertEqual(r.exit_code, 0)
+
+    def test_unittest_no_tests_ran_banner_is_not_a_pass(self):
+        self.assertTrue(self._run("NO TESTS RAN").vacuous)
+
+    def test_pytest_no_tests_ran_is_not_a_pass(self):
+        self.assertTrue(self._run("no tests ran in 0.01s").vacuous)
+
+    def test_pytest_no_tests_collected_is_not_a_pass(self):
+        self.assertTrue(self._run("no tests collected (93 deselected) in 0.08s").vacuous)
+
+    def test_go_no_tests_to_run_is_not_a_pass(self):
+        self.assertTrue(self._run("testing: warning: no tests to run").vacuous)
+        self.assertTrue(self._run("ok  \texample.com/pkg\t0.002s [no tests to run]").vacuous)
+
+    def test_jest_and_vitest_no_tests_found_are_not_a_pass(self):
+        self.assertTrue(self._run("No tests found, exiting with code 0").vacuous)
+        self.assertTrue(self._run("No test files found, exiting with code 0").vacuous)
+
+    def test_the_failure_names_the_remedy(self):
+        r = self._run("Ran 0 tests in 0.000s")
+        self.assertIn("ran NO tests", r.stderr)
+        self.assertIn("Re-point the Verify line", r.stderr)
+
+    def test_a_real_passing_run_is_untouched(self):
+        r = self._run("Ran 9 tests in 0.001s\n\nOK")
+        self.assertTrue(r.ok)
+        self.assertFalse(r.vacuous)
+
+    def test_a_nonzero_exit_is_still_a_plain_failure_not_vacuous(self):
+        r = verify_ac.run_verifier("shell printf 'Ran 0 tests in 0.000s\\n'; exit 5",
+                                   30, Path.cwd())
+        self.assertFalse(r.ok)
+        self.assertFalse(r.vacuous)  # a shell verb owns its exit; nothing to attribute
+
+
+    def test_only_test_running_verbs_are_judged_for_vacuity(self):
+        # The kind guard's own contract. No verb currently SHIPPING emits a runner summary
+        # through a non-test kind (`grep`/`file` run quiet), so this is defence-in-depth
+        # against a future verb, and is asserted directly rather than through a verifier
+        # that cannot reach the branch.
+        signature = "Ran 0 tests in 0.000s"
+        for kind in ("shell", "pytest", "go", "jest", "vitest", "fallback"):
+            with self.subTest(kind=kind):
+                self.assertTrue(verify_ac._ran_no_tests(kind, signature, ""))
+        for kind in ("grep", "file", "http", "eval", "invalid", "blocked"):
+            with self.subTest(kind=kind):
+                self.assertFalse(verify_ac._ran_no_tests(kind, signature, ""))
+
+    def test_unrelated_tool_output_cannot_disarm_the_check(self):
+        # A blob-wide "did anything pass?" veto was tried and removed. A `shell` Verify line
+        # is routinely `make test` / `npm run check`, and a co-running linter or coverage tool
+        # printing "N passed" then silenced the gate entirely - a false NEGATIVE, which is a
+        # worse failure than the false positive the veto was added to fix.
+        for noise in ("Coverage: 12 passed", "lint: 0 failed, 1 passed", "eslint 4 passed",
+                      "PASS", "ok  \tex/other\t0.010s"):
+            with self.subTest(noise=noise):
+                self.assertTrue(
+                    verify_ac._ran_no_tests("shell", f"Ran 0 tests in 0.000s\n{noise}\n", ""),
+                    "unrelated output must not speak for the runner under test")
+                self.assertTrue(
+                    verify_ac._ran_no_tests("shell", f"no tests ran in 0.01s\n{noise}\n", ""))
+
+    def test_a_go_filter_matching_nothing_is_vacuous_even_beside_the_binarys_pass_line(self):
+        # `testing: warning: no tests to run` is printed by the test binary, which prints PASS
+        # on the same stream - so a PASS-based veto made this signature dead in every real run.
+        out = ("testing: warning: no tests to run\nPASS\n"
+               "ok  \tex/foo\t0.002s [no tests to run]\n")
+        self.assertTrue(verify_ac._ran_no_tests("go", out, ""))
+
+    def test_a_bare_go_warning_with_no_package_summary_is_still_vacuous(self):
+        self.assertTrue(verify_ac._ran_no_tests("go", "testing: warning: no tests to run\n", ""))
+
+    def test_a_multi_package_go_run_with_real_results_is_not_vacuous(self):
+        # `go test ./...` prints `[no test files]` per package WITHOUT tests while others
+        # pass. Failing that green suite would tell the author to re-point a Verify line at
+        # tests that demonstrably ran.
+        green = ("ok  \tex/foo\t0.012s\n"
+                 "?   \tex/internal/util\t[no test files]\n"
+                 "ok  \tex/bar\t0.004s\n")
+        self.assertFalse(verify_ac._ran_no_tests("go", green, ""))
+        self.assertFalse(verify_ac._ran_no_tests("shell", green, ""))
+
+    def test_a_go_run_where_no_package_ran_anything_is_vacuous(self):
+        none = "?   \tex/a\t[no test files]\n?   \tex/b\t[no test files]\n"
+        self.assertTrue(verify_ac._ran_no_tests("go", none, ""))
+
+    def test_a_go_run_filter_matching_nothing_is_still_vacuous(self):
+        # The package line carries a bracket suffix, so it is not evidence anything ran.
+        out = "testing: warning: no tests to run\nok  \tex/foo\t0.002s [no tests to run]\n"
+        self.assertTrue(verify_ac._ran_no_tests("go", out, ""))
+
+    def test_a_jest_workspace_with_one_project_empty_is_not_vacuous(self):
+        mixed = "PASS src/a.test.js\nNo tests found, exiting with code 0\n"
+        self.assertFalse(verify_ac._ran_no_tests("jest", mixed, ""))
+        self.assertTrue(verify_ac._ran_no_tests("jest", "No tests found, exiting with code 0\n", ""))
+
+    def test_a_partly_deselected_pytest_run_is_not_vacuous(self):
+        self.assertFalse(verify_ac._ran_no_tests("shell", "3 passed, 90 deselected in 0.08s\n", ""))
+        self.assertTrue(verify_ac._ran_no_tests("shell", "no tests ran in 0.01s\n", ""))
+
+    def test_the_signature_is_read_from_stderr_too(self):
+        # unittest writes its summary to stderr, pytest to stdout.
+        self.assertTrue(verify_ac._ran_no_tests("shell", "", "Ran 0 tests in 0.000s"))
+
+    def test_a_non_test_verb_is_never_judged_vacuous(self):
+        # `grep` has no test count, and could match a signature inside the file it searches.
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "notes.md"
+            f.write_text("Ran 0 tests in 0.000s\n", encoding="utf-8")
+            r = verify_ac.run_verifier("grep 'Ran 0 tests' notes.md", 30, Path(td))
+            self.assertTrue(r.ok)
+            self.assertFalse(r.vacuous)
+
+    def test_prose_mentioning_a_count_mid_line_does_not_false_positive(self):
+        # Anchored patterns: an honest test that PRINTS about test counts still passes.
+        r = self._run("checked that we never claim Ran 0 tests in a report")
+        self.assertTrue(r.ok)
+        self.assertFalse(r.vacuous)
+
+    def test_report_counts_and_flags_the_vacuous_ac(self):
+        story = (
+            "# US9001: demo\n\n## Acceptance Criteria\n\n"
+            "### AC1: a filter that matches nothing\n\n"
+            "- **Verify:** shell printf 'Ran 0 tests in 0.000s\\n'\n"
+            "- **Verified:** yes (2026-01-01)\n"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sp = root / "story.md"
+            sp.write_text(story, encoding="utf-8")
+            rep = verify_ac.verify_story(sp, True, 30, root)
+            self.assertEqual(rep.failed, 1)
+            self.assertEqual(rep.verified, 0)
+            self.assertEqual(rep.vacuous, 1)
+            self.assertTrue(rep.failures[0]["vacuous"])
+
+
+class UnresolvedPytestVerifierTests(unittest.TestCase):
+    """BG0231 - a pytest verifier whose named test no longer exists must be attributed as an
+    unresolved verifier, not read as a code failure. A deleted node exits 4 and a stale -k
+    pattern exits 5; both mean the runner ran nothing, so the green they replace proves
+    nothing, and the remedy (re-point the Verify line) is different from fixing code."""
+
+    def _pytest_project(self, d):
+        (Path(d) / "test_present.py").write_text(
+            "def test_here():\n    assert True\n\ndef test_fails():\n    assert False\n",
+            encoding="utf-8")
+
+    def test_a_deleted_node_is_vacuous_not_a_plain_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._pytest_project(d)
+            r = verify_ac.run_verifier("pytest test_present.py::test_GONE", 60, Path(d))
+            self.assertFalse(r.ok)
+            self.assertTrue(r.vacuous, "a deleted node ran nothing - it proves nothing")
+            self.assertIn(r.exit_code, (4, 5))
+
+    def test_a_stale_k_pattern_is_vacuous(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._pytest_project(d)
+            r = verify_ac.run_verifier("pytest test_present.py -k test_GONE", 60, Path(d))
+            self.assertFalse(r.ok)
+            self.assertTrue(r.vacuous, "a -k pattern matching nothing ran nothing")
+
+    def test_the_vacuous_pytest_result_names_the_remedy(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._pytest_project(d)
+            r = verify_ac.run_verifier("pytest test_present.py::test_GONE", 60, Path(d))
+            self.assertIn("Re-point the Verify line", r.stderr)
+
+    def test_a_real_failure_is_a_plain_failure_not_vacuous(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._pytest_project(d)
+            r = verify_ac.run_verifier("pytest test_present.py::test_fails", 60, Path(d))
+            self.assertFalse(r.ok)
+            self.assertFalse(r.vacuous, "the test ran and failed - that is a code failure")
+            self.assertEqual(r.exit_code, 1)
+
+    def test_a_real_pass_is_untouched(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._pytest_project(d)
+            r = verify_ac.run_verifier("pytest test_present.py::test_here", 60, Path(d))
+            self.assertTrue(r.ok)
+            self.assertFalse(r.vacuous)
+
+
+class SkippedPytestVerifierTests(unittest.TestCase):
+    """BG0317 - a pytest run whose selected tests were ALL skipped exits 0 and prints
+    "1 skipped", which the no-tests-ran regex does not match. The default per-AC path stamped
+    such an AC green while the batch path, reading the SAME run out of JUnit XML, refused the
+    skip as not-a-pass. Identical inputs, opposite verdicts; the green one is the dangerous
+    one, because a skipped test proves exactly as much as a test that never ran."""
+
+    def _run(self, script: str):
+        return verify_ac.run_verifier(f"shell printf '%s\\n' {shlex_quote(script)}",
+                                      30, Path.cwd())
+
+    def test_an_all_skipped_run_is_not_a_pass(self):
+        r = self._run("1 skipped in 0.01s")
+        self.assertFalse(r.ok)
+        self.assertTrue(r.vacuous)
+        self.assertEqual(r.exit_code, 0)
+
+    def test_the_banner_summary_form_is_judged_too(self):
+        self.assertTrue(self._run("===== 1 skipped in 0.01s =====").vacuous)
+
+    def test_skips_beside_deselections_and_warnings_are_still_vacuous(self):
+        self.assertTrue(self._run("2 skipped, 91 deselected, 1 warning in 0.08s").vacuous)
+
+    def test_a_skip_beside_a_real_pass_is_still_a_pass(self):
+        r = self._run("3 passed, 1 skipped in 0.04s")
+        self.assertTrue(r.ok, "one test did run and pass - that is not vacuous")
+        self.assertFalse(r.vacuous)
+
+    def test_a_real_skipped_node_matches_the_batch_path_verdict(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "test_skipped.py").write_text(
+                "import pytest\n\n\n"
+                "@pytest.mark.skip(reason='not today')\n"
+                "def test_a():\n    assert True\n",
+                encoding="utf-8")
+            r = verify_ac.run_verifier("pytest test_skipped.py::test_a", 60, Path(d))
+        self.assertFalse(r.ok, "the JUnit batch path calls this not-a-pass; so must this one")
+        self.assertTrue(r.vacuous)
+        # The same run through the batch path, for the parity this bug was about.
+        xml = ('<testsuites><testsuite>'
+               '<testcase classname="test_skipped" name="test_a"><skipped /></testcase>'
+               '</testsuite></testsuites>')
+        nodes = verify_ac._parse_junit_xml(xml, ["test_skipped.py"])
+        self.assertFalse(nodes["test_skipped.py::test_a"])
+
+    def test_the_cached_verdict_does_not_call_a_skip_a_failure(self):
+        # The cache records pass/not-pass, so it cannot tell a skip from a red test. Saying
+        # "cached pytest failure" for a skipped node sends the reader to debug code that
+        # never ran.
+        r = verify_ac.resolve_pytest_from_cache("pytest tests/test_x.py::test_a",
+                                                {"tests/test_x.py::test_a": False})
+        self.assertFalse(r.ok)
+        self.assertIn("skipped", r.stderr)
+        self.assertNotRegex(r.stderr, r"cached pytest failure")
+
+
+class AllSkippedNonPytestRunnerTests(unittest.TestCase):
+    """BG0348 - the all-skipped hole was closed for pytest only. Every other runner family
+    exits 0 on a run where nothing executed and prints a summary the zero-count signatures do
+    not match, so the AC was stamped green by tests that never ran. `unittest` matters most:
+    it is this repository's own default runner."""
+
+    def _run(self, script: str):
+        return verify_ac.run_verifier(f"shell printf '%s\\n' {shlex_quote(script)}",
+                                      30, Path.cwd())
+
+    # --- unittest -------------------------------------------------------------------
+    def test_a_real_all_skipped_unittest_run_is_not_a_pass(self):
+        """The exact bytes a real `python3 -m unittest` all-skipped run prints."""
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "test_allskip.py").write_text(
+                "import unittest\n\n\n"
+                "class T(unittest.TestCase):\n"
+                "    @unittest.skip('not today')\n"
+                "    def test_a(self):\n        self.assertTrue(False)\n",
+                encoding="utf-8")
+            r = verify_ac.run_verifier("shell python3 -m unittest test_allskip", 60, Path(d))
+        self.assertEqual(r.exit_code, 0, "unittest exits 0 on an all-skipped run")
+        self.assertFalse(r.ok, "nothing ran, so nothing was proved")
+        self.assertTrue(r.vacuous)
+        self.assertIn("SKIPPED", r.stderr)
+
+    def test_a_mixed_unittest_run_with_one_skip_is_still_a_pass(self):
+        """`Ran 4 tests` beside `skipped=1` means three tests really ran - not vacuous."""
+        r = self._run("Ran 4 tests in 0.001s\n\nOK (skipped=1)")
+        self.assertTrue(r.ok, "three tests ran and passed")
+        self.assertFalse(r.vacuous)
+
+    def test_unittest_skips_beside_expected_failures_are_not_all_skipped(self):
+        r = self._run("Ran 2 tests in 0.001s\n\nOK (skipped=1, expected failures=1)")
+        self.assertFalse(r.vacuous, "an expected failure is a test that ran")
+
+    def test_two_unittest_runs_one_all_skipped_one_green_is_not_vacuous(self):
+        # A `shell` Verify line routinely runs both suites. One empty run beside a real one
+        # must not fail the gate.
+        r = self._run("Ran 1 test in 0.000s\n\nOK (skipped=1)\n"
+                      "Ran 9 tests in 0.100s\n\nOK")
+        self.assertFalse(r.vacuous)
+
+    def test_two_unittest_runs_both_all_skipped_is_vacuous(self):
+        r = self._run("Ran 1 test in 0.000s\n\nOK (skipped=1)\n"
+                      "Ran 3 tests in 0.100s\n\nOK (skipped=3)")
+        self.assertTrue(r.vacuous)
+
+    # --- jest -----------------------------------------------------------------------
+    def test_an_all_skipped_jest_run_is_not_a_pass(self):
+        r = self._run("Test Suites: 1 skipped, 1 total\n"
+                      "Tests:       3 skipped, 3 total\n"
+                      "Snapshots:   0 total")
+        self.assertFalse(r.ok)
+        self.assertTrue(r.vacuous)
+        self.assertIn("SKIPPED", r.stderr)
+
+    def test_a_mixed_jest_run_is_still_a_pass(self):
+        r = self._run("Tests:       1 skipped, 2 passed, 3 total")
+        self.assertTrue(r.ok)
+        self.assertFalse(r.vacuous)
+
+    def test_a_jest_run_of_only_todos_ran_nothing_either(self):
+        self.assertTrue(self._run("Tests:       2 todo, 2 total").vacuous)
+        self.assertTrue(self._run("Tests:       1 skipped, 1 todo, 2 total").vacuous)
+
+    # --- vitest ---------------------------------------------------------------------
+    def test_an_all_skipped_vitest_run_is_not_a_pass(self):
+        r = self._run(" Test Files  1 skipped (1)\n      Tests  3 skipped (3)")
+        self.assertFalse(r.ok)
+        self.assertTrue(r.vacuous)
+        self.assertIn("SKIPPED", r.stderr)
+
+    def test_a_mixed_vitest_run_is_still_a_pass(self):
+        r = self._run(" Test Files  1 passed (1)\n      Tests  2 passed | 1 skipped (3)")
+        self.assertTrue(r.ok)
+        self.assertFalse(r.vacuous)
+
+    # --- go -------------------------------------------------------------------------
+    def test_a_go_run_whose_every_test_skipped_is_not_a_pass(self):
+        r = self._run("=== RUN   TestA\n    a_test.go:6: not today\n--- SKIP: TestA (0.00s)\n"
+                      "PASS\nok  \tex/foo\t0.002s")
+        self.assertFalse(r.ok)
+        self.assertTrue(r.vacuous)
+        self.assertIn("SKIPPED", r.stderr)
+
+    def test_a_go_run_with_one_real_pass_beside_a_skip_is_still_a_pass(self):
+        r = self._run("--- SKIP: TestA (0.00s)\n--- PASS: TestB (0.00s)\n"
+                      "PASS\nok  \tex/foo\t0.002s")
+        self.assertTrue(r.ok)
+        self.assertFalse(r.vacuous)
+
+    # --- the remedy the reader is given --------------------------------------------
+    def test_the_all_skipped_remedy_is_not_the_re_point_one(self):
+        # Re-pointing a Verify line at a different test is the wrong advice here: the
+        # selector is fine, the test is switched off.
+        r = self._run("Ran 1 test in 0.000s\n\nOK (skipped=1)")
+        self.assertIn("SKIPPED", r.stderr)
+        self.assertNotIn("Re-point the Verify line at a test that exists", r.stderr)
+
+    def test_a_green_run_of_every_family_is_untouched(self):
+        for green in ("Ran 9 tests in 0.001s\n\nOK",
+                      "Tests:       3 passed, 3 total",
+                      " Test Files  1 passed (1)\n      Tests  3 passed (3)",
+                      "--- PASS: TestA (0.00s)\nPASS\nok  \tex/foo\t0.002s",
+                      "3 passed in 0.04s"):
+            with self.subTest(green=green.splitlines()[0]):
+                r = self._run(green)
+                self.assertTrue(r.ok)
+                self.assertFalse(r.vacuous)
+
+
+def shlex_quote(s: str) -> str:
+    import shlex as _s
+    return _s.quote(s)
+
+
+class GrepDashPatternTests(unittest.TestCase):
+    """A dash-leading grep pattern must not be read as the tool's own flags (US0228)."""
+
+    def _build(self, expr: str, with_rg: bool):
+        orig = verify_ac.shutil.which
+        self.addCleanup(setattr, verify_ac.shutil, "which", orig)
+        verify_ac.shutil.which = lambda name: "/usr/bin/rg" if (with_rg and name == "rg") else None
+        return verify_ac._build_command(expr, cwd=Path.cwd())
+
+    def test_dash_leading_pattern_is_passed_behind_dash_e(self):
+        for with_rg in (True, False):
+            with self.subTest(rg=with_rg):
+                _, cmd = self._build("grep -Ran notes.md", with_rg)
+                self.assertIn("-e", cmd)
+                self.assertEqual(cmd[cmd.index("-e") + 1], "-Ran")
+                # and never as a bare positional ahead of -e
+                self.assertLess(cmd.index("-e"), cmd.index("-Ran"))
+
+    def test_paths_sit_behind_a_double_dash_terminator(self):
+        for with_rg in (True, False):
+            with self.subTest(rg=with_rg):
+                _, cmd = self._build("grep pattern notes.md", with_rg)
+                self.assertIn("--", cmd)
+                self.assertTrue(all(cmd.index("--") < cmd.index(p)
+                                    for p in cmd if p.endswith("notes.md")))
+
+    def test_both_backends_are_hardened(self):
+        _, with_rg = self._build("grep -x notes.md", True)
+        _, without = self._build("grep -x notes.md", False)
+        self.assertEqual(with_rg[:4], ["rg", "-q", "-e", "-x"])
+        self.assertEqual(without[:4], ["grep", "-rqE", "-e", "-x"])
+        for cmd in (with_rg, without):
+            self.assertIn("--", cmd)
+
+    def test_ordinary_patterns_are_unaffected(self):
+        # The search still finds what it found before - semantics unchanged, only quoting.
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "notes.md").write_text("hello world\n", encoding="utf-8")
+            self.assertTrue(verify_ac.run_verifier("grep 'hello' notes.md", 30, Path(td)).ok)
+            self.assertFalse(verify_ac.run_verifier("grep 'absent' notes.md", 30, Path(td)).ok)
+
+    def test_a_dash_leading_pattern_actually_matches_end_to_end(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "notes.md").write_text("-Ran the thing\n", encoding="utf-8")
+            r = verify_ac.run_verifier("grep '\\-Ran' notes.md", 30, Path(td))
+            self.assertTrue(r.ok, f"exit={r.exit_code} stderr={r.stderr}")
+
+
+class US0166Ac3Tests(unittest.TestCase):
+    """US0166 AC3's own verifier must check its claim, not misparse into a green (US0226).
+
+    Half of that claim - that both docs teach `--require-close` - was retired with the flag by
+    US0942, so AC3 is now retired in the D0259 pattern rather than left grepping for text the
+    docs no longer carry. The half that stands, the "never at deployed" close clause, is still
+    checked against both files here.
+
+    Reads the dogfooded workspace by path, so it is dev-repo-only: from an installed copy
+    the story is not there and these would raise FileNotFoundError, which says nothing
+    about the consuming project's own install (BG0209).
+    """
+
+    STORY = (Path(__file__).resolve().parents[5]
+             / "sdlc-studio/stories/US0166-ship-a-stop-hook-installer-and-redefine-sprint.md")
+
+    def setUp(self):
+        if not workspace.in_dev_repo():
+            self.skipTest(workspace.SKIP_REASON)
+
+    def _ac3(self):
+        blocks = verify_ac.parse_story(self.STORY.read_text(encoding="utf-8"))
+        ac3 = next((b for b in blocks if b.ac_id == "AC3"), None)
+        self.assertIsNotNone(ac3, "US0166 AC3 not found")
+        return ac3
+
+    def test_ac3_is_retired_rather_than_grepping_for_the_retired_flag(self):
+        v = self._ac3().verifier
+        self.assertTrue(v.startswith("manual - retired by US0942"), v)
+        self.assertNotIn("require-close", v)
+
+    def test_ac3_no_longer_carries_a_bare_grep_verb_with_a_flag(self):
+        # `grep -q ...` as a DSL verb parses the flag as the PATTERN - the original defect.
+        v = self._ac3().verifier
+        self.assertFalse(v.startswith("grep -"))
+
+    def test_the_close_clause_still_stands_in_both_files(self):
+        repo_root = self.STORY.resolve().parents[2]
+        r = verify_ac.run_verifier(
+            "shell cd .claude/skills/sdlc-studio && grep -q 'never at .deployed' help/gate.md "
+            "&& grep -q 'never at .deployed' reference-retro.md", 60, repo_root)
+        self.assertTrue(r.ok, f"exit={r.exit_code} stderr={r.stderr[:300]}")
+        self.assertFalse(r.vacuous)
+
+
+class DuplicateVerifierTests(unittest.TestCase):
+    """US0227: two ACs sharing a selector cannot both discriminate.
+
+    The two workspace-reading tests below are dev-repo-only and skip from an installed
+    copy (BG0209); `test_duplicates_are_reported_with_every_claiming_ac` builds its own
+    fixture in a temporary directory and runs everywhere, which is what keeps the
+    detector itself covered off the dev repo.
+    """
+
+    STORIES = Path(__file__).resolve().parents[5] / "sdlc-studio" / "stories"
+
+    def _verifiers(self, prefix: str) -> list[str]:
+        if not workspace.in_dev_repo():
+            self.skipTest(workspace.SKIP_REASON)
+        path = next(p for p in self.STORIES.glob(f"{prefix}-*.md"))
+        return [" ".join(b.verifier.split())
+                for b in verify_ac.parse_story(path.read_text(encoding="utf-8"))
+                if b.verifier]
+
+    def test_the_named_stories_no_longer_share_a_selector(self):
+        a, b = self._verifiers("US0172"), self._verifiers("US0173")
+        self.assertTrue(a and b)
+        self.assertFalse(set(a) & set(b), "US0172 and US0173 still share a Verify command")
+        # and neither leans on the broad class-wide filter that hid the overlap
+        for v in a + b:
+            self.assertNotIn("-k AttemptsAndCost", v)
+
+    def test_us0163_acs_select_different_suites(self):
+        vs = self._verifiers("US0163")
+        self.assertGreaterEqual(len(vs), 2)
+        self.assertEqual(len(set(vs)), len(vs), "US0163's ACs still share a Verify command")
+
+    def test_duplicates_are_reported_with_every_claiming_ac(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "US0001-a.md").write_text(
+                "# US0001: a\n\n## Acceptance Criteria\n\n"
+                "### AC1: one\n- **Verify:** shell run-the-suite\n\n"
+                "### AC2: two\n- **Verify:** shell run-the-suite\n", encoding="utf-8")
+            (root / "US0002-b.md").write_text(
+                "# US0002: b\n\n## Acceptance Criteria\n\n"
+                "### AC1: one\n- **Verify:** shell something-else\n", encoding="utf-8")
+            dupes = verify_ac.duplicate_verifiers(sorted(root.glob("*.md")))
+            self.assertEqual(len(dupes), 1)
+            self.assertEqual(dupes[0]["verifier"], "shell run-the-suite")
+            self.assertEqual(dupes[0]["acs"], ["US0001 AC1", "US0001 AC2"])
+
+    def test_whitespace_normalised_and_manual_exempt(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "US0001-a.md").write_text(
+                "# US0001: a\n\n## Acceptance Criteria\n\n"
+                "### AC1: one\n- **Verify:** shell run   the-suite\n\n"
+                "### AC2: two\n- **Verify:** shell run the-suite\n\n"
+                "### AC3: three\n- **Verify:** manual an operator reads it\n\n"
+                "### AC4: four\n- **Verify:** manual an operator reads it\n", encoding="utf-8")
+            dupes = verify_ac.duplicate_verifiers(sorted(root.glob("*.md")))
+            self.assertEqual(len(dupes), 1, "spacing-only difference is the same run")
+            self.assertEqual(dupes[0]["acs"], ["US0001 AC1", "US0001 AC2"])
+            self.assertNotIn("manual", dupes[0]["verifier"])
+
+    def test_a_story_with_no_duplicates_reports_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "US0001-a.md").write_text(
+                "# US0001: a\n\n## Acceptance Criteria\n\n"
+                "### AC1: one\n- **Verify:** shell run-a\n\n"
+                "### AC2: two\n- **Verify:** shell run-b\n", encoding="utf-8")
+            self.assertEqual(verify_ac.duplicate_verifiers(sorted(root.glob("*.md"))), [])
+
+
+class RootRelativeWriteTests(unittest.TestCase):
+    """BG0220: every path verify_ac reads or writes anchors on the PROJECT ROOT, never on
+    the current directory. Each test runs from a cwd that is not the root - a test that
+    chdir'd to the root would pass on a script that ignores `--root` entirely and prove
+    nothing. Same class as BG0219 (lessons.py wrote its digest beside the cwd)."""
+
+    def setUp(self) -> None:
+        self._prev_cwd = Path.cwd()
+        self._td = tempfile.TemporaryDirectory()
+        self.root = Path(self._td.name) / "proj"
+        (self.root / "sdlc-studio" / "stories").mkdir(parents=True)
+        (self.root / "sdlc-studio" / "epics").mkdir(parents=True)
+        self.story = self.root / "sdlc-studio" / "stories" / "US0001-login.md"
+        self.story.write_text(
+            "# US0001: Login\n\n## Acceptance Criteria\n\n"
+            "### AC1: it runs\n- **Verify:** shell true\n", encoding="utf-8")
+        (self.root / "sdlc-studio" / "epics" / "EP0001-x.md").write_text(
+            "# EP0001: x\n\n## Stories\n\n| ID | Title |\n| --- | --- |\n| US0001 | Login |\n",
+            encoding="utf-8")
+        # a nested working directory inside the project, standing in for `scripts/`
+        self.inner = self.root / "scripts"
+        self.inner.mkdir()
+
+    def tearDown(self) -> None:
+        import os
+        os.chdir(self._prev_cwd)
+        self._td.cleanup()
+
+    def _chdir(self, d: Path) -> None:
+        import os
+        os.chdir(d)
+
+    def _strays(self, d: Path) -> list[str]:
+        """Anything verify_ac left beside `d` that was not there before."""
+        return sorted(p.name for p in d.iterdir())
+
+    def test_run_without_root_writes_under_the_discovered_root_not_the_cwd(self) -> None:
+        """The reported symptom: `run` from a subdirectory grew a stray sdlc-studio/.local
+        tree beside the cwd, because --root defaulted to the cwd rather than the project."""
+        self._chdir(self.inner)
+        rc = _quiet_main(["run", "--file", str(self.story), "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._strays(self.inner), [],
+                         "verify_ac wrote beside the cwd instead of under the project root")
+        self.assertTrue(
+            (self.root / "sdlc-studio" / ".local" / "verify-report.dry-run.json").is_file(),
+            "the dry-run report did not land under the project root")
+
+    def test_run_without_root_writes_history_under_the_discovered_root(self) -> None:
+        self._chdir(self.inner)
+        rc = _quiet_main(["run", "--file", str(self.story)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._strays(self.inner), [])
+        self.assertTrue(
+            (self.root / "sdlc-studio" / ".local" / "verify-history.jsonl").is_file(),
+            "the history log did not land under the project root")
+
+    def test_report_reads_the_report_run_wrote_under_the_same_root(self) -> None:
+        """`run --root X` then `--root X report` must agree on where the report is. They
+        did not: run anchored on the root and report resolved against the cwd, so the
+        gate that reads the report saw 'no report' from anywhere but the root."""
+        self._chdir(self.inner)
+        self.assertEqual(_quiet_main(["run", "--root", str(self.root)]), 0)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = verify_ac.main(["--root", str(self.root), "report"])
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertNotIn("no report", err.getvalue())
+
+    def test_scaffold_matrix_out_is_written_under_the_root(self) -> None:
+        """`--out` is a write, and it resolved against the cwd."""
+        self._chdir(self.inner)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = verify_ac.main(["--root", str(self.root), "scaffold-matrix",
+                                 "--epic", "EP0001", "--out", "matrix.md"])
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.root / "matrix.md").is_file(),
+                        "the matrix was written beside the cwd, not under the root")
+        self.assertEqual(self._strays(self.inner), [])
+
+    def test_ts_check_spec_is_resolved_under_the_root(self) -> None:
+        """The spec carries a KNOWN-BAD row, so only a run that actually read the file can
+        report the issue. Asserting rc 0 here would be vacuous: `ts_check` reads a missing
+        spec as empty text and reports a clean matrix, so the cwd-relative miss passed."""
+        spec = self.root / "ts.md"
+        spec.write_text(
+            "## AC Coverage Matrix\n\n"
+            "| Story | AC | Test Case | Status |\n"
+            "| --- | --- | --- | --- |\n"
+            "| US0001 | AC1 | {{test}} | pass |\n", encoding="utf-8")
+        self._chdir(self.inner)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = verify_ac.main(["--root", str(self.root), "ts-check", "--spec", "ts.md"])
+        self.assertEqual(rc, 1, "a root-relative --spec was not read from a foreign cwd")
+        self.assertIn("placeholder", out.getvalue())
+
+    def test_an_absolute_path_is_still_honoured_verbatim(self) -> None:
+        """Anchoring must not capture an absolute path the caller chose deliberately."""
+        self._chdir(self.inner)
+        out = Path(self._td.name) / "outside-the-root.json"
+        rc = _quiet_main(["run", "--root", str(self.root), "--report", str(out)])
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.is_file(), "an absolute --report was re-anchored under the root")
+
+    def test_a_named_root_is_honoured_verbatim_not_re_pointed_by_discovery(self) -> None:
+        """Discovery widens the default `.` only. A root the caller NAMED is where the run
+        writes, even when a bigger project sits above it - silently retargeting a named
+        root would be the same class of lie in the other direction."""
+        named = self.inner            # inside self.root, but not itself a project root
+        rc = _quiet_main(["run", "--root", str(named),
+                          "--dir", str(self.root / "sdlc-studio" / "stories")])
+        self.assertEqual(rc, 0)
+        self.assertTrue((named / "sdlc-studio" / ".local" / "verify-report.json").is_file(),
+                        "the named root was ignored")
+        self.assertFalse((self.root / "sdlc-studio" / ".local").exists(),
+                         "discovery overrode a root the caller named")
+
+    def test_discovery_does_not_escape_a_cwd_with_no_project_above_it(self) -> None:
+        """With no project root anywhere above, the cwd is the honest answer - discovery
+        must not silently walk to `/` and write somewhere unrelated."""
+        with tempfile.TemporaryDirectory() as bare:
+            self.assertEqual(verify_ac.discover_root(Path(bare)), Path(bare).resolve())
+
+
+class AcFingerprintTests(unittest.TestCase):
+    """BG0232 - the freshness spine pinned by its own test, from both sides.
+
+    A fingerprint that never changes is as useless as one that always does; only the pair -
+    differs on a material change, stable across an immaterial one - distinguishes a real hash
+    from a constant or a passthrough. Every mutation here purges bytecode implicitly (the
+    functions are pure), so a same-length edit cannot hide behind a cached .pyc.
+    """
+
+    STORY = (
+        "# US0001: x\n\n> **Status:** Ready\n\n"
+        "### AC1: the thing works\n"
+        "- **Given** a\n- **When** b\n- **Then** c\n"
+        "- **Verify:** pytest tests/test_x.py -k test_a\n"
+        "- **Verified:** yes (2026-01-01)\n"
+    )
+
+    def test_fingerprint_is_stable_across_a_status_change(self) -> None:
+        before = verify_ac.ac_fingerprint(self.STORY)
+        after = verify_ac.ac_fingerprint(self.STORY.replace("Status:** Ready", "Status:** Done"))
+        self.assertEqual(before, after, "a Status edit changed nothing the verifier runs")
+
+    def test_fingerprint_is_stable_across_a_revision_history_row(self) -> None:
+        before = verify_ac.ac_fingerprint(self.STORY)
+        after = verify_ac.ac_fingerprint(
+            self.STORY + "\n## Revision History\n\n| Date | Author | Change |\n"
+            "| --- | --- | --- |\n| 2026-01-02 | x | groomed |\n")
+        self.assertEqual(before, after, "a Revision History row is not an AC change")
+
+    def test_fingerprint_is_stable_across_the_verified_stamp(self) -> None:
+        before = verify_ac.ac_fingerprint(self.STORY)
+        after = verify_ac.ac_fingerprint(
+            self.STORY.replace("Verified:** yes (2026-01-01)", "Verified:** no (2026-05-05)"))
+        self.assertEqual(before, after, "the machine-maintained stamp must not feed back in")
+
+    def test_fingerprint_changes_when_a_verify_command_changes(self) -> None:
+        before = verify_ac.ac_fingerprint(self.STORY)
+        after = verify_ac.ac_fingerprint(
+            self.STORY.replace("test_x.py -k test_a", "test_x.py -k test_b"))
+        self.assertNotEqual(before, after, "a re-pointed verifier must go stale")
+
+    def test_fingerprint_changes_when_an_ac_title_changes(self) -> None:
+        before = verify_ac.ac_fingerprint(self.STORY)
+        after = verify_ac.ac_fingerprint(
+            self.STORY.replace("AC1: the thing works", "AC1: the thing works differently"))
+        self.assertNotEqual(before, after, "a retitled AC is a different claim")
+
+    def test_fingerprint_changes_when_an_ac_is_added(self) -> None:
+        before = verify_ac.ac_fingerprint(self.STORY)
+        after = verify_ac.ac_fingerprint(
+            self.STORY + "\n### AC2: another\n- **Verify:** file README.md\n")
+        self.assertNotEqual(before, after, "an added AC changes what must pass")
+
+    def test_fingerprint_changes_when_an_ac_is_removed(self) -> None:
+        two = self.STORY + "\n### AC2: another\n- **Verify:** file README.md\n"
+        self.assertNotEqual(verify_ac.ac_fingerprint(two),
+                            verify_ac.ac_fingerprint(self.STORY),
+                            "removing an AC changes the coverage the entry claims")
+
+    def test_fingerprint_is_not_a_constant(self) -> None:
+        # guards the crudest break - a hash function replaced by a literal passes every
+        # stability test above and fails only this
+        a = verify_ac.ac_fingerprint(self.STORY)
+        b = verify_ac.ac_fingerprint("### ACZ: unrelated\n- **Verify:** file X.md\n")
+        self.assertNotEqual(a, b)
+
+
+#: The four verifiers US0310 ACTUALLY SHIPPED in commit e1bc477, recovered from git rather
+#: than invented for this test. All four passed. None of them touched the guard they claimed
+#: to verify, and the sprint published a verified count four higher than its evidence
+#: supported. They are the fixture because a guard is validated with the bug it defends
+#: against (LL0010), and a hand-written approximation would be a guess about the shape.
+US0310_SHIPPED_VERIFIERS = [
+    'grep "review is a concurrent-writer window" .claude/skills/sdlc-studio/reference-sprint.md',
+    'grep "symlink" .claude/skills/sdlc-studio/reference-review.md',
+    'grep "green" .claude/skills/sdlc-studio/reference-review.md',
+    'grep "window" .claude/skills/sdlc-studio/reference-sprint.md',
+]
+
+
+class MarkdownEvidenceLintTests(unittest.TestCase):
+    """BG0264: a verifier that only reads prose proves a sentence was written.
+
+    Five versions of this guard were defeated in four review rounds, every one by trying to
+    ENUMERATE what the runner reads. The current design inverts the burden: a prose verb is
+    refused unless a non-markdown file it reads can be pointed at, so every uncertainty
+    refuses. These tests pin the escapes that were actually found, not invented ones.
+    """
+
+    #: The four verifiers US0310 SHIPPED in e1bc477, recovered from git. All four passed,
+    #: none touched the guard they claimed to verify, and the sprint published a verified
+    #: count four higher than its evidence supported.
+    US0310_SHIPPED_VERIFIERS = [
+        'grep "review is a concurrent-writer window" .claude/skills/sdlc-studio/reference-sprint.md',
+        'grep "symlink" .claude/skills/sdlc-studio/reference-review.md',
+        'grep "green" .claude/skills/sdlc-studio/reference-review.md',
+        'grep "window" .claude/skills/sdlc-studio/reference-sprint.md',
+    ]
+
+    #: Every form found by review, quoted as the reviewer wrote it. Round 1: the tokens as
+    #: written. Round 2: a directory glob, a flag read as the pattern, a bare directory.
+    #: Round 3: hidden and symlinked files rg will not read. Round 4: rg --files listing a
+    #: file rg cannot open, and rg --files exiting 2 on one unreadable subdirectory.
+    ESCAPES_FOUND_BY_REVIEW = [
+        'grep "anything" sdlc-studio/reviews/*',
+        'grep -c "window" .claude/skills/sdlc-studio/reference-sprint.md',
+        'grep -r "x" .claude/skills/sdlc-studio/best-practices/',
+        'grep "anything" sdlc-studio/reviews/',
+        'grep -m 1 "x" .claude/skills/sdlc-studio/reference-cr.md',
+        'grep --include x "y" .claude/skills/sdlc-studio/reference-rfc.md',
+        'grep -R "x" .claude/skills/sdlc-studio/help/',
+    ]
+
+    @staticmethod
+    def _root() -> Path:
+        return Path(__file__).resolve().parents[5]
+
+    def test_every_verifier_us0310_shipped_is_refused(self) -> None:
+        for expr in self.US0310_SHIPPED_VERIFIERS:
+            with self.subTest(expr=expr):
+                self.assertIsNotNone(verify_ac.lint_markdown_evidence(expr, self._root()))
+
+    def test_every_escape_found_by_review_is_refused(self) -> None:
+        for expr in self.ESCAPES_FOUND_BY_REVIEW:
+            with self.subTest(expr=expr):
+                self.assertIsNotNone(verify_ac.lint_markdown_evidence(expr, self._root()))
+
+    def test_a_behavioural_verifier_is_untouched(self) -> None:
+        root = self._root()
+        for expr in ("pytest scripts/tests/test_x.py::C::t",
+                     "shell scripts/gate.py --check",
+                     "manual the operator confirms the banner renders",
+                     'grep "x" .claude/skills/sdlc-studio/scripts/verify_ac.py',
+                     'grep "x" .claude/skills/sdlc-studio/scripts/'):
+            with self.subTest(expr=expr):
+                self.assertIsNone(verify_ac.lint_markdown_evidence(expr, root))
+
+    def test_a_mixed_target_list_is_not_refused(self) -> None:
+        # BG0264 AC1: a target list naming markdown AND code reads the code, so it can
+        # discriminate. Both orders, so judging the first target alone refuses one of them.
+        md = ".claude/skills/sdlc-studio/reference-sprint.md"
+        py = ".claude/skills/sdlc-studio/scripts/sprint.py"
+        for targets in (f"{md} {py}", f"{py} {md}"):
+            with self.subTest(targets=targets):
+                self.assertIsNone(verify_ac.lint_markdown_evidence(
+                    f"grep 'refuses' {targets}", self._root()))
+
+    def test_the_file_verb_is_refused_over_markdown_and_over_a_prose_directory(self) -> None:
+        # BG0266: `file <dir>` runs `test -e`, which passes forever. The inverted burden
+        # closes it without a separate rule - a prose directory demonstrates nothing.
+        root = self._root()
+        self.assertIsNotNone(verify_ac.lint_markdown_evidence(
+            "file .claude/skills/sdlc-studio/reference-cr.md", root))
+        self.assertIsNotNone(verify_ac.lint_markdown_evidence(
+            "file .claude/skills/sdlc-studio/help/", root))
+
+    # BOTH tests below assert the rg-PRESENT behaviour and only that. `_runner_candidates`
+    # has two paths: with `rg` the candidate set is `rg --files`, which SKIPS hidden and
+    # ignored files; without it the runner is `grep -rqE`, which genuinely DOES read them, so
+    # a hidden `.py` licenses the directory and it is right to. Neither test said so, so both
+    # failed on a runner with no ripgrep - green here, red in CI, for two releases.
+    #
+    # Skipped rather than rewritten to pass either way: "a hidden decoy does not license" is
+    # not a claim about `grep`, and making it pass under grep would mean asserting something
+    # weaker than the criterion. CI installs ripgrep so the skip does not silently take the
+    # coverage away - a skip nobody notices is the same hole with a friendlier colour.
+    @unittest.skipUnless(shutil.which("rg"),
+                         "this claim is about the rg candidate set; without rg the runner is "
+                         "`grep -rqE`, which reads hidden files, so the decoy licenses correctly")
+    def test_a_hidden_symlinked_or_unreadable_decoy_does_not_license_a_prose_directory(self) -> None:
+        # Round 3 and round 4's escapes together. rg skips hidden files, follows no symlink
+        # found in a walk, and cannot open a file it lacks permission for - so none of these
+        # is evidence that the runner reads anything but prose.
+        outer = Path(tempfile.mkdtemp(prefix="verify_ac_decoys_"))
+        try:
+            (outer / "real.py").write_text("code\n")
+            docs = outer / "docs"
+            docs.mkdir()
+            (docs / "note.md").write_text("the guard refuses\n")
+            (docs / ".hidden.py").write_text("code\n")
+            locked = docs / "locked.py"
+            locked.write_text("code\n")
+            try:
+                (docs / "link.py").symlink_to(outer / "real.py")
+                locked.chmod(0o000)
+            except OSError:
+                pass
+            try:
+                self.assertIsNotNone(
+                    verify_ac.lint_markdown_evidence('grep "refuses" docs', outer))
+            finally:
+                try:
+                    locked.chmod(0o644)
+                except OSError:
+                    pass
+        finally:
+            shutil.rmtree(outer, ignore_errors=True)
+
+    @unittest.skipUnless(shutil.which("rg"),
+                         "this claim is about the rg candidate set; without rg the runner is "
+                         "`grep -rqE`, which reads hidden files, so the decoy licenses correctly")
+    def test_an_unreadable_subdirectory_refuses_rather_than_falling_back_to_a_plain_walk(self) -> None:
+        # Round 4 MAJOR-1. `rg --files` exits 2 when any part of the tree errors. Falling
+        # back to rglob then re-listed the hidden files rg refuses to read, reinstating the
+        # escape. No candidates must mean no demonstration, which refuses.
+        outer = Path(tempfile.mkdtemp(prefix="verify_ac_rgerr_"))
+        try:
+            docs = outer / "docs"
+            docs.mkdir()
+            (docs / "note.md").write_text("x\n")
+            (docs / ".hidden.py").write_text("code\n")
+            vault = docs / "vault"
+            vault.mkdir()
+            (vault / "a.md").write_text("x\n")
+            try:
+                vault.chmod(0o000)
+            except OSError:
+                self.skipTest("cannot make a directory unreadable here")
+            try:
+                self.assertIsNotNone(verify_ac.lint_markdown_evidence('grep "x" docs', outer))
+            finally:
+                vault.chmod(0o755)
+        finally:
+            shutil.rmtree(outer, ignore_errors=True)
+
+    def test_a_real_code_file_in_a_directory_licenses_it(self) -> None:
+        # The guard must not refuse everything. A readable, non-markdown, non-symlink file
+        # is the demonstration the design asks for.
+        tmp = Path(tempfile.mkdtemp(prefix="verify_ac_mixed_"))
+        try:
+            (tmp / "note.md").write_text("x\n")
+            (tmp / "impl.py").write_text("code\n")
+            self.assertIsNone(verify_ac.lint_markdown_evidence(f'grep "x" {tmp}', tmp))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_one_predicate_decides_what_markdown_means(self) -> None:
+        # The case rule lived in two places and they disagreed, so a mutant dropping one
+        # `.lower()` flipped a verdict while every test stayed green. One predicate now.
+        for name in ("a.md", "A.MD", "x/y/Z.Md"):
+            with self.subTest(name=name):
+                self.assertTrue(verify_ac._is_markdown(name))
+        for name in ("a.py", "a.markdown", "README"):
+            with self.subTest(name=name):
+                self.assertFalse(verify_ac._is_markdown(name))
+
+    def test_an_uppercase_extension_directory_is_refused(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="verify_ac_case_"))
+        try:
+            (tmp / "NOTE.MD").write_text("x\n")
+            (tmp / "b.MD").write_text("x\n")
+            self.assertIsNotNone(verify_ac.lint_markdown_evidence(f'grep "x" {tmp}', tmp))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_nested_all_markdown_directory_is_refused(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="verify_ac_nested_"))
+        try:
+            (tmp / "a.md").write_text("x\n")
+            deep = tmp / "sub" / "deeper"
+            deep.mkdir(parents=True)
+            (deep / "b.md").write_text("x\n")
+            self.assertIsNotNone(verify_ac.lint_markdown_evidence(f'grep "x" {tmp}', tmp))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_missing_operand_proves_nothing(self) -> None:
+        # MEASURED: `rg -q -e -r -- x help/` exits 0, warning about the missing path while
+        # matching inside the directory. A flag form is a working silent verifier, not a
+        # loudly broken one, so an unread operand must not license it.
+        root = self._root()
+        self.assertIsNotNone(verify_ac.lint_markdown_evidence(
+            'grep -r "x" .claude/skills/sdlc-studio/help/', root))
+
+    def test_the_written_split_matches_the_dsl_not_an_invented_one(self) -> None:
+        self.assertEqual(verify_ac._verifier_targets('grep -c "x" a.md'), ["x", "a.md"])
+        _, argv = verify_ac._build_command('grep -c "x" a.md', cwd=".")
+        self.assertEqual(argv[argv.index("--") + 1:], ["x", "a.md"])
+
+    def test_without_rg_a_symlinked_code_file_still_licenses_nothing(self) -> None:
+        # `rg --files` already omits symlinks, so the symlink rule only bites on the
+        # `grep -rqE` fallback - and no test covered that branch, so deleting the rule
+        # survived mutation. `grep -r` follows only paths named on the command line.
+        outer = Path(tempfile.mkdtemp(prefix="verify_ac_norg_link_"))
+        try:
+            (outer / "real.py").write_text("code\n")
+            docs = outer / "docs"
+            docs.mkdir()
+            (docs / "note.md").write_text("the guard refuses\n")
+            try:
+                (docs / "link.py").symlink_to(outer / "real.py")
+            except OSError:
+                self.skipTest("cannot create a symlink here")
+            real_which = verify_ac.shutil.which
+            verify_ac.shutil.which = lambda n: None if n == "rg" else real_which(n)
+            try:
+                self.assertIsNotNone(
+                    verify_ac.lint_markdown_evidence('grep "refuses" docs', outer))
+            finally:
+                verify_ac.shutil.which = real_which
+        finally:
+            shutil.rmtree(outer, ignore_errors=True)
+
+    def test_without_rg_a_hidden_code_file_DOES_license_it(self) -> None:
+        # The counter-test, so the rule above cannot be satisfied by refusing everything:
+        # `grep -rqE` really does read hidden files, so one is a genuine demonstration.
+        outer = Path(tempfile.mkdtemp(prefix="verify_ac_norg_hidden_"))
+        try:
+            docs = outer / "docs"
+            docs.mkdir()
+            (docs / "note.md").write_text("x\n")
+            (docs / ".hidden.py").write_text("code\n")
+            real_which = verify_ac.shutil.which
+            verify_ac.shutil.which = lambda n: None if n == "rg" else real_which(n)
+            try:
+                self.assertIsNone(verify_ac.lint_markdown_evidence('grep "x" docs', outer))
+            finally:
+                verify_ac.shutil.which = real_which
+        finally:
+            shutil.rmtree(outer, ignore_errors=True)
+
+    def test_lint_exits_non_zero_on_a_draft_story_and_zero_once_done(self) -> None:
+        root = FixtureRoot()
+        try:
+            story = root.tmp / "sdlc-studio" / "stories" / "US0003-prose.md"
+            (root.tmp / "notes.md").write_text("the guard refuses\n")
+            body = (
+                "# US0003: a criterion about a guard\n\n"
+                "> **Status:** {status}\n\n"
+                "## Acceptance Criteria\n\n"
+                "### AC1: the guard refuses\n\n"
+                "- **Verify:** grep \"the guard refuses\" notes.md\n"
+            )
+            args = argparse.Namespace(root=str(root.tmp), dir="sdlc-studio/stories",
+                                      story=str(story), repo_root=None)
+            story.write_text(body.format(status="Draft"))
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                draft_rc = verify_ac.cmd_lint(args)
+            story.write_text(body.format(status="Done"))
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                done_rc = verify_ac.cmd_lint(args)
+            self.assertEqual((draft_rc, done_rc), (1, 0))
+        finally:
+            root.cleanup()
+
+
+class StackedVerifierTests(unittest.TestCase):
+    """BG0265: a stacked Verify line is refused while authoring. `run` executes every line
+    (BG0687), but the stamp, conformance and selector tools read only the first."""
+
+    def test_a_second_verify_line_in_one_block_is_refused(self) -> None:
+        root = FixtureRoot()
+        try:
+            story = root.tmp / "sdlc-studio" / "stories" / "US0004-stacked.md"
+            body = (
+                "# US0004: a criterion with two checks\n\n"
+                "> **Status:** {status}\n\n"
+                "## Acceptance Criteria\n\n"
+                "### AC1: it does two things\n\n"
+                "- **Verify:** pytest a/b.py::C::t_one\n"
+                "- **Verify:** pytest a/b.py::C::t_two\n"
+            )
+            args = argparse.Namespace(root=str(root.tmp), dir="sdlc-studio/stories",
+                                      story=str(story), repo_root=None)
+            story.write_text(body.format(status="Draft"))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = verify_ac.cmd_lint(args)
+            self.assertEqual(rc, 1)
+            # The refusal must NAME the dropped verifier, not merely count it - an author
+            # who cannot see which check was discarded cannot act on the message.
+            self.assertIn("t_two", buf.getvalue())
+            # Past authoring it has shipped; refusing retrospectively blocks a lint over
+            # history without helping anyone, exactly as the markdown-evidence guard does.
+            story.write_text(body.format(status="Done"))
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(verify_ac.cmd_lint(args), 0)
+        finally:
+            root.cleanup()
+
+    # ---- BG0603: the lint refuses at every NON-TERMINAL status, through the shipped command
+    _SCRIPTS = Path(__file__).resolve().parents[1]
+
+    @staticmethod
+    def _bg0603_tree(d: str, statuses: dict) -> Path:
+        """A fixture tree the lint can walk: one artefact per (id, status), every selector
+        distinct so no duplicate group forms. Shapes: `stacked` (two Verify lines under one criterion), `single`
+        (one each, one a code-backed grep), `prose` (one grep over a markdown file)."""
+        root = Path(d)
+        (root / "sdlc-studio" / "stories").mkdir(parents=True)
+        (root / "sdlc-studio" / "bugs").mkdir(parents=True)
+        (root / "src").mkdir(); (root / "src" / "thing.py").write_text("x = 1\n", encoding="utf-8")
+        n = 0
+        for uid, (status, shape) in statuses.items():
+            n += 1
+            sub = "stories" if uid.startswith("US") else "bugs"
+            if shape == "stacked":
+                acs = (f"### AC1: two checks\n\n- **Verify:** pytest a/b.py::C::t_{n}_one\n"
+                       f"- **Verify:** pytest a/b.py::C::t_{n}_two\n")
+            elif shape == "prose":
+                acs = f"### AC1: prose evidence\n\n- **Verify:** grep x sdlc-studio/{sub}/{uid}-fixture.md\n"
+            else:
+                acs = (f"### AC1: one check\n\n- **Verify:** pytest a/b.py::C::t_{n}_one\n\n"
+                       f"### AC2: code-backed evidence\n\n- **Verify:** grep x src/thing.py\n")
+            (root / "sdlc-studio" / sub / f"{uid}-fixture.md").write_text(
+                f"# {uid}: fixture\n\n> **Status:** {status}\n\n## Acceptance Criteria\n\n{acs}",
+                encoding="utf-8")
+        return root
+
+    def _bg0603_lint(self, root: Path):
+        """The shipped lint over stories and bugs, as a subprocess."""
+        import subprocess  # noqa: PLC0415
+        return subprocess.run(
+            [sys.executable, str(self._SCRIPTS / "verify_ac.py"), "lint", "--bugs",
+             "--root", str(root)],
+            capture_output=True, text=True, timeout=900, check=False)
+
+    def test_stacked_verifiers_are_refused_at_open(self) -> None:
+        """BG0603 AC1. MUTANTS: (1) reintroduce the enumerated `{"draft", "ready"}` set in place
+        of the terminal check - today's code - so an Open bug is never linted; (2) reintroduce an
+        enumerated set naming `Open` capitalised while comparing the lowercased status, so it never
+        matches; (3) enumerate `open` and leave `in progress` out - the In Progress bug's line goes
+        missing."""
+        import tempfile  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as d:
+            root = self._bg0603_tree(d, {"BG0001": ("Open", "stacked"),
+                                         "BG0002": ("In Progress", "stacked")})
+            r = self._bg0603_lint(root)
+            out = r.stdout + r.stderr
+            self.assertNotEqual(0, r.returncode, out)
+            for name in ("BG0001-fixture.md AC1: REFUSED: 1 further",
+                         "BG0002-fixture.md AC1: REFUSED: 1 further"):
+                self.assertIn(name, out, f"the criterion was not refused by name:\n{out}")
+
+    def test_ready_still_refuses(self) -> None:
+        """BG0603 AC2. MUTANT: make the window `{"open"}` alone, so widening to Open moved the
+        rule off Ready."""
+        import tempfile  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as d:
+            # Two STORIES: Ready is not a bug status, and a bug at Ready would reach the
+            # unrecognised-status branch rather than the window (the review caught that).
+            root = self._bg0603_tree(d, {"US0001": ("Ready", "stacked"), "US0002": ("Ready", "stacked")})
+            r = self._bg0603_lint(root)
+            out = r.stdout + r.stderr
+            self.assertNotEqual(0, r.returncode, out)
+            self.assertIn("US0001-fixture.md AC1: REFUSED: 1 further", out)
+            self.assertIn("US0002-fixture.md AC1: REFUSED: 1 further", out)
+
+    def test_a_single_verifier_at_open_passes(self) -> None:
+        """BG0603 AC3, the paired control. MUTANTS: (1) `lint_stacked_verifiers` refuses every
+        block - the Open bug's exit 0 dies; (2) `lint_markdown_evidence` refuses every `grep` -
+        the code-backed grep dies; (3) `_still_authoring` returns True unconditionally - the FIXED bug's
+        stacked lines are refused, the terminal edge of "non-terminal"."""
+        import tempfile  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as d:
+            root = self._bg0603_tree(d, {"BG0001": ("Open", "single"),
+                                         "BG0002": ("Fixed", "stacked")})
+            r = self._bg0603_lint(root)
+            out = r.stdout + r.stderr
+            self.assertEqual(0, r.returncode, out)
+            self.assertNotIn("REFUSED", out, out)
+
+    def test_the_markdown_only_refusal_shares_the_window(self) -> None:
+        """BG0603 AC4. MUTANT: gate `lint_markdown_evidence` on the old `{"draft", "ready"}`
+        window while the stacked lint uses the new one - the Open bug's prose grep is no longer
+        refused."""
+        import tempfile  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as d:
+            root = self._bg0603_tree(d, {"BG0001": ("Open", "prose")})
+            r = self._bg0603_lint(root)
+            out = r.stdout + r.stderr
+            self.assertNotEqual(0, r.returncode, out)
+            self.assertIn("BG0001-fixture.md", out)
+            self.assertRegex(out, r"-> REFUSED: .*prose", out)
+
+    def test_a_decorated_terminal_status_is_exempt_and_an_unreadable_one_fails_closed(self) -> None:
+        """BG0603 AC5. MUTANTS: (1) pass the raw status to `is_terminal_status` without
+        canonicalising it - `Done (v5.0.1)` reads as non-terminal and the Done story is refused;
+        (2) return False for an unknown id prefix - the XX file is skipped; (3) return False for
+        an unrecognised status - the `Bananas` story is skipped."""
+        import subprocess, tempfile  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as d:
+            root = self._bg0603_tree(d, {"US0001": ("Done (v5.0.1)", "stacked"),
+                                         "US0002": ("Bananas", "stacked")})
+            (root / "sdlc-studio" / "stories" / "XX0001-fixture.md").write_text(
+                (root / "sdlc-studio" / "stories" / "US0002-fixture.md").read_text(encoding="utf-8")
+                .replace("US0002", "XX0001").replace("t_2_", "t_9_"), encoding="utf-8")
+            r = self._bg0603_lint(root)
+            out = r.stdout + r.stderr
+            self.assertNotIn("US0001-fixture.md AC1: REFUSED", out,
+                             "a decorated terminal status was read as non-terminal:\n" + out)
+            self.assertIn("US0002-fixture.md AC1: REFUSED: 1 further", out,
+                          "an unrecognised status did not fail closed:\n" + out)
+            # the unknown prefix is reachable only through --story (the walk yields US/BG alone)
+            xx = subprocess.run(
+                [sys.executable, str(self._SCRIPTS / "verify_ac.py"), "lint", "--root", str(root),
+                 "--story", str(root / "sdlc-studio" / "stories" / "XX0001-fixture.md")],
+                capture_output=True, text=True, timeout=900, check=False)
+            self.assertIn("XX0001-fixture.md AC1: REFUSED: 1 further", xx.stdout + xx.stderr,
+                          "an unknown id prefix did not fail closed:\n" + xx.stdout + xx.stderr)
+
+    def test_the_parser_records_the_dropped_verifiers_rather_than_discarding_them(self) -> None:
+        blocks = verify_ac.parse_story(
+            "### AC1: x\n\n- **Verify:** pytest a::t1\n- **Verify:** pytest a::t2\n"
+            "- **Verify:** pytest a::t3\n")
+        self.assertEqual(blocks[0].verifier, "pytest a::t1")
+        self.assertEqual(blocks[0].extra_verifiers, ["pytest a::t2", "pytest a::t3"])
+
+    def test_no_ac_block_in_the_workspace_stacks_verifiers(self) -> None:
+        """The census, over the live tree. Seven verifiers once sat here unexecuted - four on
+        stories at Done, two of them counted inside a published claim of 84 criteria verified.
+        `run` now executes them (BG0687), but a stamp or conformance check still reads the first
+        line alone, so this workspace keeps one check per criterion."""
+        if not workspace.in_dev_repo():
+            self.skipTest("census applies to the dev repo's own workspace")
+        root = Path(__file__).resolve().parents[5]
+        offenders = []
+        for sub in ("stories", "bugs"):
+            d = root / "sdlc-studio" / sub
+            if not d.is_dir():
+                continue
+            for f in sorted(d.glob("*.md")):
+                for b in verify_ac.parse_story(sdlc_md.read_text_safe(f)):
+                    if b.extra_verifiers:
+                        offenders.append(f"{f.name} {b.ac_id} (+{len(b.extra_verifiers)})")
+        self.assertEqual(offenders, [], "AC blocks stacking verifiers the stamp and conformance checks never read")
+
+
+class StampResolutionTests(unittest.TestCase):
+    """BG0256: a stamp is evidence only while the thing it points at still exists."""
+
+    TESTFILE = ".claude/skills/sdlc-studio/scripts/tests/test_critic.py"
+    SELF_FILE = ".claude/skills/sdlc-studio/scripts/tests/test_verify_ac.py"
+    LIVE = "test_neutral_text_reports_no_violations"
+
+    def _story(self, tmp: Path, verifier: str, stamped: str = "yes") -> Path:
+        d = tmp / "sdlc-studio" / "stories"
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / "US9001-dead.md"
+        f.write_text(
+            "# US9001: a stamped criterion\n\n> **Status:** Done\n\n"
+            "## Acceptance Criteria\n\n### AC1: it holds\n\n"
+            f"- **Verify:** {verifier}\n- **Verified:** {stamped} (2026-07-20)\n")
+        return f
+
+    def test_a_recorded_green_whose_selector_selects_nothing_is_reported_stale(self) -> None:
+        """Both shapes, in one test so neither can carry the other: a `-k` pattern matching
+        nothing while its file still collects - the shape that produced this bug, and the one
+        a file-exists check passes - and a node address whose class is gone."""
+        root = Path(__file__).resolve().parents[5]
+        tmp = Path(tempfile.mkdtemp(prefix="verify_ac_stamp_"))
+        try:
+            for verifier in (f"pytest {self.TESTFILE} -k test_no_such_name_anywhere",
+                             f"pytest {self.TESTFILE}::NoSuchClass::test_gone"):
+                with self.subTest(verifier=verifier):
+                    f = self._story(tmp, verifier)
+                    rows = verify_ac.unresolvable_stamps(f, root)
+                    self.assertEqual([r["ac"] for r in rows], ["AC1"])
+                    # The reader must be told WHICH pointer died, not that the story changed.
+                    self.assertIn(verifier.split()[-1], rows[0]["verifier"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_resolving_selector_stays_green_and_no_test_body_is_executed(self) -> None:
+        """The negative control. Without it the fix is indistinguishable from marking every
+        stamp stale, which is the same defect with the sign flipped. Resolution is decided by
+        COLLECTION: the check must answer without running the test it names."""
+        root = Path(__file__).resolve().parents[5]
+        tmp = Path(tempfile.mkdtemp(prefix="verify_ac_live_"))
+        try:
+            f = self._story(tmp, f"pytest {self.TESTFILE} -k {self.LIVE}")
+            self.assertEqual(verify_ac.unresolvable_stamps(f, root), [])
+            # No test BODY runs: every subprocess this check spawns is a --collect-only
+            # call. Clear the file cache first so a call is actually made to observe.
+            verify_ac._COLLECT_CACHE.clear()
+            calls = []
+            real = verify_ac.subprocess.run
+
+            def spy(cmd, *a, **kw):
+                calls.append(cmd)
+                return real(cmd, *a, **kw)
+
+            verify_ac.subprocess.run = spy
+            try:
+                self.assertIs(verify_ac.selector_resolves(
+                    f"pytest {self.TESTFILE} -k {self.LIVE}", root), True)
+            finally:
+                verify_ac.subprocess.run = real
+            self.assertTrue(calls, "no collection was performed")
+            for cmd in calls:
+                self.assertIn("--collect-only", cmd)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_an_unanswerable_verifier_is_not_reported_as_dead_and_costs_no_subprocess(self) -> None:
+        """None, not False: a `manual`/`grep`/`shell` selector cannot be collected, and
+        calling it unresolvable would mark every non-pytest stamp stale.
+
+        The subprocess assertion is the load-bearing half. Deleting the verb guard still
+        returned None for all three - but only by luck downstream (`which("manual")` misses,
+        `rg` chokes on `--collect-only`), which meant the guard could be removed with every
+        test green while the check started shelling out for verifiers it cannot answer."""
+        verify_ac._COLLECT_CACHE.clear()
+        real = verify_ac.subprocess.run
+        calls = []
+        verify_ac.subprocess.run = lambda cmd, *a, **kw: calls.append(cmd)
+        try:
+            for expr in ("manual the operator confirms it",
+                         'grep "x" .claude/skills/sdlc-studio/scripts/verify_ac.py',
+                         "shell scripts/gate.py --check"):
+                with self.subTest(expr=expr):
+                    self.assertIsNone(verify_ac.selector_resolves(expr, "."))
+        finally:
+            verify_ac.subprocess.run = real
+        self.assertEqual(calls, [], "an unanswerable verifier shelled out anyway")
+
+    def test_an_unstamped_ac_with_a_dead_selector_is_not_reported(self) -> None:
+        # An unstamped AC claims nothing, so a dead selector there is the author's business
+        # at the next run - not a false green on disk, which is what this bug is about.
+        root = Path(__file__).resolve().parents[5]
+        tmp = Path(tempfile.mkdtemp(prefix="verify_ac_unstamped_"))
+        try:
+            f = self._story(tmp, f"pytest {self.TESTFILE} -k test_no_such_name", stamped="no")
+            self.assertEqual(verify_ac.unresolvable_stamps(f, root), [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+    def test_resolution_is_answered_in_process_against_a_cached_file_collection(self) -> None:
+        """The regression fix: one collection per FILE, not per AC. A node address, a class
+        prefix, and a -k boolean are all resolved against the same cached node list, so a
+        second selector into the same file spawns no further subprocess."""
+        root = Path(__file__).resolve().parents[5]
+        verify_ac._COLLECT_CACHE.clear()
+        tf = self.TESTFILE
+        # An exact node address that exists in this very file resolves True; its class prefix
+        # also resolves True; a bogus method under a real class resolves False.
+        me = "%s::StampResolutionTests::test_a_k_boolean_expression_resolves_without_pytests_engine" % self.SELF_FILE
+        self.assertIs(verify_ac.selector_resolves(f"pytest {me}", root), True)
+        self.assertIs(verify_ac.selector_resolves(
+            f"pytest {self.SELF_FILE}::StampResolutionTests", root), True)
+        self.assertIs(verify_ac.selector_resolves(
+            f"pytest {self.SELF_FILE}::StampResolutionTests::test_gone_forever", root), False)
+        calls = []
+        real = verify_ac.subprocess.run
+        verify_ac.subprocess.run = lambda *a, **k: (calls.append(a), real(*a, **k))[1]
+        try:
+            live = verify_ac.selector_resolves(f"pytest {tf} -k {self.LIVE}", root)
+            # second selector, same file - must hit the cache, no new subprocess
+            before = len(calls)
+            other = verify_ac.selector_resolves(f"pytest {tf} -k no_such_test_name_at_all", root)
+        finally:
+            verify_ac.subprocess.run = real
+        self.assertIs(live, True)
+        self.assertIs(other, False)
+        self.assertEqual(len(calls), before, "a repeated file target re-collected instead of using the cache")
+
+    def test_a_k_boolean_expression_resolves_without_pytests_engine(self) -> None:
+        nodes = ["t.py::test_alpha_one", "t.py::test_beta_two"]
+        self.assertTrue(verify_ac._k_selects("alpha", nodes))
+        self.assertTrue(verify_ac._k_selects("alpha or gamma", nodes))
+        self.assertFalse(verify_ac._k_selects("alpha and gamma", nodes))
+        self.assertTrue(verify_ac._k_selects("not gamma", nodes))
+        self.assertFalse(verify_ac._k_selects("gamma", nodes))
+
+    def test_the_command_exits_non_zero_on_a_story_whose_stamped_verifier_cannot_resolve(self) -> None:
+        root = Path(__file__).resolve().parents[5]
+        tmp = Path(tempfile.mkdtemp(prefix="verify_ac_cmd_"))
+        try:
+            dead = self._story(tmp, f"pytest {self.TESTFILE} -k test_no_such_name_anywhere")
+            args = argparse.Namespace(root=str(root), dir="sdlc-studio/stories",
+                                      story=str(dead), bugs=False, repo_root=None)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                rc = verify_ac.cmd_stamps(args)
+            self.assertEqual(rc, 1)
+            out = buf.getvalue()
+            self.assertIn("US9001", out)
+            self.assertIn("AC1", out)
+            self.assertIn("test_no_such_name_anywhere", out)
+
+            live = self._story(tmp, f"pytest {self.TESTFILE} -k {self.LIVE}")
+            args.story = str(live)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(verify_ac.cmd_stamps(args), 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class _FakeCollectionServer:
+    """Stands in for `verify_ac.CollectionServer`: answers each file from `answers`, stores the
+    answer under the key `_collect_nodes` reads, and logs the file."""
+
+    def __init__(self, cwd, answers, log, barrier=None) -> None:
+        self.cwd, self.answers, self.log, self.barrier = cwd, answers, log, barrier
+        self.closed = False
+
+    def collect(self, test_file):
+        if self.barrier is not None:
+            self.barrier.wait()
+        self.log.append(test_file)
+        nodes = self.answers.get(test_file, [])
+        verify_ac._COLLECT_CACHE[(test_file, str(self.cwd))] = nodes
+        return nodes
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@unittest.skipUnless(shutil.which("pytest"), "stamps resolves only pytest selectors")
+class StampsCollectSideBySideTests(unittest.TestCase):
+    """BG1187: `stamps` collects each stamped file once, side by side, while it judges them, and
+    still names each dead stamp and exits 1."""
+
+    def setUp(self) -> None:
+        verify_ac._COLLECT_CACHE.clear()
+        self.addCleanup(verify_ac._COLLECT_CACHE.clear)
+        self.root = Path(tempfile.mkdtemp(prefix="verify_ac_bg1187_"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def _unit(self, folder: str, name: str, acs: list[tuple[str, str]]) -> None:
+        d = self.root / "sdlc-studio" / folder
+        d.mkdir(parents=True, exist_ok=True)
+        body = f"# {name.split('-')[0]}: x\n\n> **Status:** Done\n\n## Acceptance Criteria\n\n"
+        for i, (verifier, stamped) in enumerate(acs, 1):
+            body += f"### AC{i}: a\n\n- **Verify:** {verifier}\n- **Verified:** {stamped}\n\n"
+        (d / name).write_text(body, encoding="utf-8")
+
+    def _stamps(self, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = verify_ac.main(["stamps", *extra, "--root", str(self.root)])
+        return rc, out.getvalue(), err.getvalue()
+
+    def _fakes(self, answers, barrier=None):
+        log, started = [], []
+
+        def start(cwd):
+            server = _FakeCollectionServer(cwd, answers, log, barrier)
+            started.append(server)
+            return server
+        return log, started, start
+
+    def test_each_stamped_file_is_collected_once_by_the_servers_before_it_is_judged(self) -> None:
+        """MUTANTS: queue nothing from `cmd_stamps`; queue a file already queued, or the held
+        file again (a file collected twice); drop the `yes` filter (an unstamped criterion's
+        file collected); drop the `_k_term_files` files (the second file of an or-joined `-k`
+        left to a fresh collection); servers started for another directory; stop no server."""
+        self._unit("stories", "US9101-a.md", [
+            ("pytest t/test_a.py::test_live", "yes"),
+            ("pytest t/test_a.py::test_gone", "yes"),
+            ("pytest t/test_b.py -k alpha", "yes"),
+            ("pytest t/test_unstamped.py::test_x", "no"),
+            ("manual check", "yes")])
+        self._unit("bugs", "BG9101-b.md", [
+            ("pytest t/test_c.py t/test_d.py -k \"alpha or beta\"", "yes")])
+        answers = {"t/test_a.py": ["t/test_a.py::test_live"],
+                   "t/test_b.py": ["t/test_b.py::test_alpha"],
+                   "t/test_c.py": ["t/test_c.py::test_alpha"],
+                   "t/test_d.py": ["t/test_d.py::test_beta"]}
+        log, started, start = self._fakes(answers)
+        fresh = []
+        with unittest.mock.patch.object(verify_ac.CollectionServer, "start", start), \
+             unittest.mock.patch.object(verify_ac, "_collect_fresh",
+                                        lambda f, cwd=None: fresh.append(f) or []):
+            rc, out, err = self._stamps("--bugs")
+        self.assertEqual(sorted(log), sorted(answers), log)
+        self.assertEqual(fresh, [], "a file the servers answered was collected again")
+        self.assertTrue(started and all(s.closed for s in started), "a server was left running")
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("US9101 AC2: stamped verified, but its verifier selects nothing", out)
+        self.assertNotIn("AC1", out)
+        self.assertNotIn("AC3", out)
+        self.assertNotIn("BG9101", out)
+
+    @staticmethod
+    def _no_fresh(test_file, cwd=None):
+        raise AssertionError(f"{test_file} was collected outside the servers")
+
+    def _side_by_side(self, files, start, fresh=None):
+        """Submit `files`, wait for every queued collection, then close. `close` drops a
+        collection no worker has begun, so without the wait the test would judge how soon a
+        worker thread starts rather than what is collected (BG1223)."""
+        collections = verify_ac._SideBySideCollection(self.root)
+        with unittest.mock.patch.object(verify_ac.CollectionServer, "start", start), \
+             unittest.mock.patch.object(verify_ac, "_collect_fresh", fresh or self._no_fresh):
+            try:
+                for f in files:
+                    collections.submit(f)
+                concurrent.futures.wait(list(verify_ac._COLLECT_PENDING.values()))
+            finally:
+                collections.close()
+
+    def test_the_collections_run_side_by_side(self) -> None:
+        """MUTANT: one worker, or `max_workers=1`: two collections that each wait for the other
+        then never meet, the barrier breaks, and neither file is cached."""
+        if (os.cpu_count() or 1) < 2:
+            self.skipTest("needs two cores")
+        barrier = threading.Barrier(2, timeout=10)
+        _log, started, start = self._fakes({"a.py": ["a.py::t"], "b.py": ["b.py::t"]}, barrier)
+        self._side_by_side(["a.py", "b.py"], start)
+        key = str(self.root)
+        self.assertEqual(verify_ac._COLLECT_CACHE.get(("a.py", key)), ["a.py::t"])
+        self.assertEqual(verify_ac._COLLECT_CACHE.get(("b.py", key)), ["b.py::t"])
+        self.assertTrue(started and all(s.closed for s in started), "a server was left running")
+        self.assertEqual(verify_ac._COLLECT_PENDING, {}, "close left queued files behind")
+
+    def test_a_read_of_a_queued_file_waits_for_its_collection(self) -> None:
+        """MUTANT: drop the wait on `_COLLECT_PENDING` from `_collect_nodes`: the read finds no
+        answer yet and collects the file again in a process of its own."""
+        log, _started, start = self._fakes({"a.py": ["a.py::t"], "b.py": ["b.py::t"]})
+        slow = _FakeCollectionServer.collect
+
+        def collect(server, f):
+            time.sleep(0.5)
+            return slow(server, f)
+        fresh = []
+        collections = verify_ac._SideBySideCollection(self.root)
+        with unittest.mock.patch.object(_FakeCollectionServer, "collect", collect), \
+             unittest.mock.patch.object(verify_ac.CollectionServer, "start", start), \
+             unittest.mock.patch.object(verify_ac, "_collect_fresh",
+                                        lambda f, cwd=None: fresh.append(f) or []):
+            try:
+                collections.submit("a.py")
+                collections.submit("b.py")
+                got = verify_ac._collect_nodes("b.py", self.root)
+            finally:
+                collections.close()
+        self.assertEqual(got, ["b.py::t"])
+        self.assertEqual(fresh, [], "a queued file was collected again")
+
+    def test_with_no_server_each_file_gets_a_collection_of_its_own(self) -> None:
+        """MUTANTS: collect nothing when no server starts; send a lone file to a server; queue
+        a file already cached."""
+        verify_ac._COLLECT_CACHE[("cached.py", str(self.root))] = ["cached.py::t"]
+        fresh = []
+
+        def collect(f, cwd=None):
+            fresh.append(f)
+            return [f + "::t"]
+        self._side_by_side([f"{n}.py" for n in ("a", "b", "cached")], lambda cwd: None, collect)
+        self.assertEqual(sorted(fresh), ["a.py", "b.py"])
+        self.assertEqual(verify_ac._COLLECT_CACHE[("b.py", str(self.root))], ["b.py::t"])
+        started = []
+        self._side_by_side(["lone.py", "a.py"], lambda cwd: started.append(cwd))
+        self.assertEqual(started, [], "one uncached file was sent to a server")
+        self.assertNotIn(("lone.py", str(self.root)), verify_ac._COLLECT_CACHE)
+
+    def test_with_every_collection_begun_late_each_file_is_still_collected(self) -> None:
+        """BG1223: every worker thread waits 0.5 s before it takes a collection. The control:
+        closed at once, `close` drops both queued files, as documented, and nothing is collected. The no-server test above then passes under the same delay. MUTANT:
+        drop `_side_by_side`'s wait on `_COLLECT_PENDING`, so close collects nothing and the
+        no-server test reads [] against ['a.py', 'b.py']."""
+        real = concurrent.futures.thread._worker
+
+        def late(*args, **kwargs):
+            time.sleep(0.5)
+            return real(*args, **kwargs)
+        fresh = []
+        with unittest.mock.patch.object(concurrent.futures.thread, "_worker", late):
+            collections = verify_ac._SideBySideCollection(self.root)
+            with unittest.mock.patch.object(verify_ac.CollectionServer, "start", lambda cwd: None), \
+                 unittest.mock.patch.object(verify_ac, "_collect_fresh",
+                                            lambda f, cwd=None: fresh.append(f) or [f + "::t"]):
+                collections.submit("a.py")
+                collections.submit("b.py")
+                collections.close()
+            self.assertEqual(fresh, [], "a worker took a file before close: the delay is not in force")
+            self.test_with_no_server_each_file_gets_a_collection_of_its_own()
+
+    def test_close_waits_for_every_collection_begun(self) -> None:
+        """BG1223: `_side_by_side` waits before close, so this pins close's own wait. Both
+        collections have begun when close is called, and each takes 0.2 s more. MUTANT:
+        `shutdown(wait=False)` in `close`, so close collects nothing: it returns before either
+        collection ends."""
+        if (os.cpu_count() or 1) < 2:
+            self.skipTest("needs two cores")
+        barrier, fresh = threading.Barrier(3, timeout=10), []
+
+        def collect(f, cwd=None):
+            barrier.wait()
+            time.sleep(0.2)
+            fresh.append(f)
+            return [f + "::t"]
+        collections = verify_ac._SideBySideCollection(self.root)
+        with unittest.mock.patch.object(verify_ac.CollectionServer, "start", lambda cwd: None), \
+             unittest.mock.patch.object(verify_ac, "_collect_fresh", collect):
+            try:
+                collections.submit("a.py")
+                collections.submit("b.py")
+                barrier.wait()
+            finally:
+                collections.close()
+        self.assertEqual(sorted(fresh), ["a.py", "b.py"], "close returned before a begun collection ended")
+
+    def test_a_real_server_run_still_names_each_dead_stamp_and_exits_one(self) -> None:
+        """AC1's refusal through real `CollectionServer`s and real pytest, with the positive
+        control: repoint the dead stamp and the same tree exits 0. MUTANT: start the servers for
+        another directory, so their answers miss the key the check reads and every file is
+        collected again by `_collect_fresh`."""
+        probe = verify_ac.CollectionServer.start(self.root)
+        if probe is None:
+            self.skipTest("no fork, or a pytest no CollectionServer can run")
+        probe.close()
+        t = self.root / "t"
+        t.mkdir()
+        (t / "test_one.py").write_text("def test_live():\n    pass\n", encoding="utf-8")
+        (t / "test_two.py").write_text("def test_other():\n    pass\n", encoding="utf-8")
+        self._unit("stories", "US9102-a.md", [("pytest t/test_one.py::test_live", "yes"),
+                                               ("pytest t/test_two.py::test_renamed", "yes")])
+        fresh, real = [], verify_ac._collect_fresh
+        with unittest.mock.patch.object(verify_ac, "_collect_fresh",
+                                        lambda f, cwd=None: fresh.append(f) or real(f, cwd)):
+            rc, out, err = self._stamps()
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("US9102 AC2: stamped verified, but its verifier selects nothing", out)
+        self.assertIn("t/test_two.py::test_renamed", out)
+        self.assertNotIn("AC1", out)
+        self.assertIn("1 stamped AC(s) resting on a selector that resolves to nothing", err)
+        self.assertEqual(fresh, [], "the servers' answers missed the key the check reads")
+        verify_ac._COLLECT_CACHE.clear()
+        self._unit("stories", "US9102-a.md", [("pytest t/test_one.py::test_live", "yes"),
+                                               ("pytest t/test_two.py::test_other", "yes")])
+        rc, out, err = self._stamps()
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("1 file(s) checked, every stamped verifier still resolves", out)
+
+
+class FenceInfoStringTests(unittest.TestCase):
+    """A closing fence may be followed only by spaces (CommonMark 4.5). Treating an info-string
+    line as a closer released the block early and turned the illustration beneath it into a LIVE
+    shell verifier - the same harm the four-backtick case had, by a different route."""
+
+    def _first_verifier(self, body):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "US9999-x.md"
+            p.write_text("# US9999: x\n\n## Acceptance Criteria\n\n### AC1: a\n\n" + body,
+                         encoding="utf-8")
+            blocks = verify_ac.parse_story(p.read_text(encoding="utf-8"))
+            return blocks[0].verifier if blocks else None
+
+    def test_an_info_string_line_does_not_close_a_fence(self):
+        v = self._first_verifier(
+            "```\nA story looks like this:\n```markdown\n"
+            "- **Verify:** shell echo INJECTED\n```\n")
+        self.assertIsNone(v, "an illustration inside a fenced block must never become a verifier")
+
+    def test_a_tilde_info_string_line_does_not_close_a_fence(self):
+        v = self._first_verifier(
+            "~~~\nexample:\n~~~text\n- **Verify:** shell echo INJECTED\n~~~\n")
+        self.assertIsNone(v)
+
+    def test_a_bare_closer_still_closes_so_a_real_verify_after_it_parses(self):
+        v = self._first_verifier(
+            "```\nillustration\n```\n- **Verify:** shell true\n")
+        self.assertEqual(v, "shell true",
+                         "the fix must not swallow a genuine Verify line after a real closer")
+
+    def test_a_closer_with_trailing_spaces_still_closes(self):
+        v = self._first_verifier("```\nx\n```   \n- **Verify:** shell true\n")
+        self.assertEqual(v, "shell true")
+
+
+class BaselineSchemaTests(unittest.TestCase):
+    """The grouping key of a shared selector. The class kept its name when US0897 deleted the
+    verify-lint baseline it was written for, because a stamped criterion names the node below."""
+
+    def test_a_case_only_twin_of_a_selector_is_one_group_not_two_of_one(self) -> None:
+        """MUTANT: `dup_group_key` stops lowercasing the verb.
+
+        The DSL lowercases the verb before dispatch, so `PyTest x` and `pytest x` run the
+        IDENTICAL command. Grouped case-sensitively they were a group of ONE under each spelling,
+        so `len(acs) > 1` never fired and the pair was reported as no duplicate at all.
+        """
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        story = Path(td.name) / "US0001-x.md"
+        story.write_text(
+            "# US0001: x\n\n> **Status:** Ready\n\n## Acceptance Criteria\n\n"
+            "### AC1\n- **Verify:** pytest tests/test_x.py::T::t\n\n"
+            "### AC2\n- **Verify:** PyTest tests/test_x.py::T::t\n", encoding="utf-8")
+        found = verify_ac.duplicate_verifiers([story])
+        self.assertEqual(1, len(found),
+                         f"a case-only twin was not grouped with the selector it duplicates: "
+                         f"{found}")
+        self.assertEqual(2, len(found[0]["acs"]))
+
+class EmptyParseIsRefusedTests(unittest.TestCase):
+    """BG0530: `verify_ac run` reported a clean pass over criteria it never read.
+
+    311 of 534 bug files printed `ac=0 pass=0 fail=0`, exit 0 - a line byte-comparable to a
+    clean pass - and 74% of everything filed since BG0500. Nothing detected the drift between
+    the writer and the parser because the failure mode WAS exit 0.
+    """
+
+    def _unit(self, root: Path, body: str, name: str = "BG9001-x.md") -> Path:
+        d = root / "sdlc-studio" / "bugs"
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / name
+        f.write_text(body, encoding="utf-8")
+        return f
+
+    HEAD = "# BG9001: a bug\n\n> **Status:** Open\n> **Severity:** Medium\n\n"
+
+    def _run(self, root: Path, unit: str = "BG9001"):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = verify_ac.main(["run", "--id", unit, "--root", str(root), "--dry-run"])
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_a_section_that_parses_to_nothing_is_refused_through_the_cli(self) -> None:
+        """Driven as a COMMAND, not a library call - the exit code is the whole finding.
+
+        Mutant: delete the non-zero exit on a zero criterion count, which is the state 75 bug
+        files are in today and which printed a line indistinguishable from a pass.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root, self.HEAD + "## Acceptance Criteria\n\n"
+                             "- [ ] it behaves, written in a shape this parser cannot read\n")
+            rc, text = self._run(root)
+            self.assertNotEqual(rc, 0, "an unreadable criteria section reported a clean pass")
+            self.assertIn("REFUSED", text)
+            self.assertIn("executed nothing", text)
+
+    def test_absent_and_unparseable_are_different_events(self) -> None:
+        """They have different fixes, so one message for both sends the reader to the wrong one.
+        232 filed findings never claimed a verifier and nothing else in the tree refuses them.
+
+        Mutant: return one identical message for both - this reddens on the distinction.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root, self.HEAD + "## Summary\n\nno criteria section at all\n")
+            rc_absent, absent = self._run(root)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root, self.HEAD + "## Acceptance Criteria\n\n- [ ] unreadable shape\n")
+            rc_unread, unread = self._run(root)
+        self.assertNotEqual(rc_unread, 0, "an unreadable section was not refused")
+        self.assertEqual(rc_absent, 0,
+                         "a unit that never claimed a verifier was refused - 232 filed findings "
+                         "would start failing and the refusal becomes noise")
+        self.assertIn("REFUSED", unread)
+        self.assertNotIn("REFUSED", absent)
+
+    def test_criteria_with_no_verifiers_are_not_a_pass(self) -> None:
+        """THE CASE THAT WOULD SURVIVE THIS FIX, named by a seat at plan review. 36 bug files
+        parse to criteria carrying no `Verify:` line at all - `ac=N pass=0 unspecified=N`, exit
+        0 - and widening the parser MOVES the unreadable ones into that same bucket, converting
+        a would-be refusal into a silent pass while the headline count improves.
+
+        Mutant: return 0 when every parsed criterion is unspecified - the fix reproduces the
+        defect it repairs, in a different costume.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root, self.HEAD + "## Acceptance Criteria\n\n"
+                             "### AC1: it behaves\n\n- **Then** it behaves\n")
+            rc, text = self._run(root)
+            self.assertNotEqual(rc, 0, "criteria carrying no verifier reported a pass")
+            self.assertIn("NONE carries", text)
+
+    def test_a_well_formed_unit_still_passes(self) -> None:
+        """THE POSITIVE CONTROL. `verify_ac` sits in the per-commit lane, so a refusal wired
+        unconditionally satisfies every criterion above and stops every commit in every
+        consuming project.
+
+        Mutant: return the refusal for every unit regardless of what parsed - this reddens alone.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root, self.HEAD + "## Acceptance Criteria\n\n"
+                             "### AC1: it behaves\n\n- **Then** it behaves\n"
+                             "- **Verify:** shell true\n")
+            rc, text = self._run(root)
+            self.assertEqual(rc, 0, f"a well-formed unit was refused: {text}")
+            self.assertNotIn("REFUSED", text)
+
+    def test_the_corpus_scan_reports_three_distinct_states(self) -> None:
+        """The counting routine SHIPS, so the before and after figures of any fix come from the
+        same code rather than a script somebody wrote once and threw away.
+
+        Mutant: collapse the three counts into one total - the three states become
+        indistinguishable and the vacuous one hides inside an improving number.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._unit(root, self.HEAD + "## Summary\n\nnothing\n", "BG9001-a.md")
+            self._unit(root, self.HEAD + "## Acceptance Criteria\n\n- [ ] unreadable\n",
+                       "BG9002-b.md")
+            self._unit(root, self.HEAD + "## Acceptance Criteria\n\n### AC1: x\n\n"
+                             "- **Then** x\n", "BG9003-c.md")
+            self._unit(root, self.HEAD + "## Acceptance Criteria\n\n### AC1: x\n\n"
+                             "- **Then** x\n- **Verify:** shell true\n", "BG9004-d.md")
+            res = verify_ac.corpus_scan(root, "bugs")
+            self.assertEqual(
+                (res["no_section"], res["unreadable"], res["no_verifier"], res["ok"]),
+                (1, 1, 1, 1),
+                f"the three blind states are not counted apart: {res}")
+
+
+class LaneCheckTests(unittest.TestCase):
+    """A criterion verified only through the library is not evidence the feature ships.
+
+    US0577 shipped `brief_fingerprint` with a passing acceptance test and a feature that did
+    not work: the test computed it in-process while the CLI never called it. The wiring is
+    exactly what a library test does not exercise, and it is where this defect class lives.
+    """
+
+    def _fixture(self, d, verifier_body: str, verify_line: str):
+        root = Path(d)
+        (root / "scripts").mkdir(parents=True, exist_ok=True)
+        (root / "tests").mkdir(parents=True, exist_ok=True)
+        (root / "sdlc-studio" / "stories").mkdir(parents=True, exist_ok=True)
+        # A CLI-BEARING script: both markers, so a library with a convenience runner and a
+        # parser with no entry point are both excluded.
+        (root / "scripts" / "thing.py").write_text(
+            "import argparse\n\ndef fingerprint(x):\n    return x\n\n"
+            "def main(argv=None):\n    argparse.ArgumentParser().parse_args(argv)\n    return 0\n",
+            encoding="utf-8")
+        (root / "tests" / "test_thing.py").write_text(verifier_body, encoding="utf-8")
+        story = root / "sdlc-studio" / "stories" / "US0001-x.md"
+        story.write_text(
+            "# US0001: a unit\n\n> **Status:** Review\n> **Points:** 3\n"
+            "> **Affects:** scripts/thing.py, tests/test_thing.py\n\n"
+            "## Acceptance Criteria\n\n### AC1: it behaves\n\n"
+            "- **Then** it behaves\n"
+            f"- **Verify:** {verify_line}\n", encoding="utf-8")
+        return root, story
+
+    def test_a_library_only_verifier_is_reported(self) -> None:
+        """MUTANT: return [] from lane_check, or drop the `_enters_the_lane` test."""
+        mod = verify_ac
+        with tempfile.TemporaryDirectory() as d:
+            root, story = self._fixture(
+                d,
+                "import thing\n\ndef test_it():\n    assert thing.fingerprint('a') == 'a'\n",
+                "pytest tests/test_thing.py")
+            found = mod.lane_check(root, [story])
+        self.assertEqual(1, len(found), f"the library-only verifier was not reported: {found}")
+        self.assertIn("scripts/thing.py", found[0]["cli"])
+
+    def test_a_cli_verifier_is_clean(self) -> None:
+        """The control. MUTANT: report every criterion.
+
+        A check that flags everything discriminates no better than one that flags nothing, and
+        would be switched off on a gate already over its ceiling.
+        """
+        mod = verify_ac
+        with tempfile.TemporaryDirectory() as d:
+            root, story = self._fixture(
+                d,
+                "import thing\n\ndef test_it():\n    assert thing.main([]) == 0\n",
+                "pytest tests/test_thing.py")
+            found = mod.lane_check(root, [story])
+        self.assertEqual([], found, f"a verifier that enters the entry point was reported: {found}")
+
+    def test_detection_is_by_execution_not_by_name(self) -> None:
+        """MUTANT: decide from the test's NAME rather than its source.
+
+        A naming convention is satisfied by a rename. This test's name says `cli` while its
+        body never enters the lane, so a name-based detector reports it clean and this fails.
+        """
+        mod = verify_ac
+        with tempfile.TemporaryDirectory() as d:
+            root, story = self._fixture(
+                d,
+                "import thing\n\ndef test_the_cli_entry_point_works():\n"
+                "    assert thing.fingerprint('a') == 'a'\n",
+                "pytest tests/test_thing.py")
+            found = mod.lane_check(root, [story])
+        self.assertEqual(1, len(found),
+                         "a test named for the CLI but never entering it was reported clean")
+
+    def test_a_unit_touching_no_cli_is_not_reported(self) -> None:
+        """MUTANT: report every unit regardless of what it touches.
+
+        A pure-library or docs unit has no entry point to enter, so the question does not
+        arise - flagging it would be noise on units that cannot act on it.
+        """
+        mod = verify_ac
+        with tempfile.TemporaryDirectory() as d:
+            root, story = self._fixture(
+                d,
+                "import thing\n\ndef test_it():\n    assert thing.fingerprint('a') == 'a'\n",
+                "pytest tests/test_thing.py")
+            (root / "scripts" / "thing.py").write_text(
+                "def fingerprint(x):\n    return x\n", encoding="utf-8")  # no CLI now
+            found = mod.lane_check(root, [story])
+        self.assertEqual([], found, "a unit touching no CLI-bearing script was reported")
+
+
+    def test_entry_made_through_a_shared_test_helper_is_credited(self) -> None:
+        """BG0487. MUTANT: judge the scoped node's own source only.
+
+        A class that shells the CLI once in a `_run` helper and calls `self._run(...)` from
+        every method is a correct and common shape - it is the shape used by this repo's own
+        `SwapTests` and `AddEpicTests`. Scoping to the node alone reports it as never entering
+        the lane, which is a detector telling tested work it is untested. It fired on three
+        units the sprint that shipped it had delivered.
+        """
+        mod = verify_ac
+        with tempfile.TemporaryDirectory() as d:
+            root, story = self._fixture(
+                d,
+                "import thing\n\n\nclass T:\n"
+                "    def _run(self, *a):\n        return thing.main(list(a))\n\n"
+                "    def test_it(self):\n        assert self._run() == 0\n",
+                "pytest tests/test_thing.py::T::test_it")
+            found = mod.lane_check(root, [story])
+        self.assertEqual([], found,
+                         f"entry made through a shared helper was reported as no entry: {found}")
+
+    def test_helper_resolution_is_one_level_and_does_not_credit_the_whole_file(self) -> None:
+        """MUTANT: fall back to whole-file matching when the node shows no entry.
+
+        This is the failure the scoping fixed in the first place - whole-file matching reported
+        0 findings over 615 units, because one `main([...])` anywhere in a thousand-line module
+        marked every criterion in it clean. The helper the node calls must enter the lane; a
+        DIFFERENT helper elsewhere in the file entering it must not count.
+        """
+        mod = verify_ac
+        with tempfile.TemporaryDirectory() as d:
+            root, story = self._fixture(
+                d,
+                "import thing\n\n\nclass T:\n"
+                "    def _unrelated(self, *a):\n        return thing.main(list(a))\n\n"
+                "    def _lib(self, x):\n        return thing.fingerprint(x)\n\n"
+                "    def test_it(self):\n        assert self._lib('a') == 'a'\n",
+                "pytest tests/test_thing.py::T::test_it")
+            found = mod.lane_check(root, [story])
+        self.assertEqual(1, len(found),
+                         "an unrelated helper elsewhere in the file credited a library-only "
+                         "verifier - the fix restored whole-file permissiveness")
+
+    def test_a_library_only_method_beside_lane_entering_ones_is_still_reported(self) -> None:
+        """The shape the BG0487 repair could plausibly have hidden. MUTANT: credit the class.
+
+        Distinct from the plain library-only case: here the class DOES enter the lane, from a
+        sibling test method, and only the criterion's own node does not. A repair that widened
+        from the node to the class would report this clean, and that is the original US0577
+        defect walking back in through the fix for its detector.
+        """
+        mod = verify_ac
+        with tempfile.TemporaryDirectory() as d:
+            root, story = self._fixture(
+                d,
+                "import thing\n\n\nclass T:\n"
+                "    def test_other(self):\n        assert thing.main([]) == 0\n\n"
+                "    def test_it(self):\n        assert thing.fingerprint('a') == 'a'\n",
+                "pytest tests/test_thing.py::T::test_it")
+            found = mod.lane_check(root, [story])
+        self.assertEqual(1, len(found),
+                         "a library-only criterion was cleared by a SIBLING method entering the "
+                         "lane - the original defect shape is no longer reported")
+
+
+class UnanswerableGroupTests(unittest.TestCase):
+    """US0637: the duplicate groups no collection can answer are named one by one.
+
+    A group whose selector `selector_resolves` answers None for - `manual`, `grep`, `shell`, an
+    absent runner - cannot be split into discriminating halves, because nothing can say what
+    either half selects. Those groups are genuinely exempt from the burn-down, and the reader
+    needs to see WHICH: a count cannot be taken apart, so an exemption that quietly stopped
+    being true is indistinguishable from one that still holds.
+    """
+
+    def _lint(self, root) -> str:
+        mod = verify_ac
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            mod.main(["lint", "--root", str(root)])
+        return out.getvalue() + err.getvalue()
+
+    def _story(self, root, sid, verifier, acs=2):
+        d = root / "sdlc-studio" / "stories"
+        d.mkdir(parents=True, exist_ok=True)
+        body = "".join(
+            f"\n### AC{i}: it behaves {i}\n\n- **Given** a thing\n- **When** it runs\n"
+            f"- **Then** it works\n- **Verify:** {verifier}\n" for i in range(1, acs + 1))
+        (d / f"{sid}-x.md").write_text(
+            f"# {sid}: a story\n\n> **Status:** Ready\n> **Epic:** EP0100\n> **Points:** 2\n"
+            f"\n## Acceptance Criteria\n{body}", encoding="utf-8")
+
+    def test_the_set_is_derived_from_the_resolver_at_lint_time(self) -> None:
+        """MUTANT: read the exempt set from a hard-coded list instead of calling the resolver.
+
+        Two groups, identical in shape, differing ONLY in whether their selector is resolvable.
+        A hard-coded list cannot tell them apart; the resolver can. That is the whole claim.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sdlc-studio").mkdir(parents=True)
+            self._story(root, "US0001", "shell npm run lint:links")
+            # THE DISCRIMINATING CASE, and it took two attempts to find. A missing pytest FILE
+            # is not unanswerable - the resolver answers False for it, which is `stale`, a
+            # different fact. What it answers None for is an ABSENT RUNNER: `jest` is not
+            # installed here, so the resolver cannot decide what the selector selects even
+            # though the verb reads as perfectly resolvable. Without a case like this the test
+            # passes against an implementation that just groups by verb, and the claim - that
+            # the set is DERIVED from the resolver - is unheld. A hard-coding mutant survived
+            # the first version for exactly that reason.
+            self._story(root, "US0005", "jest some/spec.test.js -t a thing")
+            # THE CASE A VERB HEURISTIC CANNOT REACH. `jest` above is outside `_COLLECTABLE`, so
+            # `head not in _COLLECTABLE` short-circuits before the absent-runner branch ever runs
+            # and "the resolver answered None" is operationally the same sentence as "the verb is
+            # not pytest" - which is why swapping the resolver for a verb comparison survived
+            # (BG0523). This selector's verb IS pytest, and the resolver still answers None: it
+            # names no file target, so no collection can decide what it selects.
+            self._story(root, "US0006", "pytest -k a_thing")
+            text = self._lint(root)
+        self.assertIn("unanswerable", text, "no unanswerable section was produced")
+        exempt = text.split("unanswerable", 1)[1]
+        self.assertIn("US0001", exempt,
+                      "the manual group was not derived as unanswerable")
+        self.assertIn("US0005", exempt,
+                      "a selector whose RUNNER is absent was not reported exempt - the set is "
+                      "being guessed from the verb rather than derived from the resolver")
+        self.assertIn("US0006", exempt,
+                      "a COLLECTABLE-verb selector the resolver cannot answer was not reported "
+                      "exempt - the set is a verb comparison wearing the resolver's name")
+
+    def test_each_member_is_named_with_its_verb_and_claimants(self) -> None:
+        """MUTANT: print a count of exempt groups instead of a line each.
+
+        Asserts the verb AND every claiming AC appear, because a reader who cannot see which
+        ACs claim a group cannot judge whether the exemption is still honest.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sdlc-studio").mkdir(parents=True)
+            self._story(root, "US0003", "shell npm run lint:links", acs=3)
+            text = self._lint(root)
+        exempt = text.split("unanswerable", 1)[1]
+        self.assertIn("[shell]", exempt, "the verb making it unanswerable is not named")
+        for ac in ("US0003 AC1", "US0003 AC2", "US0003 AC3"):
+            with self.subTest(ac=ac):
+                self.assertIn(ac, exempt, f"{ac} claims the group but is not named")
+
+    def test_the_resolver_and_a_verb_heuristic_disagree_and_the_report_follows_the_resolver(self):
+        """MUTANT: replace the `selector_resolves(...) is None` call in the lint with
+        `verb != "pytest"`.
+
+        The disagreement is asserted FIRST, as the premise: `pytest` is inside `_COLLECTABLE`,
+        so a verb heuristic calls this selector answerable, while the resolver answers None
+        because the selector names no file any collection could be run over. Every fixture the
+        set was previously derived over used a verb outside `_COLLECTABLE`, where the two
+        agree by construction - so the derivation claim was unpinned however the report read.
+        """
+        self.assertIn("pytest", verify_ac._COLLECTABLE,
+                      "the premise is gone: `pytest` is no longer a collectable verb, so this "
+                      "selector no longer separates the resolver from a verb comparison")
+        self.assertIsNone(verify_ac.selector_resolves("pytest -k a_thing"),
+                          "the resolver now answers a selector naming no file target, so this "
+                          "case no longer discriminates - find another and say why")
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sdlc-studio").mkdir(parents=True)
+            self._story(root, "US0007", "pytest -k a_thing")
+            text = self._lint(root)
+        self.assertIn("unanswerable", text, "no unanswerable section was produced")
+        splittable, exempt = text.split("unanswerable", 1)
+        self.assertIn("US0007", exempt,
+                      "a group the resolver cannot answer was not reported exempt")
+        self.assertNotIn("US0007", splittable,
+                         "the same group was also told to split into discriminating halves, so "
+                         "the report is following the verb rather than the resolver")
+
+    def test_an_unanswerable_group_is_not_also_reported_as_splittable(self) -> None:
+        """MUTANT: report every group in both places.
+
+        Telling an author to split a group that cannot be split is advice they cannot take, and
+        it is how a report stops being read.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sdlc-studio").mkdir(parents=True)
+            self._story(root, "US0004", "shell npm run lint:links")
+            text = self._lint(root)
+        splittable = text.split("unanswerable", 1)[0]
+        self.assertNotIn("US0004", splittable,
+                         "an unanswerable group was also told to split into discriminating halves")
+
+class LaneCheckScopeTests(unittest.TestCase):
+    """BG0491: the corpus sweep judged stories and silently omitted bugs."""
+
+    def test_the_lane_check_sweep_covers_bugs_not_only_stories(self) -> None:
+        """MUTANT: drop the `bugs/BG*.md` glob from `cmd_lane_check`, leaving stories only.
+
+        `--ids BG0487` then prints `0 unit(s)`, which is indistinguishable from a clean result
+        for a unit nothing looked at - and 487 bugs sit outside a figure CR0539 proposes making
+        blocking. Asserted on the SOURCE of the sweep rather than on a corpus count, because a
+        count moves with the corpus and would make this test a monitor rather than a check.
+        """
+        import inspect
+        src = inspect.getsource(verify_ac.cmd_lane_check)
+        self.assertIn('"bugs"', src,
+                      "the lane-check sweep must glob the bugs directory, not stories alone")
+        self.assertIn('BG*.md', src, "bugs are selected by their own id prefix")
+        # The control: stories are still swept. A fix that swapped one for the other would
+        # satisfy the assertions above while losing the half that already worked.
+        self.assertIn('US*.md', src, "stories must remain in scope")
+
+
+class ResolvedDuplicateKeyTests(unittest.TestCase):
+    """BG0486. The scan grouped on the written string, so two criteria naming the identical
+    run in different words formed a group of one under each spelling and were reported as no
+    duplicate at all - while two ACs sharing a selector cannot both discriminate, whichever way
+    each was typed."""
+
+    def test_dup_group_key_resolves_the_command_rather_than_the_spelling(self) -> None:
+        """AC1, the merges. MUTANT: return the written form again."""
+        for a, b in [("pytest x.py::T::t", "pytest -q x.py::T::t"),
+                     ("pytest -q -x a.py", "pytest -x -q a.py")]:
+            with self.subTest(f"{a} == {b}"):
+                self.assertEqual(verify_ac.dup_group_key(a), verify_ac.dup_group_key(b),
+                                 "one command written two ways did not group")
+
+    def test_two_different_selectors_are_not_merged(self) -> None:
+        """AC3, and the reason AC1 is not the whole story: a key that merged EVERYTHING would
+        satisfy the merges and destroy the guard. MUTANT: key on the runner alone."""
+        for a, b in [("pytest a.py", "pytest b.py"), ("pytest -k one a.py", "pytest -k two a.py")]:
+            with self.subTest(f"{a} != {b}"):
+                self.assertNotEqual(verify_ac.dup_group_key(a), verify_ac.dup_group_key(b),
+                                    "two genuinely different selectors were merged")
+
+    def test_dup_group_reports_the_written_form_not_the_resolved_key(self) -> None:
+        """AC2. Quoting a resolved argv back at an author names a line in nobody's file.
+        MUTANT: report the group key instead of the spelling."""
+        d = Path(tempfile.mkdtemp(prefix="dupwritten_"))
+        self.addCleanup(__import__("shutil").rmtree, d, ignore_errors=True)
+        f = d / "US9001-x.md"
+        f.write_text("# US9001: x\n\n> **Status:** Draft\n\n## Acceptance Criteria\n\n"
+                     "### AC1: a\n\n- **Verify:** pytest tests/t.py::T::t\n\n"
+                     "### AC2: b\n\n- **Verify:** pytest -q tests/t.py::T::t\n", encoding="utf-8")
+        groups = verify_ac.duplicate_verifiers([f])
+        self.assertEqual(1, len(groups), f"the two spellings did not group: {groups}")
+        # The LOWEST spelling, so the identity is deterministic - and whichever it is, it is a
+        # line that appears in the corpus, which the resolved key is not.
+        written = {"pytest tests/t.py::T::t", "pytest -q tests/t.py::T::t"}
+        self.assertIn(groups[0]["verifier"], written,
+                      "the group is reported as an internal key rather than a written line")
+        self.assertEqual(sorted(written),
+                         sorted([groups[0]["verifier"], *groups[0]["also_written"]]),
+                         "the other spelling in the group is not shown beside it")
+
+
+# -----------------------------------------------------------------------------
+# revert-check (US0671, US0672, US0673) and derived Verification depth (US0675)
+# -----------------------------------------------------------------------------
+
+_PROD_BASE = "BASE_ONLY = 1\n"
+_PROD_HEAD = 'BASE_ONLY = 1\nSHIPPED_MARKER = "SHIPPED_MARKER"\n'
+
+_REBUILT_TEST = '''\
+def _rebuild():
+    """A private helper holding its OWN copy of the production constant."""
+    return "SHIPPED_MARKER"
+
+
+def test_marker_is_present():
+    assert _rebuild() == "SHIPPED_MARKER"
+'''
+
+_REACHING_TEST = '''\
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+
+
+def test_marker_reaches_production():
+    import prod
+    assert prod.SHIPPED_MARKER == "SHIPPED_MARKER"
+'''
+
+
+import gitutil  # noqa: E402 - tests/ is on the path; the CONFINED git runner
+
+
+def _git(cwd, *args):
+    """Every fixture git call goes through the confined runner.
+
+    An inherited repo-locating variable redirects a fixture's git onto the surrounding
+    checkout - it emptied this repository's index once - and the pre-commit hook that runs
+    this suite exports them.
+    """
+    gitutil.git(args, cwd)
+
+
+class _RevertRepo:
+    """A REAL git repository holding one unit, its production file and its verifiers.
+
+    Real git and real files rather than an injected reader, because the whole subject is what
+    happens to bytes on disk while the check runs. A stubbed `git show` would prove the
+    check's arithmetic and nothing about the property every criterion here is about.
+    """
+
+    def __init__(self, criteria: str, affects: str, *, test_body: str | None = None,
+                 extra_sections: str = "", uid: str = "US9001") -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="revert_check_"))
+        (self.tmp / "scripts").mkdir()
+        (self.tmp / "tests").mkdir()
+        self.prod = self.tmp / "scripts" / "prod.py"
+        self.prod.write_text(_PROD_BASE, encoding="utf-8")
+        if test_body:
+            (self.tmp / "tests" / "test_prod.py").write_text(test_body, encoding="utf-8")
+        _git(self.tmp, "init", "-q")
+        _git(self.tmp, "config", "user.email", "t@example.com")
+        _git(self.tmp, "config", "user.name", "t")
+        _git(self.tmp, "add", "-A")
+        _git(self.tmp, "commit", "-qm", "base")
+        self.base = gitutil.git(["rev-parse", "HEAD"], self.tmp).stdout.decode().strip()
+        self.prod.write_text(_PROD_HEAD, encoding="utf-8")
+        _git(self.tmp, "add", "-A")
+        _git(self.tmp, "commit", "-qm", "ship")
+        stories = self.tmp / "sdlc-studio" / "stories"
+        stories.mkdir(parents=True)
+        self.uid = uid
+        self.unit = stories / f"{uid}-fixture.md"
+        self.unit.write_text(
+            f"# {uid}: fixture\n\n"
+            f"> **Status:** Draft\n"
+            f"> **Affects:** {affects}\n\n"
+            f"## Acceptance Criteria\n\n{criteria}\n{extra_sections}",
+            encoding="utf-8")
+
+    def hashes(self) -> dict:
+        """Content, MODE and link-target for every file outside `.git`.
+
+        Content alone was not enough, and that gap is why two defects shipped: a file recreated
+        by `write_bytes` came back at the umask default (a tracked `100755` script reading
+        `100644`, `git status` dirty) and a symlink came back as a regular file holding its
+        target's bytes. Both leave the content hash identical, so an assertion over content
+        was structurally incapable of failing on either. `lstat`, never `stat`, so the symlink
+        itself is measured rather than what it points at."""
+        import hashlib
+        import os as _os
+        import stat as _stat
+        out = {}
+        for p in sorted(self.tmp.rglob("*")):
+            rel = str(p.relative_to(self.tmp)).replace("\\", "/")
+            if ".git/" in rel or rel.startswith(".git"):
+                continue
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            if _stat.S_ISLNK(st.st_mode):
+                out[rel] = ("symlink", _os.readlink(p), _stat.S_IMODE(st.st_mode))
+            elif _stat.S_ISREG(st.st_mode):
+                out[rel] = ("file", hashlib.sha256(p.read_bytes()).hexdigest(),
+                            _stat.S_IMODE(st.st_mode))
+        return out
+
+    def cleanup(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+def _ac(num: int, verifier: str, text: str = "the change is reached") -> str:
+    return f"- [ ] **AC{num}** {text}\n  - **Verify:** {verifier}\n"
+
+
+class RevertCheckTests(unittest.TestCase):
+    """`verify_ac.py revert-check` - CR0547.
+
+    Every case drives `verify_ac.main([...])`, the shipped entry point, rather than
+    `revert_check` directly: the wiring between the command and the function is the part a
+    library test does not exercise, and this repository has shipped a working function behind
+    a command that never called it.
+    """
+
+    def setUp(self) -> None:
+        self.repos: list = []
+
+    def tearDown(self) -> None:
+        for r in self.repos:
+            r.cleanup()
+
+    def _repo(self, *args, **kwargs) -> _RevertRepo:
+        r = _RevertRepo(*args, **kwargs)
+        self.repos.append(r)
+        return r
+
+    def _run(self, repo, extra=()) -> tuple:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = verify_ac.main(["revert-check", "--unit", repo.uid, "--root", str(repo.tmp),
+                                   "--base", repo.base, *extra])
+        return code, buf.getvalue()
+
+    def test_a_wholly_green_unit_is_refused(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, delete the `if counted and not result["red"]`
+        branch so a unit whose every measurable criterion stays green returns `pass`.
+
+        Both criteria grep text the BASE revision already carries, so reverting the production
+        change moves neither. That is the defect the whole command exists for: a test that
+        passes without the change never reached it."""
+        repo = self._repo(_ac(1, "grep BASE_ONLY scripts/prod.py")
+                          + _ac(2, "grep 'BASE_ONLY = 1' scripts/prod.py"),
+                          "scripts/prod.py")
+        code, out = self._run(repo)
+        self.assertEqual(code, 1, out)
+        self.assertIn("stayed GREEN", out)
+        self.assertIn("AC1", out)
+        self.assertIn("AC2", out)
+
+    def test_a_unit_whose_verifiers_go_red_passes(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, refuse whenever ANY criterion stays green -
+        `if counted and result["green"]` in place of `not result["red"]`.
+
+        The paired control. AC1 greps the shipped marker and goes red on the revert; AC2 greps
+        base text and stays green. A gate that refused this has measured nothing, because it
+        would refuse every unit put in front of it."""
+        repo = self._repo(_ac(1, "grep SHIPPED_MARKER scripts/prod.py")
+                          + _ac(2, "grep BASE_ONLY scripts/prod.py"),
+                          "scripts/prod.py")
+        code, out = self._run(repo)
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASSES", out)
+
+    def test_declared_exemptions_do_not_trigger_a_refusal(self) -> None:
+        """MUTANT: in `verify_ac.revert_exemptions`, return `{}`.
+
+        Two legitimately-green criteria named by a reasoned `Revert-check-exempt` field, beside
+        one that goes red. RUN-01M0CT8P measured five such criteria in a single six-unit batch,
+        so a check without the exemption refuses correct work on its first outing, and refusing
+        correct work is how a gate gets switched off."""
+        repo = self._repo(
+            _ac(1, "grep SHIPPED_MARKER scripts/prod.py")
+            + _ac(2, "grep BASE_ONLY scripts/prod.py")
+            + _ac(3, "grep BASE_ONLY scripts/prod.py"),
+            "scripts/prod.py")
+        text = repo.unit.read_text(encoding="utf-8")
+        repo.unit.write_text(text.replace(
+            "> **Affects:**",
+            "> **Revert-check-exempt:** AC2 AC3 - the paired controls assert the behaviour that "
+            "stood BEFORE the change, so they must stay green when the change is removed\n"
+            "> **Affects:**"), encoding="utf-8")
+        code, out = self._run(repo)
+        self.assertEqual(code, 0, out)
+        for ac in ("AC2", "AC3"):
+            self.assertRegex(out, rf"{ac}\s+exempt", out)
+
+    def test_the_unexercised_change_fixture_is_refused(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, invert the run classification -
+        `"red" if res.ok else "green"`.
+
+        BG0593's pre-repair working-tree state, reproduced as a fixture: the production change
+        is present, and the test rebuilds the thing under test in a private helper, so the
+        change is unexercised. Stated as a fixture and NOT as a commit by necessity - that
+        state was never committed, it lived between 788e0c3f and its repair at 20de1d1c, and
+        the mutation ledger it would otherwise be read from lives in gitignored
+        `sdlc-studio/.local/`. A criterion claiming to pin a commit that does not hold the
+        defect is a fabricated regression case, which is the class this check exists to
+        refuse."""
+        repo = self._repo(_ac(1, "pytest tests/test_prod.py::test_marker_is_present"),
+                          "scripts/prod.py, tests/test_prod.py",
+                          test_body=_REBUILT_TEST)
+        code, out = self._run(repo)
+        self.assertEqual(code, 1, out)
+        self.assertIn("stayed GREEN", out)
+        self.assertIn("AC1", out)
+
+    def test_a_verifier_that_reaches_production_goes_red(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, skip the revert loop and run the verifiers
+        against the intact tree.
+
+        The control for the fixture above, and the reason the pair is worth having: the SAME
+        pytest runner, the same node shape, one test importing the production module and one
+        rebuilding it locally. Without this, `test_the_unexercised_change_fixture_is_refused`
+        could be passing because pytest never ran at all."""
+        repo = self._repo(_ac(1, "pytest tests/test_prod.py::test_marker_reaches_production"),
+                          "scripts/prod.py, tests/test_prod.py",
+                          test_body=_REACHING_TEST)
+        code, out = self._run(repo)
+        self.assertEqual(code, 0, out)
+        self.assertIn("PASSES", out)
+
+    def test_an_unresolvable_selector_is_unresolved_not_red(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, delete the `selector_resolves(...) is False`
+        arm so an unresolvable selector is executed and its non-zero exit counted as red.
+
+        A selector failing because it names nothing is not a test reaching the change. Counted
+        as red it would manufacture a false PASS - the unit would look measured while nothing
+        had been measured at all."""
+        repo = self._repo(_ac(1, "pytest tests/test_absent.py::Missing::test_nope")
+                          + _ac(2, "grep BASE_ONLY scripts/prod.py"),
+                          "scripts/prod.py")
+        code, out = self._run(repo)
+        self.assertRegex(out, r"AC1\s+unresolved", out)
+        self.assertEqual(code, 1, out)
+        self.assertIn("stayed GREEN", out)
+        self.assertNotIn("AC1,", out.split("stayed GREEN")[1])
+
+    def test_the_tree_is_byte_identical_after_a_normal_run(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, delete the snapshot-restore loop.
+
+        Compared by per-file hash taken before and after, over every tracked and untracked
+        file outside `.git`, rather than by reading `git status`: a restore that rewrote a
+        file with different bytes and then staged them would satisfy `git status` and fail
+        this."""
+        repo = self._repo(_ac(1, "grep SHIPPED_MARKER scripts/prod.py"), "scripts/prod.py")
+        before = repo.hashes()
+        code, out = self._run(repo)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(before, repo.hashes())
+
+    def test_the_tree_is_byte_identical_after_an_interrupted_run(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, move the restore out of the `finally` onto the
+        success path.
+
+        A check that dies must not be able to leave a unit's production change reverted on
+        disk. The interruption is the verifier run raising, which is where a real one happens -
+        a timeout, a killed runner, a keyboard interrupt."""
+        repo = self._repo(_ac(1, "grep SHIPPED_MARKER scripts/prod.py"), "scripts/prod.py")
+        before = repo.hashes()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("interrupted")
+
+        with unittest.mock.patch.object(verify_ac, "run_verifier", boom):
+            with self.assertRaises(RuntimeError):
+                self._run(repo)
+        self.assertEqual(before, repo.hashes())
+
+    def test_a_sigterm_mid_check_still_restores_the_tree(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, drop the `_guard_signals(restore)` call.
+
+        A `finally` covers an exception and nothing else. An independent review measured the
+        gap by signalling a live check: SIGINT restored - Python raises `KeyboardInterrupt`, so
+        the `finally` ran - while **SIGTERM left the production change reverted on disk**. And
+        SIGTERM is what `kill`, a CI job timeout and a harness cancel all send.
+
+        Driven as a real subprocess receiving a real signal, because the defect is precisely
+        that the in-process path already worked: `test_..._after_an_interrupted_run` patches
+        `run_verifier` to raise and passes with the guard removed."""
+        repo = self._repo(_ac(1, "shell sleep 30"), "scripts/prod.py")
+        before = repo.hashes()
+        script = (
+            "import sys, os\n"
+            f"sys.path.insert(0, {str(SCRIPT_PATH.parent)!r})\n"
+            "import importlib.util\n"
+            f"spec = importlib.util.spec_from_file_location('verify_ac', {str(SCRIPT_PATH)!r})\n"
+            "m = importlib.util.module_from_spec(spec); sys.modules['verify_ac'] = m\n"
+            "spec.loader.exec_module(m)\n"
+            "print('go', flush=True)\n"
+            f"m.main(['revert-check', '--unit', {repo.uid!r}, '--root', {str(repo.tmp)!r},"
+            f" '--base', {repo.base!r}])\n")
+        proc = subprocess.Popen([sys.executable, "-c", script],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        try:
+            self.assertEqual("go\n", proc.stdout.readline(),
+                             "the child never reached the check")
+            # The verifier is a 30s sleep, so the revert is live on disk right now.
+            deadline = time.time() + 10
+            reverted = False
+            while time.time() < deadline:
+                if b"SHIPPED_MARKER" not in repo.prod.read_bytes():
+                    reverted = True
+                    break
+                time.sleep(0.05)
+            self.assertTrue(reverted, "the revert never became visible, so the signal below "
+                                      "would prove nothing about restoring it")
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+        self.assertEqual(before, repo.hashes(),
+                         "SIGTERM left the unit's production change reverted on disk")
+
+    def test_uncommitted_edits_survive_the_check(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, restore from git - `git checkout HEAD --
+        <path>` - instead of from the byte snapshot.
+
+        The first build of this did exactly that and destroyed uncommitted work, including the
+        fix it had just been used to validate. The edit here is uncommitted and is NOT at HEAD,
+        so a git-sourced restore silently drops it while leaving the tree clean."""
+        repo = self._repo(_ac(1, "grep SHIPPED_MARKER scripts/prod.py"), "scripts/prod.py")
+        repo.prod.write_text(_PROD_HEAD + "UNCOMMITTED = 3\n", encoding="utf-8")
+        before = repo.prod.read_bytes()
+        code, out = self._run(repo)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(repo.prod.read_bytes(), before)
+        self.assertIn("UNCOMMITTED", repo.prod.read_text(encoding="utf-8"))
+
+    def test_a_file_absent_at_base_keeps_its_mode_through_the_check(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, drop the `os.chmod(target, mode_)` from the
+        restore.
+
+        A file added by the change does not exist at the base ref, so the revert UNLINKS it and
+        the restore recreates it with `write_bytes` - at the process umask. An independent
+        review measured a tracked `100755` script coming back `100644` after a SUCCESSFUL run,
+        content hash identical, `git status` dirty. Every executable file in this repository is
+        a script named in some unit's `Affects`, and this repository's own `repo-writes` lane
+        refuses a commit whose run modified a tracked file - so the check would have broken the
+        commit it was meant to inform."""
+        repo = self._repo(_ac(1, "grep SHIPPED_MARKER scripts/prod.py"),
+                          "scripts/prod.py, scripts/new_tool.py")
+        added = repo.tmp / "scripts" / "new_tool.py"
+        added.write_text("# added by this change\n", encoding="utf-8")
+        added.chmod(0o755)
+        before = repo.hashes()
+        code, out = self._run(repo)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(before, repo.hashes())
+        self.assertEqual(0o755, stat.S_IMODE(added.lstat().st_mode),
+                         "the file came back at the umask default, not the mode it had")
+
+    def test_a_symlink_in_affects_is_reported_rather_than_reverted(self) -> None:
+        """MUTANT: in `verify_ac._revertible`, drop the `path.is_symlink()` arm.
+
+        `is_file()` FOLLOWS a symlink, so the link was classified production, unlinked, and
+        recreated as a regular file holding its target's bytes - `git status` reporting a type
+        change, at exit 0. Where the link existed at base, `write_bytes` wrote THROUGH it and
+        reverted the target instead of the declared path: a wrong measurement, taken in
+        silence. Neither is a revert of what the unit declared."""
+        repo = self._repo(_ac(1, "grep SHIPPED_MARKER scripts/prod.py"),
+                          "scripts/prod.py, scripts/link.py")
+        (repo.tmp / "scripts" / "link.py").symlink_to("prod.py")
+        before = repo.hashes()
+        code, out = self._run(repo)
+        self.assertEqual(code, 3, out)
+        self.assertIn("scripts/link.py", out)
+        self.assertEqual(before, repo.hashes())
+        self.assertTrue((repo.tmp / "scripts" / "link.py").is_symlink(),
+                        "the symlink was replaced by a regular file")
+
+    def test_a_path_outside_the_repo_root_is_reported_and_never_touched(self) -> None:
+        """MUTANT: in `verify_ac._revertible`, drop the `is_absolute()` / `is_relative_to`
+        arm.
+
+        `(root / rel)` resolves `..` segments, and an ABSOLUTE `rel` replaces the root
+        outright, so `../victim/secret.py` and `/tmp/…/victim.py` both looked like ordinary
+        production files. `git show <ref>:<path>` then failed, the file was read as absent at
+        base and DELETED, and it came back at the process umask - a `0o600` private file
+        returned group- and world-readable, with the unit reported as PASSING. `revert_targets`
+        promised this defence in its own docstring and the code did not have it."""
+        repo = self._repo(_ac(1, "grep SHIPPED_MARKER scripts/prod.py"), "scripts/prod.py")
+        victim = repo.tmp.parent / f"victim-{repo.tmp.name}.py"
+        victim.write_text("SECRET = 1\n", encoding="utf-8")
+        victim.chmod(0o600)
+        try:
+            text = repo.unit.read_text(encoding="utf-8")
+            repo.unit.write_text(
+                text.replace("> **Affects:** scripts/prod.py",
+                             f"> **Affects:** scripts/prod.py, {victim}"), encoding="utf-8")
+            code, out = self._run(repo)
+            self.assertEqual(code, 3, out)
+            # THE REASON, not just the exit code. Removing this arm alone still reported the
+            # unit - `git ls-tree` fails on an absolute path, so the git-failure guard caught
+            # it one step later and the mutant SURVIVED a test that only checked exit 3. A
+            # repair masking the defect beside it is invisible unless the report is read.
+            self.assertIn("not a readable file here", out,
+                          "the path was reported as a GIT failure rather than refused as "
+                          "outside the repository, so this passes with the guard removed")
+            self.assertNotIn("could not read", out)
+            self.assertTrue(victim.exists(), "a file OUTSIDE the repository was deleted")
+            self.assertEqual("SECRET = 1\n", victim.read_text(encoding="utf-8"))
+            self.assertEqual(0o600, stat.S_IMODE(victim.lstat().st_mode),
+                             "a private file outside the repository came back world-readable")
+        finally:
+            victim.unlink(missing_ok=True)
+
+    def test_a_git_failure_is_reported_rather_than_read_as_absent_at_base(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, swallow `_BaseUnreadable` and carry on with an
+        empty blob.
+
+        THIS TEST CANNOT FAIL ON AN EDIT INSIDE `_base_blob`, because it patches `_base_blob`
+        wholesale - an independent review named that and proved it by collapsing the reader
+        with this test still green. The `_base_blob` decision is AC14's, driven end to end
+        against a real git failure. What this one pins is the CATCH site.
+
+        Absent-at-base and could-not-ask are different answers, and reading the second as the
+        first DELETES the production file - which manufactures exactly the red this gate looks
+        for, then reports the unit as passing. Reached in practice by a workspace nested below
+        the repository root, where `git show` exits 128 saying the path exists but not under
+        that name, and by a `git show` timeout."""
+        repo = self._repo(_ac(1, "grep BASE_ONLY scripts/prod.py"), "scripts/prod.py")
+        before = repo.hashes()
+        with unittest.mock.patch.object(
+                verify_ac, "_base_blob",
+                side_effect=verify_ac._BaseUnreadable("fatal: path exists, but not in HEAD")):
+            code, out = self._run(repo)
+        self.assertEqual(code, 3, out)
+        self.assertIn("could not read", out)
+        self.assertEqual(before, repo.hashes(),
+                         "the production file was disturbed after git could not be asked")
+
+    def test_a_real_git_failure_at_the_base_ref_is_reported_rather_than_read_as_absent(self) -> None:
+        """MUTANT: in `verify_ac._base_blob`, drop the `ls-tree` existence question and return
+        `None` whenever `git show` exits non-zero.
+
+        THE SIBLING TEST ABOVE CANNOT FAIL ON THAT EDIT, because it patches `_base_blob`
+        wholesale and so mocks out the very decision the criterion is about. An independent
+        review collapsed `_base_blob` to `shown = _git("show", ...); return None if
+        shown.returncode else shown.stdout` and watched all 25 tests in this class pass. So
+        this one drives a REAL git failure end to end: the tree object still lists the path,
+        and the BLOB it points at is deleted from the object store, so `ls-tree` answers yes
+        and `show` fails. Absent-at-base and could-not-ask are then genuinely different
+        questions and only the real code can tell them apart.
+
+        Read as absent, the check DELETES the production file and manufactures the red it is
+        looking for."""
+        repo = self._repo(_ac(1, "grep BASE_ONLY scripts/prod.py"), "scripts/prod.py")
+        blob = gitutil.git(["rev-parse", f"{repo.base}:scripts/prod.py"],
+                           repo.tmp).stdout.decode().strip()
+        loose = repo.tmp / ".git" / "objects" / blob[:2] / blob[2:]
+        if not loose.exists():                       # packed: unpack rather than skip
+            gitutil.git(["unpack-objects"], repo.tmp, check=False)
+        self.assertTrue(loose.exists(),
+                        "the base blob is not a loose object, so this fixture cannot break it")
+        loose.unlink()
+        listed = gitutil.git(["ls-tree", "--name-only", repo.base, "--", "scripts/prod.py"],
+                             repo.tmp, check=False)
+        self.assertIn(b"scripts/prod.py", listed.stdout,
+                      "the tree no longer lists the path, so `show` failing proves nothing")
+        shown = gitutil.git(["show", f"{repo.base}:scripts/prod.py"], repo.tmp, check=False)
+        self.assertNotEqual(0, shown.returncode,
+                            "git could still read the blob, so there is no failure to report")
+        before = repo.hashes()
+        code, out = self._run(repo)
+        self.assertEqual(code, 3, out)
+        self.assertIn("could not read", out)
+        self.assertEqual(before, repo.hashes(),
+                         "the production file was disturbed after git could not be asked")
+
+    def test_a_verifier_that_never_ran_is_not_counted_as_evidence(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, classify every non-ok result as `red`.
+
+        `run_verifier` already distinguishes an expression it could not parse (`invalid`), one
+        the trust boundary refused to run (`blocked`), and a runner that exited clean having
+        run nothing (`vacuous`). None of those is a test noticing the change. Counted red, a
+        unit whose `Verify:` line is a typo PASSES the one check that asks whether its tests
+        reach anything - the same false pass AC5 states the rule against, one kind over."""
+        repo = self._repo(_ac(1, "definitely-not-a-runner tests/x.py")
+                          + _ac(2, "grep BASE_ONLY scripts/prod.py"),
+                          "scripts/prod.py")
+        code, out = self._run(repo)
+        self.assertRegex(out, r"AC1\s+unmeasured", out)
+        self.assertEqual(code, 1, out)
+        self.assertIn("stayed GREEN", out)
+
+    def test_an_inherited_git_dir_does_not_steer_the_revert(self) -> None:
+        """MUTANT: in `verify_ac._base_blob`/`_ref_exists`, drop `env=_git_env()`.
+
+        The registration in `tools/tests/test_skill_tests_env.py` holds the LIST equal to every
+        other copy; it says nothing about the list being APPLIED, and an independent review
+        removed both `env=` arguments with all 348 tests in scope still green. `git -C` does not
+        override an inherited `GIT_DIR`, and git hooks export one - this repository's own hooks
+        run this code. Here `GIT_DIR` points at a DIFFERENT repository whose base ref does not
+        contain the path at all: unscrubbed, the check answers for that repository instead."""
+        repo = self._repo(_ac(1, "grep SHIPPED_MARKER scripts/prod.py"), "scripts/prod.py")
+        # A DECOY WITH DIFFERENT CONTENT. An identical fixture was tried first and could not
+        # discriminate: same bytes, same fixed identity, same timestamp second, so both base
+        # commits hashed to the same sha and the mis-steered read returned the right answer by
+        # coincidence. The decoy's base must be something the real base is not.
+        other = Path(tempfile.mkdtemp(prefix="revert_decoy_"))
+        self.addCleanup(shutil.rmtree, other, True)
+        (other / "scripts").mkdir(parents=True)
+        (other / "scripts" / "prod.py").write_text(
+            _PROD_HEAD + "DECOY = 1\n", encoding="utf-8")
+        _git(other, "init", "-q")
+        _git(other, "add", "-A")
+        _git(other, "commit", "-qm", "decoy")
+        before = repo.hashes()
+        env = dict(os.environ)
+        env["GIT_DIR"] = str(other / ".git")
+        env["GIT_WORK_TREE"] = str(other)
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            code, out = self._run(repo)
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"AC1\s+red", out)
+        self.assertEqual(before, repo.hashes())
+
+    def test_the_revert_purges_cached_bytecode_for_every_file_it_touches(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, make `_purge_pyc` a no-op.
+
+        CPython invalidates a `.pyc` on (source mtime, source size), so a same-length revert
+        landing inside one timestamp granule reuses the ORIGINAL bytecode - a subprocess then
+        imports the code that is no longer on disk and the criterion reads green over a tree
+        that was reverted. This repository has recorded that false verdict twice, and an
+        independent review found the purge here pinned by nothing at all.
+
+        Asserted at the SURFACE the hazard lives on: a stale `.pyc` for a reverted module is
+        gone by the time any verifier runs, and gone again afterwards."""
+        repo = self._repo(_ac(1, "grep SHIPPED_MARKER scripts/prod.py"), "scripts/prod.py")
+        cache = repo.tmp / "scripts" / "__pycache__"
+        cache.mkdir()
+        stale = cache / "prod.cpython-999.pyc"
+        stale.write_bytes(b"stale bytecode for the un-reverted module\n")
+        seen = {}
+
+        real = verify_ac.run_verifier
+
+        def spy(expr, timeout, cwd, **kw):
+            seen["during"] = stale.exists()
+            return real(expr, timeout, cwd, **kw)
+
+        with unittest.mock.patch.object(verify_ac, "run_verifier", spy):
+            code, out = self._run(repo)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(seen.get("during", True),
+                         "the stale .pyc was still on disk while the verifiers ran, so a "
+                         "subprocess could import the un-reverted module")
+        self.assertFalse(stale.exists(), "the stale .pyc survived the restore")
+
+    def test_a_unit_with_no_production_file_is_reported_not_passed(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, drop the empty-`production` branch so the
+        check falls through and returns `pass`.
+
+        Nothing to revert is not evidence that the tests reach anything. An absence and a pass
+        must not read the same, so this exits on its own code and names the condition."""
+        repo = self._repo(_ac(1, "grep _rebuild tests/test_prod.py"),
+                          "tests/test_prod.py, docs/notes.md", test_body=_REBUILT_TEST)
+        code, out = self._run(repo)
+        self.assertEqual(code, 3, out)
+        self.assertIn("names no production file", out)
+
+    def test_a_unit_whose_every_selector_is_dead_is_reported_not_passed(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, delete the `not counted and unresolved` branch
+        so a unit with nothing measurable returns `pass`.
+
+        Found by running the boundary lane over a real batch: a unit whose tests are not
+        written yet came back GREEN from the one check that exists to ask whether its verifiers
+        reach anything at all. It is the empty-`Affects` rule one step further in - an absence
+        and a pass must not read the same - and it is distinguished from the all-EXEMPT case,
+        which legitimately passes."""
+        repo = self._repo(_ac(1, "pytest tests/test_absent.py::Missing::test_nope")
+                          + _ac(2, "pytest tests/test_absent.py::Missing::test_also_nope"),
+                          "scripts/prod.py")
+        code, out = self._run(repo)
+        self.assertEqual(code, 3, out)
+        self.assertIn("2 unresolvable selector(s)", out)
+        self.assertIn("REPORTED rather than passed", out)
+
+    def test_a_wholly_exempt_unit_is_reported_and_not_refused(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, return `pass` when `counted` is empty and every
+        criterion is exempt.
+
+        This test asserted the MUTANT until an independent review executed the consequence:
+        adding one self-authored line, `> **Revert-check-exempt:** AC1 AC2 AC3 AC4 AC5 - one
+        reason covering the lot`, turned the gate off for a whole unit and printed PASSES. A
+        declared exemption is a reason a criterion cannot be measured, never evidence that it
+        was.
+
+        REPORTED (exit 3) and not REFUSED (exit 1), which is the distinction AC3 turns on: its
+        law is that a declared exemption must not REFUSE the unit, and saying that nothing
+        could be measured is not a refusal."""
+        repo = self._repo(_ac(1, "grep BASE_ONLY scripts/prod.py"), "scripts/prod.py")
+        text = repo.unit.read_text(encoding="utf-8")
+        repo.unit.write_text(text.replace(
+            "> **Affects:**",
+            "> **Revert-check-exempt:** AC1 - the criterion pins an ordering no single edit can "
+            "reverse without also deleting the field it orders\n> **Affects:**"),
+            encoding="utf-8")
+        code, out = self._run(repo)
+        self.assertEqual(code, 3, out)
+        self.assertIn("nothing measurable", out)
+        self.assertIn("1 exempt", out)
+        self.assertNotIn("stayed GREEN", out)
+
+    def test_an_unresolvable_affects_path_is_reported(self) -> None:
+        """MUTANT: in `verify_ac.revert_check`, drop the `unresolvable` branch and revert the
+        subset that does resolve.
+
+        A partial revert tests a change nobody described: the unit is judged against a surface
+        smaller than the one it declared, and the verdict reads the same either way."""
+        repo = self._repo(_ac(1, "grep SHIPPED_MARKER scripts/prod.py"),
+                          "scripts/prod.py, scripts/absent.py")
+        code, out = self._run(repo)
+        self.assertEqual(code, 3, out)
+        self.assertIn("scripts/absent.py", out)
+        self.assertIn("not a readable file here", out)
+
+
+class UnevaluableSelectorTests(unittest.TestCase):
+    """BG0628: a selector naming a file THE TREE DOES NOT HOLD is not a stale selector.
+
+    `selector_resolves` returns False when `_collect_nodes` yields None, and that covers two
+    facts with opposite remedies: a file that EXISTS and will not collect (a syntax error, a
+    missing import - genuine debt, fix the test) and a file the tree does not contain at all
+    (nothing to fix, the reading is simply not available here). Conformance counted both as
+    `verified` unmet, so the same 814 units scored 304, 671 or 732 conformant depending only on
+    which directories were copied, with no line saying which reading you had.
+
+    That matters because this project's own review doctrine instructs every adversarial reviewer
+    to copy the tree before running anything - so the wrong reading is the one an independent
+    reviewer is told to produce. Two did in one session and both reported it as fact.
+    """
+
+    def test_the_shared_predicate_still_refuses_an_absent_file(self) -> None:
+        """`selector_resolves` is NOT widened, deliberately.
+
+        Three lanes read it and two of them need `False` for a file that is not there: the write
+        guard, where a mistyped path must be refused rather than laundered into "not judged
+        here", and revert-check, where a selector pointing at nothing is a dead pointer worth
+        naming. Only conformance needs the other reading, so the distinction is drawn in
+        `unevaluable_stamps` and SUBTRACTED there - never by loosening a predicate three lanes
+        depend on. The first cut of this unit did loosen it and broke both.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self.assertIs(
+                False, verify_ac.selector_resolves("pytest tests/test_absent.py::T::test_x", root),
+                "the shared predicate was widened; the write guard and revert-check both "
+                "depend on this staying False")
+
+    def test_a_present_file_that_will_not_collect_is_still_false(self) -> None:
+        """The control, and the half that must NOT be softened. A file that exists and cannot be
+        collected is real debt - the stamp points at something broken."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_broken.py").write_text(
+                "this is not python(((\n", encoding="utf-8")
+            expr = "pytest tests/test_broken.py::T::test_x"
+            self.assertIs(
+                False, verify_ac.selector_resolves(expr, root),
+                "a file that exists and will not collect must stay unresolvable - softening it "
+                "would hide the dead stamps this check exists to find")
+
+    def test_only_stamped_criteria_are_reported(self) -> None:
+        """An UNSTAMPED criterion makes no claim, so a selector it cannot resolve is the
+        author's business at the next run, not this tree's inability. Dropping the
+        `Verified: yes` filter changed behaviour and no test could see it."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sdlc-studio" / "stories").mkdir(parents=True)
+            story = root / "sdlc-studio" / "stories" / "US0001-a.md"
+            story.write_text(
+                "# US0001: a\n\n> **Status:** Done\n\n## Acceptance Criteria\n\n"
+                "- [ ] **AC1** given x, when y, then z\n"
+                "  - **Verify:** pytest tests/test_absent.py::test_x\n", encoding="utf-8")
+            self.assertEqual([], verify_ac.unevaluable_stamps(story, root),
+                             "an UNSTAMPED criterion was reported - it claims nothing, so its "
+                             "selector says nothing about this tree")
+
+    def test_a_present_file_the_tree_cannot_collect_is_unevaluable_too(self) -> None:
+        """A file can be HERE while what it imports is not, and that is the same "this tree
+        cannot answer" fact as an absent file.
+
+        Checking only the selector's own path was too narrow. A review measured the consequence
+        through the shipped CLI: a checkout without `.claude/skills/sdlc-studio/` read 727/814
+        with 5 non-conformant against 731/814 with 1, because `tools/tests/test_lint_corpus.py`
+        IS present there and dies on `FileNotFoundError` for a module that is not.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sdlc-studio" / "stories").mkdir(parents=True)
+            (root / "tests").mkdir()
+            # Present, and uncollectable because what it opens is not in the tree.
+            (root / "tests" / "test_needs_absent.py").write_text(
+                "open('lib/absent_module.py')\n\ndef test_x():\n    assert True\n",
+                encoding="utf-8")
+            story = root / "sdlc-studio" / "stories" / "US0001-a.md"
+            story.write_text(
+                "# US0001: a\n\n> **Status:** Done\n\n## Acceptance Criteria\n\n"
+                "- [x] **AC1** given x, when y, then z\n"
+                "  - **Verify:** pytest tests/test_needs_absent.py::test_x\n"
+                "  - **Verified:** yes (2026-09-02)\n", encoding="utf-8")
+            rows = verify_ac.unevaluable_stamps(story, root)
+            self.assertEqual(1, len(rows),
+                             f"a present-but-uncollectable file was scored as debt: {rows}")
+
+    def test_a_file_broken_on_its_own_terms_is_still_dead(self) -> None:
+        """The control, and the half that must NOT be softened. A file that fails to collect for
+        its OWN reasons is real debt - there is nothing absent to name, so it stays a dead stamp
+        and the unit stays non-conformant."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sdlc-studio" / "stories").mkdir(parents=True)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_broken.py").write_text(
+                "this is not python(((\n", encoding="utf-8")
+            story = root / "sdlc-studio" / "stories" / "US0001-a.md"
+            story.write_text(
+                "# US0001: a\n\n> **Status:** Done\n\n## Acceptance Criteria\n\n"
+                "- [x] **AC1** given x, when y, then z\n"
+                "  - **Verify:** pytest tests/test_broken.py::test_x\n"
+                "  - **Verified:** yes (2026-09-02)\n", encoding="utf-8")
+            self.assertEqual([], verify_ac.unevaluable_stamps(story, root),
+                             "a syntactically broken file was excused as an incomplete tree")
+
+    def test_unevaluable_stamps_names_them_separately(self) -> None:
+        """The reporting half conformance reads: which stamped ACs could not be judged HERE."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sdlc-studio" / "stories").mkdir(parents=True)
+            story = root / "sdlc-studio" / "stories" / "US0001-a.md"
+            story.write_text(
+                "# US0001: a\n\n> **Status:** Done\n\n## Acceptance Criteria\n\n"
+                "- [x] **AC1** given x, when y, then z\n"
+                "  - **Verify:** pytest tests/test_absent.py::T::test_x\n"
+                "  - **Verified:** yes (2026-09-02)\n", encoding="utf-8")
+            rows = verify_ac.unevaluable_stamps(story, root)
+            self.assertEqual(1, len(rows), rows)
+            self.assertEqual("AC1", rows[0]["ac"])
+            self.assertEqual("tests/test_absent.py", rows[0]["missing"])
+            # A SUBSET of the unresolvable set, not a disjoint one: the shared predicate reports
+            # both, and conformance subtracts. Asserting disjointness would pin the design this
+            # unit abandoned when it broke the write guard and revert-check.
+            dead = {s["ac"] for s in verify_ac.unresolvable_stamps(story, root)}
+            self.assertTrue({r["ac"] for r in rows} <= dead,
+                            "unevaluable stamps must be a subset of what the shared predicate "
+                            "reports, or conformance's subtraction removes nothing")
+
+
+class NearMissScopingTests(unittest.TestCase):
+    """BG0643 AC3: the close-match branch of `selector_near_miss` is scoped to the named class.
+
+    MUTANT: gather candidates at that depth from every class (the pre-BG0643 code) - the
+    cross-class assertion dies, because `test_alpha_thingy` is a 0.97 match to
+    `ExistingA::test_alpha_thing` and the selector names `ExistingB`.
+    """
+
+    _SUITE = (
+        "import unittest\n\n\n"
+        "class ExistingA(unittest.TestCase):\n"
+        "    def test_alpha_thing(self):\n        pass\n\n"
+        "    def test_beta(self):\n        pass\n\n\n"
+        "class ExistingB(unittest.TestCase):\n"
+        "    def test_gamma_ray(self):\n        pass\n\n\n"
+        "def test_module_level():\n    pass\n"
+    )
+
+    def test_a_close_match_in_another_class_is_not_a_near_miss(self) -> None:
+        import tempfile  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "tests").mkdir()
+            (Path(d) / "tests" / "test_probe.py").write_text(self._SUITE, encoding="utf-8")
+            sel = "pytest tests/test_probe.py::"
+            # cross-class: the only close match lives in ExistingA - no hint, so the writer files
+            self.assertIsNone(verify_ac.selector_near_miss(sel + "ExistingB::test_alpha_thingy", cwd=d))
+            # in-class: the same method name under its own class IS a near miss
+            hint = verify_ac.selector_near_miss(sel + "ExistingA::test_alpha_thingy", cwd=d)
+            self.assertIsNotNone(hint)
+            self.assertIn("did you mean `test_alpha_thing`", hint,
+                          "the backticked close match, not the echoed selector")
+            self.assertIn("ExistingA", hint, "the hint does not say which class it searched")
+            # a node hanging below a collected test names the test it hangs off
+            below = verify_ac.selector_near_miss(sel + "ExistingA::test_alpha_thing::extra", cwd=d)
+            self.assertEqual("did you mean tests/test_probe.py::ExistingA::test_alpha_thing", below)
+            # ... and for a MODULE-LEVEL test, where the prefix is one segment deep: a
+            # `len(parts) > 2` shortcut would let `file::test_func::extra` file at exit 0.
+            below_fn = verify_ac.selector_near_miss(sel + "test_module_level::extra", cwd=d)
+            self.assertEqual("did you mean tests/test_probe.py::test_module_level", below_fn)
+            # same-leaf: unchanged, names the class the author meant
+            hint = verify_ac.selector_near_miss(sel + "WrongClass::test_alpha_thing", cwd=d)
+            self.assertIsNotNone(hint)
+            self.assertIn("ExistingA::test_alpha_thing", hint)
+            # a class the file does not collect has no candidates at all
+            self.assertIsNone(verify_ac.selector_near_miss(sel + "NewClass::test_alpha_thingy", cwd=d))
+
+
+class CriteriaSectionTests(unittest.TestCase):
+    """BG0648 AC2 and AC3: what the runner runs is what the brief judged. MUTANTS: keep
+    executing every `**ACn**` block wherever it sits; widen the brief to every block; narrow
+    the no-section artefact to zero criteria in the runner; keep the brief at zero criteria for
+    the no-section artefact; skip misplaced blocks silently in lint."""
+
+    _SCRIPTS = Path(__file__).resolve().parents[1]
+
+    def _fixture(self) -> Path:
+        root = Path(tempfile.mkdtemp(prefix="criteria_section_")); self.addCleanup(shutil.rmtree, root, True)
+        for sub in ("bugs", "stories", "personas/seats"):
+            (root / "sdlc-studio" / sub).mkdir(parents=True)
+        (root / "sdlc-studio" / ".config.yaml").write_text("schema_version: 3\n", encoding="utf-8")
+        (root / "sdlc-studio" / "personas" / "seats" / "qa.md").write_text("<!-- role: qa -->\n# Sam - QA amigo\n\nthe charter\n", encoding="utf-8")
+        (root / "sdlc-studio" / "bugs" / "BG0001-two-shapes.md").write_text(
+            "# BG0001: two shapes\n\n> **Status:** Open\n> **Affects:** src/x.py\n\n## Acceptance Criteria\n\n"
+            "- [ ] **AC1** Given a, when b, then c\n  - **Verify:** shell true\n\n## Impact\n\n"
+            "- [ ] **AC2** Given x, when y, then z - a verifier that FAILS, so execution shows\n  - **Verify:** shell false\n\n"
+            "### AC3: the heading shape, also misplaced\n\n- **Verify:** shell false\n\n"
+            "## Test Plan\n\n| Criterion | Mutant | Title |\n| --- | --- | --- |\n| AC1 | drop the guard | Given a, when b, then c |\n", encoding="utf-8")
+        (root / "sdlc-studio" / "stories" / "US0002-nosection.md").write_text(
+            "# US0002: nosection\n\n> **Status:** Ready\n> **Affects:** src/y.py\n\n## User Story\n\n"
+            "### AC1: it works\n\n- **Verify:** shell true\n\n### AC2: it also works\n\n- **Verify:** shell true\n", encoding="utf-8")
+        # a `## ` line INSIDE a fence is an illustration, never a section change: AC2 after it is still in
+        (root / "sdlc-studio" / "bugs" / "BG0005-fenced.md").write_text(
+            "# BG0005: fenced\n\n> **Status:** Open\n> **Affects:** src/f.py\n\n## Acceptance Criteria\n\n"
+            "- [ ] **AC1** Given a, when b, then c\n  - **Verify:** shell true\n\n```\n## Notes (inside a fence)\n```\n\n"
+            "- [ ] **AC2** Given d, when e, then f\n  - **Verify:** shell true\n", encoding="utf-8")
+        # a heading in another case carrying more words is STILL the section, for every reader
+        (root / "sdlc-studio" / "bugs" / "BG0004-variant.md").write_text(
+            "# BG0004: variant\n\n> **Status:** Open\n> **Affects:** src/v.py\n\n## acceptance criteria (revised)\n\n"
+            "- [ ] **AC1** Given a, when b, then c\n  - **Verify:** shell true\n\n## Notes\n\n"
+            "- [ ] **AC2** Given x, when y, then z\n  - **Verify:** shell false\n", encoding="utf-8")
+        (root / "sdlc-studio" / "stories" / "US0003-story-misplaced.md").write_text(
+            "# US0003: story misplaced\n\n> **Status:** Ready\n> **Affects:** src/s.py\n\n## Acceptance Criteria\n\n"
+            "### AC1: in\n\n- **Verify:** shell true\n\n## Notes\n\n### AC2: out\n\n- **Verify:** shell false\n", encoding="utf-8")
+        (root / "sdlc-studio" / "bugs" / "BG0003-clean.md").write_text(
+            "# BG0003: clean\n\n> **Status:** Open\n> **Affects:** src/z.py\n\n## Acceptance Criteria\n\n"
+            "- [ ] **AC1** Given a, when b, then c\n  - **Verify:** shell true\n\n## Impact\n\nnone\n", encoding="utf-8")
+        return root
+
+    def _run(self, script, *args, root):
+        return subprocess.run([sys.executable, "-B", str(self._SCRIPTS / script), *args, "--root", str(root)],
+                              capture_output=True, text=True, check=False, timeout=600)
+
+    def test_verify_ac_and_the_brief_count_the_same_criteria(self) -> None:
+        root = self._fixture()
+        # the misplaced blocks carry FAILING verifiers: a run that stays green never executed them
+        r = self._run("verify_ac.py", "run", "--id", "BG0001", root=root)
+        out = r.stdout + r.stderr
+        self.assertEqual(0, r.returncode, out)
+        self.assertIn("ac=1 pass=1 fail=0", out, "the run did not count the section's one criterion alone: " + out)
+        self.assertNotIn("AC2", out); self.assertNotIn("AC3", out)
+        b = self._run("critic.py", "brief", "--unit", "BG0001", "--seat", "qa", root=root)
+        self.assertEqual(0, b.returncode, b.stderr)
+        acs = b.stdout[b.stdout.index("Acceptance criteria (canonical"):b.stdout.index("Review depth:")]
+        self.assertIn("**AC1**", acs); self.assertNotIn("**AC2**", acs); self.assertNotIn("AC3", acs)
+        # the fallback: NO section keeps the whole-file read in BOTH readers, so they agree at two
+        r2 = self._run("verify_ac.py", "run", "--id", "US0002", root=root)
+        self.assertIn("ac=2 pass=2 fail=0", r2.stdout + r2.stderr, r2.stdout + r2.stderr)
+        b2 = self._run("critic.py", "brief", "--unit", "US0002", "--seat", "qa", root=root)
+        acs2 = b2.stdout[b2.stdout.index("Acceptance criteria (canonical"):b2.stdout.index("Review depth:")]
+        self.assertIn("### AC1: it works", acs2); self.assertIn("### AC2: it also works", acs2)
+        self.assertNotIn("no Acceptance Criteria section", acs2, "the brief still renders zero criteria for the no-section artefact")
+        # the heading variant: one rule for the runner, the brief and the fingerprint
+        r3 = self._run("verify_ac.py", "run", "--id", "BG0004", root=root)
+        self.assertIn("ac=1 pass=1 fail=0", r3.stdout + r3.stderr, r3.stdout + r3.stderr)
+        b3 = self._run("critic.py", "brief", "--unit", "BG0004", "--seat", "qa", root=root)
+        acs3 = b3.stdout[b3.stdout.index("Acceptance criteria (canonical"):b3.stdout.index("Review depth:")]
+        self.assertIn("**AC1**", acs3); self.assertNotIn("**AC2**", acs3, "the brief's heading rule differs from the runner's")
+        r5 = self._run("verify_ac.py", "run", "--id", "BG0005", root=root)
+        self.assertIn("ac=2 pass=2 fail=0", r5.stdout + r5.stderr, "a heading inside a fence moved the section: " + r5.stdout + r5.stderr)
+        text = (root / "sdlc-studio" / "bugs" / "BG0001-two-shapes.md").read_text(encoding="utf-8")
+        # the shared block reader sees the section's one criterion, never the two misplaced
+        # shell verifiers beside it
+        self.assertEqual(["AC1"], [b.ac_id for b in verify_ac.criteria_blocks(text)],
+                         "the block reader counts the misplaced criteria")
+        self.assertEqual(verify_ac.ac_fingerprint(text), verify_ac.ac_fingerprint(text.replace("shell false", "shell true")),
+                         "editing a misplaced criterion's verifier changed the fingerprint of what the run judged")
+        self.assertNotEqual(verify_ac.ac_fingerprint(text), verify_ac.ac_fingerprint(text.replace("shell true\n", "shell echo 1\n", 1)))
+
+    def test_lint_names_a_misplaced_criterion_with_its_section(self) -> None:
+        root = self._fixture()
+        r = self._run("verify_ac.py", "lint", "--bugs", root=root)
+        out = r.stdout + r.stderr
+        self.assertIn("BG0001-two-shapes.md AC2: unreviewable - sits under `## Impact`, outside `## Acceptance Criteria`", out, out)
+        self.assertIn("BG0001-two-shapes.md AC3: unreviewable - sits under `## Impact`", out, out)
+        self.assertNotIn("BG0003-clean.md AC1: unreviewable", out, "the clean artefact was named: " + out)
+        self.assertIn("BG0004-variant.md AC2: unreviewable", out, "the heading variant's misplaced criterion was not named")
+        self.assertIn("US0003-story-misplaced.md AC2: unreviewable", out, "a story's misplaced criterion was not named - the lint reads bugs only")
+        self.assertNotIn("BG0004-variant.md AC1", out, "the variant heading was not read as the section")
+
+
+class StagedStampsTests(unittest.TestCase):
+    """BG0653: a staged rename or deletion of a test node a stamped selector names is refused
+    at commit time, judged against the INDEX blob by AST - never HEAD, never the working tree,
+    never pytest collection - and a stamp already dead at HEAD is reported, never refused."""
+
+    TEST = "tools/tests/test_probe.py"
+    OTHER = "tools/tests/test_elsewhere.py"
+    KEPT = ("def test_top():\n    assert True\n\n\n"
+            "async def test_async_top():\n    assert True\n\n\n"
+            "class Probe:\n    def test_it(self):\n        assert True\n\n"
+            "    def test_other(self):\n        assert True\n\n"
+            "    async def test_async(self):\n        assert True\n")
+
+    def _repo(self, tmp: Path, *, selector: str, head_body: str | None = None) -> Path:
+        root = tmp / "r"
+        (root / "tools" / "tests").mkdir(parents=True)
+        (root / "sdlc-studio" / "stories").mkdir(parents=True)
+        (root / "sdlc-studio" / "bugs").mkdir(parents=True)
+        (root / self.TEST).write_text(head_body if head_body is not None else self.KEPT, encoding="utf-8")
+        (root / self.OTHER).write_text("class Other:\n    def test_x(self):\n        assert True\n", encoding="utf-8")
+        (root / "sdlc-studio" / "stories" / "US9001-stamped.md").write_text(
+            "# US9001: a stamped criterion\n\n> **Status:** Done\n\n"
+            "## Acceptance Criteria\n\n### AC1: it holds\n\n"
+            f"- **Verify:** {selector}\n- **Verified:** yes (2026-07-20)\n", encoding="utf-8")
+        # a second artefact: a stamped method selector, an UNSTAMPED criterion (skipped), and a
+        # stamped selector naming a test file this commit does NOT stage (skipped)
+        (root / "sdlc-studio" / "bugs" / "BG9002-stamped.md").write_text(
+            "# BG9002: a stamped bug criterion\n\n> **Status:** Fixed\n\n"
+            "## Acceptance Criteria\n\n- [x] **AC2** Given it, when it, then it.\n"
+            f"  - **Verify:** pytest {self.TEST}::Probe::test_other\n"
+            "  - **Verified:** yes (2026-07-20)\n"
+            "- [ ] **AC3** Given it, when it, then it too.\n"
+            f"  - **Verify:** pytest {self.TEST}::Probe::test_gone\n"
+            "  - **Verified:** no\n"
+            "- [x] **AC4** Given another file, when it, then it.\n"
+            f"  - **Verify:** pytest {self.OTHER}::Other::test_x\n"
+            "  - **Verified:** yes (2026-07-20)\n", encoding="utf-8")
+        gitutil.git(["init", "-q"], root)
+        gitutil.git(["add", "-A"], root)
+        gitutil.git(["commit", "-q", "--no-verify", "-m", "fixture"], root)
+        return root
+
+    def _stamps(self, root: Path) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = verify_ac.main(["stamps", "--staged", "--root", str(root)])
+        return rc, out.getvalue(), err.getvalue()
+
+    def _stage(self, root: Path, rel: str, body) -> None:
+        p = root / rel
+        p.write_bytes(body) if isinstance(body, bytes) else p.write_text(body, encoding="utf-8")
+        gitutil.git(["add", rel], root)
+
+    # -- AC1 -------------------------------------------------------------------------
+    def test_a_staged_rename_that_orphans_a_stamped_selector_is_refused_and_a_kept_node_passes(self) -> None:
+        """MUTANTS: resolve against HEAD's bytes (the staged rename reads live); resolve against
+        the working tree (the index-unchanged control reads dead); drop the `ast.ClassDef`
+        descent (the kept METHOD reads dead); drop the `-k` branch (a `-k` selector reads as a
+        bare path and the renamed node reads live); drop `AsyncFunctionDef` (the kept async
+        method reads dead).
+
+        Three-state fixture: HEAD holds `Probe::test_it`, the INDEX holds it renamed, and the
+        working tree holds a third body distinct from both, so only a reader of the index blob
+        answers right."""
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::Probe::test_it")
+            self._stage(root, self.TEST, self.KEPT.replace("def test_it(", "def test_moved("))
+            (root / self.TEST).write_text(self.KEPT + "\n# a third body, in the working tree only\n",
+                                          encoding="utf-8")
+            rc, out, err = self._stamps(root)
+            self.assertEqual(rc, 1, out + err)
+            self.assertIn("US9001 AC1", out, "the artefact and criterion must be named")
+            self.assertIn(f"{self.TEST}::Probe::test_it", out, "the selector must be named")
+            self.assertNotIn("BG9002", out, "the kept method `test_other` and the unstaged file must not be named")
+            self.assertIn("orphaned by this commit", err)
+        with tempfile.TemporaryDirectory() as d:
+            # Control one: a staged edit that keeps every node passes - a resolver walking
+            # module-level defs alone reads the kept METHOD as dead, and one blind to async
+            # defs reads the kept async method as dead.
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::Probe::test_async")
+            self._stage(root, self.TEST, self.KEPT.replace("assert True", "assert 1 == 1"))
+            rc, out, err = self._stamps(root)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("every one still resolves", out)
+        with tempfile.TemporaryDirectory() as d:
+            # Control two: the rename exists ONLY in the working tree; the index still holds the
+            # node, so the commit carries it and the lane passes.
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::Probe::test_it")
+            self._stage(root, self.TEST, self.KEPT.replace("assert True", "assert 2 == 2"))
+            (root / self.TEST).write_text(self.KEPT.replace("def test_it(", "def test_moved("),
+                                          encoding="utf-8")
+            rc, out, err = self._stamps(root)
+            self.assertEqual(rc, 0, out + err)
+        with tempfile.TemporaryDirectory() as d:
+            # An ASYNC method renamed: the refusal half for async defs. A reader blind to
+            # `AsyncFunctionDef` reads the node as absent at HEAD too, and would REPORT the stamp
+            # as already dead instead of refusing - so the control above cannot kill that reader,
+            # and this case must.
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::Probe::test_async")
+            self._stage(root, self.TEST, self.KEPT.replace("def test_async(", "def test_async_moved("))
+            rc, out, _ = self._stamps(root)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("US9001 AC1: stamped verified, but its verifier selects nothing", out)
+        with tempfile.TemporaryDirectory() as d:
+            # A MODULE-LEVEL async def renamed: the other half of the async arm.
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::test_async_top")
+            self._stage(root, self.TEST, self.KEPT.replace("def test_async_top(", "def test_async_apex("))
+            rc, out, _ = self._stamps(root)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("US9001 AC1", out)
+        with tempfile.TemporaryDirectory() as d:
+            # The `-k` shape, 324 stamped instances in this corpus: the pattern is judged over
+            # the AST-derived node ids, so renaming the node it matches is refused...
+            root = self._repo(Path(d), selector=f"pytest {self.TEST} -k test_it")
+            self._stage(root, self.TEST, self.KEPT.replace("test_it", "test_moved"))
+            rc, out, _ = self._stamps(root)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("US9001 AC1", out)
+        with tempfile.TemporaryDirectory() as d:
+            # ...and a `-k` pattern that still matches passes.
+            root = self._repo(Path(d), selector=f"pytest {self.TEST} -k test_it")
+            self._stage(root, self.TEST, self.KEPT.replace("assert True", "assert 3 == 3"))
+            rc, out, _ = self._stamps(root)
+            self.assertEqual(rc, 0, out)
+        with tempfile.TemporaryDirectory() as d:
+            # The other two shapes: a module-level function, and a bare path.
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::test_top")
+            self._stage(root, self.TEST, self.KEPT.replace("def test_top(", "def test_apex("))
+            rc, out, _ = self._stamps(root)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("US9001 AC1", out)
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}")
+            self._stage(root, self.TEST, self.KEPT.replace("def test_top(", "def test_apex("))
+            rc, out, _ = self._stamps(root)
+            self.assertEqual(rc, 0, out)   # the file is still in the index
+
+    # -- AC2 -------------------------------------------------------------------------
+    def test_a_commit_staging_no_test_file_is_answered_without_a_sweep(self) -> None:
+        """MUTANT: remove the short-circuit, so `--staged` walks every story and bug body when no
+        test file is staged. The fixture stages a REAL non-test file, so a short-circuit on an
+        empty index would pass for the wrong reason."""
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::Probe::test_it")
+            self._stage(root, "sdlc-studio/notes.md", "a markdown artefact\n")
+            reads = []
+            walks = []
+            real_read = verify_ac.sdlc_md.read_text_safe
+            real_walk = verify_ac.walk_stories
+
+            def spy_read(path, default=""):
+                reads.append(str(path)); return real_read(path, default)
+
+            def spy_walk(*a, **k):
+                walks.append(a); return real_walk(*a, **k)
+            with unittest.mock.patch.object(verify_ac.sdlc_md, "read_text_safe", spy_read), \
+                 unittest.mock.patch.object(verify_ac, "walk_stories", spy_walk):
+                rc, out, err = self._stamps(root)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("no test file staged", out)
+            corpus = [r for r in reads if "sdlc-studio/stories" in r or "sdlc-studio/bugs" in r]
+            self.assertEqual(corpus, [], "no story or bug body may be read")
+            self.assertEqual(walks, [], "the corpus must not be walked")
+
+    # -- AC5 -------------------------------------------------------------------------
+    @unittest.skipUnless((Path(__file__).resolve().parents[5] / "sdlc-studio" / "bugs").is_dir(),
+                         "corpus-scoped: needs this repository's bug corpus")
+    def test_bg0585_ac6_rests_on_a_live_selector(self) -> None:
+        """MUTANT: revert BG0585 AC6's selector to `test_the_corpus_census_moves_by_exactly_four`,
+        the node 245513c9 renamed; `stamps --story` on that file must report one dead stamp."""
+        repo = Path(__file__).resolve().parents[5]
+        matches = sorted((repo / "sdlc-studio" / "bugs").glob("BG0585-*.md"))
+        self.assertEqual(len(matches), 1, matches)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = verify_ac.main(["stamps", "--story", str(matches[0]), "--root", str(repo)])
+        self.assertEqual(rc, 0, out.getvalue() + err.getvalue())
+        self.assertIn("every stamped verifier still resolves", out.getvalue())
+
+    # -- AC6 -------------------------------------------------------------------------
+    def test_a_failed_git_call_is_refused_not_read_as_nothing_staged(self) -> None:
+        """MUTANTS: treat a failed `git diff --cached` as an empty staged set; treat a blob that
+        fails to parse as resolved; decode a blob with errors='replace' so non-UTF-8 bytes are
+        judged as text."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "nogit"
+            (root / "sdlc-studio" / "stories").mkdir(parents=True)
+            rc, out, err = self._stamps(root)
+            self.assertEqual(rc, 2, out + err)
+            self.assertIn("git could not answer", err)
+            self.assertLessEqual(err.count("\n"), 3, "the refusal must not carry git's usage text: " + err[:200])
+            self.assertNotIn("no test file staged", out)
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::Probe::test_it")
+            self._stage(root, self.TEST, "def test_it(:\n    broken\n")
+            rc, out, err = self._stamps(root)
+            self.assertEqual(rc, 2, out + err)
+            self.assertIn(self.TEST, err)
+            self.assertIn("does not parse", err)
+            self.assertNotIn("still resolves", out)
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::Probe::test_it")
+            self._stage(root, self.TEST, b"\xff\xfe" + self.KEPT.encode("utf-8"))
+            rc, out, err = self._stamps(root)
+            self.assertEqual(rc, 2, out + err)
+            self.assertIn(self.TEST, err)
+            self.assertIn("not UTF-8", err)
+
+    # -- AC7 -------------------------------------------------------------------------
+    def test_a_staged_deletion_of_a_named_file_is_refused_naming_the_artefact_and_criterion(self) -> None:
+        """MUTANTS: add a `continue` for a `D` entry of `git diff --cached --name-status`, so the
+        deletion is passed over silently; drop the rename pair so a `git mv` reads as a plain
+        deletion and never names the new path. The deletion is classified BEFORE any `git show`,
+        so its wording is `deleted`, never AC6's git refusal."""
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::Probe::test_it")
+            gitutil.git(["rm", "-q", self.TEST], root)
+            rc, out, err = self._stamps(root)
+            self.assertEqual(rc, 1, out + err)
+            self.assertIn("US9001 AC1", out)
+            self.assertIn("BG9002 AC2", out)
+            self.assertIn("deleted in the index", out)
+            self.assertNotIn("git could not answer", err)
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::Probe::test_it")
+            gitutil.git(["mv", self.TEST, "tools/tests/test_probe_moved.py"], root)
+            rc, out, err = self._stamps(root)
+            self.assertEqual(rc, 1, out + err)
+            self.assertIn("renamed to tools/tests/test_probe_moved.py", out)
+            self.assertNotIn("deleted in the index", out)
+
+    # -- AC8 -------------------------------------------------------------------------
+    def test_a_stamp_already_dead_at_head_is_reported_and_never_refused(self) -> None:
+        """MUTANT: delete the HEAD comparison, so every dead selector is this commit's. A stamp
+        that was already dead at HEAD is a pre-existing finding: reported by name, counted by the
+        scheduled corpus lane, and never a reason to refuse an unrelated edit to its file."""
+        with tempfile.TemporaryDirectory() as d:
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::Probe::test_it",
+                              head_body=self.KEPT.replace("def test_it(", "def test_long_gone("))
+            self._stage(root, self.TEST, self.KEPT.replace("def test_it(", "def test_long_gone(")
+                        + "\n# a comment-only edit\n")
+            rc, out, err = self._stamps(root)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("US9001 AC1", out)
+            self.assertIn("already dead at HEAD - reported, not refused", out)
+            self.assertNotIn("orphaned by this commit", out + err)
+        with tempfile.TemporaryDirectory() as d:
+            # The control: a genuine orphan beside a pre-existing one still refuses, and the two
+            # are told apart in the output.
+            root = self._repo(Path(d), selector=f"pytest {self.TEST}::Probe::test_it",
+                              head_body=self.KEPT.replace("def test_it(", "def test_long_gone("))
+            self._stage(root, self.TEST, self.KEPT.replace("def test_it(", "def test_long_gone(")
+                        .replace("def test_other(", "def test_other_moved("))
+            rc, out, err = self._stamps(root)
+            self.assertEqual(rc, 1, out + err)
+            self.assertIn("BG9002 AC2: stamped verified, but its verifier selects nothing", out)
+            self.assertIn("US9001 AC1: stamped verified and already dead at HEAD", out)
+            self.assertIn("1 already dead at HEAD, reported", err)
+
+
+class LineCoverageTests(unittest.TestCase):
+    """US0815: `verify_ac run --coverage` names every line a unit itself added that its own
+    verifiers never executed, against the base ref of the run whose batch names the unit."""
+
+    UNIT = "US9301"
+    MATE = "US9302"
+    STORY = "sdlc-studio/stories/US9301-cov.md"
+    PROD = "prod/mod.py"
+    BASE_PROD = "def used():\n    return 1\n\n\ndef dormant():\n    return 2\n"
+    TEST = "tests/test_mod.py"
+    BASE_TEST = ("import sys, pathlib\nsys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))\n"
+                 "from prod import mod\n\n\nclass TestT:\n    def test_a(self):\n        assert mod.used() == 1\n")
+
+    def _story(self, root: Path, unit: str, affects: str, verifiers: list, name: str | None = None) -> Path:
+        p = root / "sdlc-studio" / "stories" / (name or f"{unit}-cov.md")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        acs = "".join(f"- [ ] **AC{i}** Given it, when it, then it.\n  - **Verify:** {v}\n" for i, v in enumerate(verifiers, 1))
+        p.write_text(f"# {unit}: coverage fixture\n\n> **Status:** In Progress\n> **Affects:** {affects}\n\n"
+                     f"## Acceptance Criteria\n\n{acs}", encoding="utf-8")
+        return p
+
+    def _run_state(self, root: Path, base: str, batch: list) -> None:
+        from lib import run_state as rs  # noqa: PLC0415
+        (root / "sdlc-studio" / ".local").mkdir(parents=True, exist_ok=True)
+        (root / "sdlc-studio" / ".local" / "run-state.json").write_text(json.dumps(
+            {"schema": rs.SCHEMA, "run_id": "RUN-FIXTURE", "started_at": "2026-09-01T00:00:00Z",
+             "ended_at": "2026-09-02T00:00:00Z", "outcome": "goal-reached", "goal": "done",
+             "batch": batch, "base_ref": base}), encoding="utf-8")
+
+    def _commit(self, root: Path, msg: str) -> str:
+        gitutil.git(["add", "-A"], root)
+        gitutil.git(["commit", "-q", "--no-verify", "-F", "-"], root, input=msg, text=True)
+        return gitutil.git(["rev-parse", "HEAD"], root, text=True).stdout.strip()
+
+    def _repo(self, tmp: Path) -> tuple[Path, str]:
+        root = tmp / "r"
+        (root / "prod").mkdir(parents=True); (root / "tests").mkdir(); (root / "docs").mkdir()
+        (root / "prod" / "__init__.py").write_text("", encoding="utf-8")
+        (root / self.PROD).write_text(self.BASE_PROD, encoding="utf-8")
+        (root / self.TEST).write_text(self.BASE_TEST, encoding="utf-8")
+        (root / "docs" / "note.md").write_text("# note\n", encoding="utf-8")
+        (root / ".gitignore").write_text("sdlc-studio/.local/\n__pycache__/\n", encoding="utf-8")
+        self._story(root, self.UNIT, f"{self.PROD}, docs/note.md", [f"pytest {self.TEST}::TestT::test_a"])
+        gitutil.git(["init", "-q"], root)
+        base = self._commit(root, "base\n")
+        self._run_state(root, base, [self.UNIT])
+        return root, base
+
+    def _run(self, root: Path, unit: str, *extra: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = verify_ac.main(["run", "--id", unit, "--coverage", "--root", str(root), "--dry-run", *extra])
+        return rc, out.getvalue(), err.getvalue()
+
+    def _append(self, root: Path, rel: str, text: str) -> None:
+        p = root / rel; p.write_text(p.read_text(encoding="utf-8") + text, encoding="utf-8")
+
+    # -- AC1 -------------------------------------------------------------------------
+    def test_uncovered_added_lines_are_named_by_number_and_covered_ones_are_not(self) -> None:
+        """MUTANTS (rows): delete the hunk filter so every line is listed (the control's dormant
+        function appears); replace the per-commit attribution with one diff (the cluster-mate's
+        line is listed); delete the batch-membership check (the foreign run's ref is read);
+        widen the match to body prose; narrow it to the subject alone (the Refs-only commit's
+        line vanishes); read only the first Refs line."""
+        with tempfile.TemporaryDirectory() as d:
+            root, base = self._repo(Path(d))
+            self._append(root, self.PROD, "\n\ndef added_used():\n    return 3\n\n\ndef added_dead():\n    return 4\n")
+            self._append(root, self.TEST, "\n    def test_a2(self):\n        assert mod.added_used() == 3\n")
+            # the unit's own selector must reach added_used: name it in the story's verifier
+            self._story(root, self.UNIT, f"{self.PROD}, docs/note.md", [f"pytest {self.TEST}::TestT::test_a", f"pytest {self.TEST}::TestT::test_a2"])
+            self._commit(root, f"fix({self.UNIT}): add a used and a dead function\n")
+            self._append(root, self.PROD, "\n\ndef mate_dead():\n    return 5\n")
+            self._commit(root, f"fix({self.MATE}): the cluster-mate's own line\n\nLanded beside {self.UNIT}, whose work this is not.\n")
+            self._append(root, self.PROD, "\n\ndef refs_dead():\n    return 6\n")
+            self._commit(root, f"chore: paperwork\n\nRefs: US9309\nRefs: {self.UNIT}\n")
+            self._append(root, self.PROD, "\n\ndef comma_dead():\n    return 7\n")
+            self._commit(root, f"chore: more paperwork\n\nRefs: US9309, {self.UNIT}\n")
+            # an UNCOMMITTED edit to the tracked module: blame's zero sha, the unit's line
+            self._append(root, self.PROD, "\n\ndef wt_dead():\n    return 8\n")
+            rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 1, out + err)
+            src = (root / self.PROD).read_text(encoding="utf-8").splitlines()
+            def line_of(name):
+                # the BODY line: a `def` line executes at import, so the statement that goes
+                # unexecuted when nothing calls the function is the one beneath it
+                return next(i + 2 for i, ln in enumerate(src) if ln.startswith(f"def {name}("))
+            m = re.search(r"coverage: prod/mod.py: (\d+) added statement\(s\), (\d+) executed, (\d+) uncovered: (.*)", out)
+            self.assertIsNotNone(m, out)
+            listed = {int(x) for x in m.group(4).split(", ")}
+            for name in ("added_dead", "refs_dead", "comma_dead", "wt_dead"):
+                self.assertIn(line_of(name), listed, f"{name} must be listed as this unit's uncovered line: {out}")
+            self.assertNotIn(line_of("mate_dead"), listed, "a cluster-mate's commit is not this unit's, even though its body names it")
+            self.assertNotIn(line_of("dormant"), listed, "a line that pre-dates the base ref is not an added line")
+            self.assertNotIn(line_of("added_used"), listed)
+            self.assertIn("coverage: uncovered: 4", out)
+        with tempfile.TemporaryDirectory() as d:
+            # The paired control: every added line executed -> uncovered 0, and the dormant
+            # pre-existing function is still there for the diff-filter mutant to trip over.
+            root, base = self._repo(Path(d))
+            self._append(root, self.PROD, "\n\ndef added_used():\n    return 3\n")
+            self._append(root, self.TEST, "\n    def test_a2(self):\n        assert mod.added_used() == 3\n")
+            self._story(root, self.UNIT, f"{self.PROD}, docs/note.md", [f"pytest {self.TEST}::TestT::test_a", f"pytest {self.TEST}::TestT::test_a2"])
+            self._commit(root, f"fix({self.UNIT}): all executed\n")
+            rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("coverage: uncovered: 0", out)
+        with tempfile.TemporaryDirectory() as d:
+            # A run whose batch names a DIFFERENT unit is never read: with no --base the check
+            # refuses naming the flag, never diffs against the foreign run's ref.
+            root, base = self._repo(Path(d))
+            self._run_state(root, base, ["US9399"])
+            rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 2, out + err)
+            self.assertIn("--base <ref>", err)
+            rc, out, err = self._run(root, self.UNIT, "--base", base)
+            self.assertEqual(rc, 0, out + err)
+        with tempfile.TemporaryDirectory() as d:
+            # A NEW module the unit wrote and has not staged: blame cannot see it, and read as
+            # "no lines" its dead function measured as zero statements. Every line is the unit's.
+            root, base = self._repo(Path(d))
+            (root / "prod" / "new.py").write_text("def fresh_used():\n    return 8\n\n\ndef fresh_dead():\n    return 9\n", encoding="utf-8")
+            self._append(root, self.TEST, "\n    def test_new(self):\n        from prod import new\n        assert new.fresh_used() == 8\n")
+            self._story(root, self.UNIT, f"{self.PROD}, prod/new.py, docs/note.md", [f"pytest {self.TEST}::TestT::test_a", f"pytest {self.TEST}::TestT::test_new"])
+            rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 1, out + err)
+            self.assertIn("coverage: prod/new.py: 4 added statement(s), 3 executed, 1 uncovered: 6", out)
+
+    # -- AC2 -------------------------------------------------------------------------
+    def test_only_the_units_own_verifiers_count_as_coverage(self) -> None:
+        """MUTANTS: replace the per-selector collection with a collection over the whole test
+        module the selector names (the sibling test runs); change the untraced-only branch to
+        count the file as uncovered (the exit-0 assertion dies)."""
+        with tempfile.TemporaryDirectory() as d:
+            root, base = self._repo(Path(d))
+            self._append(root, self.PROD, "\n\ndef added_dead():\n    return 4\n")
+            # a SIBLING test in the same module executes it - not one of the unit's selectors
+            self._append(root, self.TEST, "\n    def test_sibling(self):\n        assert mod.added_dead() == 4\n")
+            self._commit(root, f"fix({self.UNIT}): a line only a sibling test reaches\n")
+            rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 1, out + err)
+            self.assertIn("1 uncovered", out)
+        with tempfile.TemporaryDirectory() as d:
+            root, base = self._repo(Path(d))
+            self._append(root, self.PROD, "\n\ndef added_dead():\n    return 4\n")
+            self._story(root, self.UNIT, f"{self.PROD}, docs/note.md", ["shell echo ok"])
+            self._commit(root, f"fix({self.UNIT}): only a shell verifier\n")
+            rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("coverage: prod/mod.py: not measured - no traced verifier", out)
+            self.assertIn("coverage: not traced - `shell echo ok`", out)
+        with tempfile.TemporaryDirectory() as d:
+            root, base = self._repo(Path(d))
+            self._story(root, self.UNIT, f"{self.PROD}, docs/note.md", ["manual: checked by a human", "frobnicate the widget"])
+            self._commit(root, f"fix({self.UNIT}): a manual and an unparseable verifier\n")
+            rc, out, err = self._run(root, self.UNIT)
+            # the run's OWN verdict fails the unrecognised verifier (exit 1); the coverage half
+            # still lists it untraced and says nothing of the manual one
+            self.assertEqual(rc, 1, out + err)
+            self.assertIn("coverage: not traced - `frobnicate the widget`", out)
+            self.assertNotIn("not traced - `manual", out, "a manual verifier is a human's, never listed as untraced: " + out)
+
+    # -- AC3 -------------------------------------------------------------------------
+    def test_a_missing_coverage_module_is_refused_not_read_as_covered(self) -> None:
+        """MUTANTS: swallow the import failure on the selector interpreter and return an empty
+        uncovered set; drop the version-floor check."""
+        with tempfile.TemporaryDirectory() as d:
+            root, base = self._repo(Path(d))
+            self._append(root, self.PROD, "\n\ndef added_dead():\n    return 4\n")
+            self._commit(root, f"fix({self.UNIT}): x\n")
+            hidden = Path(d) / "python-without-coverage"
+            hidden.write_text(f"#!/bin/sh\nexec {sys.executable} -S \"$@\"\n", encoding="utf-8"); hidden.chmod(0o755)
+            with unittest.mock.patch.dict(os.environ, {"SDLC_COVERAGE_PYTHON": str(hidden)}):
+                rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 2, out + err)
+            self.assertIn("coverage: not measured - the coverage module is absent", err)
+            self.assertNotIn("uncovered: 0", out)
+            stub = Path(d) / "stub"; (stub / "coverage").mkdir(parents=True)
+            (stub / "coverage" / "__init__.py").write_text("__version__ = '6.5.0'\n", encoding="utf-8")
+            old = Path(d) / "python-old-coverage"
+            old.write_text(f"#!/bin/sh\nPYTHONPATH={stub} exec {sys.executable} \"$@\"\n", encoding="utf-8"); old.chmod(0o755)
+            with unittest.mock.patch.dict(os.environ, {"SDLC_COVERAGE_PYTHON": str(old)}):
+                rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 2, out + err)
+            self.assertIn("below the floor 7.10", err)
+            # present, at the floor, and unable to RUN: `python -m coverage` fails, and a
+            # measurement that never happened must not read as zero added statements
+            broken = Path(d) / "broken"; (broken / "coverage").mkdir(parents=True)
+            (broken / "coverage" / "__init__.py").write_text("__version__ = '7.12.0'\n", encoding="utf-8")
+            lame = Path(d) / "python-lame-coverage"
+            lame.write_text(f"#!/bin/sh\nPYTHONPATH={broken} exec {sys.executable} \"$@\"\n", encoding="utf-8"); lame.chmod(0o755)
+            with unittest.mock.patch.dict(os.environ, {"SDLC_COVERAGE_PYTHON": str(lame)}):
+                rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 2, out + err)
+            self.assertIn("coverage: not measured", err); self.assertIn("exited", err)
+            self.assertNotIn("uncovered: 0", out)
+            with unittest.mock.patch.dict(os.environ, {"SDLC_COVERAGE_PYTHON": str(Path(d) / "no-such-python")}):
+                rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 2, out + err)
+            self.assertIn("coverage: not measured - the coverage module is absent", err)
+        with tempfile.TemporaryDirectory() as d:
+            # A verifier that outruns the timeout: refused by name, and the partial data file
+            # a run cut short leaves behind is purged rather than combined by the next run.
+            root, base = self._repo(Path(d))
+            self._append(root, self.PROD, "\n\ndef added_dead():\n    return 4\n")
+            # the verifier spawns a TRACED child that finishes - writing a real parallel data
+            # file - and only then outruns the timeout, so the handler's purge runs with
+            # something to delete. Seeding a file instead cannot reach it: the pre-run purge
+            # has already emptied the directory, and a killed child writes nothing.
+            self._append(root, self.TEST, "\n    def test_slow(self):\n        import subprocess, time\n"
+                         "        subprocess.run([sys.executable, str(pathlib.Path(__file__).resolve().parents[1] / 'prod' / 'mod.py')], capture_output=True)\n"
+                         "        time.sleep(20)\n")
+            self._append(root, self.PROD, "\n\ndef child_only():\n    print('child')\n\n\nif __name__ == '__main__':\n    child_only()\n")
+            story = self._story(root, self.UNIT, f"{self.PROD}, docs/note.md", [f"pytest {self.TEST}::TestT::test_slow"])
+            self._commit(root, f"fix({self.UNIT}): a slow verifier\n")
+            leftover_dir = root / "sdlc-studio" / ".local" / "coverage"; leftover_dir.mkdir(parents=True)
+            (leftover_dir / f"{self.UNIT}.coverage.partial").write_text("left by a run cut short\n", encoding="utf-8")
+            with self.assertRaises(verify_ac.CoverageUnavailable) as cm:
+                verify_ac.coverage_report(root, story, self.UNIT, base_ref=base, timeout=6)
+            self.assertIn("exceeded 6s under coverage", str(cm.exception))
+            left = list((root / "sdlc-studio" / ".local" / "coverage").glob(f"{self.UNIT}.coverage*"))
+            self.assertEqual(left, [], "a run cut short leaves no data file for the next run to combine: " + str(left))
+
+    # -- AC4 -------------------------------------------------------------------------
+    def test_the_cli_exit_code_and_report_carry_the_verdict(self) -> None:
+        """MUTANTS: hard-code the CLI exit code to 0; move coverage's data file to the tree
+        root; omit the Affects hash from the report's `coverage` key."""
+        with tempfile.TemporaryDirectory() as d:
+            root, base = self._repo(Path(d))
+            self._append(root, self.PROD, "\n\ndef added_dead():\n    return 4\n")
+            self._commit(root, f"fix({self.UNIT}): x\n")
+            argv = [sys.executable, str(SCRIPT_PATH), "run", "--id", self.UNIT, "--coverage", "--root", str(root), "--dry-run", "--report", "sdlc-studio/.local/cov-report.json"]
+            cp = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+            self.assertEqual(cp.returncode, 1, cp.stdout + cp.stderr)
+            rep = json.loads((root / "sdlc-studio" / ".local" / "cov-report.dry-run.json").read_text(encoding="utf-8"))
+            entry = rep["coverage"]["US9301-cov"]
+            self.assertEqual(entry["base_ref"], base); self.assertEqual(len(entry["affects_hash"]), 64)
+            first_hash = entry["affects_hash"]
+            self._append(root, "docs/note.md", "\nthe same names, different bytes\n")
+            cp = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+            rep = json.loads((root / "sdlc-studio" / ".local" / "cov-report.dry-run.json").read_text(encoding="utf-8"))
+            self.assertNotEqual(rep["coverage"]["US9301-cov"]["affects_hash"], first_hash, "the hash is over the files' CONTENT, so a gate can tell a stale report from a current one")
+            self.assertEqual(len(entry["files"]["prod/mod.py"]["uncovered"]), 1)
+            self.assertEqual([p.name for p in root.glob(".coverage*")], [], "coverage's data files must never land at the tree root")
+            self._append(root, self.TEST, "\n    def test_a3(self):\n        assert mod.added_dead() == 4\n")
+            self._story(root, self.UNIT, f"{self.PROD}, docs/note.md", [f"pytest {self.TEST}::TestT::test_a", f"pytest {self.TEST}::TestT::test_a3"])
+            self._commit(root, f"fix({self.UNIT}): covered\n")
+            cp = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+            self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
+            cp = subprocess.run([*argv, "--base", "deadbeefcafe"], capture_output=True, text=True, timeout=600)
+            self.assertEqual(cp.returncode, 2, cp.stdout + cp.stderr)
+            self.assertIn("base ref `deadbeefcafe` does not resolve here", cp.stderr)
+            # a ref that resolves but sits off HEAD's line of history: nothing since it can be
+            # attributed, and reading that as zero added lines would pass a wrong ref
+            gitutil.git(["checkout", "-q", "-b", "aside", base], root)
+            self._append(root, "docs/note.md", "\naside\n"); aside = self._commit(root, "aside: not on the line\n")
+            gitutil.git(["checkout", "-q", "-"], root)
+            cp = subprocess.run([*argv, "--base", aside], capture_output=True, text=True, timeout=600)
+            self.assertEqual(cp.returncode, 2, cp.stdout + cp.stderr)
+            self.assertIn("is not an ancestor of HEAD", cp.stderr)
+
+    # -- AC5 -------------------------------------------------------------------------
+    def test_a_non_python_affects_file_is_reported_not_measurable(self) -> None:
+        """MUTANTS: replace the not-measurable branch for a non-Python file with covered;
+        replace it with uncovered, which the exit-0 control kills."""
+        with tempfile.TemporaryDirectory() as d:
+            root, base = self._repo(Path(d))
+            self._append(root, "docs/note.md", "\nmore prose the unit added\n")
+            self._commit(root, f"docs({self.UNIT}): prose only\n")
+            rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("coverage: docs/note.md: not measurable", out)
+            self.assertIn("coverage: uncovered: 0", out)
+            # An Affects file that no longer exists (a module the unit deleted): blame fails
+            # and there is nothing to read, so it has no lines - never a crash, never untracked
+            self._story(root, self.UNIT, f"{self.PROD}, prod/gone.py, docs/note.md", [f"pytest {self.TEST}::TestT::test_a"])
+            rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("coverage: prod/gone.py: 0 added statement(s), 0 executed, 0 uncovered", out)
+
+    # -- AC6 -------------------------------------------------------------------------
+    def test_a_line_executed_only_in_a_spawned_child_is_covered(self) -> None:
+        """MUTANT: remove the subprocess patching so a child interpreter's lines read
+        uncovered."""
+        with tempfile.TemporaryDirectory() as d:
+            root, base = self._repo(Path(d))
+            self._append(root, self.PROD, "\n\ndef child_only():\n    print('child')\n\n\nif __name__ == '__main__':\n    child_only()\n")
+            self._append(root, self.TEST, f"\n    def test_child(self):\n        import subprocess\n        cp = subprocess.run([sys.executable, str(pathlib.Path(__file__).resolve().parents[1] / 'prod' / 'mod.py')], capture_output=True, text=True)\n        assert cp.stdout.strip() == 'child'\n")
+            self._story(root, self.UNIT, f"{self.PROD}, docs/note.md", [f"pytest {self.TEST}::TestT::test_a", f"pytest {self.TEST}::TestT::test_child"])
+            self._commit(root, f"fix({self.UNIT}): a child-only line\n")
+            data_dir = root / "sdlc-studio" / ".local" / "coverage"; data_dir.mkdir(parents=True)
+            (data_dir / f"{self.UNIT}.coverage.stale").write_text("left by an earlier run\n", encoding="utf-8")
+            rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("coverage: uncovered: 0", out)
+            self.assertEqual([p.name for p in data_dir.glob(f"{self.UNIT}.coverage*")], [], "the run's data files, and any stale one, are removed after the read")
+        with tempfile.TemporaryDirectory() as d:
+            # A REAL data file from an earlier, interrupted run, in which a sibling test executed
+            # the dead line: combined, it would read the line covered. Purged before the run, the
+            # unit's own selector alone decides.
+            root, base = self._repo(Path(d))
+            self._append(root, self.PROD, "\n\ndef added_dead():\n    return 4\n")
+            self._append(root, self.TEST, "\n    def test_sibling(self):\n        assert mod.added_dead() == 4\n")
+            self._commit(root, f"fix({self.UNIT}): a line only a sibling reaches\n")
+            data_dir = root / "sdlc-studio" / ".local" / "coverage"; data_dir.mkdir(parents=True)
+            # the earlier run is its own process: it must not inherit the rc of a lane that may
+            # be measuring THIS test, or its data lands in that lane's file instead of the leftover
+            clean_env = {k: v for k, v in os.environ.items() if not k.startswith("COVERAGE")}
+            cp = subprocess.run([sys.executable, "-m", "coverage", "run", f"--data-file={data_dir / (self.UNIT + '.coverage.leftover')}", f"--source={root / 'prod'}", "-m", "pytest", "-q", "-p", "no:cacheprovider", f"{self.TEST}::TestT::test_sibling"], cwd=str(root), capture_output=True, text=True, timeout=300, env=clean_env)
+            self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
+            self.assertTrue((data_dir / f"{self.UNIT}.coverage.leftover").is_file())
+            rc, out, err = self._run(root, self.UNIT)
+            self.assertEqual(rc, 1, out + err)
+            self.assertIn("1 uncovered", out)
+
+
+class VerifiedFieldIsReadTests(unittest.TestCase):
+    """BG0733. A criterion's `Verified:` line did not survive contact with the verifier, and the
+    bug as filed understated it. Measured through the shipped CLI: a parsed `no`, `manual` or
+    `stale` is OVERWRITTEN with `yes` by a green selector, so the disclosure is destroyed rather
+    than ignored; and `VERIFIED_RE` demanded end-of-line after the optional parenthetical, so any
+    value carrying a reason matched nothing, after which a fresh `yes` was inserted above the
+    original and the criterion carried two contradictory verdicts. 17 of this corpus's 3143
+    `Verified:` lines sat in that second state."""
+
+    def _story(self, *criteria: str, status: str = "In Progress") -> tuple[Path, Path]:
+        d = Path(tempfile.mkdtemp(prefix="verified_field_"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "sdlc-studio" / "stories").mkdir(parents=True)
+        body = "\n".join(criteria)
+        path = d / "sdlc-studio" / "stories" / "US9100-probe.md"
+        path.write_text(
+            f"# US9100: probe\n\n> **Status:** {status}\n> **Affects:** a.py\n\n"
+            f"## Acceptance Criteria\n\n{body}\n\n## Revision History\n\n"
+            "| Date | Author | Change |\n| --- | --- | --- |\n| 2026-09-22 | probe | created |\n",
+            encoding="utf-8")
+        return d, path
+
+    def _run(self, root: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-B", str(SCRIPT_PATH), "run", "--id", "US9100",
+             "--root", str(root)], capture_output=True, text=True, check=False)
+
+    @staticmethod
+    def _verified_lines(path: Path) -> list[str]:
+        return [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()
+                if "**Verified:**" in ln]
+
+    def test_a_recorded_no_fails_and_is_not_rewritten(self) -> None:
+        """AC1. The selector is green and the author said no. Today the line is overwritten with
+        `yes`, which destroys the only record that anybody doubted the criterion."""
+        root, path = self._story(
+            "- [x] **AC1: a thing**", "  - **Verify:** shell true",
+            "  - **Verified:** no - two of fifteen cases still fail")
+        out = self._run(root)
+        self.assertIn("fail=1", out.stdout + out.stderr,
+                      "a criterion its author recorded as unmet must not count as passing")
+        self.assertEqual(["- **Verified:** no - two of fifteen cases still fail"],
+                         self._verified_lines(path),
+                         "the recorded verdict was rewritten by the run that read it")
+        # Now that every non-positive verdict is protected, this message is the ONLY place an
+        # author's reason surfaces for the case the bug is about. One assertion kills the mutant
+        # that drops it from the failure text.
+        self.assertIn("two of fifteen cases still fail", out.stdout + out.stderr,
+                      "the author's reason must reach the reader, not just the verdict")
+
+    def test_manual_passes_and_keeps_its_own_word(self) -> None:
+        """AC2. `manual` is a POSITIVE verdict - 18 of them in the corpus - and it records HOW the
+        criterion was verified, so normalising it to `yes` loses the author's distinction."""
+        root, path = self._story(
+            "- [x] **AC1: a thing**", "  - **Verify:** shell true", "  - **Verified:** manual")
+        out = self._run(root)
+        self.assertIn("pass=1", out.stdout + out.stderr)
+        self.assertIn("fail=0", out.stdout + out.stderr)
+        self.assertEqual(["- **Verified:** manual"], self._verified_lines(path))
+
+    def test_a_value_with_a_trailing_reason_parses_and_carries_it(self) -> None:
+        """AC3. The shipped pattern demanded end-of-line after the optional parenthetical, so
+        every annotated line in the corpus missed entirely."""
+        line = "  - **Verified:** manual - byte-identical, confirmed independently by the reviewer"
+        m = sdlc_md.VERIFIED_RE.match(line)
+        self.assertIsNotNone(m, "an annotated value must parse, not miss")
+        self.assertEqual("manual", m.group(2).lower())
+        root, path = self._story("- [x] **AC1: a thing**", "  - **Verify:** shell true", line)
+        out = self._run(root)
+        self.assertIn("pass=1", out.stdout + out.stderr)
+        self.assertEqual(1, len(self._verified_lines(path)),
+                         "a parsed line must not gain a second verdict beside it")
+        # The REPORT, not the file. A positive verdict is never rewritten, so asserting on the
+        # file stayed green even with the reason capture deleted - that mutant SURVIVED.
+        payload = json.loads((root / "sdlc-studio" / ".local" / "verify-report.json")
+                             .read_text(encoding="utf-8"))
+        reasons = [r for story in payload["stories"].values()
+                   for r in (story.get("recorded_reasons") or [])]
+        self.assertTrue(any("byte-identical" in (r.get("reason") or "") for r in reasons),
+                        f"the recorded reason never reached the report: {reasons}")
+
+    def test_an_unreadable_value_is_reported_and_no_second_line_is_inserted(self) -> None:
+        """AC4. `PARTIAL` is outside the vocabulary. Today the parser cannot see the line, inserts
+        a fresh `yes` above it, and the criterion ends up carrying two contradictory verdicts."""
+        root, path = self._story(
+            "- [x] **AC1: a thing**", "  - **Verify:** shell true",
+            "  - **Verified:** PARTIAL (2026-09-22) - two of fifteen cases fail")
+        out = self._run(root)
+        blob = out.stdout + out.stderr
+        self.assertNotIn("pass=1", blob, "an unreadable verdict must not report as satisfied")
+        self.assertEqual(1, len(self._verified_lines(path)),
+                         "a second, contradictory Verified line was inserted above the original")
+        self.assertIn("PARTIAL", self._verified_lines(path)[0])
+
+    def test_an_absent_verified_line_is_not_a_denial(self) -> None:
+        """AC5. 660 of this corpus 3793 criteria carry no `Verified:` line. Treating an absent field as a denial
+        would redden the entire backlog at once, so this is the half that must NOT change."""
+        root, path = self._story("- [x] **AC1: a thing**", "  - **Verify:** shell true")
+        out = self._run(root)
+        self.assertIn("pass=1", out.stdout + out.stderr)
+        self.assertIn("fail=0", out.stdout + out.stderr)
+        self.assertEqual(1, len(self._verified_lines(path)))
+        self.assertTrue(self._verified_lines(path)[0].startswith("- **Verified:** yes"))
+
+    def test_a_failing_recorded_verdict_moves_no_status(self) -> None:
+        """AC6. Seven Done units carry a recorded `no`. Reporting the truth about them is the
+        point; reopening them is a separate decision nobody has taken."""
+        root, path = self._story(
+            "- [x] **AC1: a thing**", "  - **Verify:** shell true", "  - **Verified:** no",
+            status="Done")
+        out = self._run(root)
+        # Assert the branch is REACHED before asserting what it does not do. The first version
+        # asserted only the status, so it passed while the run was greening the line instead of
+        # failing it - the fixture demonstrated the defect it was named against.
+        self.assertIn("fail=1", out.stdout + out.stderr,
+                      "the recorded-not-verified branch must be reached for this to prove anything")
+        self.assertEqual(["- **Verified:** no"], self._verified_lines(path))
+        self.assertIn("> **Status:** Done", path.read_text(encoding="utf-8"),
+                      "reporting a failing verdict must not transition the unit")
+
+    def test_the_red_fix_green_loop_closes_end_to_end(self) -> None:
+        """AC7. `update_verified` writes the downgrade ITSELF when a stamped-green criterion goes
+        red, and the author writes the identical shape, so provenance cannot be read from the line
+        - it has to be MARKED. Driven as the real two-step loop rather than a hand-built fixture,
+        because the first repair passed a hand-built one while the loop still could not close."""
+        d = Path(tempfile.mkdtemp(prefix="verified_loop_"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "sdlc-studio" / "stories").mkdir(parents=True)
+        path = d / "sdlc-studio" / "stories" / "US9100-probe.md"
+        path.write_text(
+            "# US9100: probe\n\n> **Status:** In Progress\n> **Affects:** a.py\n\n"
+            "## Acceptance Criteria\n\n- [x] **AC1: a thing**\n"
+            f"  - **Verify:** shell test -f {d / 'flag.txt'}\n"
+            "  - **Verified:** yes (2026-01-01)\n\n## Revision History\n\n"
+            "| Date | Author | Change |\n| --- | --- | --- |\n| 2026-09-22 | probe | created |\n",
+            encoding="utf-8")
+
+        red = self._run(d)
+        self.assertIn("fail=1", red.stdout + red.stderr, "step 1: the selector must go red")
+        downgraded = self._verified_lines(path)[0]
+        self.assertTrue(downgraded.startswith("- **Verified:** no"))
+        self.assertIn("downgraded by verify_ac", downgraded,
+                      "the tool must MARK its own downgrade, or nothing can tell it from an author's")
+
+        (d / "flag.txt").write_text("", encoding="utf-8")
+        green = self._run(d)
+        self.assertIn("pass=1", green.stdout + green.stderr,
+                      "step 2: the loop must close - the tool's own downgrade is not a disclosure")
+        self.assertIn("fail=0", green.stdout + green.stderr)
+        self.assertTrue(self._verified_lines(path)[0].startswith("- **Verified:** yes"))
+
+    def test_a_bare_recorded_no_is_protected(self) -> None:
+        """AC7b, and the finding that sank the first repair. Every one of this corpus's 18
+        non-positive lines is BARE - no reason - so keying protection on a reason being present
+        protected none of them, and 100% of the real instances were still destroyed. An UNMARKED
+        verdict is the author's; the cost of being wrong is one manual edit, against silently
+        erasing a disclosure."""
+        for value in ("no", "no (2026-07-20)", "stale"):
+            with self.subTest(value=value):
+                root, path = self._story(
+                    "- [x] **AC1: a thing**", "  - **Verify:** shell true",
+                    f"  - **Verified:** {value}", status="Done")
+                out = self._run(root)
+                self.assertIn("fail=1", out.stdout + out.stderr,
+                              f"a bare {value!r} is the corpus shape and must not be greened")
+                self.assertEqual([f"- **Verified:** {value}"], self._verified_lines(path),
+                                 "the recorded verdict was destroyed by the run that read it")
+                self.assertIn("> **Status:** Done", path.read_text(encoding="utf-8"))
+
+    def test_a_flip_records_what_it_replaced(self) -> None:
+        """AC7c. `old_state` is the audit field for exactly this event; hardcoding "none" made a
+        cleared verdict indistinguishable from one that was never there."""
+        d = Path(tempfile.mkdtemp(prefix="verified_flip_"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        (d / "sdlc-studio" / "stories").mkdir(parents=True)
+        path = d / "sdlc-studio" / "stories" / "US9100-probe.md"
+        marked = "no (2026-01-01) - downgraded by verify_ac - the selector was red at verification time"
+        path.write_text(
+            "# US9100: probe\n\n> **Status:** In Progress\n> **Affects:** a.py\n\n"
+            "## Acceptance Criteria\n\n- [x] **AC1: a thing**\n  - **Verify:** shell true\n"
+            f"  - **Verified:** {marked}\n\n## Revision History\n\n"
+            "| Date | Author | Change |\n| --- | --- | --- |\n| 2026-09-22 | probe | created |\n",
+            encoding="utf-8")
+        self._run(d)
+        payload = json.loads((d / "sdlc-studio" / ".local" / "verify-report.json")
+                             .read_text(encoding="utf-8"))
+        flips = [f for story in payload["stories"].values() for f in (story.get("flips") or [])]
+        self.assertEqual([{"ac": "AC1", "old_state": "no", "new_state": "yes"}], flips,
+                         "the flip must name the verdict it replaced, not report none")
+
+    def test_the_value_must_be_a_whole_word(self) -> None:
+        """AC8. Without the word boundary, `yesterday` parses as a positive `yes` - the mutant that
+        drops it survived all 411 tests in this module."""
+        for text in ("yesterday", "nope", "manually by hand", "stalemate",
+                     "yes-ish", "yes/no unclear", "manual/automated", "no-longer-true"):
+            with self.subTest(value=text):
+                self.assertIsNone(
+                    sdlc_md.VERIFIED_RE.match(f"  - **Verified:** {text}"),
+                    f"{text!r} is not a verdict and must not parse as one")
+
+    def test_stale_is_not_a_positive_verdict(self) -> None:
+        """AC9. The changelog and the docstring both assert it; nothing pinned it, and a mutant
+        adding `stale` to the positive set survived all 411 tests."""
+        self.assertNotIn("stale", sdlc_md.VERIFIED_POSITIVE)
+        root, _path = self._story(
+            "- [x] **AC1: a thing**", "  - **Verify:** shell true",
+            "  - **Verified:** stale - the fixture moved under it")
+        out = self._run(root)
+        self.assertIn("fail=1", out.stdout + out.stderr)
+
+if __name__ == "__main__":
+    unittest.main()
+

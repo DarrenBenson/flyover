@@ -1,0 +1,265 @@
+<!--
+Load when: /sdlc-studio init or /sdlc-studio init help
+Dependencies: SKILL.md (always loaded first)
+Related: reference-outputs.md, templates/
+-->
+
+# /sdlc-studio init - Project Context
+
+## You can just ask
+
+SDLC Studio is model-invoked - say it in plain language:
+
+| Just say... | Runs |
+| --- | --- |
+| "Set this project up for SDLC Studio" | `/sdlc-studio init` |
+| "Work out what stack this project uses" | `/sdlc-studio init --detect` |
+| "Set it up and seed the starter docs too" | `/sdlc-studio init --scaffold` |
+| "Show me what setup would write before it does it" | `/sdlc-studio init --dry-run` |
+| "Reconfigure this project from scratch" | `/sdlc-studio init --force` |
+
+Gather project context before starting SDLC workflow. Creates a configuration file with project-specific settings.
+
+## Guided onboarding - `init guided`
+
+New to SDLC Studio, or setting up a project from nothing? `init guided` is the one command that
+walks you the whole way - from an empty (or existing) repo to a ready first sprint plan - so you do
+not have to know the pipeline order or which document comes next.
+
+```bash
+/sdlc-studio init guided             # start, or resume where you left off
+/sdlc-studio init guided --confirm   # accept the drafted stage and advance
+/sdlc-studio init guided --skip      # skip the current stage (a recorded decision)
+/sdlc-studio init guided --reset     # start the walk again from the first stage
+```
+
+It runs one stage at a time and draws each in turn, so you review a draft and confirm before it
+moves on. The stages, in order:
+
+1. **agents** - seed the project agent-instructions (`AGENTS.md` + `CLAUDE.md`) so every tool reads
+   the same discipline, and the lean subagent definitions `.claude/agents/sdlc-builder.md` and
+   `.claude/agents/sdlc-reviewer.md` (a `tools` line of Bash, Read, Edit, Write and Monitor, so a
+   lane or review agent starts without the skill and tool catalogues it never uses). Each file is
+   drafted only if absent: a project that already has its own `AGENTS.md` still gets the missing
+   definitions, and a definition you have edited is left untouched and reported skipped.
+2. **prd** - the Product Requirements: created from a conversation on a greenfield repo, or generated
+   from the existing code on a brownfield one.
+3. **trd** - the Technical Requirements, generated from the PRD.
+4. **tsd** - the Test Strategy, generated from the PRD (and the detected stack on a brownfield repo)
+   so the sprint plan later has a strategy to read.
+5. **personas** - grow the engineering team from the PRD and its risk signals, to accept or edit.
+6. **decompose** - break the PRD into epics and sized stories.
+7. **plan** - the first sprint plan - onboarding ends exactly where delivery begins.
+
+A stage ends when you confirm or skip it, or when the project already holds its finished output. A
+document still carrying its template's `{{placeholders}}` is a draft, not a finished output (quoting
+one in a code span or a fenced example does not count), so the stage that drafted it stays the
+resume point until you fill it in or confirm it. That covers the
+`AGENTS.md` that `init` seeds, too. An existing `AGENTS.md` with no lifecycle doctrine (framework
+boilerplate, say) leaves the **agents** stage open: it offers to append the starter's
+`## Operating doctrine` block and never rewrites your file.
+
+It works on both **greenfield** (nothing yet - each document is authored with you) and **brownfield**
+(existing code - the stack is detected and the documents are generated from what is already there)
+projects; the path is classified for you at the first stage. Progress is checkpointed, so you can
+leave and come back - `status` and `hint` keep pointing you at `init guided` and name the next stage
+until you reach that first plan.
+
+## Quick Reference
+
+```bash
+/sdlc-studio init                   # Create tree + indexes + config + agent-instructions
+/sdlc-studio init --detect          # Infer the stack from project files
+/sdlc-studio init --scaffold        # Also seed prd/trd/tsd and the personas/index.md registry
+/sdlc-studio init --dry-run         # Preview every write (show config, confirm, then run)
+/sdlc-studio init --force           # Overwrite existing files
+```
+
+Backed by `scripts/init.py` - deterministic, idempotent (never overwrites
+without `--force`), and it pre-creates every `_index.md` so the first `new` of any type is
+indexed (no empty-project `indexed=false`). The directory tree, indexes, and
+agent-instructions are written without prompting; config is load-bearing, so review the
+`--dry-run` preview and confirm before a real run on greenfield.
+
+## Purpose
+
+Initialises SDLC Studio for a project by:
+
+- Detecting language and framework from project files
+- Gathering preferences for testing and documentation
+- Creating `.sdlc-studio.yaml` configuration file
+- Setting up the `sdlc-studio/` directory structure
+
+## What Happens
+
+1. **Detect Project Type**
+   - Scan for language indicators (package.json, pyproject.toml, go.mod, etc.)
+   - Identify primary framework
+   - Classify project type (Web App, API Backend, CLI, etc.)
+
+2. **Gather Preferences**
+   - Ask about test approach (TDD default, frameworks)
+   - Ask about documentation style (British/American English)
+   - Ask about diagram preferences
+
+3. **Create Configuration**
+   - Write `.sdlc-studio.yaml` with gathered settings
+   - Create `sdlc-studio/` directory structure
+   - Seed the agent-instructions file if absent (see Onboarding step 2): copy
+     `templates/agent-instructions.md` → `AGENTS.md` and
+     `templates/agent-instructions.CLAUDE.md` → `CLAUDE.md`, then fill placeholders.
+   - Seed the subagent definitions if absent: `templates/agents/sdlc-builder.md` and
+     `templates/agents/sdlc-reviewer.md` → `.claude/agents/`, verbatim.
+   - Write the default `definition-of-ready.md` / `definition-of-done.md` (the
+     project's editable ready/done bars - see `reference-decisions.md#dor-dod`)
+
+4. **Offer the DoR/DoD tailoring pass** (with `--detect`)
+   - Propose stack-derived criteria (language, test framework, Dockerfile deploy
+     surface) for the documents - a Python CLI's done bar differs from a web service's
+   - Nothing is applied without acceptance: re-run with `--accept-tailoring` (or edit
+     the documents by hand); the static documents remain the source of truth
+   - The tailored result always passes the check-id registry validation
+
+5. **Report**
+   - Configuration summary
+   - Next steps to start pipeline
+
+## Output
+
+### Configuration File: `.sdlc-studio.yaml`
+
+```yaml
+# SDLC Studio Configuration
+# Generated by /sdlc-studio init
+
+project:
+  name: my-project
+  type: web_application
+  language: typescript
+  framework: express
+
+testing:
+  default_approach: tdd
+  unit_framework: jest
+  integration_framework: jest
+  e2e_framework: playwright
+  coverage_targets:
+    unit: 90
+    integration: 85
+    e2e_features: 100
+
+documentation:
+  style: british
+  include_diagrams: true
+  diagram_tool: mermaid
+
+quality:
+  linter: eslint
+  formatter: prettier
+  type_checker: typescript
+
+paths:
+  sdlc_root: sdlc-studio
+  tests: tests
+  source: src
+```
+
+### Directory Structure
+
+```text
+sdlc-studio/
+├── prd.md          # (created later with /sdlc-studio prd)
+├── trd.md          # (created later with /sdlc-studio trd)
+├── tsd.md          # (created later with /sdlc-studio tsd)
+├── personas/       # index.md registry (seeded by guided onboarding or --scaffold) + cards
+├── epics/          # Epic documents
+├── stories/        # User story documents
+├── plans/          # Implementation plans
+├── test-specs/     # Test specifications
+├── bugs/           # Bug reports
+└── workflows/      # Workflow state files
+```
+
+## Detection Logic
+
+| File | Detection |
+| ------ | ----------- |
+| `package.json` | Node.js/TypeScript project |
+| `pyproject.toml` | Python project |
+| `go.mod` | Go project |
+| `Cargo.toml` | Rust project |
+| `pom.xml` | Java/Maven project |
+| `build.gradle` | Java/Kotlin/Gradle project |
+| `*.csproj` | C#/.NET project |
+
+### Framework Detection
+
+| Indicator | Framework |
+| ----------- | ----------- |
+| `express` in dependencies | Express.js |
+| `fastapi` in dependencies | FastAPI |
+| `react` in dependencies | React |
+| `next` in dependencies | Next.js |
+| `django` in dependencies | Django |
+| `flask` in dependencies | Flask |
+| `gin-gonic/gin` in go.mod | Gin |
+| `spring` in pom.xml | Spring Boot |
+
+## Options
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `--detect` | Auto-detect all settings | false |
+| `--force` | Overwrite existing config | false |
+| `--accept-tailoring` | Apply the stack-derived DoR/DoD suggestions (with `--detect`); otherwise they are only offered | false |
+
+## Configuration Priority
+
+Settings are determined in this order:
+
+1. Existing `.sdlc-studio.yaml` (if not --force)
+2. User answers to questions
+3. Auto-detection from project files
+4. SDLC Studio defaults
+
+## Examples
+
+```bash
+# Interactive setup
+/sdlc-studio init
+
+# Auto-detect everything
+/sdlc-studio init --detect
+
+# Reconfigure existing project
+/sdlc-studio init --force
+```
+
+## Next Steps
+
+After init:
+
+```bash
+/sdlc-studio status   # Verify configuration
+/sdlc-studio prd      # Start with Product Requirements
+```
+
+## Onboarding an agent to this project
+
+`init` configures the project; **onboarding** gives the agent the working discipline:
+
+1. **Read `reference-doctrine.md`** – the project-*agnostic* operating rules (the skill is the OS; RFC/CR/ADR choice; reconcile cadence + file-census; review cadence incl. a CODE leg; ship-paperwork-in-the-same-commit; consult gates; TDD; cross-repo numbering; recall `lessons/`).
+2. **Seed or check the project agent-instructions file.**
+   - **If absent:** create `AGENTS.md` from `templates/agent-instructions.md` and a one-line `CLAUDE.md` from `templates/agent-instructions.CLAUDE.md` (`@AGENTS.md`), then fill the `{{placeholders}}` with this project's specifics. `AGENTS.md` is the cross-tool standard (Codex, Copilot, Cursor, opencode); Claude Code reads `CLAUDE.md`, which imports it.
+   - **If present:** run `python3 "$CLAUDE_SKILL_DIR/scripts/validate.py" instructions` and apply the suggested improvements - do not overwrite the hand-written specifics.
+   A good file *references* the doctrine rather than restating it, then adds only what is unique to this project (architecture, config/secret handling, deploy/CI, code-style rules, the agents/services, house language). Keep current-state out of it: that belongs in `sdlc-studio/reviews/LATEST.md` (progressive disclosure).
+3. **`/sdlc-studio lessons recall`** – load the cross-project lessons-learned before design/process decisions.
+4. If `sdlc-studio/reviews/LATEST.md` exists, read it for current orientation.
+
+## See Also
+
+- `help/getting-started.md` - **the greenfield runbook**: the canonical command order from
+  here to a reviewable backlog and on through the sprint handoff (run this next)
+- `/sdlc-studio status help` - Pipeline status
+- `/sdlc-studio prd help` - Product requirements
+- `reference-outputs.md` - Output formats

@@ -1,0 +1,297 @@
+# SDLC Studio Reference - Skill Internal Scripts
+
+Runtime helpers that live in the skill's `scripts/` directory and
+are invoked by workflow reference files. Claude calls these; users do
+not.
+
+<!-- Load when: a reference file instructs invoking a script in scripts/ -->
+
+## Reading Guide
+
+| Section | When to Read |
+| --- | --- |
+| Locating the skill directory | When running any script example |
+| Rationale | When deciding whether a new helper belongs in scripts/ |
+| Invocation | When a reference file needs to call a script |
+| Contract | When writing or modifying a script |
+| Catalogue | When finding an existing helper before writing a new one |
+
+## Locating the Skill Directory {#skill-dir}
+
+Script examples use the form `python3 "$CLAUDE_SKILL_DIR/scripts/<name>.py"`.
+Claude Code sets `$CLAUDE_SKILL_DIR` to this skill's directory at every install
+level (personal, project, or plugin). If unset (another agent tool, or a shell
+outside skill execution), substitute the directory containing this skill's
+`SKILL.md` (e.g. `~/.claude/skills/sdlc-studio`, `~/.agents/skills/sdlc-studio`,
+`.github/skills/sdlc-studio`). The quoted variable fails loudly when unset;
+never guess between multiple installed copies.
+
+## Rationale {#scripts-rationale}
+
+SDLC Studio was Claude-native through v1.5.0: every workflow was a markdown
+instruction executed with built-in tools. Three capabilities need
+deterministic computation:
+
+1. **AST repository indexing** (`repo_map.py`) – reinventing a ranked
+   file index every session wastes tokens and drifts.
+2. **AC verifier execution** (`verify_ac.py`) – running pytest, curl,
+   or shell assertions at scale needs a single entry point that
+   parses results and updates story files atomically.
+3. **GitHub issue sync** (`github_sync.py`) – diffing local CR/Story
+   files against GitHub Issues and writing back needs idempotent
+   logic that a script can unit-test.
+
+A later wave extends the same principle - **determinism in scripts,
+judgement in Claude** - to the highest-frequency mechanical workflows:
+
+1. **Drift detection** (`reconcile.py`) – the file census and index-drift
+   comparison doctrine rule 3 prescribes is a deterministic algorithm.
+2. **Pipeline status** (`status.py`) – the four-pillar census and hint ladder.
+3. **Artifact validation** (`validate.py`) – ID/Status/structure linting.
+4. **ID allocation** (`next_id.py`) – cross-repo-safe numbering (rule 13).
+5. **Review inputs** (`review_prep.py`) – the mechanical inputs the five-leg
+   review consumes (staleness, persona usage, counts).
+
+These five are **read-only**: each emits JSON (or writes only to
+`.local/`), and Claude consumes it and does the judgement - adjudicating
+ambiguous drift, applying body-level edits, and rendering the dashboard or
+the review verdict. The census and computation move to the script; the
+decision stays with Claude. The five-leg review verdict and the CODE leg in
+particular are never scripted - they are irreducibly judgement.
+
+For everything else (reading files, walking directories, simple
+transforms) Claude's built-in tools are still the right answer. The
+scripts directory is for computation that benefits from being written
+once and tested. All scripts share `lib/sdlc_md.py`, the single source of
+truth for the markdown conventions (metadata fields, artifact IDs, AC
+blocks, the artifact-type and status-vocabulary tables).
+
+## Invocation {#scripts-invocation}
+
+Reference files call scripts via Bash:
+
+```bash
+python3 "$CLAUDE_SKILL_DIR/scripts/repo_map.py" query \
+  --story sdlc-studio/stories/US0001-user-login.md --top 10
+```
+
+Always use the absolute path from repo root. Never `cd` into the
+scripts directory. Always pass `--dry-run` first when the workflow
+explicitly supports it.
+
+## Contract {#scripts-contract}
+
+Every script in `scripts/`:
+
+1. Starts with `#!/usr/bin/env python3` and is executable
+2. Uses `argparse` subcommands for commands (e.g. `repo_map.py build`)
+3. Supports `--help` on every subcommand
+4. Exits non-zero on any failure that should halt the workflow
+5. Never mutates files outside `sdlc-studio/.local/` or the files
+   passed on the command line. One flagged exception: `plan.py archive`
+   moves files under `~/.claude/plans/`, an operator-owned directory
+   outside any project - it is the only script that writes outside
+   `.local/`, only on that explicit subcommand, and it never deletes
+   or overwrites
+6. Never fetches network resources except the explicit GitHub CLI
+   wrapper, and even then only via the `gh` tool (no token handling)
+7. Prints plain text to stdout by default, with `--format json` where
+   machine-parseable output matters
+8. Has unit tests under `scripts/tests/test_<script>.py`
+9. Takes id lists the one documented way - a repeatable `--id` or a single
+   comma-separated `--ids` (`sdlc_md.add_ids_argument` / `resolve_ids`), and the
+   recorder subject id as `--unit` - so no verb needs a per-script `--help` probe
+   (swept by `tests/test_cli_grammar.py`)
+
+10. Resolves `--root` through `sdlc_md.resolve_root(args)` and anchors any
+    relative output path with `sdlc_md.under_root(root, rel)` - never a bare
+    `Path(args.root)`. A NAMED root is honoured verbatim; the family default
+    `.` means "work it out from here" and is discovered upward to the nearest
+    directory holding an `sdlc-studio/` workspace. Assuming `.` was the cwd is
+    the defect this exists to prevent: a run from a subdirectory wrote its
+    output into a stray `sdlc-studio/.local` tree beside the cwd, printed the
+    path it had used, and exited 0 - so the report the Done gate reads was
+    never where the gate looks. One resolver, not a path-joining idiom per
+    script, is what keeps a writer and its reader agreeing where a file lives.
+    Swept by `tests/test_root_census.py`, which measures every script in the
+    directory and holds a recorded census to that measurement: a script may be
+    anchored, unanchored with a filed follow-up naming it, or a deliberate
+    non-root surface with its reason stated, and a newly added script with no
+    entry fails the sweep rather than joining unclassified.
+
+11. Takes free text as a DOCUMENT, never as a shell argument.
+    `file_finding.resolve_prose_fields` is the one loader, so every
+    prose-taking writer shares a path instead of growing its own:
+    `file_finding.py file`, `artifact.py new`, `critic.py supersede`,
+    `decisions.py add|promote|waive`,
+    `ledger.py record`, `lessons.py add|revalidate`,
+    `close_owed.py baseline` and `sprint.py goal-verdict|goal-review`.
+    Each takes `--fields-file FIELDS.json`, and `--fields-file -` reads the
+    document from stdin, so text already held in a pipe need not be spilled to
+    a temporary file to stay safe. Backticks and `$(` are command substitution
+    inside a shell argument, so on the flag path the prose is executed rather
+    than stored: one filing ran `git commit -a` against the live repository,
+    and another lost two commands with no message at all. The flags still work
+    and now report a field that arrives already mangled, but that report is
+    defence in depth rather than the fix. Measured against the recorded
+    corruptions it catches three of the four with no false positive over this
+    project's own artefact prose; the fourth is undetectable in principle,
+    because a token lost from the START of a sentence leaves grammatical text
+    behind and carries no mark to find. The document is the fix - it never
+    crosses a shell at all.
+
+See `best-practices/script.md` for the shared style rules (shebang,
+error handling, CLI flags over config files, and the CLI argument grammar).
+
+## Catalogue {#scripts-catalogue}
+
+The catalogue is grouped into detail pages (each under the reference budget). This index
+lists every script with a one-line summary; open the linked page for the full entry.
+
+### Creation & mutation - [reference-scripts-create.md](reference-scripts-create.md)
+
+- `artifact.py` - `new --type retro|review`: the meta-artifacts are tool-created too
+- `init.py` - Deterministic greenfield initialiser - `init` is now an executable, not a manual
+- `decisions.py` - Project decisions log - the canonical home for load-bearing decisions, both
+- `transition.py` - Deterministic status transition + cascade. `set --id <ID> --status <new>` sets `Status`,
+  and the canonical one-call bug close is `set --id BGxxxx --status Fixed --verdict approve --reviewer <R> --author <A> --brief <fingerprint>` -
+  independent verdict and gated transition in one call, every predictable refusal raised before any write.
+  The reviewer is a separate context that did not write the fix, briefed with `critic.py brief --unit BGxxxx --seat qa`;
+  `--brief` carries the fingerprint that brief printed. A `--verdict` without it is warned on stderr, never refused
+- `archive.py` - Index archival for large boards. `archive --type <t> --release <r>` moves a
+- `refine.py` - Decompose a request (RFC/CR) into an epic and stories, with the two-backlog links wired. `refine show --request <id>` surfaces the request's content and confirms it is refinable; `refine apply --request <id> --epic-title "..." --story "title|points[|affects]" ...` creates the epic (T-shirt sized from the point total, `Parent:` the request) and each story, writes the request's `Decomposed-into:`, rolls the epic's `Derived Point Total`, moves the request to its working status (In Progress / In Review), and surfaces `--question` items for a Three-Amigos consult. The automation of the hand-decomposition the two-backlog gates otherwise ask an operator to do, and the migration path for an upgrading project (an old childless CR becomes stories). Validates before minting: a non-request, an already-decomposed request, or an off-scale story point is refused and nothing is written.
+- `file_finding.py` - Deterministic Bug/CR/RFC filer for audit findings. Allocates a
+  collision-free id, renders a structured artefact and appends the index row. **File a
+  finding with `--fields-file finding.json`, not with prose flags**, and note that its
+  loader is the shared one every prose-taking writer uses - see rule 11 of the script
+  contract above for the full rule, the writers that take a document, and what the
+  flag path still does.
+- `persona_gen.py` - Deterministic floor of team/stakeholder generation: `stamp` marks a generated card provisional with a content hash, `classify` reports authored / generated-pristine / generated-edited (the never-clobber discriminator), `accept` clears provisional labels (batch-accept + persona review)
+- `next_id.py` - `allocate`: next free ID for a type (`--remote` also scans `origin/main`)
+- `ledger.py` - The append-only per-tranche decisions ledger. `record` appends a decision + rationale to `sdlc-studio/decisi...
+- `rfc.py` - RFC helpers - the `rfc decide` multi-RFC decision digest (per-draft open-decision + workstream counts + read...
+- `retro.py` - The retro spine. `validate --id RETROxxxx` is a CONTENT check (required sections, at least one real lesson, every finding dispositioned) and is what the close gate calls - a retro that exists but says nothing is not a retro. `dispose` reports each finding as filed / declined / undecided. `extract` lifts the retro's `## Lessons` bullets into the project lessons log, idempotently, so a lesson written in a retro reaches the digest the next sprint reads
+
+### Reconcile, verify & checks - [reference-scripts-verify.md](reference-scripts-verify.md)
+
+- `gate.py` - Portable, ecosystem-neutral CI quality gate. Aggregates the deterministic checks;
+  `--release` is the pre-tag form (the same gate plus an executing AC-verify pass, one exit code);
+  `--require-retro` is the sprint-close form (retro present + lessons re-validated + summary current)
+- `verify_ac.py` - Executes AC verifiers defined in story files and updates each AC's
+  `Verified:` stamp in place. `stamps --staged` judges only the stamped selectors naming a test
+  file the commit stages, against the index blob by AST in all four selector shapes, and
+  reports a stamp already dead at HEAD rather than refusing it - the `stamps-staged`
+  pre-commit lane.
+- `mutation.py` - The opt-in mutation probe no gate reads - the complement of `verify_ac.py`: verify_ac
+  confirms an AC's tests pass, this asks whether they would fail if the feature broke. Every run
+  appends one row to `sdlc-studio/.local/mutation-series.jsonl` recording what it cost
+  (wall-clock) and what it found, so the gate is judged on its record rather than on the run that
+  happened last; a refused or all-errored run is recorded as producing no evidence and can never
+  be read as a clean run. `yield --run MRUNxxx` reports the artefacts filed from a run beside its
+  survivor count. A window (`window open` / `window close`) declares that a process is rewriting
+  source files in place, and the gate refuses to pass while one is open. No per-target ledger
+  is kept: `register`, `retract`, `retractions` and `audit` are retired and refused by name.
+- `reconcile.py` - Builds the artifact-file census and reports `_index.md` drift as JSON.
+  `settle` applies the mechanical drift (indexes, and each epic whose units are all terminal,
+  closed to its derived Done or Superseded) and restages exactly what it wrote; a commit hook
+  runs it, and a file carrying unstaged work is left and named, never staged.
+- `status.py` - `pillars`: four-pillar census (Requirements/Code/Tests/Reviews) as JSON
+- `validate.py` - `check`: lint artifact structure (ID, Status vocabulary, title, AC presence, an optional
+- `conformance.py` - The lifecycle-conformance gate. `detect_conformance` reports per-story stages (decomposed -> AC -> verifiabl...
+- `doc_coverage.py` - The documentation-coverage check - the `documented` DoD floor. Hard-fails when a Type-Reference command lack...
+- `doc_freshness.py` - Advisory freshness check for `sdlc-studio/reviews/LATEST.md` - the state anchor drifts silently. Compares th...
+- `integrity.py` - Referential integrity. `detect_integrity` flags missing required links (e.g. a story with no epic) and dangl...
+
+### Audit, review & critic - [reference-scripts-review.md](reference-scripts-review.md)
+
+- `ac_scope.py` - Authoring lint (advisory): `check` flags a story whose acceptance criteria mention a
+- `spec_guard.py` - Spec-edit guard (schema v3 only, dormant on v2). A delivery must not silently falsify the
+- `constitution.py` - Project-constitution principle gate. Asserts the machine-checkable
+- `schema_check.py` - One CI-runnable command over the schema-v3 team-schema rules, emitting STABLE rule ids so the
+- `review_prep.py` - `prep`: deterministic inputs for the five-leg review (artifact staleness,
+- `disclosure.py` - Progressive-disclosure + Claude Code best-practice check, **advisory**. Flags reference-/
+- `readiness.py` - Tranche pre-flight readiness (deterministic). `check` grooms a batch for readiness - weak-AC, unmet-deps, already-terminal, link-integrity; `profile` resolves an audit lens pack for the adversarial `audit` command, and `profile --validate` holds every lens to its signature contract; `detector-owed` names the lenses filed under two separate audit runs that still have no mechanical detector (exits 0 clean, 1 owed, 3 cannot-judge).
+- `backfill_audit_runs.py` - One-off-shaped migration with a standing guard. `plan` reports which findings name an audit run inside their `Raised-by` prose; `apply` lifts it into an `Audit-run` field, records the lens as explicitly unknown (never guessed), and seeds each run into the register as `backfilled`; `check` is the standing sweep - it exits non-zero when any finding names a run in prose that its field does not carry. A `Raised-by` line naming two run ids is resolved only when the prose says which filed it (`run <B>` versus `<A> carry-over`), and refused otherwise.
+- `audit_cost.py` - Audit run cost estimate and its measurement loop. `run` estimates a fan-out before it starts, calibrated from the medians of what has been recorded; `record` appends a finished run's scope, estimate and actuals to the committed ledger under `sdlc-studio/retros/evidence/`. **That row is also the audit-run REGISTER:** `record --run-id` is what makes a run citable by `file_finding --audit-run`, so a close-out that omits it leaves every finding's attribution refused.
+- `critic.py` - The independent-critic verdict ledger. `record` writes a committed verdict to `sdlc-studio/reviews/critic-ve...
+- `persona_resolve.py` - Resolves the worker amigo for a delegated sub-agent, most-specific-first: a project-authored practitioner am...
+
+### Upgrade, deploy & version - [reference-scripts-upgrade.md](reference-scripts-upgrade.md)
+
+- `deploy.py` - Orchestrate-only deploy last-mile. Read-only, ecosystem-neutral: it never deploys, never
+- `version_check.py` - Skill version check + self-update signal. Compares the installed version
+- `migrate_v3.py` - One-shot schema v2 -> v3 migration (sequential ids -> type-prefixed short ULIDs):
+- `backfill_authorship.py` - Backfills a structured `> **Raised-by:** Name; type; version` reference onto artefacts that
+- `lite_profile.py` - Promotion for the lite profile (`profile: lite` collapses the pipeline to PRD ->
+- `project_upgrade.py` - Migrate a CONSUMING project to the current skill conventions, the project-side complement
+- `resume.py` - Resume an interrupted sprint from the persisted ledger + loop-state, so a context reset or crash continues t...
+
+### Domain helpers & orchestration - [reference-scripts-domain.md](reference-scripts-domain.md)
+
+- `repo_map.py` - Pure-Python repository indexer. Produces
+- `complexity.py` - Cognitive (SonarSource) + cyclomatic complexity per function from Python's
+- `provenance.py` - Artifact provenance. Makes deterministic creation the *checkable* path: `new`
+- `changelog.py` - Per-unit CHANGELOG fragments (`changelog.d/`), composed deterministically
+  into `[Unreleased]` and consumed; the release gate fails on a stray fragment. Kills the
+  shared-file contention the same-commit paperwork rule otherwise forces
+- `flow.py` - Deterministic flow metrics, the zero-token SCHEDULE instrument (cost is
+  points x measured rate, a different axis). `compute` reports per-unit cycle time
+  (Created -> delivered, git history with a revision-row fallback), weekly throughput
+  (delivered statuses only), and work-item age for every non-terminal unit; a unit whose
+  dates cannot be resolved is NAMED unmeasurable, never guessed. Advisory; feeds no gate
+- `telemetry.py` - Run telemetry recorder. `record` appends a per-unit run outcome
+- `pvd.py` - PVD projection + drift. `sync` projects the one writable master
+- `blocker_sweep.py` - The inverse of `audit`'s `unmet-deps`: finds units whose blockers have **cleared**. `sweep`
+- `triage_noise.py` - Creation-time triage noise controls (schema v3 only, dormant on v2). A **session cap**
+- `triage_sampling.py` - Triage-as-sampled-audit (schema v3). `sample(items, seed)` picks the findings a human audits:
+- `github_sync.py` - Two-way sync between local CR/Story/Epic files and GitHub Issues via
+- `digest.py` - Context tiering - mechanical, drift-checked digests of closed (terminal) artefacts so
+- `plan.py` - Claude Code plan-file manager for `~/.claude/plans/`.
+- `lessons.py` - Lessons manager for both tiers: the project's `sdlc-studio/retros/LESSONS.md`
+  and the skill's cross-project registry; `revalidate` + `summary` are the gated sprint-close loop
+- `sprint.py` - The Goal-Driven Development loop's planner. `plan <query> --order priority|wsjf` selects + dependency-orders...; `plan` refuses an ungroomed batch, `breakdown` reports the same census read-only...
+- `autosprint.py` - Deprecated re-exporting alias for `sprint.py` (the old name); prefer `sprint`.
+- `sprint_report.py` - The end-of-sprint page and the compulsory checklist, which are ONE document.
+  `show --id RETROxxxx` composes delivered units and points, cost with rework counted, velocity,
+  estimate-versus-actual, mutation yield, proof and seam coverage from the retro, `retro accuracy`
+  and telemetry. `checklist --id RETROxxxx` prints the compulsory set alone and exits non-zero while
+  any item is outstanding: one row per stage of the cycle plus the figures a close otherwise
+  re-derives by hand (planned against delivered, dropped / held / carried over with reasons, scope
+  creep as a ratio, review attribution by seat and lens count, impediments, carried known issues,
+  cost). Every row is derived except the stop-ship rulings, which are a judgement and live in the
+  retro's `## Known issues carried` table. `cycle_drift()` is the anti-drift guard: a sprint ceremony
+  verb with no checklist row fails it. Read-only.
+  Three further verbs compose the REPORT OF RECORD - the page an operator signs, which `sprint close`
+  files for them as it PREPARES the run, so these are for inspecting one rather than producing one.
+  `build --id RETROxxxx [--format text|json]` derives every figure with its source, prints the page
+  and files nothing, and refuses a run it cannot report honestly; `--write` is refused, naming
+  `sprint close`, because only the close stamps the tokens and records the gate verdicts first, and
+  a sealed run's signed report is re-filed only after `sprint.py reopen`; `render --report RPTxxxx [--to markdown|html] [--out
+  PATH]` renders a filed report from its stored JSON - `--to`, not `--format`, because it chooses
+  a RENDERING rather than a serialisation, and `--format` is spelled one way family-wide;
+  `check --report RPTxxxx` re-derives the figures and compares the fingerprint, which is how a signed
+  report is shown to still describe the tree. The fingerprint digests the ordered figure SET, never
+  the file, so signing a report does not invalidate the signature it just recorded. A signed page's
+  readings of sources that move after the run - the findings it lists, unit Points, waiver text -
+  are replayed from the committed version carrying the fingerprint the run record's signature
+  holds, so a later triage or re-size does not invalidate it and an edited page cannot re-sign
+  itself. Only the page the run record's signature names is anchored, and every other signed
+  version in its history, merges included, is named; a signed page no commit holds yet is
+  re-derived from the tree throughout. The anchor defends against edits committed to the page;
+  the run record in `sdlc-studio/.local/` is not versioned, so verifying a signature needs the
+  signing clone's run record. The lessons and lane-yield appendices are shown as filed and never
+  checked
+- `handoff.py` - The remaining-work join, read-only (`show`): a JOIN over the run's own evidence
+  naming every remaining item with its pointer (file / AC / check) and a copilot-tail vs judgement
+  tag. It writes nothing: the signed report hands over the remaining work, and `sprint plan
+  --worklist RPTxxxx` plans it. `status.py` reads its remaining count
+- `route.py` - Difficulty-aware model-tier routing, **advisory - no gate reads a tier**, no model API ever called (ids are ...
+- `config.py` - Merged per-project configuration reader. Layers `templates/config-defaults.yaml` under the project's `sdlc-s...
+- `loop_guard.py` - The sprint deterministic guardrails. The iteration cap, the repetition-breaker (repeated failure signature),...
+
+## See Also
+
+- `scripts/README.md` - directory conventions
+- `reference-*.md` - the workflow references
+
+- `sprint.py lane brief|return` - dispatch a delivery lane with its contract, obligations and proof owed, and accept it back with its own acceptance criteria run. Refuses a unit with no readable contract; forces `blocked` when a criterion did not pass.

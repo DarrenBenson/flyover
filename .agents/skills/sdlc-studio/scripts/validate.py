@@ -1,0 +1,1755 @@
+#!/usr/bin/env python3
+"""SDLC Studio artifact-structure validator.
+
+A deterministic linter for sdlc-studio artifacts: ID format, a title, a
+metadata block, a Status drawn from the type's allowed vocabulary, and (for
+stories) at least one acceptance criterion. Reports violations as JSON so
+Claude consumes findings instead of eyeballing files. The analogue of Spec
+Kit's `check-prerequisites`: the deterministic constraints layer.
+
+Subcommands:
+  check  Validate a file, a directory, or every artifact under the repo root.
+
+Exit code is non-zero when any error-severity violation is found.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import sdlc_md, tiers  # noqa: E402
+import persona_gen  # noqa: E402  (the provenance stamp/reviewed grammar - one source)
+import file_finding  # noqa: E402  (the pseudo-`Verify:` detector the creators refuse on - one authority)
+
+_AC_SECTION_RE = re.compile(r"^#{2,}\s+.*acceptance criteria", re.I | re.M)
+
+# Scaffold tiers an artefact may declare in `> **Template:**`. From lib.tiers - the one
+# authority the creator, the gate and the backstop all read, so none of them can be working
+# from a different vocabulary than the others.
+TEMPLATE_TIERS = tiers.TEMPLATE_TIERS
+
+# The closed severity vocabulary. Every check emits one of these spellings and the summary
+# counters count every one of them, so a per-line finding can never be reported and then omitted
+# from the tail. A near-miss spelling (`warn`) once printed WARN lines under `warnings=0`.
+# `info` is an acknowledgement, not a violation: it is printed and counted, but it does not make
+# a file unclean and never affects an exit code. Only the instructions check emits it today.
+SEVERITY_ERROR = "error"
+SEVERITY_WARNING = "warning"
+SEVERITY_INFO = "info"
+SEVERITIES = (SEVERITY_ERROR, SEVERITY_WARNING, SEVERITY_INFO)
+
+
+def _has_ac_section(text: str) -> bool:
+    """True if an 'Acceptance Criteria' heading is followed by at least one line
+    of content (bullet, numbered item, or prose) before the next heading.
+
+    Accepts the common plain-bullet-list AC style, not only labelled `ACn` ids.
+    """
+    m = _AC_SECTION_RE.search(text)
+    if not m:
+        return False
+    for line in text[m.end():].splitlines():
+        s = line.strip()
+        if s.startswith("#"):
+            break  # next heading — section ended with no content
+        if s and not s.startswith(">"):
+            return True
+    return False
+
+
+def _has_criteria(text: str) -> bool:
+    """True when the artefact carries acceptance criteria in any accepted shape: labelled
+    `### ACn` / `- **ACn:**` ids, or a populated `## Acceptance Criteria` section.
+
+    ONE predicate, so the story floor and the bug floor cannot drift into disagreeing about
+    what counts as a criterion on identical bytes.
+
+    A STATED ABSENCE is not a criterion. `file_finding` writes that paragraph automatically
+    when a finding's evidence is too thin to derive one, so it is what a thin finding gets by
+    DEFAULT rather than something an author chooses. `sdlc_md.count_acs` already reads it as
+    zero; this predicate read the populated section as criteria present, and the floor consults
+    this one - so a bug carrying nothing verifiable reached a terminal status with nothing to
+    refuse it. Two predicates answering one question, disagreeing on identical bytes, and the
+    looser one deciding: the same defect the lane's two parsers had. The marker is imported
+    from the tool that writes it rather than restated here, because a second copy of the string
+    is how the two would drift apart again.
+    """
+    if _states_absence(text):
+        return False
+    return (any(sdlc_md.extract_ac_id(line) for line in text.splitlines())
+            or _has_ac_section(text))
+
+
+def _states_absence(text: str) -> bool:
+    """True when the CRITERIA SECTION's content is the tool's own stated-absence paragraph.
+
+    Scoped to the section, not the document. Scanning the whole body made any artefact that
+    merely QUOTES the filer's sentence - a bug filed about the filer, a revision note, a repro
+    paragraph - read as carrying no criteria at all, even with a populated section right there.
+    That is the same over-broad predicate this function was written to remove, one section up.
+    """
+    try:
+        import file_finding  # noqa: PLC0415 - sibling; lazy so an unrelated run never pays
+    except ImportError:                                   # pragma: no cover - defensive
+        return False
+    mark = getattr(file_finding, "THIN_EVIDENCE_MARK", None)
+    if not mark:                                          # pragma: no cover - defensive
+        return False
+    section = _criteria_section(text)
+    return bool(section) and mark in section and not any(
+        sdlc_md.extract_ac_id(line) for line in section.splitlines())
+
+
+def _criteria_section(text: str) -> str:
+    """The body of the `## Acceptance Criteria` section, to the next heading of any level."""
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*#{1,6}\s+acceptance criteria\b", line, re.IGNORECASE):
+            start = i + 1
+            break
+    if start is None:
+        return ""
+    out = []
+    for line in lines[start:]:
+        if re.match(r"^\s*#{1,6}\s+\S", line) and not re.match(r"^\s*#{3,6}\s+AC\d", line,
+                                                               re.IGNORECASE):
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
+def _is_ungroomed(text: str) -> bool:
+    """True when the story declares its ACs an explicit grooming placeholder - a known
+    pre-Ready state, not a malformed artefact.
+
+    THE PREDICATE IS CONFORMANCE'S, imported rather than restated. Both guards run in the same
+    pre-commit gate, and they held two definitions of the same state: `refine` writes the
+    ungroomed marker as a blockquote, `_has_ac_section` skips blockquotes, so the story refine
+    had just minted was reported as having no acceptance criteria at all and the commit that
+    created the backlog was refused. A second copy of the rule here would drift again; there is
+    one test and this reads it.
+
+    An empty AC section with no marker is untouched by this: nothing declares it ungroomed, so
+    it stays the `no-ac` error it always was.
+    """
+    try:
+        import conformance  # noqa: PLC0415 - local: conformance pulls reconcile/critic/verify_ac
+    except Exception as exc:  # noqa: BLE001 - validate must run from a partial install
+        sdlc_md.debug("validate.ungroomed", exc)
+        # Degraded, and deliberately the same TOKEN rather than a second rule: without the
+        # predicate's owner on the path, the marker's presence is all that can be read.
+        return sdlc_md.UNGROOMED_AC_TOKEN in text
+    return conformance.story_is_ungroomed(text)
+
+
+# --- Partial-capability declaration ----------------------------------------------------------
+# A unit may ship one half of a capability - the consumer with no producer, or the producer with
+# no consumer. That is legitimate, and it is only an ANSWER when the unit says so and names the
+# unit that ships the other half; an acknowledged gap nobody owns is the same as an unacknowledged
+# one, and the record then reads as a complete capability the system does not have.
+#
+# The declaration is read from an EXPLICIT place - the `> **Partial:**` metadata line, or a
+# `## Scope note` section - and never from prose that merely contains the words. Several artefacts
+# in this backlog discuss `consumer-only` in their own acceptance criteria, so a whole-body phrase
+# sweep would refuse every artefact that describes this rule.
+PARTIAL_SCOPES = ("consumer-only", "producer-only")
+#: `consumer-only`, `consumer only`, `CONSUMER only` - how an author actually writes it.
+_PARTIAL_PHRASE_RE = re.compile(r"\b(consumer|producer)[\s-]only\b", re.I)
+_SCOPE_NOTE_RE = re.compile(r"^#{2,}\s+scope note\b.*$", re.I | re.M)
+
+
+def _section_body(text: str, m: re.Match) -> str:
+    """The body under a heading match, up to the next heading of any level."""
+    body = text[m.end():]
+    nxt = re.search(r"^#{1,6}\s", body, re.M)
+    return body[:nxt.start()] if nxt else body
+
+
+def declared_partial_capability(text: str) -> dict | None:
+    """The unit's partial-capability declaration, or None when it makes none.
+
+    `{scope, where, text}` - `scope` is the declared half (or None when the `Partial:` field
+    carries a value naming neither, which is a finding rather than a shrug: an unrecognised
+    value would read as no declaration and silently exempt the unit). `text` is the declaring
+    passage, which is where the follow-up must be named.
+    """
+    field = sdlc_md.extract_field(text, "Partial")
+    if field is not None:
+        m = _PARTIAL_PHRASE_RE.search(field)
+        scope = f"{m.group(1).lower()}-only" if m else None
+        return {"scope": scope, "where": "the `> **Partial:**` line", "text": field}
+    note = _SCOPE_NOTE_RE.search(text)
+    if note:
+        body = _section_body(text, note)
+        m = _PARTIAL_PHRASE_RE.search(body)
+        if m:
+            return {"scope": f"{m.group(1).lower()}-only",
+                    "where": "the `## Scope note` section", "text": body}
+    return None
+
+
+def _follow_up_ids(passage: str, own: str | None) -> list[str]:
+    """Artefact ids named in the declaring passage, excluding the unit's own id. Uses the
+    family's one unanchored id finder, so what counts as an id here is what counts everywhere."""
+    mine = sdlc_md.norm_id(own) if own else None
+    seen = []
+    for m in sdlc_md.ID_SEARCH_RE.finditer(passage):
+        rid = sdlc_md.norm_id(m.group(0))
+        if rid != mine and rid not in seen:
+            seen.append(rid)
+    return seen
+
+
+# Directory basename -> artifact type, for inferring a file's type from path.
+_DIR_TO_TYPE = {
+    Path(rel).name: type_ for type_, (rel, _prefix) in sdlc_md.ARTIFACT_TYPES.items()
+}
+
+
+def infer_type(path: Path) -> str | None:
+    """Infer artifact type from the file's parent directory, else its ID prefix."""
+    by_dir = _DIR_TO_TYPE.get(path.parent.name)
+    if by_dir:
+        return by_dir
+    rec = sdlc_md.extract_record_id(path.stem)
+    if not rec:
+        return None
+    for type_, (_rel, prefix) in sdlc_md.ARTIFACT_TYPES.items():
+        if rec.replace("-", "").startswith(prefix):
+            return type_
+    return None
+
+
+def validate_file(path: Path, type_: str, repo_root: Path | None = None,
+                  sweep_selectors: bool = False) -> list[dict]:
+    """Return a list of violation dicts for one artifact file. Pass repo_root so a
+    project's `.config.yaml` status_vocab extensions count as valid."""
+    out: list[dict] = []
+
+    def add(severity: str, rule: str, message: str, **extra) -> None:
+        out.append({
+            "file": str(path), "type": type_,
+            "severity": severity, "rule": rule, "message": message, **extra,
+        })
+
+    rec = sdlc_md.extract_record_id(path.stem)
+    prefix = sdlc_md.ARTIFACT_TYPES[type_][1]
+    # A valid id is either a v2 sequential (id_number resolves) or a v3 short-ULID (BG-01JQK3F8).
+    if rec is None or (sdlc_md.id_number(rec) is None and not sdlc_md.is_v3_id(rec)):
+        add("error", "id-format",
+            f"filename '{path.name}' does not start with a valid {prefix} ID (v2 {prefix}NNNN or v3 ULID)")
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        add("error", "unreadable", str(exc))
+        return out
+
+    for field, lines in _repeated_single_valued(text).items():
+        add(SEVERITY_ERROR, "repeated-field",
+            f"`{field}` appears {len(lines)} times (lines {', '.join(str(n) for n in lines)}) "
+            f"but is single-valued. `extract_field` searches, so the FIRST wins and the rest "
+            f"still read as live metadata; `transition` rewrites only the first when the value "
+            f"is corrected. Keep one line, or add the field to `sdlc_md.PLURAL_FIELDS` if it is "
+            f"genuinely plural.")
+
+    if sdlc_md.extract_h1_title(text) is None:
+        add("error", "no-title", "no `# Title` heading found")
+
+    status = sdlc_md.extract_field(text, "Status")
+    if status is None:
+        add("error", "no-status", "no `> **Status:**` metadata line found")
+    elif sdlc_md.canonical_status(status, sdlc_md.status_vocab(type_, repo_root)) is None:
+        # Decorated statuses ('Done (v2.66.0)') are valid — only a status whose
+        # leading token is not in the vocabulary at all is flagged.
+        allowed = ", ".join(sdlc_md.status_vocab(type_, repo_root))
+        add("error", "status-vocab",
+            f"status '{status}' is not one of the allowed {type_} statuses ({allowed}); "
+            f"an established project status can be declared in sdlc-studio/.config.yaml "
+            f"under status_vocab.{type_} - see reference-config.md")
+
+    # An RFC that reached Accepted with a decision still Open. The transition gate refuses
+    # this going forward, but a gate on the change alone leaves every file that predates it
+    # untouched while still reporting the workspace clean - which is how six RFCs came to be
+    # Accepted, decomposed and delivered carrying only the boilerplate Open row. Reuses
+    # transition's reader so the two cannot drift into disagreeing about what Open means.
+    if type_ == "rfc" and status is not None and status.strip().lower().startswith("accepted"):
+        import transition  # noqa: PLC0415 - local: keep transition off validate's cold paths
+        still_open = transition._rfc_open_decisions(text)
+        if still_open:
+            recorded = transition._rfc_override_reason(text)
+            add("warning" if recorded else "error", "accepted-open-decision",
+                f"RFC is Accepted but {len(still_open)} decision row(s) are still Open "
+                f"({', '.join(still_open)}) - close each with what actually shipped"
+                + (f"; override recorded: {recorded}" if recorded else ""))
+
+    # The scaffold tier the artefact was rendered at. Absent is valid and means "not the
+    # planning tier" (every artefact predating the tier). A value outside the known set is
+    # an error, not a shrug: `plannning` would read as not-planning and switch the
+    # promotion gate silently off - a lane with nothing to prove reading as proof.
+    tier = sdlc_md.extract_field(text, "Template")
+    if tier is not None and tier.strip().lower() not in TEMPLATE_TIERS:
+        add("error", "template-tier",
+            f"template tier '{tier}' is not one of {', '.join(TEMPLATE_TIERS)} - an "
+            "unrecognised tier reads as 'not planning' and would silently disable the "
+            "promotion gate")
+
+    # Resolved ONCE, here, because several rules below turn on it (the criteria floor, the
+    # footprint warnings and the body-scaffold severity) and two of them once
+    # answered "is this finished?" differently on the same bytes. The terminal set is DERIVED
+    # from the type's own vocabulary (`is_terminal_status`), never enumerated: a project that
+    # adds a terminal status is covered without editing this file.
+    _canon = sdlc_md.canonical_status(status, sdlc_md.status_vocab(type_, repo_root)) if status else None
+    _terminal = bool(_canon) and sdlc_md.is_terminal_status(type_, _canon)
+
+    # A declared half-capability. Declaring it is what makes the gap a record; naming the
+    # follow-up is what gives the record an owner.
+    partial = declared_partial_capability(text)
+    if partial is not None:
+        if partial["scope"] is None:
+            add(SEVERITY_ERROR, "partial-scope",
+                f"`Partial:` value {partial['text'].strip()!r} names neither half "
+                f"({', '.join(PARTIAL_SCOPES)}) - an unrecognised value reads as no "
+                "declaration at all and would silently exempt the unit from the caller check")
+        elif not _follow_up_ids(partial["text"], rec):
+            add(SEVERITY_ERROR, "partial-no-followup",
+                f"unit declares itself {partial['scope']} but {partial['where']} names no "
+                "follow-up unit - an acknowledged gap nobody owns is the same as an "
+                "unacknowledged one; name the id of the unit that ships the other half")
+
+    if type_ == "story":
+        if (not _has_criteria(text) and not _ac_exempt(rec, repo_root)
+                and not _is_ungroomed(text)):
+            add("error", "no-ac",
+                "story has no acceptance criteria (`### ACn`, `- **ACn:**`, or a "
+                "populated `## Acceptance Criteria` section)")
+
+    # The same floor for the OTHER delivery unit. The project's non-negotiable is that work
+    # becomes a story OR A BUG with acceptance criteria before it becomes a diff; a story was
+    # held to that and a bug was not, so 228 bugs reached a terminal status carrying no
+    # criterion and no verifier while real code landed against each. With neither, the
+    # Done-freshness spine, `verify_ac`, the release lane's unspecified-AC refusal and the
+    # close reconcile can never speak for those units.
+    #
+    # The bar is the TERMINAL status, not every status: a bug is filed from a symptom and the
+    # criteria are owed by the time the record starts speaking for shipped code. `story` is
+    # already held to it at every status above and `epic` is a container whose criteria are its
+    # breakdown, so this names the one type the floor was missing rather than sweeping the
+    # product types.
+    # Open Questions on a TERMINAL artefact, for every type. The same helper the transition
+    # gate calls, so the two cannot disagree about what a resolved question is - two readings
+    # of one rule is two rules, and the looser one wins.
+    if _terminal:
+        for item in sdlc_md.unresolved_questions(text, repo_root):
+            add(SEVERITY_ERROR, "open-question",
+                f"{_canon} artefact still asks an Open Question: {item} - record the ruling "
+                f"under a `## Resolved Questions` heading, or file it as a follow-up artefact "
+                f"and cite the id")
+
+    if type_ in ("bug", "story"):
+        # A retro or handoff that happens to carry an `ACn` shape is out of scope here: the
+        # rule guards the two artefact types the runner verifies and the seat brief judges.
+        import verify_ac  # noqa: PLC0415 - deferred: validate must run without the runner
+        if verify_ac.has_criteria_section(text):
+            for ac_id, heading in verify_ac.misplaced_criteria(text):
+                key = f"{sdlc_md.norm_id(rec)}:{ac_id}" if rec else None
+                known = bool(key) and key in _read_baseline(repo_root, _CRITERIA_BASELINE)
+                add(SEVERITY_WARNING if known else SEVERITY_ERROR, "criterion-outside-section",
+                    f"{ac_id} sits under `## {heading or '(no heading)'}`, outside `## Acceptance "
+                    f"Criteria` - the runner skips it, the seat brief never shows it and the Done gate "
+                    f"refuses it; move it into the section"
+                    + (" [recorded in the criteria baseline as known debt]" if known else ""),
+                    baseline_key=key)
+        elif verify_ac.parse_story(text):
+            key = f"{sdlc_md.norm_id(rec)}:section" if rec else None
+            known = bool(key) and key in _read_baseline(repo_root, _CRITERIA_BASELINE)
+            add(SEVERITY_WARNING if known else SEVERITY_ERROR, "criterion-outside-section",
+                f"{len(verify_ac.parse_story(text))} criteria and no `## Acceptance Criteria` "
+                f"section - create the section and move them into it, so the brief and the "
+                f"runner read the same criteria"
+                + (" [recorded in the criteria baseline as known debt]" if known else ""),
+                baseline_key=key)
+    if type_ == "bug" and _terminal and not _has_criteria(text):
+        key = sdlc_md.norm_id(rec) if rec else None
+        known = bool(key) and key in _read_baseline(repo_root, _CRITERIA_BASELINE)
+        add(SEVERITY_WARNING if known else SEVERITY_ERROR, "no-ac",
+            f"bug is {_canon} with no acceptance criteria (`### ACn`, `- **ACn:**`, or a "
+            "populated `## Acceptance Criteria` section) - with no criterion and no verifier "
+            "nothing in the machinery can speak for the code that landed against it"
+            + (" [recorded in the criteria baseline as known debt]" if known else ""),
+            baseline_key=key)
+
+    # A REQUEST's acceptance criterion is prose. A command-shaped `Verify:` written into it is
+    # executed by nothing, so it is assurance with no proof behind it: a wrong command is a
+    # permanent false red, and a loose one (a grep that matches unrelated prose) is a false green
+    # on a feature nobody built. The creators REFUSE to write one; this reports the ones already
+    # on disk. A warning, not an error: the instances predate the guard, and the gate must not
+    # fail unrelated work - but they are named, with their line, rather than silently tolerated.
+    #
+    # WHICH types is `sdlc_md.executes_verifiers`, not a list restated here. This lane used to
+    # name bugs, while `verify_ac` was already running a bug's verifiers - so the two guards gave
+    # an author opposite advice about the same line, and there was no agreed way to close a bug.
+    # Open requests only: a finished one is a closed record, and advice on it has no reader.
+    if (type_ in sdlc_md.FINDING_TYPES and not sdlc_md.executes_verifiers(type_)
+            and not _terminal):
+        for lineno, line, cmd in file_finding.scan_prose_acs(text):
+            add("warning", "pseudo-verify",
+                f"line {lineno}: acceptance criterion carries a command-shaped `Verify:` "
+                f"({cmd!r}) that NOTHING executes - a {type_} is a REQUEST, decomposed rather than "
+                f"delivered, so it is not among the types whose verifiers run "
+                f"(`sdlc_md.EXECUTES_VERIFIERS`). "
+                f"Restate it as the observable outcome; executable proof belongs on the stories "
+                f"this is actioned into. Offending line: {line.strip()}",
+                # The COMMAND, not the line number: a line number moves when unrelated prose is
+                # edited above it.
+                targets=[cmd])
+
+    # An `Affects` the artefact's OWN content contradicts: a `Verify:` line targeting a file the
+    # declaration omits. THE PREDICATE IS THE PLANNER'S (`sprint.affects_mismatch`), imported
+    # rather than re-derived, so a single artefact checked here and the same artefact checked in a
+    # batch cannot reach opposite verdicts. A WARNING: it is advice, and nothing refuses on it.
+    #
+    # OPEN WORK ONLY. A terminal artefact is a finished record: a file it named that was deleted
+    # since - by design, or by the unit that superseded it - says nothing about the record, and
+    # re-judging it minted a warning for every deletion. The unresolvable half (a declared path
+    # with nothing behind it) is therefore not reported here at all: on open work it is the file
+    # the unit will create, and on a finished unit the file may be gone on purpose. The planner
+    # still reads it for the batch it plans.
+    if repo_root is not None and type_ in ("story", "bug", "cr") and not _terminal:
+        try:
+            import sprint  # noqa: PLC0415 - deferred sibling; validate must run without it
+            mism = sprint.affects_mismatch(repo_root, text)
+        except Exception as exc:  # noqa: BLE001 - a validate run must never break on this
+            sdlc_md.debug("validate.affects_mismatch", exc)
+            mism = {"unresolvable": [], "undeclared": []}
+        if mism["undeclared"]:
+            add(SEVERITY_WARNING, "affects-undeclared",
+                "the artefact's own `Verify:` lines target file(s) its `Affects` omits: "
+                f"{', '.join(mism['undeclared'])}",
+                targets=sorted(mism["undeclared"]))
+
+    # Sweep the EXISTING corpus for stamped criteria whose selector no longer
+    # selects anything. The write-time guard stops new ones; nothing was reading the ones already
+    # on disk, which is how 53 criteria went red across stories already at Done while `README.md`
+    # told readers acceptance criteria get run - true of the mechanism, false of the corpus.
+    #
+    # OPT-IN, because resolution costs a `pytest --collect-only` per distinct test file and the
+    # per-commit gate is already over its budget; a check whose cost is paid on every commit is one
+    # that gets switched off. The scheduled lane passes the flag, so the corpus is swept on a
+    # cadence rather than never - the recorded ruling on this bug.
+    #
+    # A WARNING, not an error: D0136/D0137 ship the 53 known reds against v5.1, and an error would
+    # put the release gate red on a set the operator has ruled deferred.
+    #
+    # Only STAMPED criteria are examined (`unresolvable_stamps`): an unstamped AC makes no claim,
+    # so a dead selector there is the author's business at the next run, not a false green on disk.
+    if sweep_selectors and repo_root is not None and type_ in ("story", "bug"):
+        try:
+            import verify_ac  # noqa: PLC0415 - deferred: validate must run without the runner
+            dead_stamps = verify_ac.unresolvable_stamps(path, repo_root)
+        except Exception as exc:  # noqa: BLE001 - a validate run must never break on this
+            sdlc_md.debug("validate.unresolvable_stamps", exc)
+            dead_stamps = []
+        for row in dead_stamps:
+            add(SEVERITY_WARNING, "verify-unresolvable",
+                f"{row['ac']} is stamped verified but its `Verify:` selector selects nothing: "
+                f"{row['verifier']} - the stamp reads as evidence for a check that cannot run",
+                targets=[f"{row['ac']}:{row['verifier']}"])
+
+    # Schema-v3 team-schema: a typed, resolvable `raised_by`. v2 artefacts are exempt, so the
+    # rule cannot fail an existing sequential-id project until it opts into v3.
+    if repo_root is not None and sdlc_md.is_schema_v3(repo_root):
+        auth = sdlc_md.parse_authorship(text, "Raised-by")
+        if auth is None:
+            add("error", "authorship-structured",
+                "schema-v3 artefact has no `> **Raised-by:** Name; type; version` line "
+                "(type is one of human | persona | agent)")
+        elif auth["type"] not in ("human", "persona", "agent"):
+            add("error", "authorship-type",
+                f"raised_by type '{auth['type']}' must be one of human | persona | agent")
+        elif not sdlc_md.resolve_author(auth["name"], auth["type"], repo_root):
+            add("error", "authorship-unresolved",
+                f"raised_by persona '{auth['name']}' does not resolve to a document under "
+                "sdlc-studio/personas/")
+
+        # Separation of duties: the triager must not be the raiser (the adversarial-review
+        # discipline compiled into a check). A solo human self-triaging only WARNS - a lone
+        # operator with no second identity must not deadlock (solo-first stays primary).
+        triaged = sdlc_md.parse_authorship(text, "Triaged-by")
+        if auth and triaged and triaged["name"]:
+            same = (sdlc_md.norm_id(auth["name"]) == sdlc_md.norm_id(triaged["name"])
+                    and auth["type"] == triaged["type"])
+            if same:
+                sev = "warning" if triaged["type"] == "human" else "error"
+                add(sev, "duties-separated",
+                    f"triaged_by '{triaged['name']}' is the same as raised_by - a different "
+                    "seat must triage (hand off to another reviewer)")
+
+        # Optional, record-only tranche reference (orchestrator pass-through). Absent is fine;
+        # a present-but-empty value is a malformed record. sdlc-studio never allocates it - it
+        # only reads it (the "what shipped in tranche X" query). `tranche_ref` captures the value
+        # newline-safely, and the query reads through the same helper so the two agree.
+        if re.search(r"\*\*Tranche:\*\*", text) and sdlc_md.tranche_ref(text) is None:
+            add("error", "tranche-shape",
+                "tranche reference present but empty - give it a value or remove the field "
+                "(sdlc-studio reads a tranche reference, never allocates it)")
+
+        # Evidence-or-it-did-not-happen for a bug. Presence only (truth stays with reviewers
+        # and verify_ac); a placeholder counts as absent. A CR owes none: it is a request, and
+        # nothing writes a Size or an Impact onto a CR filed without one (`refine` sizes the epic
+        # it writes), so a demand for them could only fail a CR the shipped tools had moved on.
+        if type_ == "bug" and not _bug_has_evidence(text):
+            add("error", "evidence-present",
+                "bug has no evidence - cite a file:line reference, command output, or "
+                "reproduction steps")
+
+    # An ungroomed (pre-Ready) story's AC placeholders are a WARNING, not an error: refine seeds
+    # them and validate must not block the refine commit that creates the Draft backlog. What
+    # still keeps the work out of DELIVERY is conformance, which reports such a story as missing
+    # `specified, verifiable` once it is Ready+, and the AC-verify gate on Done. NOT the Ready
+    # transition itself, which succeeds: the earlier wording here claimed the placeholder "keeps
+    # the story out of Ready/Done", and that half is false. Every other type/status: error.
+    #
+    # A BODY slot (the `**As a** {{role}}` block and every other scaffolded section) is graded on
+    # the same principle but a different boundary, because every type is minted with one: it is an
+    # ERROR once the artefact has reached a TERMINAL status for its type, and a warning while it is
+    # still in flight. A terminal artefact carrying an unfilled slot is a finished record with a
+    # blank where its content should be; a fresh one carrying the same slot is simply not written
+    # yet. The terminal set is derived from the type's own vocabulary (`is_terminal_status`), never
+    # enumerated here, so a project that adds a terminal status is covered without editing this.
+    # FRESHNESS, not type. A Draft story's placeholder was a warning while a freshly-minted
+    # CR's was an ERROR, so the recommended path - `artifact.py new --type cr` - produced an
+    # artefact that blocked the very next commit, and the author had to hand-edit what the tool
+    # had just written. That is the hand-authoring the deterministic path exists to avoid,
+    # induced by it. A request at its opening status is "not written yet" for exactly the same
+    # reason a Draft story is; once it moves past that, the placeholder is real debt and errors.
+    _opening_status = {"story": ("Proposed", "Draft"), "bug": ("Open",),
+                       "cr": ("Proposed",),
+                       "rfc": ("Draft",)}.get(type_, ())
+    _not_yet_written = _canon in _opening_status
+    _ac_sev = SEVERITY_WARNING if _not_yet_written else SEVERITY_ERROR
+    # A widened check must not block on the backlog it reveals. When the sweep was extended from
+    # the AC section to the whole body it surfaced 31 already-terminal artefacts carrying an
+    # unfilled scaffold - real debt, but debt that predates the check. Those ids are recorded in a
+    # committed baseline and report as a warning; anything NOT in it errors, so the count can only
+    # fall. Removing an id is one-way: the check errors on it from then on.
+    _body_sev = SEVERITY_ERROR if _terminal else (_ac_sev if type_ == "story" else SEVERITY_WARNING)
+    _waived = (lambda tok: _baselined(path, repo_root, tok)) if _terminal else (lambda tok: False)
+    _check_placeholders(text, add, ac_severity=_ac_sev, body_severity=_body_sev, baselined=_waived)
+    return out
+
+
+_PLACEHOLDER = re.compile(r"\{\{[^}]*\}\}")
+_GWT = re.compile(r"\s*[-*]\s+\*\*(Given|When|Then)\b")
+_META = re.compile(r">\s*\*\*[\w ]+:\*\*")
+_CHECKBOX = re.compile(r"\s*[-*]\s+\[[ xX]\]")  # `- [ ] {{criterion}}` (change-request / story AC checklist)
+_BULLET_VAL = re.compile(r"^\s*[-*]\s+(?:\[[ xX]\]\s+)?(?:\*\*[^*]+\*\*:?\s*)?(.*)$")
+_FENCE = re.compile(r"^\s*(?:```|~~~)")
+# Any body line's fillable value: what remains after an optional bullet, checkbox, heading marker
+# and bold label. `**As a** {{role}}` -> `{{role}}`; a prose sentence keeps its words and so is
+# never placeholder-ONLY.
+_BODY_VAL = re.compile(r"^\s*(?:[-*+]\s+)?(?:\[[ xX]\]\s+)?(?:#{1,6}\s+)?(?:\*\*[^*]+\*\*:?\s*)?(.*)$")
+
+
+def _unfilled(value: str | None) -> bool:
+    """True when a value is a placeholder slot, not real content: nothing of substance
+    remains after the `{{...}}` and surrounding punctuation are removed. Mirrors
+    conformance._real so the two gates agree on what counts as filled."""
+    residue = _PLACEHOLDER.sub("", value or "")
+    return re.sub(r"[\s.,;:!?*_`>~\-]+", "", residue) == ""
+
+
+def _ac_value(line: str) -> str:
+    """The fillable value of an AC structural line (text after the heading/marker)."""
+    for rx in (sdlc_md.AC_HEADING_RE, sdlc_md.AC_BULLET_RE, sdlc_md.VERIFY_RE):
+        m = rx.match(line)
+        if m:
+            return m.group(2) or ""
+    m = _BULLET_VAL.match(line)  # Given/When/Then or `- [ ]` checkbox bullet
+    return m.group(1) if m else line
+
+
+def _body_value(line: str) -> str:
+    """The fillable value of an ordinary body line (text after any bullet/heading/bold label)."""
+    m = _BODY_VAL.match(line)
+    return m.group(1) if m else line
+
+
+_FILE_LINE = re.compile(r"[\w./-]+\.\w+:\d+")
+
+
+def _section_has_content(text: str, *names: str) -> bool:
+    """True when a `## Name` heading exists with non-placeholder body text under it."""
+    for name in names:
+        m = re.search(rf"^#{{1,4}}\s+{re.escape(name)}\b.*$", text, re.M | re.I)
+        if not m:
+            continue
+        body = text[m.end():]
+        nxt = re.search(r"^#{1,4}\s", body, re.M)
+        body = body[:nxt.start()] if nxt else body
+        if body.strip() and not _unfilled(body):
+            return True
+    return False
+
+
+def _bug_has_evidence(text: str) -> bool:
+    """A bug carries evidence: a file:line reference, a code/output block, or reproduction steps."""
+    if _FILE_LINE.search(text) or "```" in text:
+        return True
+    return _section_has_content(text, "Steps to Reproduce", "Reproduction", "Evidence")
+
+
+#: Findings that already existed when the body sweep was widened, as `ID:{{token}}` - the FINDING,
+#: never the artefact. Keying on the artefact blanketed every placeholder in a listed file for ever,
+#: so a NEW blank in an old record inherited the waiver.
+_PLACEHOLDER_BASELINE = "sdlc-studio/.placeholder-baseline.txt"
+#: Units already at a terminal status with no acceptance criteria when that rule was introduced,
+#: one artefact id per line. Same contract as the placeholder baseline: captured from the
+#: checker's own output (`check --emit-baseline`), never hand-written, and removing a line is
+#: one-way, so the recorded count can only fall.
+_CRITERIA_BASELINE = "sdlc-studio/.criteria-baseline.txt"
+#: Keyed by (resolved repo root, baseline file): a bare module global leaked one repo's baseline
+#: into the next, and cached a failed read as an empty set so the retry never happened.
+_baseline_cache: dict[tuple[str, str], set[str]] = {}
+
+
+def _read_baseline(repo_root, rel: str) -> set[str]:
+    """The recorded pre-existing findings of one baseline file for this root, read once per
+    (root, file).
+
+    A missing or unreadable baseline is an EMPTY set - every finding then errors, which is the
+    safe direction: an absent baseline can never quieten one. A failed read is not cached, so a
+    transient failure is retried rather than frozen as "nothing is baselined".
+    """
+    key = (str(Path(repo_root or ".").resolve()), rel)
+    if key in _baseline_cache:
+        return _baseline_cache[key]
+    try:
+        src = (Path(repo_root or ".") / rel).read_text(encoding="utf-8")
+    except (OSError, TypeError, ValueError):
+        return set()  # deliberately NOT cached
+    entries = {ln.strip() for ln in src.splitlines() if ln.strip() and not ln.startswith("#")}
+    _baseline_cache[key] = entries
+    return entries
+
+
+def _placeholder_baseline(repo_root) -> set[str]:
+    """The recorded pre-existing body-scaffold findings for this root."""
+    return _read_baseline(repo_root, _PLACEHOLDER_BASELINE)
+
+
+def _baselined(path, repo_root, token: str) -> bool:
+    """Is THIS placeholder token, in THIS artefact, recorded as pre-existing debt?"""
+    m = re.search(r"((?:BG|US|EP|CR|RFC)\d{4})", Path(path).name)
+    return bool(m) and f"{m.group(1)}:{token}" in _placeholder_baseline(repo_root)
+
+
+_FIELD_LINE_RE = re.compile(r"^>?[^\S\n]*\*\*([^*:]+):\*\*")
+
+
+def _repeated_single_valued(text: str) -> dict:
+    """{field: [line numbers]} for every metadata field that repeats and is not declared plural.
+
+    The plural set is DECLARED in `sdlc_md.PLURAL_FIELDS`, never inferred from the corpus - a
+    guard that learned plurality from what it saw would exempt the very field somebody had just
+    wrongly repeated. Only the metadata block at the head of the artefact is scanned: a
+    `**Field:**` shape inside the body is prose, and the first `##` heading ends the block.
+    """
+    seen: dict = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        if line.startswith("## "):
+            break
+        m = _FIELD_LINE_RE.match(line)
+        if not m:
+            continue
+        field = m.group(1).strip()
+        if field in sdlc_md.PLURAL_FIELDS:
+            continue
+        seen.setdefault(field, []).append(n)
+    return {f: ns for f, ns in seen.items() if len(ns) > 1}
+
+def _check_placeholders(text: str, add, ac_severity: str = SEVERITY_ERROR,
+                        body_severity: str | None = None, baselined=None) -> None:
+    """Flag an unresolved `{{...}}` slot left ANYWHERE outside a code fence - a metadata line, an
+    acceptance-criteria structural line (AC heading, ACn / Given / When / Then / checkbox bullet,
+    Verify), or any other body line. Flags only a line whose *value* is placeholder-ONLY, so prose
+    that legitimately discusses `{{placeholder}}` syntax, and a real AC that merely references
+    a token, are never flagged (consistent with conformance._real).
+
+    The body sweep is deliberately NOT an enumeration of the sections that may hold a scaffold. It
+    used to read metadata plus the AC section only, and the `**As a** {{role}}` block the scaffolder
+    mints sits in neither, so 39 stories reached Done carrying an unfilled persona slot while the
+    check reported zero findings. A list of covered places silently exempts whatever it
+    forgot; the covered set is now every line, with fenced blocks the one stated exclusion because
+    a fence is sample text, not a slot.
+
+    Metadata placeholders are always an error. An AC placeholder uses `ac_severity` and a body
+    placeholder `body_severity` (defaulting to `ac_severity`); both must be one of `SEVERITIES` or
+    the summary counters will not see them. The caller passes `SEVERITY_WARNING` for an ungroomed
+    (pre-Ready) story - a fresh refine output whose ACs are still scaffolds - so the refine commit
+    that creates it lands, and for the body of any in-flight artefact, since every type is minted
+    with its sections scaffolded. The story is still kept out of DELIVERY by conformance's
+    specified/verifiable bar (unchanged) and by the AC-verify gate on Done; the transition to Ready
+    is not itself blocked, so do not read this as gating it."""
+    body_severity = body_severity or ac_severity
+    baselined = baselined or (lambda tok: False)
+    in_ac = False
+    _fence: tuple[str, int] | None = None
+    for line in text.splitlines():
+        _fence, _is_fence_line = sdlc_md.fence_step(line.strip(), _fence)
+        if _is_fence_line or _fence is not None:
+            continue
+        if line.startswith("## "):
+            in_ac = "acceptance criteria" in line.lower()
+            continue
+        if not _PLACEHOLDER.search(line):
+            continue
+        if _META.match(line):
+            if _unfilled(line[_META.match(line).end():]):
+                add("error", "placeholder", f"unresolved placeholder in metadata: {line.strip()}")
+        elif in_ac and (sdlc_md.AC_HEADING_RE.match(line) or sdlc_md.AC_BULLET_RE.match(line)
+                        or sdlc_md.VERIFY_RE.match(line) or _GWT.match(line) or _CHECKBOX.match(line)):
+            if _unfilled(_ac_value(line)):
+                add(ac_severity, "placeholder",
+                    f"unresolved placeholder in acceptance criteria: {line.strip()}")
+        elif _unfilled(_body_value(line)):
+            # The waiver is per TOKEN, so a new blank in an already-listed record still errors.
+            tok = _PLACEHOLDER.search(line)
+            sev = body_severity
+            if sev == SEVERITY_ERROR and tok and baselined(tok.group(0)):
+                sev = SEVERITY_WARNING
+            add(sev, "placeholder", f"unresolved placeholder in body: {line.strip()}")
+
+
+def _ac_exempt(rec: str | None, repo_root: Path | None) -> bool:
+    """A story is exempt from the no-ac check when its id is at or before the project's
+    forward-only adoption cutoff (`.config.yaml` `conformance.adopt_after`). Shares the
+    one cutoff parser (`sdlc_md.parse_cutoff`) and the `<=` boundary with conformance and
+    provenance - a bare int or a prefixed id both parse, and an unparseable value raises
+    loud rather than silently exempting nothing - so a project that adopts the
+    executable-AC discipline partway does not retroactively fail every shipped story."""
+    if repo_root is None or rec is None:
+        return False
+    cutoff = sdlc_md.parse_cutoff(sdlc_md.project_override(repo_root, "conformance.adopt_after"),
+                                  allow_ulid=True)
+    return sdlc_md.cutoff_exempts(rec, cutoff)
+
+
+def changed_artifact_paths(repo_root: Path, types=None) -> set[Path] | None:
+    """Resolved paths of the ARTEFACT files this working tree has changed against HEAD.
+
+    None when the git probe cannot answer - UNKNOWN, never "nothing changed". A caller reading
+    None as an empty diff would judge nothing and print a clean exit code over an unexamined
+    tree, so every caller degrades to the whole workspace instead.
+    """
+    import gate  # noqa: PLC0415 - the family's one git changed-file idiom, read not re-derived
+    names = gate.changed_paths(str(repo_root))
+    if names is None:
+        return None
+    if not names:
+        # AN EMPTY DIFF IS NOT AN EMPTY SCOPE. A clean checkout - CI, a deploy preflight, a close
+        # preflight - has nothing changed, so there is nothing to narrow TO; scoping there judged
+        # ZERO units and printed PASS over an unexamined workspace. Measured: a story committed
+        # with `Status: Bananas`, tree clean, `gate.py --root .` -> gate: PASS, where the same
+        # tree failed before scoping existed. Nothing to scope means judge everything, exactly as
+        # an unanswerable probe does.
+        return None
+    bases = set()
+    for type_ in (types or list(sdlc_md.ARTIFACT_TYPES)):
+        rel, _prefix = sdlc_md.ARTIFACT_TYPES[type_]
+        bases.add((Path(repo_root) / rel).resolve())
+    out: set[Path] = set()
+    for name in names:
+        path = (Path(repo_root) / name).resolve()
+        if path.suffix != ".md" or path.name == "_index.md":
+            continue
+        if path.parent in bases:
+            out.add(path)
+    return out
+
+
+def collect_targets(args: argparse.Namespace) -> list[tuple[Path, str]]:
+    """Resolve the (file, type) pairs to validate from the CLI args."""
+    repo_root = sdlc_md.resolve_root(args)
+    targets: list[tuple[Path, str]] = []
+    if args.file:
+        path = Path(args.file)
+        type_ = args.type or infer_type(path)
+        if type_:
+            targets.append((path, type_))
+        return targets
+    types = [args.type] if args.type else list(sdlc_md.ARTIFACT_TYPES)
+    for type_ in types:
+        for path in sdlc_md.artifact_files(type_, repo_root):
+            targets.append((path, type_))
+    return targets
+
+
+def excluded_id_files(repo_root: Path, types=None) -> list[dict]:
+    """Warnings for id-named files the census EXCLUDES (no artifact header and
+    no declared companion suffix) - exclusion must be visible, never silent:
+    the operator either restores the artifact header or declares the suffix
+    under conventions.companion_suffixes."""
+    from lib import conventions
+    out: list[dict] = []
+    for type_ in (types or list(sdlc_md.ARTIFACT_TYPES)):
+        rel, prefix = sdlc_md.ARTIFACT_TYPES[type_]
+        want = prefix.upper()
+        counted = set(sdlc_md.artifact_files(type_, repo_root))
+        suffixes = tuple(f"-{s}" for s in conventions.companion_suffixes(repo_root))
+        for p in sdlc_md.walk_glob(Path(repo_root) / rel, "*.md"):
+            if p.name == "_index.md" or p in counted:
+                continue
+            if suffixes and p.stem.endswith(suffixes):
+                continue  # a declared companion is fine by design
+            rec = sdlc_md.extract_record_id(p.stem)
+            if rec and sdlc_md.norm_id(rec).startswith(want):
+                out.append({"file": str(p), "rule": "not-an-artifact",
+                            "severity": "warning",
+                            "message": (f"id-named file carries no artifact header - if it is "
+                                        f"an artifact, add the `# {sdlc_md.norm_id(rec)}: <title>` "
+                                        f"title or a `> **Status:**` line; if it is a companion "
+                                        f"doc, declare its suffix under "
+                                        f"conventions.companion_suffixes")})
+    return out
+
+
+def check_dor_dod(root: Path) -> list[dict]:
+    """Validate the project's DoR/DoD documents when present: every `[check: <id>]`
+    tag must resolve through the registered vocabulary. An unknown id is an ERROR -
+    a tag nothing enforces is human intent silently unenforced. A retired id
+    (`sdlc_md.RETIRED_CHECK_IDS`) is a WARNING naming the removal instead: a DoD
+    written before the retirement is not wrong, only out of date. Untagged criteria
+    are explicitly human-judged and never flagged."""
+    out: list[dict] = []
+    for name in ("definition-of-ready.md", "definition-of-done.md"):
+        path = root / "sdlc-studio" / name
+        if not path.is_file():
+            continue
+        text = sdlc_md.read_text_safe(path)
+        for bad in sdlc_md.unknown_check_ids(text or ""):
+            known = ", ".join(sorted(sdlc_md.DOR_DOD_CHECK_IDS))
+            out.append({"file": str(path), "severity": "error", "rule": "unknown-check-id",
+                        "message": f"[check: {bad}] resolves to no registered check - "
+                                   f"an unenforced tag is a silently weakened bar; "
+                                   f"registered ids: {known}"})
+        for old in sdlc_md.retired_check_ids(text or ""):
+            out.append({"file": str(path), "severity": SEVERITY_WARNING,
+                        "rule": "retired-check-id",
+                        "message": f"[check: {old}] is retired and enforces nothing "
+                                   f"({sdlc_md.RETIRED_CHECK_IDS[old]}); delete the tag, or "
+                                   f"let `migrate` strip it once it carries that step"})
+        for nm in sdlc_md.check_tag_near_misses(text or ""):
+            out.append({"file": str(path), "severity": "error", "rule": "malformed-check-tag",
+                        "message": f"{nm} is shaped like a check tag but does not parse "
+                                   f"(wrong case or spacing) - it would read as no tag, leaving "
+                                   f"its criterion silently unenforced; use the exact form "
+                                   f"[check: <id>]"})
+    return out
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    """Validate the selected artifacts and report violations.
+
+    `--changed` narrows the PER-FILE lane to the artefacts in this working tree's diff. It
+    narrows nothing else: `excluded_id_files` and `check_dor_dod` still sweep the whole tree,
+    and an untouched file's error is still printed - marked advisory, and left out of the count
+    that decides the exit code. A scope that swallowed the finding would be worse than the slow
+    check it saves, so nothing here removes a line from the report.
+    """
+    repo_root = sdlc_md.resolve_root(args)
+    if not args.file and not (Path(repo_root) / "sdlc-studio").is_dir():
+        # Nothing to check is not a clean check: `checked=0 errors=0` at exit 0 reads as a
+        # workspace that passed.
+        print(f"validate: no sdlc-studio/ workspace was found under {repo_root} - nothing was "
+              f"checked (run `init.py run`, or pass --root)", file=sys.stderr)
+        return 1
+    targets = collect_targets(args)
+    scope = None
+    if getattr(args, "changed", False) and not args.file:
+        scope = changed_artifact_paths(repo_root, [args.type] if args.type else None)
+    violations: list[dict] = []
+    for path, type_ in targets:
+        found = validate_file(path, type_, repo_root,
+                              sweep_selectors=getattr(args, "verify_selectors", False))
+        if scope is not None and path.resolve() not in scope:
+            for v in found:
+                v["scoped_out"] = True  # the severity is the fact; only the counting moves
+        violations.extend(found)
+    if not args.file:  # whole-tree (or per-type) runs also sweep the excluded
+        violations.extend(excluded_id_files(
+            repo_root, [args.type] if args.type else None))
+        violations.extend(check_dor_dod(repo_root))
+
+    if getattr(args, "emit_baseline", False):
+        # The baseline is CAPTURED from the checker's own output, never hand-written: a
+        # hand-kept list drifts from what the checker actually reports and then quietens
+        # nothing (or the wrong thing). Every finding carrying a `baseline_key` is emitted,
+        # so a rule that later gains one is covered without editing this.
+        keys = sorted({v["baseline_key"] for v in violations if v.get("baseline_key")})
+        print(f"# Captured from `validate.py check --emit-baseline` on "
+              f"{sdlc_md.now_iso8601()} - do not hand-edit.")
+        print("# Pre-existing findings recorded as known debt. Removing a line is one-way:")
+        print("# the check errors on it from then on, so the count can only fall.")
+        for key in keys:
+            print(key)
+        return 0
+
+    def _judged(v: dict) -> bool:
+        return not v.get("scoped_out")
+
+    errors = sum(1 for v in violations if v["severity"] == SEVERITY_ERROR and _judged(v))
+    advisory = sum(1 for v in violations if v["severity"] == SEVERITY_ERROR and not _judged(v))
+    warnings = sum(1 for v in violations if v["severity"] == SEVERITY_WARNING and _judged(v))
+    judged_n = sum(1 for p, _ in targets if scope is None or p.resolve() in scope)
+    scope_line = ""
+    if args.file:
+        # A scoped run must SAY it was scoped. 'no findings here' and 'no findings anywhere'
+        # are different claims, and a clean tail with nothing else on it is read as the second -
+        # which is how a green single-file check comes to be reported as a clean workspace.
+        scope_line = (f"scope: 1 artefact judged ({args.file}); no other artefact was read, and "
+                      f"the repo-wide census and DoR/DoD sweeps did NOT run - this says nothing "
+                      f"about the rest of the workspace")
+    elif getattr(args, "changed", False):
+        scope_line = ("scope: the git changed-file probe could not answer, so the WHOLE "
+                      "workspace was judged" if scope is None else
+                      f"scope: {judged_n} of {len(targets)} artefact(s) judged (this diff); "
+                      f"{advisory} advisory error(s) outside it, still printed; the repo-wide "
+                      f"census and DoR/DoD sweeps ran over everything")
+
+    if args.format == "json":
+        print(json.dumps({
+            "generated_at": sdlc_md.now_iso8601(),
+            "checked": len(targets),
+            "violations": violations,
+            "scope": {"changed": bool(getattr(args, "changed", False)) and not args.file,
+                      "degraded": bool(getattr(args, "changed", False))
+                      and not args.file and scope is None,
+                      # the artefact a single-file run covered, so a machine reader can tell a
+                      # scoped silence from a workspace-wide one
+                      "file": args.file or None,
+                      "sweeps_ran": not args.file,
+                      "judged": judged_n},
+            "summary": {"errors": errors, "warnings": warnings,
+                        "advisory_errors": advisory},
+        }, indent=2))
+    else:
+        for v in violations:
+            mark = "ADVISORY" if not _judged(v) else v["severity"].upper()
+            print(f"{mark:8} {v['file']}: [{v['rule']}] {v['message']}")
+        if scope_line:
+            print(scope_line)
+        print(f"checked={len(targets)} errors={errors} warnings={warnings}"
+              + (f" advisory_errors={advisory}" if scope is not None else ""))
+    return 1 if errors else 0
+
+
+# The working model: what the instructions file must ESTABLISH, as opposed to what it points
+# at. Each element is its own rule so a finding is specific, and each cites the section and the
+# line of `templates/agent-instructions.md` that supplies it, so a repair needs no read of the
+# whole template. `markers` are the spellings that count as stating the element - several per
+# element, because a project writes its own words and the check must not demand the template's.
+WORKING_MODEL_RULES = (
+    {"key": "delivery-flow",
+     "element": "delivery flows through stories and sprints, not ad-hoc coding",
+     "section": "Non-negotiable gates",
+     "anchor": "No ad-hoc coding",
+     "markers": ("ad-hoc coding", "ad hoc coding", "flows through the skill", "-> story ->")},
+    {"key": "tool-allocated-ids",
+     "element": "ids and index rows are tool-allocated, never hand-authored",
+     "section": "How to work",
+     "anchor": "Never hand-allocate ids or hand-author",
+     "markers": ("hand-allocate", "hand-author", "artifact.py", "the index is derived")},
+    {"key": "executable-ac-gate",
+     "element": "a story reaches Done only when its executable ACs pass",
+     "section": "How to work",
+     "anchor": "A story reaches Done only when its executable ACs pass",
+     "markers": ("executable ac", "transition -> done", "gated on the verify")},
+    {"key": "independent-review",
+     "element": "review is independent of the author",
+     "section": "Non-negotiable gates",
+     "anchor": "Review is independent of the author",
+     "markers": ("independent of the author", "independent review", "reviewer of record",
+                 "author != reviewer")},
+)
+_OPT_OUT_KEY = "instructions.working_model_opt_out"
+
+
+def working_model_opt_outs(root: Path) -> set[str]:
+    """The working-model elements a project has deliberately scoped out, read from
+    `instructions.working_model_opt_out` in `sdlc-studio/.config.yaml` (a single name or a
+    list). An unknown name is ignored: an opt-out may not switch off a rule that does not
+    exist, or a typo would silently disable the check it was aimed at."""
+    raw = sdlc_md.project_override(root, _OPT_OUT_KEY)
+    if raw is None:
+        return set()
+    values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+    known = {spec["key"] for spec in WORKING_MODEL_RULES}
+    named = {str(v).strip().lower().removeprefix("no-") for v in values}
+    return named & known
+
+
+#: A literal install path of this skill for one tool: the Claude Code or `.agents` folder, bare or
+#: `./` (project-local), `../`, under `~`, `$HOME`, `"$HOME"`, `${HOME}` or `%USERPROFILE%`, under an
+#: absolute or drive-letter prefix, with `/` or `\` separators. AGENTS.md is read by every tool a
+#: team uses, and each installs the skill somewhere else, so such a path resolves only for one of
+#: them. The template writes `<skill>` instead and defines it once.
+#:
+#: A match starts only where a path can start - the line's start or a delimiter - so it never
+#: begins part-way through a URL, a relative prefix or a quoted variable; that is what keeps every
+#: suggestion a well-formed path and the vendoring exemption reachable. A URL to the skill's source
+#: is a link, not a path an agent opens, and never matches.
+_SKILL_PATH_RE = re.compile(
+    r"""(?<![^\s`'"(\[<{=,;|])"""                   # start of line or a delimiter
+    r"""(?P<prefix>"""
+    r"""~[/\\]"""
+    r"""|"?\$(?:HOME|\{HOME\})"?[/\\]"""
+    r"""|%(?:USERPROFILE|HOME)%[/\\]"""
+    r"""|[A-Za-z]:[/\\](?:[\w.@-]+[/\\])*"""        # a drive letter
+    r"""|/(?:[\w.@-]+/)*"""                         # an absolute POSIX path
+    r"""|(?:\.\.[/\\])+"""                          # outside the project
+    r"""|\.[/\\]"""                                 # `./`: project-local, like the bare form
+    r""")?"""
+    r"""(?P<dir>\.(?:claude|agents)[/\\]skills[/\\]sdlc-studio)(?![\w-])""")
+#: The placeholder's own definition line, the one place the per-tool paths are named: it states
+#: what `<skill>` IS. A line that merely starts with the token is not a definition.
+_SKILL_DEFINITION_RE = re.compile(r"^\s*`<skill>`\s+(?:below\s+)?(?:is|means|=)\s")
+#: Where the shipped definition line lives, quoted to a file that has none.
+_INSTRUCTIONS_TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "agent-instructions.md"
+
+
+def skill_definition_line() -> str | None:
+    """The template's `<skill>` definition line, or None when the template cannot be read."""
+    try:
+        text = _INSTRUCTIONS_TEMPLATE.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return next((ln for ln in text.splitlines() if _SKILL_DEFINITION_RE.match(ln)), None)
+
+
+def _vendored(root: Path, prefix: str, directory: str) -> bool:
+    """A project-local path (bare or `./`) that exists under `root`: a skill vendored in the
+    repository resolves for everyone who clones it."""
+    if prefix not in ("", "./", ".\\"):
+        return False
+    return (root / directory.replace("\\", "/")).is_dir()
+
+
+def foreign_skill_paths(root: Path, text: str) -> list[dict]:
+    """The AGENTS.md lines that name a literal skill install path, each with its `<skill>` form:
+    `[{"line": n, "text": ..., "paths": [...], "suggestion": ...}]`.
+
+    Read from the text alone, so every clone gets the same answer whatever is installed on the
+    machine running it. The one exception is the project's OWN tree: a project-local path that
+    exists under `root` is a skill vendored in the repository (this one is), which resolves for
+    everyone who clones it, so it is not reported. The placeholder's definition line is exempt."""
+    out: list[dict] = []
+    for n, line in enumerate(text.splitlines(), start=1):
+        if _SKILL_DEFINITION_RE.match(line):
+            continue
+        hits = [m for m in _SKILL_PATH_RE.finditer(line)
+                if not _vendored(root, m.group("prefix") or "", m.group("dir"))]
+        if not hits:
+            continue
+        # Each reported span, prefix and all, becomes `<skill>`; built by position so a second
+        # occurrence of the same text elsewhere on the line is never touched by accident.
+        suggestion, last = "", 0
+        for m in hits:
+            suggestion += line[last:m.start()] + "<skill>"
+            last = m.end()
+        suggestion += line[last:]
+        out.append({"line": n, "text": line.strip(), "paths": [m.group(0) for m in hits],
+                    "suggestion": suggestion.strip()})
+    return out
+
+
+def check_instructions(root: Path) -> list[dict]:
+    """Hygiene-check a project's agent-instructions files (AGENTS.md / CLAUDE.md).
+
+    AGENTS.md is the canonical instructions file; CLAUDE.md should be a thin
+    `@AGENTS.md` pointer. Warns when the exemplar elements are missing or when the
+    file looks bloated with per-ship narrative (which belongs in LATEST.md).
+    """
+    out: list[dict] = []
+
+    def add(severity: str, rule: str, message: str, **extra) -> None:
+        out.append({"severity": severity, "rule": rule, "message": message, **extra})
+
+    agents = root / "AGENTS.md"
+    claude = root / "CLAUDE.md"
+
+    if not agents.exists():
+        # The ONLY rule whose remedy is fully deterministic: writing a file that does not
+        # exist. Every other rule is about content already present, which cannot be rewritten
+        # without losing project sections. The `seedable` marker (plus `target`/`template`)
+        # is what lets a caller act on the structure instead of parsing this message; the
+        # severity stays `error` so the exit contract CI reads is unchanged.
+        add(SEVERITY_ERROR, "no-agents",
+            "no AGENTS.md (the canonical instructions file); `migrate --apply` seeds it "
+            "from templates/agent-instructions.md",
+            seedable=True, target="AGENTS.md", template="templates/agent-instructions.md")
+
+    if claude.exists():
+        ctext = claude.read_text(encoding="utf-8")
+        if "@AGENTS.md" not in ctext:
+            add("warning", "claude-not-pointer",
+                "CLAUDE.md exists but does not import `@AGENTS.md`; it should be a thin "
+                "pointer so the canonical instructions live in AGENTS.md")
+
+    if not agents.exists():
+        return out
+
+    text = agents.read_text(encoding="utf-8")
+    lower = text.lower()
+    for rule, present, message in [
+        ("no-doctrine-pointer",
+         "reference-doctrine" in text or "operating doctrine" in lower,
+         "no operating-doctrine pointer (reference `reference-doctrine.md`, do not restate it)"),
+        ("no-latest-pointer",
+         "latest.md" in lower,
+         "no pointer to `sdlc-studio/reviews/LATEST.md` (the current-state anchor)"),
+        ("no-release-gate",
+         "reconcile --verify" in text or "pre-release" in lower or "release gate" in lower,
+         "no pre-release gate (`reconcile --verify` + the review legs)"),
+        ("no-compaction-rule",
+         "compact" in lower or "compaction" in lower,
+         "no context-compaction re-read rule (re-read LATEST.md + run status after a reset)"),
+    ]:
+        if not present:
+            add(SEVERITY_WARNING, rule, message)
+
+    # The working model. Every rule above is a cross-reference; a file can satisfy all of them
+    # and never say work is done this way. These test that the practice is stated.
+    opted_out = working_model_opt_outs(root)
+    for spec in WORKING_MODEL_RULES:
+        if spec["key"] in opted_out:
+            add(SEVERITY_INFO, f"{spec['key']}-opted-out",
+                f"{spec['element']} - recorded as a deliberate opt-out "
+                f"(`{_OPT_OUT_KEY}` in sdlc-studio/.config.yaml), so it is not checked",
+                element=spec["key"], opted_out=True)
+            continue
+        if any(m in lower for m in spec["markers"]):
+            continue
+        add(SEVERITY_WARNING, f"no-{spec['key']}",
+            f"AGENTS.md does not establish that {spec['element']}; supply it from "
+            f"templates/agent-instructions.md, section \"{spec['section']}\" "
+            f"(\"{spec['anchor']}\")",
+            element=spec["key"], template_section=spec["section"],
+            template_anchor=spec["anchor"])
+
+    # CLAUDE.md is not read: only Claude Code reads it, where `.claude/skills` is correct.
+    for hit in foreign_skill_paths(root, text):
+        add(SEVERITY_WARNING, "foreign-skill-path",
+            f"AGENTS.md line {hit['line']} names one tool's skill install path, which other tools "
+            f"do not have: \"{hit['text']}\" - write it as \"{hit['suggestion']}\" (`<skill>` is "
+            f"defined once in templates/agent-instructions.md); reported, never rewritten",
+            line=hit["line"], paths=hit["paths"], suggestion=hit["suggestion"])
+    # A file written before `<skill>` was defined is told to write `<skill>` and never told what
+    # it means. Said once, with the template's own line, whenever the file uses or is told to use
+    # the placeholder and defines it nowhere.
+    uses_placeholder = "<skill>" in text or any(f["rule"] == "foreign-skill-path" for f in out)
+    if uses_placeholder and not any(_SKILL_DEFINITION_RE.match(ln) for ln in text.splitlines()):
+        definition = skill_definition_line()
+        add(SEVERITY_WARNING, "no-skill-definition",
+            "AGENTS.md uses (or is told to use) the `<skill>` placeholder but never defines it; "
+            + (f"add the template's definition line: \"{definition}\"" if definition else
+               "add the definition line from templates/agent-instructions.md (the template "
+               "could not be read here)"))
+
+    n_lines = text.count("\n") + 1
+    if n_lines > 300:
+        add("warning", "bloat-length",
+            f"AGENTS.md is {n_lines} lines; instructions should stay lean - move "
+            "current-state/history into sdlc-studio/reviews/LATEST.md")
+    n_versions = len(re.findall(r"\bv?\d+\.\d+\.\d+\b", text))
+    if n_versions >= 12:
+        add("warning", "bloat-narrative",
+            f"{n_versions} version strings in AGENTS.md - looks like per-ship narrative; "
+            "move it to LATEST.md")
+
+    return out
+
+
+def cmd_instructions(args: argparse.Namespace) -> int:
+    """Validate the project's agent-instructions files and report."""
+    violations = check_instructions(Path(args.root).resolve())
+    errors = sum(1 for v in violations if v["severity"] == SEVERITY_ERROR)
+    warnings = sum(1 for v in violations if v["severity"] == SEVERITY_WARNING)
+    notes = sum(1 for v in violations if v["severity"] == SEVERITY_INFO)
+    if args.format == "json":
+        print(json.dumps({
+            "generated_at": sdlc_md.now_iso8601(),
+            "violations": violations,
+            "summary": {"errors": errors, "warnings": warnings, "info": notes},
+        }, indent=2))
+    else:
+        for v in violations:
+            print(f"{v['severity'].upper():7} [{v['rule']}] {v['message']}")
+        # A recorded opt-out is an acknowledgement, not a defect, so it does not withhold the
+        # clean line - but a single real finding does. The false assurance this check exists to
+        # end was exactly this line printed over a file that established nothing.
+        if not errors and not warnings:
+            print("agent-instructions files look good.")
+        print(f"errors={errors} warnings={warnings} info={notes}")
+    return 1 if errors else 0
+
+
+def _persona_cast_role(text: str) -> str | None:
+    """The cast role declared in a persona's Quick Reference, or None."""
+    m = re.search(r"\|\s*\*\*Cast role\*\*\s*\|\s*([^|]+?)\s*\|", text, re.I)
+    if not m:
+        return None
+    val = m.group(1).strip().lower()
+    # the role whose word appears EARLIEST in the cell (not by our tuple order, so
+    # "secondary supporting the primary" reads as secondary, not primary)
+    found = [(val.find(r), r) for r in ("primary", "secondary", "supplemental", "negative",
+                                        "customer", "served") if r in val]
+    return min(found)[1] if found else None
+
+
+def _headings(text: str) -> list[str]:
+    return [h.strip().lower() for h in re.findall(r"^##+\s+(.*)$", text, re.M)]
+
+
+def _starts(headings: list[str], *prefixes: str) -> bool:
+    """True if any heading STARTS WITH any prefix (case-insensitive). Prefix, not substring,
+    so a bare `## Context` does not satisfy `Behaviours & Context`, and `## Why End Goals
+    Matter` does not satisfy `End Goals`."""
+    return any(h.startswith(pfx) for h in headings for pfx in prefixes)
+
+
+def check_personas(root: Path) -> list[dict]:
+    """Cast-role-aware well-formedness check for goal-directed personas.
+
+    Advisory - a persona is a design aid, and a draft is legitimate; not in the hard
+    gate. One finding errors: two Primary personas declaring the same `Interface:` (the
+    elastic user reborn - Cooper's one-Primary-per-interface rule); everything else warns. Scans `sdlc-studio/personas/*.md` (skips index.md). A standard
+    persona (primary/secondary/supplemental) wants Who They Are, End Goals, Experience Goals,
+    Behaviours & Context, Frustrations, Scenario; a **Negative** persona swaps Experience Goals
+    for a Why-not (and keeps a Scenario/how-to-handle); Customer/Served make Experience + Scenario
+    optional. When the flat glob inspects nothing but
+    persona-shaped files sit nested in subdirs, emit a `persona-layout` advisory rather than a
+    clean pass on an empty inspection (LL0008). The same rationale covers the legacy flat
+    layout: a project whose only personas live in `sdlc-studio/personas.md` (the file the
+    story workflow reads when no registry cards exist) gets a `persona-layout` advisory plus
+    a light structural check (`persona-legacy`: unfilled boilerplate, no persona sections) -
+    never a vacuous clean pass on the one persona file actually consumed. No-op only when
+    neither layout holds any personas.
+    """
+    out: list[dict] = []
+    pdir = Path(root) / "sdlc-studio" / "personas"
+    if not pdir.is_dir():
+        return _check_legacy_personas_md(Path(root))
+    inspected = 0
+    primaries: list[tuple[Path, str | None]] = []
+    for p in sorted(pdir.glob("*.md")):
+        # design personas only - skip index / readme / a consult-guide / underscore files, and the
+        # seats/ subdir (review-seat charters, a different schema) is already excluded by the flat glob
+        if p.name.lower() in {"index.md", "readme.md", "consult-guide.md"} or p.name.startswith("_"):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        inspected += 1
+        role = _persona_cast_role(text)
+        hs = _headings(text)
+        if role is None:
+            out.append({"severity": "warning", "rule": "persona-cast-role", "file": str(p),
+                        "message": "no Cast role in the Quick Reference "
+                                   "(primary/secondary/supplemental/negative/customer/served)"})
+        checks = [("Who They Are", _starts(hs, "who they are")),
+                  ("End Goals", _starts(hs, "end goals")),
+                  ("Behaviours & Context", _starts(hs, "behaviour")),
+                  ("Frustrations", _starts(hs, "frustrations"))]
+        if role == "negative":
+            # the rationale heading, not any heading with "why" (e.g. "Why this matters")
+            why_not = any(h.startswith("why") and "not" in h for h in hs)
+            checks.append(("Why we are not designing for them", why_not))
+            checks.append(("Scenario / how to handle", _starts(hs, "scenario", "how to handle", "how we handle")))
+        elif role not in ("customer", "served"):  # standard, or unknown role
+            checks.append(("Experience Goals", _starts(hs, "experience goals")))
+            checks.append(("Scenario", _starts(hs, "scenario")))
+        for name, ok in checks:
+            if not ok:
+                out.append({"severity": "warning", "rule": "persona-section", "file": str(p),
+                            "message": f"missing section: {name}"})
+        if role == "primary":
+            im = re.search(r"\|\s*\*\*Interface\*\*\s*\|\s*([^|]+?)\s*\|", text, re.I)
+            primaries.append((p, im.group(1).strip().casefold() if im else None))
+
+    # Cooper: exactly one Primary per interface - two Primaries means two interfaces.
+    # A multi-Primary cast is a warning (the project may genuinely have two interfaces);
+    # two Primaries DECLARING the same optional Interface: is the elastic user reborn
+    # and the one place this check errors.
+    if len(primaries) > 1:
+        declared = [(p, i) for p, i in primaries if i]
+        shared = {i for _, i in declared if sum(1 for _, j in declared if j == i) > 1}
+        if shared:
+            names = ", ".join(p.name for p, i in declared if i in shared)
+            out.append({"severity": "error", "rule": "persona-one-primary", "file": str(pdir),
+                        "message": f"two Primary personas declare the same Interface "
+                                   f"({', '.join(sorted(shared))}): {names} - one Primary "
+                                   "per interface; merge them or split the interface"})
+        elif any(i is None for _, i in primaries):
+            names = ", ".join(p.name for p, _ in primaries)
+            out.append({"severity": "warning", "rule": "persona-one-primary", "file": str(pdir),
+                        "message": f"{len(primaries)} Primary personas ({names}) - Cooper's "
+                                   "rule is one Primary per interface; declare an "
+                                   "`| **Interface** | ... |` row in each Quick Reference "
+                                   "or demote all but one"})
+
+    # The stakeholder panel (personas/stakeholders/) has its own schema - the other side
+    # of the table: type declared, goals, veto lines, evidence read, Cooper Cast
+    # designation. Same advisory contract as design personas: warnings only, never gated.
+    sdir = pdir / "stakeholders"
+    if sdir.is_dir():
+        for p in sorted(sdir.glob("*.md")):
+            if p.name.startswith("_") or p.name.lower() in {"index.md", "readme.md"}:
+                continue
+            try:
+                text = p.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            m = _STAKEHOLDER_TYPE_RE.search(text)
+            if not m or m.group(1).lower() not in STAKEHOLDER_TYPES_ALLOWED:
+                out.append({"severity": "warning", "rule": "stakeholder-type", "file": str(p),
+                            "message": "no machine-readable `<!-- stakeholder: ... -->` type "
+                                       f"in the allowed set ({', '.join(sorted(STAKEHOLDER_TYPES_ALLOWED))}) "
+                                       "- the consult cannot group this card"})
+            hs = _headings(text)
+            for name in ("Who They Are", "What They Want", "Veto Lines", "Evidence They Read"):
+                if not _starts(hs, name.lower()):
+                    out.append({"severity": "warning", "rule": "stakeholder-section",
+                                "file": str(p), "message": f"missing section: {name}"})
+            if not re.search(r"\*\*Cast:\*\*\s*(Customer|Served)\b", text, re.I):
+                out.append({"severity": "warning", "rule": "stakeholder-cast", "file": str(p),
+                            "message": "no Cooper Cast designation (**Cast:** Customer | "
+                                       "Served) - the buyer-never-overrides-the-Primary "
+                                       "arbitration cannot be applied"})
+
+    # LL0008: a pass must mean "inspected and well-formed", never "found nothing to inspect". When
+    # the flat glob found no design personas but persona-shaped files sit in subdirs (e.g.
+    # personas/team/, personas/amigos/), emit an advisory rather than a vacuous clean pass.
+    # seats/ (review-seat charters) and stakeholders/ (the generated panel) are the generator's
+    # canonical output homes - different schemas, excluded by design.
+    if inspected == 0:
+        nested = [p for p in pdir.rglob("*.md")
+                  if p.parent != pdir
+                  and "seats" not in p.relative_to(pdir).parts
+                  and "stakeholders" not in p.relative_to(pdir).parts
+                  and p.name.lower() not in {"index.md", "readme.md", "consult-guide.md"}
+                  and not p.name.startswith("_")]
+        if nested:
+            out.append({"severity": "warning", "rule": "persona-layout", "file": str(pdir),
+                        "message": f"personas present but not in the flat Cooper layout "
+                                   f"({len(nested)} nested files found); not validated"})
+        # no design cards in the registry - the story pipeline falls back to the legacy
+        # flat personas.md, so that file must not escape unexamined (LL0008)
+        out.extend(_check_legacy_personas_md(Path(root)))
+    return out
+
+
+def _check_legacy_personas_md(root: Path) -> list[dict]:
+    """Light structural check for the legacy flat `sdlc-studio/personas.md` - the file the
+    story workflow reads when the personas/ registry holds no design cards. Advisory only
+    (a looser schema than the registry cards): its use gets a `persona-layout` advisory,
+    and an unfilled or persona-less file gets a `persona-legacy` flag. Returns [] when the
+    file is absent - a project with no personas at all is the prerequisite checks' problem,
+    not a validation finding."""
+    flat = root / "sdlc-studio" / "personas.md"
+    if not flat.is_file():
+        return []
+    out = [{"severity": "warning", "rule": "persona-layout", "file": str(flat),
+            "message": "legacy flat personas.md in use (no personas/ registry design cards) "
+                       "- story generation reads this file and only a light structural check "
+                       "applies here; consider migrating to the personas/ registry "
+                       "(reference-persona.md)"}]
+    try:
+        text = flat.read_text(encoding="utf-8")
+    except OSError as exc:
+        out.append({"severity": "warning", "rule": "persona-legacy", "file": str(flat),
+                    "message": f"personas.md exists but cannot be read ({exc})"})
+        return out
+    if "{{" in text:
+        out.append({"severity": "warning", "rule": "persona-legacy", "file": str(flat),
+                    "message": "unfilled template placeholders ({{...}}) remain - "
+                               "personas.md is boilerplate, not a populated persona set"})
+    sections = [h for h in re.findall(r"^##\s+(.+)$", text, re.M) if "{{" not in h]
+    if not sections:
+        out.append({"severity": "warning", "rule": "persona-legacy", "file": str(flat),
+                    "message": "no persona sections (## <name>) found - the file the story "
+                               "workflow reads is empty of personas"})
+    return out
+
+
+_SERVES_RE = re.compile(r"^>?\s*\*\*Serves:\*\*\s*(.+?)\s*$", re.M)
+
+
+def _persona_name_index(root: Path) -> dict[str, str]:
+    """casefolded resolvable persona names -> filename: each H1's leading name (before
+    any ` - role` suffix) and each file stem (hyphens as spaces)."""
+    idx: dict[str, str] = {}
+    pdir = root / "sdlc-studio" / "personas"
+    if not pdir.is_dir():
+        return idx
+    for p in sorted(pdir.glob("*.md")):
+        if p.name.lower() in {"index.md", "readme.md", "consult-guide.md"} or p.name.startswith("_"):
+            continue
+        try:
+            first = next((ln for ln in p.read_text(encoding="utf-8").splitlines()
+                          if ln.startswith("# ")), "")
+        except OSError:
+            continue
+        h1 = first.lstrip("# ").split(" - ")[0].strip()
+        if h1:
+            idx[h1.casefold()] = p.name
+        idx[p.stem.replace("-", " ").casefold()] = p.name
+    return idx
+
+
+def check_serves(root: Path) -> dict:
+    """Persona-tagged requirements coverage (the Serves: convention) - DORMANT until the
+    project carries at least one `**Serves:**` tag or opts in with `serves_coverage: true`
+    in .config.yaml, so untagged projects never see a new warning. When active: every
+    named persona must resolve to a persona file (a tag pointing nowhere reads as covered
+    and is worse than no tag), a story serving nobody is flagged, and a coverage table
+    (persona -> tagged-unit count) is emitted. Advisory - warnings only, never gated."""
+    findings: list[dict] = []
+    coverage: dict[str, int] = {}
+    tagged = 0
+    units: list[tuple[Path, list[str]]] = []
+    for sub in ("stories", "prd.md"):
+        base = root / "sdlc-studio" / sub
+        files = sorted(base.glob("*.md")) if base.is_dir() else ([base] if base.is_file() else [])
+        for p in files:
+            if p.name.startswith("_"):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            # strip fenced code blocks first - a story QUOTING the convention must not
+            # activate the check or mint phantom warnings
+            prose = re.sub(r"^```.*?^```\s*?$", "", text, flags=re.M | re.S)
+            names = [n.strip() for m in _SERVES_RE.finditer(prose)
+                     for n in m.group(1).split(",") if n.strip()]
+            if names:
+                tagged += 1
+            units.append((p, names))
+    active = tagged > 0 or bool(sdlc_md.project_override(root, "serves_coverage"))
+    if not active:
+        return {"active": False, "findings": [], "coverage": {}}
+    idx = _persona_name_index(root)
+    for p, names in units:
+        if not names:
+            findings.append({"severity": "warning", "rule": "serves-nobody", "file": str(p),
+                             "message": "no **Serves:** tag - which persona's End Goals "
+                                        "does this serve? (a unit serving nobody is a "
+                                        "feature-creep candidate)"})
+            continue
+        for n in names:
+            resolved = idx.get(n.casefold())
+            if resolved is None:
+                findings.append({"severity": "warning", "rule": "serves-unresolved",
+                                 "file": str(p),
+                                 "message": f"Serves: '{n}' resolves to no persona file - "
+                                            "fix the name or create the persona"})
+            else:
+                # key coverage on the resolved file, not the tag's raw spelling, so
+                # case variants of one persona never fragment into separate rows
+                coverage[resolved] = coverage.get(resolved, 0) + 1
+    return {"active": True, "findings": findings, "coverage": coverage}
+
+
+def cmd_serves(args: argparse.Namespace) -> int:
+    """Report Serves: coverage (advisory; exits 0)."""
+    res = check_serves(Path(args.root).resolve())
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps(res, indent=2))
+        return 0
+    if not res["active"]:
+        print("serves: dormant (no **Serves:** tags and no serves_coverage opt-in)")
+        return 0
+    for v in res["findings"]:
+        print(f"{v['severity'].upper():7} [{v['rule']}] {v['file']}: {v['message']}")
+    if res["coverage"]:
+        print("\n| Persona | Units served |\n| --- | --- |")
+        for name, n in sorted(res["coverage"].items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"| {name} | {n} |")
+    print(f"serves: warnings={len(res['findings'])} personas-covered={len(res['coverage'])}")
+    return 0
+
+
+STAKEHOLDER_TYPES_ALLOWED = {"buyer", "compliance", "ops", "served"}
+_STAKEHOLDER_TYPE_RE = re.compile(r"<!--\s*stakeholder:\s*([a-z][a-z0-9-]*)\s*-->", re.I)
+
+SEAT_ROLES_ALLOWED = {"engineering", "qa", "product", "security", "sre", "data", "ux"}
+_SEAT_ROLE_RE = re.compile(r"<!--\s*role:\s*([a-z][a-z0-9-]*)\s*-->", re.I)
+_SEAT_REVIEW_SECTIONS = ("Lens", "Pushes Back When", "Shadow")
+# Tight, word-boundary demographic denylist (Cooper: a characteristic that influences no
+# design decision is omitted; demographics are the canonical fluff). Deliberately short to
+# avoid false positives - the broader judgement lives in persona review, not this check.
+_DEMOGRAPHIC_RE = re.compile(
+    r"\b(\d+\s+years\s+old|married|husband|wife|hobbies|her gender|his gender)\b", re.I)
+
+
+_PROVENANCE_LINE_RE = re.compile(r"<!--\s*provenance\s*:", re.I)
+
+
+def check_seats(root: Path, require_stamp: list[Path] | None = None) -> list[dict]:
+    """Error-level well-formedness for the working-team seat cards (personas/seats/) - the
+    mechanical floor of team generation (the review-render hard error given an owner).
+
+    Per card: a declared role comment in the allowed set; the review-render section
+    headings; a clean demographic denylist; one card per role (a duplicate claim is an
+    error - the resolver would tiebreak lexically, which is deterministic but arbitrary);
+    and any provenance comment must parse as the generation stamp or the reviewed marker
+    (a malformed one silently classifies as authored, dropping out of the provisional
+    advisory). `require_stamp` names files the flow just generated: each MUST carry a
+    valid stamp or reviewed marker - authored cards are never in that list, so the check
+    stays non-circular - and a named path that matches no scanned card is itself an
+    error (the guard fails loudly on input it cannot verify, never vacuously passes). Cast size: >5 seats is an error (persona proliferation); missing
+    core roles is a warning (a project mid-authoring is legal). Runs standalone
+    (`validate seats`) and is REQUIRED at the end of a team-generation flow; it is not in
+    the default hard gate, so existing projects are never bricked by adoption."""
+    out: list[dict] = []
+    required = {p.resolve(): p for p in (require_stamp or [])}
+    required_seen: set[Path] = set()
+    sdir = root / "sdlc-studio" / "personas" / "seats"
+    if not sdir.is_dir() and not required:
+        return out
+    # no seats/ at all is legal for a --stakeholders-only run: the required-path
+    # reconciliation below still verifies stamps and fails loudly on misses
+    cards = sorted(sdir.glob("*.md")) if sdir.is_dir() else []
+    roles_seen: dict[str, str] = {}
+    for p in cards:
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError as exc:
+            out.append({"severity": "error", "rule": "seat-unreadable", "file": str(p),
+                        "message": f"unreadable seat card: {exc}"})
+            continue
+        m = _SEAT_ROLE_RE.search(text)
+        if not m:
+            out.append({"severity": "error", "rule": "seat-no-role", "file": str(p),
+                        "message": "no machine-readable `<!-- role: ... -->` - the resolver "
+                                   "cannot map this seat"})
+        else:
+            role = m.group(1).lower()
+            if role not in SEAT_ROLES_ALLOWED:
+                out.append({"severity": "error", "rule": "seat-unknown-role", "file": str(p),
+                            "message": f"role '{role}' not in the allowed set "
+                                       f"({', '.join(sorted(SEAT_ROLES_ALLOWED))})"})
+            elif role in roles_seen:
+                out.append({"severity": "error", "rule": "seat-duplicate-role", "file": str(p),
+                            "message": f"role '{role}' already claimed by {roles_seen[role]} - "
+                                       "one card per role (the lexical tiebreak is arbitrary)"})
+            else:
+                roles_seen[role] = p.name
+        missing = [h for h in _SEAT_REVIEW_SECTIONS
+                   if not re.search(rf"^##+\s+{re.escape(h)}\b", text, re.M)]
+        if missing:
+            out.append({"severity": "error", "rule": "seat-no-review-render", "file": str(p),
+                        "message": f"missing review-render section(s): {', '.join(missing)} - "
+                                   "a seat that cannot review is not a seat"})
+        dm = _DEMOGRAPHIC_RE.search(text)
+        if dm:
+            out.append({"severity": "error", "rule": "seat-demographic-fluff", "file": str(p),
+                        "message": f"demographic token '{dm.group(0)}' - a characteristic that "
+                                   "influences no engineering decision is omitted (goals, not "
+                                   "demographics)"})
+        stamped = bool(persona_gen.STAMP_RE.search(text)
+                       or persona_gen.REVIEWED_RE.search(text))
+        for ln in text.splitlines():
+            if (_PROVENANCE_LINE_RE.search(ln)
+                    and not persona_gen.STAMP_RE.search(ln)
+                    and not persona_gen.REVIEWED_RE.search(ln)):
+                out.append({"severity": "error", "rule": "seat-malformed-stamp",
+                            "file": str(p),
+                            "message": f"provenance comment does not parse ({ln.strip()!r}) - "
+                                       "it would silently classify as authored and drop out "
+                                       "of the provisional advisory"})
+                break
+        if p.resolve() in required:
+            required_seen.add(p.resolve())
+            if not stamped:
+                out.append({"severity": "error", "rule": "seat-no-stamp", "file": str(p),
+                            "message": "generated card carries no provenance stamp or "
+                                       "reviewed marker - run persona_gen.py stamp before "
+                                       "completing the flow"})
+    # Stakeholder cards share the malformed-stamp rule (the silent-declassify failure
+    # mode is identical), though never the seat schema.
+    stakedir = (root / "sdlc-studio" / "personas" / "stakeholders").resolve()
+    if stakedir.is_dir():
+        for p in sorted(stakedir.glob("*.md")):
+            try:
+                text = p.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            for ln in text.splitlines():
+                if (_PROVENANCE_LINE_RE.search(ln)
+                        and not persona_gen.STAMP_RE.search(ln)
+                        and not persona_gen.REVIEWED_RE.search(ln)):
+                    out.append({"severity": "error", "rule": "seat-malformed-stamp",
+                                "file": str(p),
+                                "message": f"provenance comment does not parse "
+                                           f"({ln.strip()!r}) - it would silently classify "
+                                           "as authored and drop out of the provisional "
+                                           "advisory"})
+                    break
+    # The stakeholder flow shares this gate: a required path under personas/stakeholders/
+    # is stamp-verified (never seat-schema-checked), so --stakeholders gets the same loud
+    # floor instead of a parallel one.
+    for res, orig in required.items():
+        if res in required_seen or res.parent != stakedir or not res.is_file():
+            continue
+        required_seen.add(res)
+        try:
+            text = res.read_text(encoding="utf-8")
+        except OSError as exc:
+            out.append({"severity": "error", "rule": "seat-unreadable", "file": str(orig),
+                        "message": f"unreadable stakeholder card: {exc}"})
+            continue
+        if not (persona_gen.STAMP_RE.search(text) or persona_gen.REVIEWED_RE.search(text)):
+            out.append({"severity": "error", "rule": "seat-no-stamp", "file": str(orig),
+                        "message": "generated card carries no provenance stamp or "
+                                   "reviewed marker - run persona_gen.py stamp before "
+                                   "completing the flow"})
+    # A guard must fail loudly on input it cannot verify, never vacuously pass: every
+    # required path that matched no scanned card (typo, cwd-relative from elsewhere,
+    # outside seats/ or stakeholders/) is an error, not a silent skip.
+    for res, orig in required.items():
+        if res not in required_seen:
+            out.append({"severity": "error", "rule": "seat-require-miss", "file": str(orig),
+                        "message": "required-stamp path matches no scanned card - the "
+                                   "stamp guarantee cannot be verified for it (check the "
+                                   "path; it must be a card under personas/seats/ or "
+                                   "personas/stakeholders/)"})
+    if len(cards) > 5:
+        out.append({"severity": "error", "rule": "seat-cast-size", "file": str(sdir),
+                    "message": f"{len(cards)} seat cards (> 5) - persona proliferation; the "
+                               "cast is 3 core + at most 2 signal-earned extras"})
+    core_missing = {"engineering", "qa", "product"} - set(roles_seen)
+    if cards and core_missing:
+        out.append({"severity": "warning", "rule": "seat-core-missing", "file": str(sdir),
+                    "message": f"core role(s) uncovered: {', '.join(sorted(core_missing))}"})
+    return out
+
+
+def cmd_seats(args: argparse.Namespace) -> int:
+    """Error-level seat-card check; exits 1 on any error (the generation flow's floor)."""
+    required = [Path(f) for f in (getattr(args, "require_stamp", None) or [])]
+    violations = check_seats(Path(args.root).resolve(), require_stamp=required)
+    errors = sum(1 for v in violations if v["severity"] == "error")
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps({"violations": violations,
+                          "summary": {"errors": errors,
+                                      "warnings": len(violations) - errors}}, indent=2))
+    else:
+        for v in violations:
+            print(f"{v['severity'].upper():7} [{v['rule']}] {v['file']}: {v['message']}")
+        print(f"seats: errors={errors} warnings={len(violations) - errors}")
+    return 1 if errors else 0
+
+
+def cmd_personas(args: argparse.Namespace) -> int:
+    """Report persona well-formedness (advisory; exits 1 only on the one error-level
+    finding, two Primaries declaring the same Interface)."""
+    violations = check_personas(Path(args.root).resolve())
+    errors = sum(1 for v in violations if v["severity"] == "error")
+    if args.format == "json":
+        print(json.dumps({"generated_at": sdlc_md.now_iso8601(), "violations": violations,
+                          "summary": {"errors": errors,
+                                      "warnings": len(violations) - errors}}, indent=2))
+    else:
+        for v in violations:
+            print(f"{v['severity'].upper():7} {v['file']}: [{v['rule']}] {v['message']}")
+        print("personas look well-formed." if not violations
+              else f"errors={errors} warnings={len(violations) - errors}")
+    return 1 if errors else 0  # advisory except the same-Interface duplicate Primary
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the argparse parser for the check and instructions subcommands."""
+    p = argparse.ArgumentParser(
+        prog="validate.py",
+        description="Validate sdlc-studio artifact structure.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("check", help="Validate artifacts.")
+    c.add_argument("--type", choices=sorted(sdlc_md.ARTIFACT_TYPES),
+                   help="Limit to one artifact type (default: all)")
+    c.add_argument("--file", help="Validate a single file (type inferred if --type omitted)")
+    c.add_argument("--root", default=".", help="Repo root (default: .)")
+    c.add_argument("--changed", action="store_true",
+                   help="Judge only the artefacts this working tree touched (staged, unstaged "
+                        "or untracked). Untouched errors are still printed, as advisory; the "
+                        "whole-tree census and DoR/DoD sweeps still run and still fail. With no "
+                        "git answer the whole workspace is judged")
+    c.add_argument("--verify-selectors", action="store_true", dest="verify_selectors",
+                   help="also sweep stamped acceptance criteria whose `Verify:` selector no "
+                        "longer selects anything (US0669). OFF by default: resolution costs a "
+                        "`pytest --collect-only` per distinct test file, which the per-commit "
+                        "gate cannot afford. The scheduled corpus lane passes it")
+    c.add_argument("--emit-baseline", action="store_true", dest="emit_baseline",
+                   help="Print the baseline record for the findings that support one (one id "
+                        "per line, ready to redirect into sdlc-studio/.criteria-baseline.txt) "
+                        "instead of a verdict. The record is captured from the checker's own "
+                        "output, never hand-written")
+    c.add_argument("--format", choices=("text", "json"), default="text")
+    c.set_defaults(func=cmd_check)
+
+    i = sub.add_parser("instructions",
+                       help="Validate the project's agent-instructions files (AGENTS.md / CLAUDE.md).")
+    i.add_argument("--root", default=".", help="Repo root (default: .)")
+    i.add_argument("--format", choices=("text", "json"), default="text")
+    i.set_defaults(func=cmd_instructions)
+
+    pp = sub.add_parser("personas",
+                        help="Well-formedness check for goal-directed personas (advisory).")
+    pp.add_argument("--root", default=".", help="Repo root (default: .)")
+    pp.add_argument("--format", choices=("text", "json"), default="text")
+    pp.set_defaults(func=cmd_personas)
+    sv = sub.add_parser("serves",
+                        help="Serves: persona-coverage report (dormant until first tag or opt-in).")
+    sv.add_argument("--root", default=".", help="Repo root (default: .)")
+    sv.add_argument("--format", choices=("text", "json"), default="text")
+    sv.set_defaults(func=cmd_serves)
+    st = sub.add_parser("seats",
+                        help="Error-level check for working-team seat cards (the generation floor).")
+    st.add_argument("--root", default=".", help="Repo root (default: .)")
+    st.add_argument("--require-stamp", nargs="+", metavar="FILE", dest="require_stamp",
+                    help="Files the flow just generated - each must carry a valid "
+                         "provenance stamp or reviewed marker (missing = error).")
+    st.add_argument("--format", choices=("text", "json"), default="text")
+    st.set_defaults(func=cmd_seats)
+    sdlc_md.add_global_root(p)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Parse arguments and dispatch to the chosen subcommand."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # Resolve the root ONCE and write it back, so every verb below anchors on the same
+    # tree. Resolving it at only one call site let the two disagree - the resolved value
+    # guarded or advised on the real project while other verbs still read a bare
+    # `--root .`, so one invocation could report on two different trees.
+    args.root = str(sdlc_md.resolve_root(args))
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001 - top-level guard
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)

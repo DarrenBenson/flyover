@@ -1,0 +1,293 @@
+# Best Practices: Scripts
+
+> **See also:** [python.md](python.md) for Python-specific library guidance (YAML, requests, Pillow).
+
+## Checklist
+
+Before considering a script complete:
+
+- [ ] Shebang line (`#!/bin/bash` or `#!/usr/bin/env python3`)
+- [ ] Executable permissions (`chmod +x`)
+- [ ] Supports `--help` with usage information
+- [ ] Handles errors gracefully (non-zero exit on failure)
+- [ ] Uses configuration from config file where applicable
+- [ ] Documented in project README or scripts/README.md
+- [ ] No hardcoded paths (use relative or config)
+- [ ] Clear output messages
+
+## Structure: Bash
+
+```bash
+#!/bin/bash
+# Brief description of what this script does
+# Usage: ./scripts/name.sh [args]
+
+set -euo pipefail  # exit on error, unset var, or any failure in a pipeline
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Help text
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    echo "Usage: $0 [options]"
+    echo ""
+    echo "Description of what this does."
+    echo ""
+    echo "Options:"
+    echo "  --help, -h    Show this help"
+    echo "  --dry-run     Preview without changes"
+    exit 0
+fi
+
+# Main logic
+main() {
+    echo "Doing the thing..."
+    # Implementation
+}
+
+main "$@"
+```
+
+## Structure: Python
+
+```python
+#!/usr/bin/env python3
+"""Brief description of what this script does.
+
+Usage:
+    python3 scripts/name.py [options]
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+# Add project root to path for imports
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+# from lib.config import get_config  # If project has shared config
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Preview without changes')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Verbose output')
+    args = parser.parse_args()
+
+    # Implementation
+    print("Doing the thing...")
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+```
+
+## Examples
+
+### Good
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+if [[ -z "${1:-}" ]]; then
+    echo "Usage: $0 <name>" >&2
+    exit 1
+fi
+
+SLUG="$1"
+echo "Processing $SLUG..."
+```
+
+### Bad
+
+```bash
+cd /home/user/projects/my-project
+python test.py
+```
+
+(No shebang, hardcoded path, no error handling)
+
+## Anti-patterns
+
+| Pattern | Problem | Fix |
+| --------- | --------- | ----- |
+| Bare `set -e` (or none) | `set -e` alone ignores unset vars and pipeline failures | Use `set -euo pipefail` |
+| Hardcoded paths | Breaks on other machines | Use `$SCRIPT_DIR` or config |
+| No `--help` | Undiscoverable | Add help flag handling |
+| Silent failures | Hard to debug | Echo status, exit non-zero |
+| Bare `except:` | Hides errors | Catch specific exceptions |
+| Print to stdout for errors | Mixed output | Use `>&2` or `stderr` |
+
+## Tooling
+
+- **Lint:** [ShellCheck](https://www.shellcheck.net/) is the static-analysis baseline - it catches
+  the whole anti-pattern class above mechanically (SC2086 unquoted expansion, SC2164 unchecked
+  `cd`, and more). Treat the anti-pattern table as *what ShellCheck enforces for you*, not a
+  hand-curated substitute.
+- **Format:** `shfmt` for consistent indentation and style.
+- Both are single binaries with no runtime; wire them into `code check` and CI.
+
+## Resolving `--root`
+
+Every script in this family takes `--root`. Resolve it with
+`sdlc_md.resolve_root(args)`, and anchor any relative output on it with
+`sdlc_md.under_root(root, rel)`. Never `Path(args.root)` directly.
+
+- A root the caller NAMED is honoured verbatim - pointing a run at another
+  project is never second-guessed.
+- The default `.` means "work it out from here", so it is discovered upward to
+  the nearest directory holding an `sdlc-studio/` workspace. A cwd that already
+  is a root resolves to itself, so the common case is unchanged.
+- An ABSOLUTE output path is passed through untouched; only a relative one is
+  anchored.
+
+A bare `Path(args.root)` writes beside the cwd. A run from a subdirectory then
+produces a stray `sdlc-studio/.local` tree, prints the path it used, and exits
+0 - the output looks written and the gate that reads it never sees it.
+
+## Configuration
+
+Use a shared config module for project-wide settings. For bash, read from config files or use environment variables.
+
+## Output Conventions
+
+| Output Type | Format | Destination |
+| ------------- | -------- | ------------- |
+| Progress messages | Plain text | stdout |
+| Errors | Prefixed with "Error:" | stderr |
+| Data for parsing | JSON | stdout |
+| Reports | Markdown | file |
+
+## A guard's message is derived from the guard {#derived-message}
+
+A user-facing sentence about what a guard, gate or check will do is computed from the guard's
+own predicate, not written alongside it. A message maintained by hand drifts the moment the
+predicate moves, and then it misleads silently - about half the time in the dangerous
+direction, telling an operator a total guard is narrow so they route around it.
+
+The counter-example that impersonates a derivation: an enumeration of the spellings a matcher
+happens to treat one way is a restatement wearing a function's clothes. It agrees with the
+predicate only on the cases the author thought of, so a case they missed reads as the opposite
+of the truth. Probing the real predicate - asking the matcher its own question over a battery
+of inputs - is what makes the sentence a derivation rather than a second copy of the rule.
+
+The compile-time echo of this rule: where a message and the verdict it describes must agree,
+one test drives both over the same battery and asserts they agree (see
+[testing.md](testing.md), heuristic 6), rather than asserting the message's text on its own.
+
+## Exit Codes
+
+| Code | Meaning |
+| ------ | --------- |
+| 0 | Success |
+| 1 | General error |
+| 2 | Invalid arguments |
+| 130 | Interrupted (Ctrl+C) |
+
+## File Locations
+
+```
+scripts/
+├── README.md              # Document all scripts
+├── lib/                   # Shared Python modules
+│   ├── __init__.py
+│   └── config.py          # Configuration loader
+├── script-name.py         # Python scripts
+└── script-name.sh         # Bash scripts
+```
+
+## Documentation
+
+Every script must be documented in `scripts/README.md`:
+
+```markdown
+### script-name.sh
+
+Brief description.
+
+```bash
+./scripts/script-name.sh [options]
+```
+
+## Subcommand verb taxonomy
+
+New CLIs pick verbs from this table (guidance for NEW commands only - no renames of
+shipped verbs). One verb per meaning keeps 40+ script surfaces guessable:
+
+| Verb | Meaning | Existing examples |
+| --- | --- | --- |
+| `check` | read-only validation; non-zero exit on findings | validate, conformance, audit, provenance |
+| `detect` | read-only drift/finding enumeration (richer report than check) | reconcile |
+| `apply` | perform the fixes `detect` found; idempotent | reconcile |
+| `run` | execute the tool's main effectful job | verify_ac, mutation |
+| `record` | append one event/verdict to a log | telemetry, critic |
+| `show` | print recorded state (add `--summary` for aggregates) | telemetry |
+| `list` | enumerate artifacts/entries | lessons, plan |
+| `new` / `batch` | create one artifact / many atomically | artifact |
+| `set` | one gated state change | transition |
+| `sweep` | scan for state that can now advance | blocker_sweep |
+
+Prefer an existing verb over a synonym (`scan`, `exec`, `emit`, `report` as a verb);
+if none fits, add the new verb here in the same change.
+
+## CLI argument grammar
+
+One grammar across the script family so an agent never has to `--help`-probe for how a
+given command spells a list or a target. Deviations cost a round-trip every time.
+
+- **id lists (batch verbs):** accept a **repeatable `--id`** OR a **single comma-separated
+  `--ids`** (the legacy spelling, kept as an alias). Declare both with
+  `sdlc_md.add_ids_argument(subparser)` and read them back with `sdlc_md.resolve_ids(args)`
+  - it merges either form into one de-duplicated, order-preserving list. Never invent a
+  third spelling (a worklist file, space-separated `nargs="+"`, a positional list).
+- **single-target verbs:** a scalar `--id` (no helper needed); `resolve_ids` still reads it.
+- **recorder subject id:** `--unit` is the family-standard field (critic, loop_guard). A verb
+  with a legacy spelling keeps it as an argparse alias: `add_argument("--tranche", "--unit",
+  dest="tranche", ...)`.
+- **target selection** (a status query vs an id list) is a mutually-exclusive choice the
+  command validates, not two half-overlapping flags.
+- **repo root:** `--root` is a **global** flag accepted **before** the subcommand on every
+  root-dealing script, and **after** the verb wherever the subcommand declares a root. Declare
+  it per-subcommand where the verb needs it, then call `sdlc_md.add_global_root(parser)` once at
+  the end of `build_parser` - it adds the top-level `--root` and re-points the per-subcommand
+  copies so a value given before the verb is not clobbered. So `x --root R sub` works on every
+  such script, and `x sub --root R` works wherever the verb itself takes a root. It must always
+  bind the standard `root` dest (never an alias to another dest - the global cannot feed that,
+  and a root given before the verb would be silently dropped). A script that deals in no repo
+  root (projects a master, manages plan files) declares no `--root` and skips the helper.
+- **repeatable value flags:** a flag a user would naturally give more than once (a status
+  filter, an epic scope) uses `action="append"`, never the default `store` - repeating a
+  `store` flag **silently drops** every value but the last. If the help says `combinable`, the
+  action must append.
+
+`tests/test_cli_grammar.py` sweeps every script's argparse tree and fails if a new command
+accepts ids in a non-conforming form, declares `--root` only per-subcommand, or lets a
+`combinable` flag overwrite on repeat.
+
+**Options:**
+
+- `--dry-run` - Preview only
+- `--verbose` - More output
+
+```
+
+## Testing
+
+Before committing:
+
+1. Run with `--help` to verify
+2. Test with valid input
+3. Test with invalid input (should fail gracefully)
+4. Test with `--dry-run` if applicable
+5. Verify exit codes

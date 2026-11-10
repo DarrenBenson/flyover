@@ -1,0 +1,1293 @@
+#!/usr/bin/env python3
+"""refine - decompose a request (RFC/CR) into an epic and stories, with the links wired.
+
+A request sits in the DISCOVERY backlog; it becomes DELIVERY work only by being broken down into
+the units that deliver it. `refine` is that step made a command: it validates the request is
+refinable, creates an epic and its stories, and writes the bidirectional `Parent:` /
+`Decomposed-into:` links the two-backlog gates verify - the wiring an operator otherwise does by
+hand. It is also the migration tool: refining an old childless CR into stories is exactly what an
+upgrading project must do.
+
+This module is the DETERMINISTIC CORE (US0129): given the request, an epic title and the story
+breakdown (title + points), it creates and wires everything atomically-enough (it validates the
+whole breakdown before minting anything, so a bad point value mints nothing). Proposing a GOOD
+breakdown is a judgement the agent/operator makes and passes in; refine does not invent it.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+try:
+    from lib import sdlc_md
+except ImportError:  # invoked from inside scripts/
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from lib import sdlc_md
+
+import artifact
+import file_finding
+import persona_resolve
+
+
+# The T-shirt Size an epic is born with, from the story-point total it decomposes into. A coarse
+# read-off, never a measurement: the epic's real size is its `Derived Point Total`, which reconcile
+# keeps equal to the sum of its stories' points. The band edges mirror the Fibonacci scale.
+def _tshirt_for(total: int) -> str:
+    return sdlc_md.size_for_points(total)   # the ONE point->size band (shared with the migration)
+
+
+# The Parent / Decomposed-into link writers moved to `lib.sdlc_md` (beside the link READERS
+# `parent_ref` / `decomposed_ids`) when `triage` became the second caller - LL0016: extract the
+# shared definition BEFORE the second caller, not after. These thin aliases keep the module-local
+# names (and refine's tests) working; both ceremonies now write links through one authority.
+_insert_after_status = sdlc_md.insert_after_status
+_write_decomposed = sdlc_md.write_decomposed
+
+
+_CRITERION_RE = re.compile(r"^-\s*\[\s?\]\s+(.+?)\s*$", re.M)
+
+
+def _ac_heading(criterion: str, limit: int = 100) -> str:
+    """The AC heading taken from a request criterion: one line, truncated at a word boundary
+    when long, and never ending in punctuation. A generated heading must pass markdownlint
+    MD026 (no trailing punctuation) in any project that lints its workspace, so no trailing
+    ellipsis or full stop is appended."""
+    # Not a pure refactor, and worth saying so: stripping BEFORE the length test means a
+    # criterion whose stripped form fits but whose raw form does not now keeps its last word
+    # instead of losing it to truncation. Longer, still inside the limit, still free of
+    # trailing punctuation - a better heading, not merely a different one.
+    text = sdlc_md.heading_title(criterion)
+    if len(text) > limit:
+        # Truncating can expose punctuation the first pass never saw, so strip again.
+        text = sdlc_md.heading_title(text[:limit].rsplit(" ", 1)[0] or text[:limit])
+    return text
+
+
+#: A criterion that already opens with its own `AC1:` label (the shape a request written to the
+#: story template carries). The seed prepends `### ACn: `, so an unstripped label landed twice in
+#: one heading. Matches the bold and plain spellings and the usual separators; nothing else is
+#: touched, so a criterion that merely mentions AC2 mid-sentence keeps its text.
+_AC_LABEL_RE = re.compile(r"^\**\s*AC\s*\d+\**\s*[:.)\]-]\s+", re.I)
+
+
+def _strip_ac_label(criterion: str) -> str:
+    """A criterion with its leading `ACn:` label removed - the seed supplies the label itself.
+    A criterion that is ONLY a label keeps its text: stripping it to nothing would seed a
+    heading with no content at all."""
+    stripped = _AC_LABEL_RE.sub("", criterion, count=1).strip()
+    return stripped or criterion
+
+
+def _request_criteria(text: str) -> list[str]:
+    """The request's own `- [ ]` acceptance criteria, in order."""
+    return _CRITERION_RE.findall(_section(text, "Acceptance Criteria"))
+
+
+#: The epic's one carried-criteria heading, and the note that closes the section. A SHARED batch
+#: epic (`refine --into`) takes criteria from several requests, so both are written exactly once
+#: and later requests merge underneath - a second `## Acceptance Criteria (Epic Level)` is a
+#: duplicate sibling heading, which fails markdownlint MD024 in any project that lints its
+#: workspace and blocks the very commit the refine was preparing.
+_EPIC_AC_HEADING = "## Acceptance Criteria (Epic Level)"
+_EPIC_AC_NOTE = ("> Carried from the request. Author each story's own ACs against its\n"
+                 "> slice while grooming - these are the epic's completion bar, not any\n"
+                 "> single story's.")
+
+
+def _epic_ac_span(text: str) -> tuple[int, int]:
+    """(start, end) of the epic-level AC section in `text` - from its heading to the next `## `
+    heading or end of file. Caller has checked the heading is present."""
+    start = text.index(_EPIC_AC_HEADING)
+    after = start + len(_EPIC_AC_HEADING)
+    nxt = re.search(r"^## ", text[after:], re.M)
+    return start, (after + nxt.start() if nxt else len(text))
+
+
+def _merge_epic_criteria(epic_path: Path, text: str, bullets: str, rid: str | None) -> None:
+    """Merge further criteria UNDER the epic's existing AC heading, attributed to the request
+    they came from (`### From CRxxxx`), keeping the closing note last.
+
+    The `--into` case: a batch epic already carrying one request's criteria takes the next
+    request's without a second top-level heading.
+    """
+    start, end = _epic_ac_span(text)
+    body = text[start:end].rstrip("\n")
+    if _EPIC_AC_NOTE in body:            # lifted here, re-attached below so it closes the section
+        body = body.replace(_EPIC_AC_NOTE, "").rstrip("\n")
+    sub = f"### From {rid}" if rid else ""
+    if sub and sub in body:
+        # Same request merging twice: extend its existing block rather than repeat the
+        # subheading, which would itself be a duplicate sibling.
+        after = body.index(sub) + len(sub)
+        nxt = re.search(r"^#{2,3} ", body[after:], re.M)
+        cut = after + (nxt.start() if nxt else len(body) - after)
+        block = body[:cut].rstrip("\n") + "\n" + bullets.rstrip("\n")
+        body = (block + "\n\n" + body[cut:].lstrip("\n")).rstrip("\n")
+    else:
+        head = f"{sub}\n\n" if sub else ""
+        body = f"{body}\n\n{head}{bullets}"
+    section = body.rstrip("\n") + "\n\n" + _EPIC_AC_NOTE + "\n\n"
+    sdlc_md.atomic_write(epic_path, text[:start] + section + text[end:].lstrip("\n"))
+
+
+def _seed_epic_criteria(epic_path: Path, criteria: list[str], rid: str | None = None) -> None:
+    """Carry a multi-story request's criteria onto the EPIC, as unticked criteria.
+
+    They describe the request whole, and the epic is what the request became. Putting them
+    on one of the stories claimed a distribution nothing had worked out - see `_seed_acs`.
+    Written as `- [ ]` rather than AC blocks because an epic-level criterion is not
+    executable on its own; each story's ACs are authored against its own slice at grooming.
+
+    An epic that already has the section is MERGED into (`_merge_epic_criteria`), not appended
+    to a second time.
+    """
+    text = epic_path.read_text(encoding="utf-8")
+    bullets = "".join(f"- [ ] {c}\n" for c in criteria)
+    if _EPIC_AC_HEADING in text:
+        _merge_epic_criteria(epic_path, text, bullets, rid)
+        return
+    section = f"{_EPIC_AC_HEADING}\n\n{bullets}\n{_EPIC_AC_NOTE}\n\n"
+    # Callable replacement: criterion text is DATA, never a regex template (a criterion
+    # holding \1 or C:\temp must land verbatim rather than expand or crash the mint).
+    if "## Revision History" in text:
+        new = re.sub(r"(?=## Revision History)", lambda m: section, text, count=1)
+    else:
+        new = text.rstrip("\n") + "\n\n" + section.rstrip("\n") + "\n"
+    sdlc_md.atomic_write(epic_path, new)
+
+
+
+def _fill_user_story(story_path: Path, title: str, request_id: str) -> None:
+    """Fill the User Story block from what minting already knows, so no `{{...}}` survives.
+
+    A template field left unfilled is indistinguishable from one an author forgot, and twenty
+    stories arrived in one run carrying all three. The values are DERIVED, never invented: the
+    capability is the story's own title, the benefit names the request it delivers, and the role
+    is the persona already resolved onto the story. That is a starting point an author sharpens
+    while grooming - which is what the field is for - rather than a placeholder that reads as an
+    omission.
+    """
+    text = sdlc_md.read_text_safe(story_path) or ""
+    role = (sdlc_md.extract_field(text, "Persona") or "").strip() or "maintainer"
+    for old, new in (("{{persona_name}}", role),
+                     ("{{role}}", role),
+                     ("{{capability}}", title.strip()),
+                     ("{{benefit}}", f"{request_id} is delivered by work that can be planned "
+                                     f"and checked")):
+        text = text.replace(old, new)
+    story_path.write_text(text, encoding="utf-8")
+
+
+def grooming_owed(repo_root: Path | str, story_ids: list[str]) -> int:
+    """How many of the minted stories still owe authored acceptance criteria.
+
+    Asked of `sprint.breakdown` - the planner's OWN census - rather than counted here, so the
+    number `refine` reports and the number `sprint plan` refuses on cannot disagree. A creator
+    quoting its own arithmetic is how the two ends came to disagree in the first place.
+    """
+    import sprint   # local: the writer borrows the planner's census, not its weight
+    units = []
+    for sid in story_ids:
+        found = sdlc_md.find_by_id(Path(repo_root), sid)
+        if found:
+            units.append({"id": sid, "type": "story", "path": str(found[0])})
+    if not units:
+        return 0
+    bd = sprint.breakdown(repo_root, units, skip_personas=True)
+    return sum(1 for u in bd.get("ungroomed") or [] if str(u.get("ac_why") or ""))
+
+def _seed_acs(story_path: Path, criteria: list[str]) -> None:
+    """Replace the story's placeholder AC scaffold with one AC block per request
+    criterion: the criterion is the TITLE, and Given/When/Then and the Verify stay explicit
+    placeholders - seeding TRANSCRIBES what the request already states, it never fabricates
+    executability (validate keeps flagging the placeholders until the author fills them).
+
+    The Then used to be the criterion too, which made it the heading restated: a criterion
+    that states its own name asserts nothing observable, and it read as authored rather than
+    as work owed, so a groomer skimming the file saw filled-in criteria. Where the heading
+    could not carry the criterion whole (a long one is truncated to keep the heading inside
+    MD026/one line), the full text is transcribed under the block so the seed loses nothing.
+
+    Called for a SINGLE-story breakdown only, where the story is the whole request. The
+    multi-story case goes to `_seed_epic_criteria`; it used to come here too, with a
+    `redistribute_note` flag adding a "redistribute these while grooming" banner. The flag
+    is gone with the behaviour: a note excusing wrong criteria is not a substitute for not
+    writing them.
+    """
+    text = story_path.read_text(encoding="utf-8")
+    blocks = []
+    for i, criterion in enumerate(criteria, 1):
+        body = _strip_ac_label(criterion)   # the seed supplies `ACn:` - the source must not
+        title = _ac_heading(body)
+        block = (f"### AC{i}: {title}\n\n"
+                 f"- **Given** {{{{context}}}}\n- **When** {{{{action}}}}\n"
+                 f"- **Then** {{{{observable outcome}}}}\n- **Verify:** {{{{executable check}}}}\n")
+        if title != body:
+            block += f"\n> Transcribed from the request: {body}\n"
+        blocks.append(block)
+    seeded = "## Acceptance Criteria\n\n" + "\n".join(blocks) + "\n"
+    # callable replacement: criterion text is DATA, never a regex template - a
+    # criterion containing \1 or C:\temp must land verbatim, not crash the mint
+    # or corrupt the story via escape expansion
+    new = re.sub(r"## Acceptance Criteria\n.*?(?=## Revision History)", lambda m: seeded,
+                 text, count=1, flags=re.S)
+    sdlc_md.atomic_write(story_path, new)
+
+
+def _mark_ungroomed(story_path: Path) -> None:
+    """Replace an ungroomed minted story's `{{placeholder}}` AC scaffold with the explicit
+    grooming-placeholder marker (`sdlc_md.UNGROOMED_AC_MARKER`).
+
+    A story refine mints without seeded criteria (a multi-story breakdown, or `--no-seed-acs`)
+    used to carry a bare `### AC1: {{define}}` scaffold that reads as thin authored content. The
+    marker states plainly that the ACs are a grooming stub, so a reader tells a groomed story from
+    an ungroomed one at a glance and `conformance` counts the ungroomed ones by the token."""
+    text = story_path.read_text(encoding="utf-8")
+    # Trailing BLANK line before the next heading: the wipe-to-Revision-History regex consumes the
+    # blank that preceded `## Revision History`, so a single `\n` here would glue the marker to the
+    # heading and fail markdownlint MD022 (blanks-around-headings). `_seed_acs` emits `\n\n` for
+    # the same reason.
+    section = "## Acceptance Criteria\n\n" + sdlc_md.UNGROOMED_AC_MARKER + "\n\n"
+    # callable replacement: the marker is a constant, but the idiom guards against a story slug or
+    # title landing a regex metacharacter in the replacement text.
+    new = re.sub(r"## Acceptance Criteria\n.*?(?=## Revision History)", lambda m: section,
+                 text, count=1, flags=re.S)
+    sdlc_md.atomic_write(story_path, new)
+
+
+def _decompose(repo_root, rid: str, rpath: Path, epic_title: str,
+               stories: list[tuple[str, int, str | None]], total: int,
+               existing_children: list[str],
+               seed_criteria: list[str] | None = None) -> tuple[str, list[str]]:
+    """Mint the epic + its stories and wire everything under ONE rollback guard, then set the
+    request's `Decomposed-into:` to `existing_children` + the new epic (append-only). The shared
+    core of `apply` (existing_children=[]) and `add` (existing_children=the request's current
+    epics): a single atomic mint, so a mid-create failure leaves the backlog untouched. Returns
+    (epic_id, story_ids)."""
+    root = Path(repo_root)
+    minted: list[Path] = []
+    try:
+        ep = artifact.new(root, "epic", epic_title,
+                          {"size": _tshirt_for(total),
+                           "summary": f"Decomposed from {rid}. Delivers the work {rid} requested."})
+        epic_id = ep["id"]
+        epic_path = Path(ep["path"])
+        minted.append(epic_path)
+        story_ids: list[str] = []
+        for idx, (title, points, affects) in enumerate(stories):
+            fields = {"epic": epic_id, "points": points}
+            if affects:
+                fields["affects"] = affects
+            s = artifact.new(root, "story", title, fields)
+            minted.append(Path(s["path"]))
+            story_ids.append(s["id"])
+            # Record the ORIGINATING request on the story: in a shared batch epic (refine --into)
+            # the epic's stories deliver different requests, so which story delivers which request
+            # must be machine-resolvable, not only in the title. A secondary traceability link -
+            # the story's Parent stays the epic, so derivation and the link gates are untouched.
+            _insert_after_status(Path(s["path"]), f"> **Delivers:** {rid}")
+            # Fill the User Story block from the title and the request, so no `{{...}}` field
+            # ships unfilled - an unfilled field reads as an omission rather than a prompt.
+            _fill_user_story(Path(s["path"]), title, rid)
+            # A SINGLE story is the request, so it takes the criteria. A multi-story
+            # breakdown cannot know which criterion belongs to which story, so it seeds
+            # none of them and the epic carries the list instead (below). Seeding them all
+            # onto story one read as authored while being wrong.
+            if idx == 0 and seed_criteria and len(stories) == 1:
+                _seed_acs(Path(s["path"]), seed_criteria)
+            else:
+                # No story-level criteria were seeded (a multi-story breakdown, or no request
+                # criteria to carry): label the AC block an ungroomed grooming placeholder rather
+                # than leaving the bare `{{placeholder}}` scaffold reading as content.
+                _mark_ungroomed(Path(s["path"]))
+        if seed_criteria and len(stories) > 1:
+            _seed_epic_criteria(epic_path, seed_criteria, rid)
+        _insert_after_status(epic_path, f"> **Parent:** {rid}")
+        _insert_after_status(epic_path, f"> **Derived Point Total:** {total}")
+        _write_decomposed(rpath, [*existing_children, epic_id])
+        _sync_linked_epics(root)
+    except BaseException:
+        for p in minted:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        raise
+    return epic_id, story_ids
+
+
+def _sync_linked_epics(root: Path) -> None:
+    """Write the request's Linked Epics index cell at the moment the link is made.
+
+    Orchestrates reconcile's tested census rather than duplicating the row-rewrite here: one
+    writer, one notion of what the cell should say. Leaving it to a later reconcile is how the
+    column drifted to a placeholder on every decomposed request in the first place. Best
+    effort - a decomposition already committed to disk must not be rolled back because a
+    derived index cell could not be refreshed; the standing census still reports it.
+    """
+    try:
+        import reconcile  # noqa: PLC0415 - local: reconcile imports broadly, keep it off cold paths
+        reconcile.apply_linked_epics(root)
+    except Exception:  # noqa: BLE001 - a derived cell never fails the mint it describes
+        pass
+
+
+#: The `Derived Point Total` field's leading integer, WHEREVER the field sits - blockquote or not,
+#: on its own line or inline - and preserving any annotation after it. `_roll_point_total` bumps the
+#: same line `extract_field` reads, so the presence check and the increment can never disagree (the
+#: strict own-line-blockquote-only regex before this duplicated or silently no-op'd an annotated or
+#: non-blockquote total - CR0322 review finding 1).
+_DERIVED_TOTAL_INT_RE = re.compile(r"(?i)(\*\*Derived Point Total:\*\*[^\S\n]*)(\d+)")
+
+
+def _roll_point_total(epic_path: Path, add: int) -> None:
+    """Roll the epic's `Derived Point Total` up by `add` (the stories a further request added via
+    `--into`). Absent, it is inserted; present, its leading integer is incremented IN PLACE
+    (whatever the line's shape or annotation). The T-shirt Size is a read-off of this total and is
+    re-derived by reconcile, so only the number is written here."""
+    text = epic_path.read_text(encoding="utf-8")
+    if _DERIVED_TOTAL_INT_RE.search(text):
+        new = _DERIVED_TOTAL_INT_RE.sub(
+            lambda m: f"{m.group(1)}{int(m.group(2)) + add}", text, count=1)
+        sdlc_md.atomic_write(epic_path, new)
+    else:
+        _insert_after_status(epic_path, f"> **Derived Point Total:** {add}")
+
+
+def _decompose_into(repo_root, rid: str, rpath: Path, epic_id: str,
+                    stories: list[tuple[str, int, str | None]], total: int,
+                    existing_children: list[str],
+                    seed_criteria: list[str] | None = None) -> tuple[str, list[str]]:
+    """Mint the request's stories UNDER an existing epic (`--into`), roll that epic's point total,
+    and wire the request's `Decomposed-into:`. The `--into` sibling of `_decompose`: it never mints
+    an epic, so a themed batch epic can hold the stories of several small requests instead of each
+    minting a singleton container. Same atomic-mint/rollback guard - a mid-create failure leaves the
+    backlog untouched. The target epic is validated by the caller BEFORE anything is minted."""
+    root = Path(repo_root)
+    epic_path = sdlc_md.find_by_id(root, epic_id)[0]
+    minted: list[Path] = []
+    try:
+        story_ids: list[str] = []
+        for idx, (title, points, affects) in enumerate(stories):
+            fields = {"epic": epic_id, "points": points}
+            if affects:
+                fields["affects"] = affects
+            s = artifact.new(root, "story", title, fields)
+            minted.append(Path(s["path"]))
+            story_ids.append(s["id"])
+            _insert_after_status(Path(s["path"]), f"> **Delivers:** {rid}")  # originating request
+            # Fill the User Story block from the title and the request, so no `{{...}}` field
+            # ships unfilled - an unfilled field reads as an omission rather than a prompt.
+            _fill_user_story(Path(s["path"]), title, rid)
+            # Same rule as `_decompose`: one story is the request and takes the criteria;
+            # several cannot be told apart, so the shared epic carries them.
+            if idx == 0 and seed_criteria and len(stories) == 1:
+                _seed_acs(Path(s["path"]), seed_criteria)
+            else:
+                _mark_ungroomed(Path(s["path"]))   # ungroomed placeholder, not bare `{{...}}`
+        if seed_criteria and len(stories) > 1:
+            _seed_epic_criteria(epic_path, seed_criteria, rid)
+        # Back-link: the shared epic names THIS request as a parent too (it already names the one
+        # it was minted for). A batch epic carries one `Parent:` line per request it delivers, so
+        # the child->parent link resolves both ways for each - the symmetry the link gates check.
+        if sdlc_md.norm_id(rid) not in {sdlc_md.norm_id(x) for x in sdlc_md.parent_refs(
+                epic_path.read_text(encoding="utf-8"))}:
+            _insert_after_status(epic_path, f"> **Parent:** {rid}")
+        _roll_point_total(epic_path, total)
+        _write_decomposed(rpath, [*existing_children, epic_id])
+        _sync_linked_epics(root)
+    except BaseException:
+        for p in minted:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        raise
+    return epic_id, story_ids
+
+
+#: The keys a breakdown file may carry. Anything else is a fault, not a silent no-op: a
+#: misspelled `epic_titel` would otherwise mint an untitled epic (or none) and read as accepted.
+_BREAKDOWN_KEYS = {"epic-title", "epic_title", "into", "stories"}
+_BREAKDOWN_STORY_KEYS = {"title", "points", "affects"}
+
+
+def _parse_breakdown_text(text: str, path: Path) -> object:
+    """The raw structure in a breakdown file: JSON, or YAML when the suffix says so (or when
+    JSON cannot read it). YAML needs PyYAML, a soft dependency everywhere else in the skill, so
+    its absence is NAMED rather than surfacing as a parse error about the file."""
+    suffix = path.suffix.lower()
+    if suffix not in (".yaml", ".yml"):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            json_error = exc
+        if suffix == ".json":
+            raise ValueError(f"{path} is not valid JSON: {json_error}")
+    try:
+        import yaml  # noqa: PLC0415 - soft dependency, mirrors config.py
+    except ImportError:
+        raise ValueError(f"{path} needs a YAML parser (pip install pyyaml), or write the "
+                         f"breakdown as JSON") from None
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{path} is not valid YAML: {exc}") from None
+
+
+def _breakdown_story(entry: object, idx: int, faults: list[str]) -> tuple[str, int, str | None] | None:
+    """One story entry from a breakdown file, or None with its faults recorded. A mapping
+    (`title`/`points`/`affects`) or the same `title|points|affects` string the `--story` flag
+    takes, so a breakdown can be pasted from a working command line."""
+    where = f"stories[{idx}]"
+    if isinstance(entry, str):
+        try:
+            return parse_story_spec(entry)
+        except ValueError as exc:
+            faults.append(f"{where}: {exc}")
+            return None
+    if not isinstance(entry, dict):
+        faults.append(f"{where} must be a mapping (title/points/affects) or a "
+                      f"'title|points|affects' string, not {type(entry).__name__}")
+        return None
+    unknown = sorted(set(entry) - _BREAKDOWN_STORY_KEYS)
+    if unknown:
+        faults.append(f"{where}: unknown key(s) {', '.join(unknown)} - allowed: "
+                      f"{', '.join(sorted(_BREAKDOWN_STORY_KEYS))}")
+    title = entry.get("title")
+    if not isinstance(title, str) or not title.strip():
+        faults.append(f"{where}: `title` is required and must be a non-empty string")
+        title = None
+    else:
+        try:
+            sdlc_md.require_single_line("story title", title)
+        except ValueError as exc:
+            faults.append(f"{where}: {exc}")
+            title = None
+    points = None
+    if "points" not in entry:
+        faults.append(f"{where}: `points` is required (Fibonacci scale)")
+    else:
+        try:
+            points = sdlc_md.check_points(entry["points"])
+        except ValueError as exc:
+            faults.append(f"{where}: {exc}")
+    affects = entry.get("affects")
+    if affects is not None and (not isinstance(affects, str) or not affects.strip()):
+        faults.append(f"{where}: `affects` must be a non-empty string when present")
+        affects = None
+    if title is None or points is None:
+        return None
+    return title, points, (affects.strip() if isinstance(affects, str) else None)
+
+
+def load_breakdown(path: Path | str) -> dict:
+    """Read a breakdown file and return `{"epic_title", "into", "stories"}`.
+
+    The whole file is checked before anything is returned, and EVERY fault is reported in one
+    refusal - the same fail-empty discipline the `--story` form already has, applied to the
+    input a bulk refine actually comes as. A breakdown that refuses story 9 after minting
+    stories 1-8 is the failure this exists to prevent, so nothing here writes.
+    """
+    p = Path(path)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read breakdown file {p}: {exc}") from None
+    data = _parse_breakdown_text(text, p)
+    if not isinstance(data, dict):
+        raise ValueError(f"{p}: a breakdown is a mapping with `stories` (and `epic-title` or "
+                         f"`into`), not {type(data).__name__}")
+    faults: list[str] = []
+    unknown = sorted(set(data) - _BREAKDOWN_KEYS)
+    if unknown:
+        faults.append(f"unknown key(s) {', '.join(unknown)} - allowed: "
+                      f"{', '.join(sorted(_BREAKDOWN_KEYS))}")
+    epic_title = data.get("epic-title", data.get("epic_title"))
+    if epic_title is not None:
+        if not isinstance(epic_title, str) or not epic_title.strip():
+            faults.append("`epic-title` must be a non-empty string")
+            epic_title = None
+        else:
+            try:
+                sdlc_md.require_single_line("epic title", epic_title)
+            except ValueError as exc:
+                faults.append(str(exc))
+                epic_title = None
+    into = data.get("into")
+    if into is not None and (not isinstance(into, str) or not into.strip()):
+        faults.append("`into` must be an epic id (EPxxxx)")
+        into = None
+    entries = data.get("stories")
+    stories: list[tuple[str, int, str | None]] = []
+    if not isinstance(entries, list) or not entries:
+        faults.append("`stories` is required and must be a non-empty list - an empty "
+                      "decomposition delivers nothing")
+    else:
+        for idx, entry in enumerate(entries):
+            parsed = _breakdown_story(entry, idx, faults)
+            if parsed:
+                stories.append(parsed)
+    if faults:
+        raise ValueError(f"breakdown file {p} has {len(faults)} fault(s); nothing minted:\n  - "
+                         + "\n  - ".join(faults))
+    return {"epic_title": epic_title.strip() if epic_title else None,
+            "into": into.strip() if into else None, "stories": stories}
+
+
+def breakdown_inputs(args: argparse.Namespace) -> tuple[list[tuple[str, int, str | None]],
+                                                        str | None, str | None]:
+    """The (stories, epic_title, into) a refine command was given, from `--breakdown` or from
+    repeated `--story` flags. The two forms are alternatives, not layers: mixing them leaves the
+    breakdown under review in the file disagreeing with the one that ran, so it is refused.
+    A flag given ALONGSIDE a breakdown file (`--epic-title`, `--into`) wins over the file's
+    value, which is the ordinary command-line precedence."""
+    story_flags = list(getattr(args, "story", None) or [])
+    epic_title = getattr(args, "epic_title", None)
+    into = getattr(args, "into_epic", None)
+    path = getattr(args, "breakdown", None)
+    if not path:
+        return [parse_story_spec(s) for s in story_flags], epic_title, into
+    if story_flags:
+        raise ValueError("--breakdown and --story are alternatives - pass the whole breakdown "
+                         "in the file, or all of it on the command line")
+    bd = load_breakdown(path)
+    return bd["stories"], epic_title or bd["epic_title"], into or bd["into"]
+
+
+def parse_story_spec(spec: str) -> tuple[str, int, str | None]:
+    """A `--story` value: `title|points` or `title|points|affects`. Returns (title, points,
+    affects|None). Points are validated against the Fibonacci scale here, before anything is
+    minted, so a bad breakdown fails loud and empty. The affects field may be a path list, the
+    `inherit` keyword (take the parent request's Affects), or `inherit:paths` (a narrowed
+    subset) - `resolve_story_affects` reads those at refine time against the parent."""
+    parts = [p.strip() for p in spec.split("|")]
+    if len(parts) < 2 or not parts[0]:
+        raise ValueError(f"story spec {spec!r} must be 'title|points' (optional '|affects')")
+    title = parts[0]
+    points = sdlc_md.check_points(parts[1])          # raises on an off-scale value
+    affects = parts[2] if len(parts) > 2 and parts[2] else None
+    return title, points, affects
+
+
+# The keyword a story spec uses to take (and optionally narrow) the parent request's Affects,
+# instead of naming its own files: `title|points|inherit` or `title|points|inherit:a.py, b.py`.
+INHERIT_TOKEN = "inherit"
+
+
+def _parent_affects(rpath: Path) -> str:
+    """The raw `Affects` value declared on the request being refined, or '' when it declares
+    none. The footprint a story inherits or is seeded from."""
+    return (sdlc_md.extract_field(rpath.read_text(encoding="utf-8"), "Affects") or "").strip()
+
+
+def _outside_parent(parent_affects: str, subset: str) -> list[str]:
+    """The paths a narrowed `inherit:subset` names that the parent's `Affects` does not.
+
+    Both sides are read by the ONE Affects parser every writer uses, so a narrowing is checked
+    against exactly the paths the planner will later see, and a backtick-wrapped or
+    parenthesised spelling of the same path matches. A subset token that parser cannot read as
+    a path counts as outside too: it is not one of the parent's paths either."""
+    parent_paths = set(file_finding.declared_affects(parent_affects))
+    outside = []
+    for tok in [t.strip() for t in subset.split(",") if t.strip()]:
+        named = file_finding.declared_affects(tok)
+        if not named or named[0] not in parent_paths:
+            outside.append(tok)
+    return outside
+
+
+def resolve_story_affects(request_id: str, parent_affects: str,
+                          affects: str | None) -> tuple[str | None, str]:
+    """Resolve one story's Affects at refine time, returning (value, mode).
+
+    - an explicit path list is used verbatim (`explicit`);
+    - the `inherit` keyword takes the parent request's Affects (`inherited`); `inherit:paths`
+      narrows it to the named subset. A story cannot inherit from a request that declares no
+      Affects - that is refused here, before anything is minted, naming the request - and the
+      narrowed form is held to the same rule plus one more: every path it names must already
+      be in the parent's Affects, because `inherit:` NARROWS. A subset that adds a path is an
+      explicit footprint wearing the inheritance keyword, and it claims a provenance the
+      parent never gave it. The keyword is matched case-insensitively, so `INHERIT` is the
+      instruction and not a story whose declared footprint is the literal word;
+    - no Affects at all is SEEDED from the parent when it has one (`seeded`, marked for
+      confirmation - a plannable-but-provisional footprint, never a silent unplannable unit);
+    - no Affects and nothing to seed from is `absent` - the caller then refuses or, under the
+      recorded opt-out, warns and mints it lenient.
+
+    So a minted story is plannable the moment it exists (the story title's 'requires OR
+    inherits'), and the only unplannable outcome - `absent` - is one the caller decides on."""
+    if affects is None:
+        return (parent_affects, "seeded") if parent_affects else (None, "absent")
+    a = affects.strip()
+    low = a.lower()
+    if low == INHERIT_TOKEN or low.startswith(INHERIT_TOKEN + ":"):
+        subset = a[len(INHERIT_TOKEN) + 1:].strip() if ":" in a else ""
+        # The parent-declares-none refusal comes FIRST and covers the narrowed form: a subset
+        # of nothing is not an inheritance, and taking the narrowed path early was how
+        # `inherit:` inherited from a request with nothing to inherit.
+        if not parent_affects:
+            raise ValueError(
+                f"a story asked to inherit an Affects, but {request_id} declares none to "
+                f"inherit - give the story its own `Affects`, or declare one on {request_id} "
+                f"first.")
+        if not subset:
+            return parent_affects, "inherited"
+        outside = _outside_parent(parent_affects, subset)
+        if outside:
+            raise ValueError(
+                f"a story asked to inherit a NARROWED Affects, but {', '.join(outside)} "
+                f"is not in {request_id}'s Affects ({parent_affects}) - `inherit:` narrows the "
+                f"parent's footprint, so a path it never declared cannot come from it. Name "
+                f"those files as the story's own `Affects` instead, or add them to "
+                f"{request_id} first.")
+        return subset, "inherited"
+    return affects, "explicit"
+
+
+def _require_or_warn_affects(repo_root: Path | str, title: str, request_id: str) -> None:
+    """A story minted with no Affects and none to seed from is UNPLANNABLE: `sprint plan` refuses
+    it. Refuse it here, before anything is minted, in the grooming-refusal idiom - naming the
+    story and how to supply an Affects. Under the recorded opt-out (`sprint.breakdown: judgement`)
+    this warns and mints instead, so a project that wants the old lenient behaviour keeps it; the
+    escape is the planner's own, read from the same config key, and omission is not an escape."""
+    import sprint   # local: the writer reads the planner's opt-out, not its weight
+    if sprint.breakdown_mode(repo_root) == "judgement":
+        print(f"warning: story {title!r} is minted with no Affects and {request_id} declares none "
+              f"to seed from - written anyway, because this project records "
+              f"`sprint.breakdown: judgement`. `sprint plan` cannot size it or check it for "
+              f"collisions.", file=sys.stderr)
+        return
+    raise ValueError(
+        f"story {title!r} names no Affects and {request_id} declares none to seed from - refused. "
+        f"Nothing was minted.\n"
+        f"  Why: a story with points but no Affects is a false promise of readiness - `sprint "
+        f"plan` refuses it (it cannot size the work nor see two units colliding on one file), so "
+        f"a refined backlog that reads as ready is a set of grooming tasks nobody can plan.\n"
+        f"  Supply ONE of:\n"
+        f"    - the story's own files: `title|points|path/to/file.py, path/to/other.py`\n"
+        f"    - `title|points|inherit` to take {request_id}'s Affects (or `inherit:subset` to "
+        f"narrow it) - once {request_id} declares one\n"
+        f"    - declare an `Affects` on {request_id}, and a story left without its own is SEEDED "
+        f"from it (marked for confirmation while grooming).\n"
+        f"  Opt out ONLY as a recorded decision: set `sprint.breakdown: judgement` in "
+        f"sdlc-studio/.config.yaml and this becomes a warning.")
+
+
+def _resolve_and_require_affects(repo_root: Path | str, request_id: str, parent_affects: str,
+                                 stories: list[tuple[str, int, str | None]]
+                                 ) -> tuple[list[tuple[str, int, str | None]], list[str]]:
+    """Resolve every story's Affects against the parent BEFORE anything is minted (refine mints
+    under one rollback guard, so a bad or absent Affects in the last story must refuse before the
+    first write). Returns the breakdown with each story's Affects filled in - explicit, inherited
+    or seeded - so a minted story is plannable, plus the seeded-confirmation NOTES the caller owes
+    the operator. A story left `absent` refuses (or, opted out, warns) via `_require_or_warn_affects`.
+
+    The notes are RETURNED, not printed: this is a library function, and a green test suite that
+    calls it must stay silent (a note printed under 2000 passing tests trains everyone to skim
+    past diagnostics). The CLI layer (`cmd_apply` / `cmd_add`) prints them for the operator."""
+    resolved: list[tuple[str, int, str | None]] = []
+    notes: list[str] = []
+    for title, points, affects in stories:
+        value, mode = resolve_story_affects(request_id, parent_affects, affects)
+        if mode == "absent":
+            _require_or_warn_affects(repo_root, title, request_id)   # refuse, or warn+mint lenient
+        elif mode == "seeded":
+            notes.append(f"note: story {title!r} was given no Affects, so it is SEEDED from "
+                         f"{request_id} ({value}) - confirm or narrow it while grooming.")
+        resolved.append((title, points, value))
+    return resolved, notes
+
+
+# The status a request moves to once it is decomposed and being delivered via its children. It
+# reaches its TERMINAL status only by derivation (G2), when the children are done - this is just
+# the "now being worked" signal. A request already terminal or without a working state is left be.
+_WORKING_STATUS = {"cr": "In Progress", "rfc": "In Review"}
+
+def _validate_into_target(root: Path, into_epic: str) -> None:
+    """Refuse (before anything is minted) an `--into` target that is unknown, not an epic, or
+    terminal - a closed epic cannot take new stories, and only an epic holds stories at all."""
+    hit = sdlc_md.find_by_id(root, into_epic)
+    if not hit:
+        raise ValueError(f"--into target {into_epic} does not exist; nothing minted")
+    epath, etype = hit
+    if etype != "epic":
+        raise ValueError(f"--into target {into_epic} is a {etype}, not an epic; only an epic "
+                         f"holds stories. Nothing minted")
+    estatus = sdlc_md.canonical_status(
+        sdlc_md.extract_field(epath.read_text(encoding="utf-8"), "Status"),
+        sdlc_md.status_vocab("epic", root))
+    if sdlc_md.is_terminal_status("epic", estatus or ""):
+        raise ValueError(f"--into target {into_epic} is terminal ({estatus}); a closed epic "
+                         f"cannot take new stories. Nothing minted")
+
+
+def refine(repo_root: Path | str, request_id: str, epic_title: str | None,
+           stories: list[tuple[str, int, str | None]], questions: list[str] | None = None,
+           dry_run: bool = False, skip_personas: bool = False,
+           seed_acs: bool = True, into_epic: str | None = None) -> dict:
+    """Decompose `request_id` into an epic titled `epic_title` holding `stories`
+    (title, points, affects?). Writes the bidirectional links and rolls the epic's point total.
+
+    Validates ALL INPUT before minting anything - the request must resolve, be a request type and
+    not already decomposed; every story's points must be on the scale (parsed already); every title
+    (epic and stories) must be a single line the creators will accept. Only after that does it mint,
+    and if a create still fails part-way (a rare IO error), it ROLLS BACK the files it wrote. So a
+    bad breakdown, or a failure mid-mint, leaves the backlog untouched - refine never
+    half-decomposes a request."""
+    root = Path(repo_root)
+    refinable(root, request_id)   # SHARED validation: non-request / already-decomposed refusals
+    rpath, rtype = sdlc_md.find_by_id(root, request_id)
+    if not stories:
+        raise ValueError("refine needs at least one --story: an empty decomposition delivers "
+                         "nothing, which is exactly what the UNDECOMPOSED check flags.")
+    # Validate EVERY title up front - `require_single_line` runs inside `artifact.new` mid-loop, so
+    # without this a bad title (a stray newline in an agent-proposed story) would raise only after
+    # the epic and earlier stories are already on disk, orphaned. The request must also carry a
+    # Status line, or the `Decomposed-into:` write would fail after the children exist.
+    # Exactly one of a new-epic title or an --into target - a request becomes one epic, whether
+    # freshly minted or the shared batch container it joins.
+    if bool(into_epic) == bool(epic_title):
+        raise ValueError("refine needs EITHER --epic-title (mint a new epic) OR --into EPxxxx "
+                         "(decompose into an existing epic), not both and not neither")
+    if into_epic:
+        _validate_into_target(root, into_epic)   # refuse a bad target BEFORE anything is minted
+    else:
+        sdlc_md.require_single_line("epic title", epic_title)
+    for title, _, _ in stories:
+        sdlc_md.require_single_line("story title", title)
+    # Resolve every story's Affects against the parent (explicit / inherit / seed) and refuse a
+    # story that has none and nothing to seed from - all BEFORE anything is minted, so a refined
+    # story is plannable the moment it exists (US0410) and refine never half-decomposes. Under the
+    # recorded opt-out (`sprint.breakdown: judgement`) an absent Affects warns rather than refuses.
+    stories, seeded_notes = _resolve_and_require_affects(root, request_id, _parent_affects(rpath), stories)
+    for title, _, affects in stories:
+        # A declared `Affects` that resolves to nothing stops the WHOLE decomposition here,
+        # before any epic or story is minted - refine mints under one rollback guard, so a bad
+        # path in the last story must refuse before the first write, not undo it after. From the
+        # shared seam, so a story minted here answers to the same rule the finding filer does.
+        if affects:
+            file_finding.check_affects_resolvable(root, affects, "story", label=f"story {title!r}")
+    if sdlc_md.extract_field(rpath.read_text(encoding="utf-8"), "Status") is None:
+        raise ValueError(f"{request_id} has no `> **Status:**` line - cannot wire its "
+                         f"`Decomposed-into:` link; fix the request first.")
+    rid = sdlc_md.extract_record_id(rpath.stem) or request_id
+    total = sum(p for _, p, _ in stories)
+    open_questions = [q for q in (questions or []) if q.strip()]
+    # Resolve the Three-Amigos panel UP FRONT (read-only), engineering-led: a refine is where the
+    # request's open questions get answered BY the seats, so a broken project seat card is a
+    # refine-blocking problem, caught before anything is minted (refine's fail-empty discipline).
+    # `--skip-personas` bypasses resolution entirely (byte-equivalent, no framing), the escape hatch.
+    amigo_consult = persona_resolve.consult(root, persona_resolve.REFINE_PANEL, open_questions,
+                                            skip_personas=skip_personas)
+    if dry_run:
+        return {"request": rid, "epic": into_epic or "(dry-run)", "epic_size": _tshirt_for(total),
+                "stories": [t for t, _, _ in stories], "points": total,
+                "open_questions": open_questions, "consult": amigo_consult, "dry_run": True,
+                "seeded_notes": seeded_notes}
+
+    seed_criteria = (_request_criteria(rpath.read_text(encoding="utf-8"))
+                     if seed_acs else None)
+    if into_epic:
+        epic_id, story_ids = _decompose_into(root, rid, rpath, into_epic, stories, total,
+                                             existing_children=[], seed_criteria=seed_criteria)
+    else:
+        epic_id, story_ids = _decompose(root, rid, rpath, epic_title, stories, total,
+                                        existing_children=[], seed_criteria=seed_criteria)
+    # 4. close the loop on the request's status: it is now being DELIVERED via its children, so it
+    # moves to its working state (it reaches terminal only by derivation, G2). Best-effort - if a
+    # gate we do not force past declines the move, the decomposition still stands.
+    moved_to = None
+    working = _WORKING_STATUS.get(rtype)
+    vocab = sdlc_md.status_vocab(rtype, root)
+    cur = sdlc_md.canonical_status(sdlc_md.extract_field(rpath.read_text(encoding="utf-8"),
+                                                         "Status"), vocab)
+    if working and cur != working and not sdlc_md.is_terminal_status(rtype, cur or ""):
+        import transition   # local import: transition pulls critic; keep off load
+        try:
+            transition.transition(root, rid, working)
+            moved_to = working
+        except (ValueError, FileNotFoundError):
+            pass
+    # Record the consult on the request itself (audit trail): which seats were consulted and the
+    # open questions. Best-effort - the decomposition stands even if the record write fails.
+    if amigo_consult.get("questions"):
+        try:
+            persona_resolve.record_consult(rpath, amigo_consult, date.today().isoformat())
+        except (OSError, ValueError):
+            pass
+    return {"request": rid, "epic": epic_id, "epic_size": _tshirt_for(total),
+            "stories": story_ids, "points": total, "status": moved_to,
+            "open_questions": open_questions, "consult": amigo_consult,
+            "dry_run": False, "seeded_notes": seeded_notes}
+
+
+def refine_add(repo_root: Path | str, request_id: str, epic_title: str | None,
+               stories: list[tuple[str, int, str | None]], dry_run: bool = False,
+               into_epic: str | None = None) -> dict:
+    """Append a FURTHER epic + stories to an ALREADY-decomposed request, or, with `into_epic`,
+    add the stories to an existing open epic (usually one the request is already decomposed into).
+
+    The inverse precondition of `refine` (apply): a request delivered in slices - one epic per
+    sprint - grows its Decomposed-into over several refines, so `add` requires the request to be
+    decomposed already and APPENDS (never clobbers) the epic to its existing children, de-duped,
+    so adding into an epic it already names lists it once. Shares apply's up-front validation and
+    atomic mint (`_decompose` / `_decompose_into`), so a bad breakdown, a bad `--into` target or a
+    mid-create failure mints nothing. Does NOT re-move the request status - it is already working."""
+    root = Path(repo_root)
+    hit = sdlc_md.find_by_id(root, request_id)
+    if not hit:
+        raise ValueError(f"no artefact found for id {request_id!r}")
+    rpath, rtype = hit
+    if not sdlc_md.is_request(rtype):
+        raise ValueError(f"refine takes a REQUEST (RFC/CR); {request_id} is a {rtype}.")
+    existing = sdlc_md.decomposed_ids(rpath.read_text(encoding="utf-8"))
+    if not existing:
+        raise ValueError(f"{request_id} is not decomposed yet - use `refine apply` for its first "
+                         f"epic; `refine add` appends a further one to an already-decomposed request.")
+    if not stories:
+        raise ValueError("refine add needs at least one --story.")
+    if into_epic and epic_title:
+        raise ValueError("refine add takes EITHER --epic-title (mint a further epic) OR --into "
+                         "EPxxxx (add to an existing epic), not both")
+    if into_epic:
+        _validate_into_target(root, into_epic)   # refuse a bad target BEFORE anything is minted
+    elif not epic_title:
+        raise ValueError("refine add needs an epic title - `--epic-title` or an `epic-title` "
+                         "key in the `--breakdown` file - or an existing epic to add to with "
+                         "`--into EPxxxx`.")
+    else:
+        sdlc_md.require_single_line("epic title", epic_title)
+    for title, _, _ in stories:
+        sdlc_md.require_single_line("story title", title)
+    # Same Affects-at-refine rule as `apply` (US0410): resolve each added story's Affects against
+    # the parent and refuse one with none and nothing to seed from, before the further epic and its
+    # stories are minted, not after.
+    stories, seeded_notes = _resolve_and_require_affects(root, request_id, _parent_affects(rpath), stories)
+    for title, _, affects in stories:
+        # Same up-front resolvable-Affects refusal as `apply`: a bad path in any added story
+        # aborts before the further epic and its stories are minted, not after.
+        if affects:
+            file_finding.check_affects_resolvable(root, affects, "story", label=f"story {title!r}")
+    rid = sdlc_md.extract_record_id(rpath.stem) or request_id
+    total = sum(p for _, p, _ in stories)
+    if dry_run:
+        return {"request": rid, "epic": into_epic or "(dry-run)", "epic_size": _tshirt_for(total),
+                "stories": [t for t, _, _ in stories], "points": total,
+                "existing_epics": existing, "dry_run": True, "seeded_notes": seeded_notes}
+    if into_epic:
+        epic_id, story_ids = _decompose_into(root, rid, rpath, into_epic, stories, total,
+                                             existing_children=existing)
+    else:
+        epic_id, story_ids = _decompose(root, rid, rpath, epic_title, stories, total,
+                                        existing_children=existing)
+    return {"request": rid, "epic": epic_id, "epic_size": _tshirt_for(total),
+            "stories": story_ids, "points": total, "existing_epics": existing,
+            "all_epics": sdlc_md.decomposed_ids(rpath.read_text(encoding="utf-8")),
+            "dry_run": False,
+            "seeded_notes": seeded_notes}
+
+
+def _section(text: str, heading: str) -> str:
+    """The body under a `## Heading`, trimmed, or '' - so `show` can surface a request's Summary,
+    Impact and Design Options without the reader opening the file."""
+    lines = text.splitlines()
+    out: list[str] = []
+    grabbing = False
+    for ln in lines:
+        if ln.startswith("## "):
+            if grabbing:
+                break
+            grabbing = ln[3:].strip().lower() == heading.lower()
+            continue
+        if grabbing:
+            out.append(ln)
+    return "\n".join(out).strip()
+
+
+def refinable(repo_root: Path | str, request_id: str, allow_decomposed: bool = False) -> dict:
+    """Validate that `request_id` can be refined and gather what an operator needs to propose the
+    breakdown: its type, summary, impact/design, any open decisions, and its existing epics. Raises
+    the SAME refusals `refine` does (non-request, already-decomposed), so `apply` and `show` agree
+    on what refinable means - a request that `apply` accepts is one it will refine.
+
+    `allow_decomposed` relaxes ONLY the already-decomposed refusal, for `show`: once `refine add`
+    exists, an operator planning the NEXT slice of a request needs to see its content AND its
+    current epics, which `show` is the natural home for. The returned `decomposed_into` lists the
+    existing epics either way (empty when none), so a caller can tell a first `apply` from an `add`.
+    `apply` keeps the strict precondition (default False); `show` passes True and stays read-only."""
+    root = Path(repo_root)
+    hit = sdlc_md.find_by_id(root, request_id)
+    if not hit:
+        raise ValueError(f"no artefact found for id {request_id!r}")
+    rpath, rtype = hit
+    if not sdlc_md.is_request(rtype):
+        raise ValueError(f"refine takes a REQUEST (RFC/CR); {request_id} is a {rtype}.")
+    text = rpath.read_text(encoding="utf-8")
+    existing = sdlc_md.decomposed_ids(text)
+    if existing and not allow_decomposed:
+        raise ValueError(f"{request_id} is already decomposed into {', '.join(existing)}.")
+    return {"id": sdlc_md.extract_record_id(rpath.stem) or request_id, "type": rtype,
+            "title": sdlc_md.extract_h1_title(text) or "",
+            "summary": _section(text, "Summary"),
+            "detail": _section(text, "Impact") or _section(text, "Design Options"),
+            "open_decisions": _section(text, "Open Decisions"),
+            "decomposed_into": existing}
+
+
+# --- the seam map --------------------------------------------------------------------
+# A SEAM is where two units of one batch touch the same thing. Thirteen of the seventeen
+# round-one majors in RUN-01KYKVZM were seam defects - four directly contradicting PAIRS in one
+# batch, every one of which passed its own acceptance criteria. A delivery lane reads ONE unit;
+# review is the first actor in the whole loop that reads two. So the pair is invisible until the
+# most expensive moment, and the repair lands after both units are built.
+#
+# The map is computed where the pair first EXISTS: at decomposition, when the batch is chosen.
+# It cannot decide correctness - nothing mechanical can - but it can say which pairs share a
+# surface and which of those has nobody responsible for what the other must not regress.
+
+#: The criterion-level declaration that OWNS a seam: what this unit must not regress in the
+#: surface it shares with a sibling. Modelled on `critic.CALLER_FIELD`, which solved the same
+#: shape of problem - a property no criterion states is a property no lane is asked about.
+SEAM_FIELD = "Preserves"
+_SEAM_RE = re.compile(rf"^\s*[-*]\s*\*\*{SEAM_FIELD}:?\*\*:?\s*(.+?)\s*$", re.I | re.M)
+
+
+def seam_declarations(text: str) -> list[str]:
+    """Every `- **Preserves:** ...` line stated IN A CRITERION, as its text.
+
+    In a criterion, which is what this field's contract has always said and what the code did
+    not do: `_SEAM_RE` scanned the whole document under `re.M`, so a Preserves line under
+    `## User Story` - or in a revision-history row quoting one - cleared the seam.
+
+    The criterion blocks come from `critic._ac_blocks_with_bodies`, which is `verify_ac`'s own
+    parser: the same reader that decides which criteria the runner executes decides which ones
+    can own a seam. A second AC parser here would let a unit own a seam from a block the
+    runner cannot see."""
+    import critic  # noqa: PLC0415 - sibling; the Caller field walks criteria the same way
+    found: list[str] = []
+    for _ac_id, body in critic._ac_blocks_with_bodies(text or ""):   # noqa: SLF001
+        for line in body:
+            m = _SEAM_RE.match(line)
+            if m:
+                found.append(m.group(1).strip())
+    return found
+
+
+def _unit_surface(root: Path, uid: str) -> tuple[set[str], str]:
+    """(the non-markdown files a unit declares, its full text). Markdown is excluded for the
+    reason `critic.mechanism_files` excludes it: two units editing one document are not sharing
+    a behaviour, and reporting every doc pair would bury the pairs that matter."""
+    hit = sdlc_md.find_by_id(root, uid)
+    if not hit:
+        return set(), ""
+    text = sdlc_md.read_text_safe(Path(hit[0]))
+    files = {f.strip().strip("`") for f in sdlc_md.affects_files(text)}
+    # RESOLVED before intersecting. The corpus writes the same file both repo-relative and
+    # skill-relative - 149 `.claude/skills/.../sprint.py` against 1 `scripts/sprint.py` - and
+    # `resolve_affects` exists precisely because both are accepted. Intersecting the raw
+    # strings meant one file under two spellings was not a seam at all. A path that
+    # resolves to nothing (a file the unit CREATES) keeps its declared spelling, so a
+    # greenfield pair is still a seam when both write it the same way.
+    out: set[str] = set()
+    for f in files:
+        if not f or f.endswith(".md"):
+            continue
+        resolved = sdlc_md.resolve_affects(root, f)
+        out.add(str(resolved.resolve()) if resolved else f)
+    return out, text
+
+
+def seam_map(repo_root: Path | str, units: list[str]) -> list[dict]:
+    """Every pair in `units` that shares a declared file, and whether the seam has an OWNER.
+
+    Owned means at least one of the two states, in a criterion, what it must not regress -
+    a `Preserves:` declaration naming the shared surface or the sibling unit. An unowned seam
+    is not a defect and is never reported as one: it is a pair nobody has been ASKED about,
+    which is the state every one of those four contradicting pairs was in.
+    """
+    import critic  # noqa: PLC0415 - sibling; its path predicate is the one used below
+    root = Path(repo_root)
+    ids = [sdlc_md.norm_id(u) for u in (units or []) if sdlc_md.norm_id(u)]
+    info = {uid: _unit_surface(root, uid) for uid in ids}
+    seams: list[dict] = []
+    for i, a in enumerate(ids):
+        for b in ids[i + 1:]:
+            shared = sorted(info[a][0] & info[b][0])
+            if not shared:
+                continue
+            owners = []
+            for owner, other in ((a, b), (b, a)):
+                declared = " ".join(seam_declarations(info[owner][1])).lower()
+                if not declared:
+                    continue
+                # PATH BOUNDARIES, not substring. `'critic.py' in 'tests/test_critic.py'` is
+                # true, so a Preserves line naming only a unit's own test file owned the seam
+                # on its source. `critic._verifier_names` documents and fixes this
+                # exact rule three files away; it is reused rather than re-derived.
+                if other.lower() in declared or any(
+                        critic._verifier_names(declared, s) for s in shared):  # noqa: SLF001
+                    owners.append(owner)
+            seams.append({"units": [a, b], "shared": shared, "owners": owners,
+                          "owned": bool(owners)})
+    return seams
+
+
+def seam_findings(repo_root: Path | str, units: list[str]) -> list[dict]:
+    """The seams nobody owns - the report `refine` and the planner print."""
+    return [s for s in seam_map(repo_root, units) if not s["owned"]]
+
+
+def render_seam_findings(seams: list[dict], total: int) -> list[str]:
+    """The lines a seam report prints. An empty result SAYS what it checked for rather than
+    printing nothing, so a batch with no seams cannot be told from one nobody mapped."""
+    if not total:
+        return ["seam map: no pair in this batch shares a declared file - nothing to own."]
+    if not seams:
+        return [f"seam map: {total} seam(s), every one owned - each pair states what it must "
+                f"not regress in the surface it shares."]
+    out = [f"seam map: {len(seams)} of {total} seam(s) have NO OWNER. A lane reads one unit; "
+           f"review is the first actor that reads two, so an unowned seam is a pair nobody is "
+           f"asked about until the most expensive moment:"]
+    for s in seams:
+        a, b = s["units"]
+        out.append(f"  {a} + {b} share {', '.join(s['shared'])} - neither states what the other "
+                   f"must not regress. Add `- **{SEAM_FIELD}:** <property>` to a criterion of "
+                   f"whichever unit owns it.")
+    return out
+
+
+def cmd_seams(args: argparse.Namespace) -> int:
+    """Report the batch's seam map. Read-only."""
+    units = [u.strip() for u in (args.units or "").replace(",", " ").split() if u.strip()]
+    if not units and getattr(args, "worklist", None):
+        # The PLANNER's reader, not a second one. This re-implemented it without the id
+        # grammar, the dedupe or the refusal, so `US0541 (3 pts)` resolved to nothing and a
+        # worklist of unresolvable ids printed the all-clear at exit 0 - a smaller tranche
+        # than approved, reported as a clean one.
+        import sprint  # noqa: PLC0415 - sibling; imported lazily, as refine's others are
+        try:
+            records, _ = sprint._worklist_units(Path(args.root), args.worklist)  # noqa: SLF001
+        except (OSError, ValueError) as exc:
+            print(f"seams refused: {exc}", file=sys.stderr)
+            return 2
+        units = [r["id"] if isinstance(r, dict) else str(r) for r in records]
+    if not units:
+        print("seams: name the batch with --units or --worklist", file=sys.stderr)
+        return 2
+    # An id that resolves to nothing is REPORTED, never skipped: a seam map over a batch that
+    # silently shrank is an all-clear about units nobody looked at.
+    unresolved = [u for u in units if not sdlc_md.find_by_id(args.root, u)]
+    if unresolved:
+        print(f"seams refused: {len(unresolved)} id(s) resolve to no artefact on disk: "
+              f"{', '.join(unresolved)}. A seam map over a batch that silently shrank is an "
+              f"all-clear about units nobody looked at", file=sys.stderr)
+        return 2
+    all_seams = seam_map(args.root, units)
+    unowned = [s for s in all_seams if not s["owned"]]
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps({"seams": all_seams, "unowned": unowned}, indent=2))
+        return 1 if unowned else 0
+    for line in render_seam_findings(unowned, len(all_seams)):
+        print(line)
+    return 1 if unowned else 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    try:
+        # show is READ-ONLY and accepts an already-decomposed request: it exists to inform a
+        # breakdown, including the NEXT slice of a request already part-refined (an `add`). It
+        # refuses only a non-request or an unresolvable id.
+        info = refinable(args.root, args.request, allow_decomposed=True)
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"not refinable: {exc}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(json.dumps(info, indent=2))
+        return 0
+    print(f"{info['id']} ({info['type']}): {info['title']}\n")
+    if info["summary"]:
+        print(f"Summary:\n{info['summary']}\n")
+    if info["detail"]:
+        print(f"Impact / design:\n{info['detail']}\n")
+    if info["open_decisions"]:
+        print(f"Open decisions (resolve with the amigos before refining):\n{info['open_decisions']}\n")
+    existing = info.get("decomposed_into") or []
+    if existing:
+        # Already part-refined: name its epics and steer to `add` (which APPENDS a slice), not
+        # `apply` (which is the first decomposition and would refuse a decomposed request).
+        print(f"Already decomposed into: {', '.join(existing)}\n")
+        print("Add the NEXT slice (appends a further epic):\n"
+              f"  refine add --request {info['id']} --epic-title \"...\" "
+              "--story \"title|points\" --story \"title|points|affects\" ...")
+    else:
+        print("Propose the breakdown, then:\n"
+              f"  refine apply --request {info['id']} --epic-title \"...\" "
+              "--story \"title|points\" --story \"title|points|affects\" ...")
+    return 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    try:
+        stories, epic_title, into_epic = breakdown_inputs(args)
+        result = refine(args.root, args.request, epic_title, stories,
+                        questions=args.question, dry_run=args.dry_run,
+                        skip_personas=getattr(args, "skip_personas", False),
+                        seed_acs=getattr(args, "seed_acs", True),
+                        into_epic=into_epic)
+    except (ValueError, FileNotFoundError, persona_resolve.RenderError) as exc:
+        print(f"refine refused: {exc}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(json.dumps(result, indent=2))
+        return 0
+    for note in result.get("seeded_notes") or []:   # the confirmation each seeded story owes
+        print(note, file=sys.stderr)
+    verb = "would refine" if result["dry_run"] else "refined"
+    print(f"{verb} {result['request']} -> {result['epic']} ({result['epic_size']}, "
+          f"{result['points']} pts) with {len(result['stories'])} story(ies): "
+          f"{', '.join(result['stories'])}")
+    # The grooming this mint just created, priced where it is incurred. The points size the
+    # DELIVERY each story describes and never the authoring of its criteria, so a refined batch
+    # reads as ready while owing a body of work nobody budgeted - twenty stories in one run, and
+    # authoring their criteria was the largest single piece of that sprint's planning. The count
+    # is the planner's own census, so it cannot disagree with what `sprint plan` refuses on.
+    if not result["dry_run"]:
+        owed = grooming_owed(args.root, result["stories"])
+        if owed:
+            print(f"  {owed} of {len(result['stories'])} story(ies) still owe authored "
+                  f"acceptance criteria - `sprint plan` refuses a batch holding them. That "
+                  f"grooming is real work and is NOT priced by the {result['points']} points "
+                  f"above, which size the delivery each story describes.")
+    if result.get("status"):
+        print(f"  {result['request']} moved to {result['status']} - it reaches terminal only by "
+              f"derivation, when its children are done")
+    if result.get("open_questions"):
+        consult = result.get("consult") or {}
+        panel = ", ".join(f"{p['seat']} ({p['role']})" for p in consult.get("panel", []))
+        lead = consult.get("lead")
+        lead_note = f"{lead} leads; " if lead else ""
+        print(f"  {len(result['open_questions'])} open question(s) for the Three-Amigos consult "
+              f"({lead_note}{panel}) - settle before building:")
+        for q in result["open_questions"]:
+            print(f"    - {q}")
+    return 0
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    try:
+        stories, epic_title, into_epic = breakdown_inputs(args)
+        result = refine_add(args.root, args.request, epic_title, stories, dry_run=args.dry_run,
+                            into_epic=into_epic)
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"refine add refused: {exc}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(json.dumps(result, indent=2))
+        return 0
+    for note in result.get("seeded_notes") or []:   # the confirmation each seeded story owes
+        print(note, file=sys.stderr)
+    verb = "would add" if result["dry_run"] else "added"
+    print(f"{verb} {result['epic']} ({result['epic_size']}, {result['points']} pts, "
+          f"{len(result['stories'])} story(ies): {', '.join(result['stories'])}) to "
+          f"{result['request']}")
+    if not result["dry_run"]:
+        print(f"  {result['request']} now decomposed into {', '.join(result['all_epics'])}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="refine", description=__doc__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("apply", help="Decompose a request into an epic + stories, links wired")
+    a.add_argument("--request", required=True, help="the RFC/CR to decompose")
+    a.add_argument("--epic-title", dest="epic_title",
+                   help="title for the NEW epic the request becomes (omit when using --into)")
+    a.add_argument("--into", dest="into_epic", metavar="EPxxxx",
+                   help="decompose the request's stories INTO this existing OPEN epic (a shared "
+                        "batch container) instead of minting a new one - the request's "
+                        "Decomposed-into points at it and its point total rolls up. A terminal, "
+                        "non-epic, or unknown target is refused with nothing minted")
+    a.add_argument("--story", action="append", metavar="TITLE|POINTS[|AFFECTS]",
+                   help="a story in the breakdown: 'title|points' or 'title|points|affects'. "
+                        "Affects may be a path list, `inherit` (take the request's Affects), or "
+                        "`inherit:paths` (narrow it). A story left with no affects is seeded from "
+                        "the request when it has one, else refused. Repeatable; points on the "
+                        "Fibonacci scale.")
+    a.add_argument("--breakdown", metavar="FILE",
+                   help="read the whole breakdown from a JSON or YAML file instead of repeated "
+                        "--story flags: `epic-title` (or `into`) and `stories` "
+                        "(title, points, affects). The file is validated WHOLE before anything "
+                        "is minted, so a bulk refine can be reviewed as data and re-run. "
+                        "Not combinable with --story")
+    a.add_argument("--question", action="append", metavar="TEXT",
+                   help="an open question for the Three-Amigos consult, surfaced at apply time "
+                        "and directed at the resolved seats (engineering-led). Repeatable.")
+    a.add_argument("--no-seed-acs", action="store_false", dest="seed_acs", default=True,
+                   help="label every story's ACs an ungroomed grooming placeholder instead of "
+                        "seeding them from the request's acceptance criteria")
+    a.add_argument("--skip-personas", action="store_true",
+                   help="force the generic path: resolve no amigo seats, no framing (byte-equivalent)")
+    a.add_argument("--dry-run", action="store_true", help="validate and report; mint nothing")
+    a.add_argument("--root", default=".")   # de-duped by add_global_root; enables `apply --root`
+    sdlc_md.add_format_arg(a)
+    a.set_defaults(func=cmd_apply)
+
+    ad = sub.add_parser("add", help="Append a FURTHER epic + stories to an already-decomposed "
+                                    "request (a later slice of a large request)")
+    ad.add_argument("--request", required=True, help="the already-decomposed RFC/CR to add to")
+    ad.add_argument("--epic-title", dest="epic_title",
+                    help="title for the new epic to append (or an `epic-title` key in the "
+                         "--breakdown file)")
+    ad.add_argument("--into", dest="into_epic", metavar="EPxxxx",
+                    help="add the stories to this existing OPEN epic (usually one the request is "
+                         "already decomposed into) instead of minting a further one; each story "
+                         "takes `Epic:` and `Delivers:` as under `apply --into`. A terminal, "
+                         "non-epic, or unknown target is refused with nothing minted")
+    ad.add_argument("--story", action="append", metavar="TITLE|POINTS[|AFFECTS]",
+                    help="a story in the new epic: 'title|points' or 'title|points|affects'. "
+                         "Affects may be a path list, `inherit`, or `inherit:paths`; a story left "
+                         "with none is seeded from the request when it has one, else refused. "
+                         "Repeatable; points on the Fibonacci scale.")
+    ad.add_argument("--breakdown", metavar="FILE",
+                    help="read the whole breakdown from a JSON or YAML file instead of repeated "
+                         "--story flags (same shape as `apply`); validated "
+                         "whole before anything is minted. Not combinable with --story")
+    ad.add_argument("--dry-run", action="store_true", help="validate and report; mint nothing")
+    ad.add_argument("--root", default=".")
+    sdlc_md.add_format_arg(ad)
+    ad.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("show", help="Show a request's content to inform the breakdown, and "
+                                    "confirm it is refinable")
+    s.add_argument("--request", required=True, help="the RFC/CR to inspect")
+    s.add_argument("--root", default=".")
+    sdlc_md.add_format_arg(s)
+    s.set_defaults(func=cmd_show)
+
+    sm = sub.add_parser("seams", help="Report the batch's seam map (pairs sharing a surface).")
+    sm.add_argument("--units", help="unit ids, comma- or space-separated")
+    sm.add_argument("--worklist", help="a worklist file naming the batch")
+    sm.add_argument("--root", default=".")
+    sm.add_argument("--format", choices=("text", "json"), default="text")
+    sm.set_defaults(func=cmd_seams)
+
+    sdlc_md.add_global_root(p)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    # Resolve the root ONCE and write it back, so every verb below anchors on the tree the
+    # run belongs to. The family default `.` means "work it out from here", not "the cwd
+    # is the project": otherwise a run from a subdirectory acts on a stray tree and exits 0.
+    args.root = str(sdlc_md.resolve_root(args))
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

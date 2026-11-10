@@ -1,0 +1,2855 @@
+#!/usr/bin/env python3
+"""The run-state object - a sprint/epic run's identity, in one place.
+
+The loop is executed by the MODEL calling discrete scripts, so until now a run had no
+identity at all: no id, no start time, no recorded outcome. What a run did was scattered
+across seven files nothing joined (`loop-state.json`, `epic-state.json`,
+`sprint-plan.json`, `telemetry.jsonl`, `verify-report.json`, `reconcile-report.json`,
+`wsjf-inputs.json`), so nothing could say "this run started here, aimed at that, and
+stopped for this reason". The handoff needs exactly that sentence, and so does anything
+later that must bound a run's appetite.
+
+This is the object: run-local (`sdlc-studio/.local/run-state.json`, gitignored like the
+rest of `.local/`), opened when the batch is approved (`sprint plan --write`) and closed
+when the run stops (`sprint.py sign`, `stop`, or a rolling run's boundary).
+
+Three properties are load-bearing, and each exists because breaking it loses work:
+
+* **The batch is CUMULATIVE.** Re-planning mid-run (a re-cut tranche, a blocker sweep
+  pulling work in) must never DISCARD an approved unit: the handoff joins over this batch,
+  so a unit dropped from a narrowed re-cut - and never attempted, so absent from the loop
+  state too - would land in no bucket at all and vanish from the handover. `open_run` on an
+  open run takes the UNION, in first-approval order. Only a CLOSED run resets it.
+* **Every mutation is LOCKED.** `update` is a read-modify-write; unlocked, concurrent
+  writers silently lose each other's keys. The lock is taken here rather than left to each
+  caller, because the callers that will hurt (a spend counter incremented per unit) have a
+  wider window than any caller in this module does.
+* **A corrupt file FAILS LOUD.** `read` raises rather than degrading a truncated file to
+  "no run was ever opened" - which would let a close overwrite a real run's identity with a
+  blank record, and print in the handover that the run was never opened. A silently dropped
+  field is a lie the next reader inherits.
+
+Extensible by contract: `update()` MERGES, and nothing here drops a key it does not
+recognise. A later capability adds its own fields (an appetite ceiling, a spend counter)
+without touching this module, and a close preserves them.
+
+A library, not a command: `sprint.py` opens, closes and seals the run, and `critic.py`, `sprint_report.py`,
+`decisions.py`, `retro.py` and `transition.py` record fields on it.
+"""
+from __future__ import annotations
+
+import contextlib
+import functools
+import hashlib
+import io
+import json
+import math
+import os
+import re
+import sys
+import types
+from pathlib import Path
+
+from . import prices, sdlc_md, token_meters
+from .token_meters import CACHE_READ, CLAUDE, HARNESS, harness_of
+
+REL = Path("sdlc-studio") / ".local" / "run-state.json"
+SCHEMA = 1
+
+# Where a CLOSED run's record is kept once the next one opens. The live file holds exactly
+# one run and every new run overwrites it, so before this a closed cycle's forecast, goal,
+# batch and verdict were gone the moment the next cycle started - which makes an N-cycle
+# rolling run unauditable: N sprints happened and one record survived. The archive is a copy
+# taken at close, keyed by `run_id`, and the live file's shape is deliberately UNCHANGED so
+# every existing reader sees exactly what it saw before.
+ARCHIVE_REL = Path("sdlc-studio") / ".local" / "run-archive"
+
+# Where a run's record is tracked, beside the report it underwrites. `sprint close` files it
+# when the page is filed, still running, which is what says in every clone that the run is
+# closed and awaits its signature; `sprint sign` files it again SEALED, so any full clone can
+# re-derive the signed page and read the signature from committed history. `.local` exists
+# only in the clone that wrote it, and anyone who can write it could re-point or strip a
+# signature kept there.
+TRACKED_REL = Path("sdlc-studio") / "reports" / "runs"
+
+# The outcome vocabulary. A run is RUNNING until something says otherwise; the three ways
+# it stops are the three the handoff exists for (goal reached, budget spent, blocked), plus
+# the honest catch-all for an operator stop. An unknown value is REFUSED, never written: a
+# free-text outcome is a field no gate can read, and this one is read.
+RUNNING = "running"
+GOAL_REACHED = "goal-reached"
+BUDGET_SPENT = "budget-spent"
+BLOCKED = "blocked"
+STOPPED = "stopped"
+# A close that FILED its remaining blockers as artefacts and ended honestly with them
+# recorded - the bounded exit between "fix everything" and "bypass the gate". States
+# plainly that work is outstanding; never used while a hard correctness gate is red.
+CLOSED_OUTSTANDING = "closed-outstanding"
+# A SIGNED run whose goal verdict was partial or missed. Distinct from `stopped`, which is an
+# abandonment: a run carried to its signature is never recorded as one.
+PARTIAL = "partial"
+MISSED = "missed"
+OUTCOMES = (RUNNING, GOAL_REACHED, BUDGET_SPENT, BLOCKED, STOPPED, CLOSED_OUTSTANDING,
+            PARTIAL, MISSED)
+CLOSED = tuple(o for o in OUTCOMES if o != RUNNING)
+
+# The fields this module owns. Anything else a caller writes is preserved verbatim - see
+# the module docstring: this list documents, it does not gate.
+FIELDS = ("schema", "run_id", "started_at", "ended_at", "outcome", "goal", "batch",
+          "batch_changes", "reopened",
+          "plan", "handoff", "session_token_baseline", "session_token_stamps", "delegated_tokens")
+
+# The session's token meter reading at the moment this run opened. The close subtracts it from
+# the meter's CURRENT reading to get the tokens THIS run spent, because the harness transcript
+# records one cumulative total per SESSION and a session can hold several sprints: without a
+# baseline the second sprint closed in a session books the first sprint's spend as its own, and
+# the third books both. That is not a rounding error - it published 341,450 and then 472,691
+# tokens per point against a measured ~25,000/pt rate, each time as if it were a measurement.
+#
+# Absent means NOT ATTRIBUTABLE, never zero. A run opened before this field existed, or one whose
+# session could not be read, has no baseline, and the honest report is then that the sprint's
+# token cost cannot be attributed - exactly as an unmeasured elapsed reads UNMEASURED rather than
+# falling back to a plausible number.
+TOKEN_BASELINE = "session_token_baseline"
+
+# The ORDERED stamps of the session meter, one per reading, replacing the single baseline above.
+#
+# The baseline is ONE reading, and a difference of two readings is a spend only when both were
+# taken from the SAME meter. `retro.run_attributed_tokens` therefore refuses to subtract a
+# baseline stamped in one session from a reading taken in another, and it is right to: they are
+# different meters. But that refusal is why a run CLOSED ACROSS SESSIONS - the normal shape of a
+# long run - reports `not attributable`, which is worse than no report at all.
+#
+# A stamp per session fixes it without weakening the rule. Each stamp records the reading, the
+# transcript it came from, the time and the KIND (`open`, `resume`, `handoff`, `report`, ...),
+# and the run total is the sum of the per-session deltas: each term is a difference of two
+# readings of one meter, which is what a spend is. A session holding a single stamp covers no
+# delta and is NAMED as uncovered rather than guessed at, so an unqualified total can never
+# stand for a partially stamped run.
+TOKEN_STAMPS = "session_token_stamps"
+#: The KIND of the stamp `open_run` takes as the run opens. It and the legacy baseline taken
+#: beside it are the run's OPENING readings: one moment read twice, which spans no spend, so a
+#: session holding only those has no closing reading.
+OPEN_STAMP = "open"
+
+# The delegated agents' token totals, one record per agent, SUPPLIED rather than measured.
+#
+# The session transcript the baseline above is read from records the MAIN THREAD only: measured
+# on one live transcript, 6,624,813 tokens of usage carried ZERO sidechain records, so every
+# delegated agent's spend was invisible to it. A run that fanned out to four cluster agents
+# published 439,982 as "the run's own spend" while the known true figure was at least 1,227,816.
+#
+# Where no subagent transcript is read, a delegated total can only be SUPPLIED - each agent
+# reports its own total when it finishes - so it is recorded with its own provenance and the
+# published sum is a LOWER BOUND (>=), never an equality. Same discipline as the mutation
+# ledger's registered-versus-re-run distinction: a claim is kept, and kept labelled.
+#
+# The harness does write each subagent's transcript, beside the session's own (`SUBAGENTS_DIR`),
+# and the meter now reads them. A run whose readings hold them (`includes_subagents`) has its
+# agents' spend measured already, so a supplied total is kept on the record and NOT added to it.
+DELEGATED = "delegated_tokens"
+#: The provenance of a delegated record whose total an agent reported. Never `measured`:
+#: nothing here read a meter.
+SUPPLIED = "supplied"
+#: The provenance of a delegated record whose total was read from the agent's own transcript
+#: (`agent_transcript_tokens`), because no total was supplied beside it.
+READ_FROM_TRANSCRIPT = "transcript"
+
+#: Where the harness keeps its per-session transcripts, overridable for tests and non-standard
+#: installs. The default is Claude Code's layout: one directory per project (the absolute path
+#: with `/` replaced by `-`), one JSONL file per session.
+TRANSCRIPTS_ENV = "SDLC_STUDIO_TRANSCRIPTS"
+
+#: The model marker for a session whose usage records name more than one model. Kept in step
+#: with `retro.MODEL_MIXED` (the same string) so a mixed harness capture and a mixed per-unit
+#: batch land in the same history cell and are excluded from the per-model rate the same way.
+SESSION_MODEL_MIXED = "mixed"
+
+
+#: D0390's weight table: what one token of each component costs, in input-token equivalents.
+#: The ONE table every priced figure is read from, at the moment the figure is formed, so a
+#: change here moves every priced figure and no caller keeps a copy of a weight.
+TOKEN_WEIGHTS = {"input": 1, "output": 5, "cache_write_5m": 1.25, "cache_write_1h": 2.0,
+                 "cache_read": 0.1}
+#: The components a reading carries, in the order a page states them.
+TOKEN_COMPONENTS = ("input", "output", "cache_write_5m", "cache_write_1h", "cache_read")
+#: How each component is named where a reader meets it.
+COMPONENT_NAMES = {"input": "input", "output": "output", "cache_write_5m": "cache write 5m",
+                   "cache_write_1h": "cache write 1h", "cache_read": "cache read"}
+#: The label of the headline figure (D0390 (1)).
+PRICED_LABEL = "priced input-equivalent tokens"
+#: A reading's components split by the model each message names, `{model: components}`, which
+#: is what a dollar figure is priced from (`usd`); "" keys a message naming no model.
+BY_MODEL = "by_model"
+#: The premium requests a harness bills as their own unit (Copilot), carried beside the tokens
+#: and never converted into them.
+PREMIUM_REQUESTS = "premium_requests"
+#: The counting basis a reading was taken on, stamped under this key on every stamp and
+#: baseline this reader writes. A stamp naming no basis was taken by an earlier reader (counted
+#: per record before BG1111, once per message on the main thread alone after it), and a
+#: difference between it and a reading on this basis is not a spend (`run_token_total`).
+METER = "meter"
+METER_BASIS = "once-per-message, main thread and subagent transcripts, priced components"
+#: The kind of a stamp re-derived, under `METER_BASIS`, from the transcript records up to an
+#: earlier-basis reading's own time. That time is its `REDERIVES` key, which pairs the two, and
+#: its `at` is the current-basis stamp it was taken with, so a window ending before that stamp
+#: leaves both out. It names no model: the readings beside it name the run's.
+REDERIVED = "rederived"
+REDERIVES = "of"
+#: Where the harness writes a session's subagent transcripts: beside the session's own file,
+#: in `<session-id>/subagents/agent-*.jsonl`, a depth-2 agent in the same flat directory.
+SUBAGENTS_DIR = "subagents"
+SUBAGENT_GLOB = "agent-*.jsonl"
+#: The meter's memo: what each transcript of the last reading held, so the next reading parses
+#: only the bytes appended since. Runtime state; deleting it costs one whole re-read.
+METER_MEMO_REL = Path("sdlc-studio") / ".local" / "meter-reads.json"
+#: How many bytes at each end of a memoised span must match before the span is taken as unchanged.
+MEMO_PROBE_BYTES = 4096
+
+
+# --- lean loop: unit actuals (EP0260) ---
+# Each batch unit's elapsed time and token spend, measured as it is delivered. Entering
+# In Progress opens a span, stamping the time and the run's token total; a terminal status
+# closes it and adds the span's minutes and token delta. A unit that re-enters In Progress
+# after closing opens another span, so both accumulate. Tokens are the run's own total
+# (`run_token_total`), and a span is measured only when both of its ends were read from the
+# same session's meter: an unread end, or an end in another session, gives None - not
+# measured - never 0.
+UNIT_ACTUALS = "unit_actuals"
+UNIT_START_STATUS = "In Progress"
+
+
+def _unit_clock() -> str:
+    """The moment a span opens or closes, as the ISO stamp the run state stores."""
+    return sdlc_md.now_iso8601()
+
+
+def record_unit_actual(repo_root: Path | str, unit_id: str, status: str,
+                       terminal: bool) -> dict | None:
+    """Open or close `unit_id`'s span for a move to `status`, and return its entry - or None
+    when nothing is recorded: no open run, a unit outside its batch, a status that neither
+    starts nor ends the work, a start while a span is open, or an end with none open.
+
+    An end while the unit's lane is in flight (briefed, not returned) records nothing either:
+    that span closes at the lane's passing return, which clears the marker first. A terminal
+    move made over a lane that never returned - `sprint sign`'s, after the close left the span
+    open - would otherwise measure the span to the move and stamp the meter, and the page the
+    signature has just sealed would re-derive INVALIDATED."""
+    uid = sdlc_md.norm_id(unit_id)
+    starting = status == UNIT_START_STATUS
+
+    def applies(state: dict) -> bool:
+        if state.get("outcome") != RUNNING or not state.get("run_id") or uid not in {
+                sdlc_md.norm_id(b) for b in (state.get("batch") or [])}:
+            return False
+        is_open = bool(((state.get(UNIT_ACTUALS) or {}).get(uid) or {}).get("open"))
+        in_flight = uid in {sdlc_md.norm_id(r.get("unit") or "")
+                            for r in state.get(IN_FLIGHT) or [] if isinstance(r, dict)}
+        return (starting and not is_open) or (terminal and is_open and not in_flight)
+
+    before = read(repo_root)
+    if not (starting or terminal) or not applies(before):
+        return None
+    stamp = _stamp(repo_root, "unit-start" if starting else "unit-end")
+    owed = _rederivations(before, stamp)
+    now = _unit_clock()
+
+    def apply(state: dict) -> dict:
+        if not applies(state):
+            return state
+        if stamp:
+            _append_stamp(state, stamp, owed)
+        total = run_token_total(state)["tokens"]
+        actuals = dict(state.get(UNIT_ACTUALS) or {})
+        entry = dict(actuals.get(uid) or {"minutes": 0.0,
+                                          "tokens": 0 if isinstance(total, int) else None})
+        if starting:
+            entry.update(started_at=now, start_tokens=total, open=True,
+                         start_source=(stamp or {}).get("source"),
+                         start_meter=(stamp or {}).get(METER))
+            if not isinstance(total, int):
+                entry["tokens"] = None
+        else:
+            entry = _closed_span(entry, now, total, stamp)
+        actuals[uid] = entry
+        state[UNIT_ACTUALS] = actuals
+        return state
+
+    return (_mutate(repo_root, apply).get(UNIT_ACTUALS) or {}).get(uid)
+
+
+def _closed_span(entry: dict, now: str, total, stamp: dict | None) -> dict:
+    """`entry` with its open span closed at `now`: the span's minutes and, when the reading at
+    `now` is on the meter the span started on, and on its counting basis, its tokens, added to
+    the entry's own. The ONE rule for ending a span, shared by a terminal move and the close's
+    settle. A span opened on an earlier basis, or before a span recorded its basis, and closed
+    on `METER_BASIS` reads None: the run totals at its two ends were formed on different bases."""
+    entry = dict(entry)
+    elapsed = sdlc_md.parse_iso8601(now) - sdlc_md.parse_iso8601(entry["started_at"])
+    entry["minutes"] = round((entry.get("minutes") or 0.0) + elapsed.total_seconds() / 60, 2)
+    entry.setdefault("tokens", 0)
+    start = entry.get("start_tokens")
+    same_meter = bool(stamp and entry.get("start_source")
+                      and stamp.get("source") == entry["start_source"]
+                      and stamp.get(METER) == entry.get("start_meter"))
+    entry["tokens"] = (entry["tokens"] + max(0, total - start)
+                       if same_meter and all(isinstance(v, int)
+                                             for v in (entry["tokens"], start, total))
+                       else None)
+    entry["open"] = False
+    return entry
+
+
+def settle_open_spans(repo_root: Path | str, unit_ids) -> list[str]:
+    """Close, at this one moment, the open In Progress span of each of `unit_ids` in the open
+    run, on ONE reading of the meter. Returns the units settled; nothing is written, and no
+    stamp taken, when none of them has a span open.
+
+    The close calls it for the units it leaves for `sprint sign` to move. The report it files
+    then measures each span to the close, and the sign's terminal move finds no span open, so
+    `record_unit_actual` records nothing and stamps nothing: the page the signature seals
+    re-derives to the figures it was filed with. Left open, the sign's move closed each span
+    and stamped the meter, and the signed page read INVALIDATED on the unit rows and the run's
+    token total."""
+    wanted = {sdlc_md.norm_id(u) for u in unit_ids or []}
+
+    def open_units(state: dict) -> list[str]:
+        if state.get("outcome") != RUNNING or not state.get("run_id"):
+            return []
+        batch = {sdlc_md.norm_id(b) for b in (state.get("batch") or [])}
+        return sorted(u for u, e in (state.get(UNIT_ACTUALS) or {}).items()
+                      if sdlc_md.norm_id(u) in wanted & batch
+                      and isinstance(e, dict) and e.get("open") and e.get("started_at"))
+
+    before = read(repo_root)
+    if not open_units(before):
+        return []
+    stamp = _stamp(repo_root, "unit-end")
+    owed = _rederivations(before, stamp)
+    now = _unit_clock()
+    settled: list[str] = []
+
+    def apply(state: dict) -> dict:
+        units = open_units(state)
+        if not units:
+            return state
+        if stamp:
+            _append_stamp(state, stamp, owed)
+        total = run_token_total(state)["tokens"]
+        actuals = dict(state.get(UNIT_ACTUALS) or {})
+        for uid in units:
+            actuals[uid] = _closed_span(actuals[uid], now, total, stamp)
+            settled.append(uid)
+        state[UNIT_ACTUALS] = actuals
+        return state
+
+    _mutate(repo_root, apply)
+    return settled
+
+
+# --- lean loop: review rounds per delivery (EP0260) ---
+# Per batch unit, how many delivery verdict rows the review ledger held for it when this run
+# first reviewed it. The rows past it are this delivery's rounds, so a unit carried out of an
+# earlier run starts again at round 1 - on the same day too, which a row's date cannot tell.
+REVIEW_BASE = "review_base"
+
+
+def batch_holds(state: dict, unit_id: str) -> bool:
+    """True when `state` is an open run whose batch names `unit_id`."""
+    return state.get("outcome") == RUNNING and sdlc_md.norm_id(unit_id) in {
+        sdlc_md.norm_id(b) for b in (state.get("batch") or [])}
+
+
+def mark_review_base(repo_root: Path | str, unit_id: str, count: int) -> None:
+    """Record `count` as `unit_id`'s REVIEW_BASE in the open run holding it, unless one is
+    recorded already: the first review of the unit in the run fixes it, and no later round
+    moves it. Nothing is written with no open run holding the unit."""
+    uid = sdlc_md.norm_id(unit_id)
+
+    def unset(state: dict) -> bool:
+        return batch_holds(state, uid) and uid not in (state.get(REVIEW_BASE) or {})
+
+    def apply(state: dict) -> dict:
+        if unset(state):
+            state[REVIEW_BASE] = {**(state.get(REVIEW_BASE) or {}), uid: int(count)}
+        return state
+
+    if unset(read(repo_root) or {}):
+        _mutate(repo_root, apply)
+
+
+class RunStateError(RuntimeError):
+    """The run state exists but cannot be read. Never degraded to "there is no run": that
+    reading would let a close write a blank record over a real run's identity."""
+
+
+class DisjointBatchError(RuntimeError):
+    """A plan would fold a batch sharing NO unit into the run already open.
+
+    One project holds one run slot. An open run carries one Sprint Goal and one closing
+    verdict, so absorbing a second, unrelated batch produces a run whose goal describes a
+    fraction of it and whose verdict carries no information. An OVERLAPPING re-plan still
+    accumulates - a re-cut or a blocker sweep pulling work in shares units with the run it
+    extends - so only a batch disjoint from the open one is refused here.
+
+    Raised BEFORE anything is written, so `run-state.json` is byte-identical after the refusal:
+    the guard sits inside `open_run.apply`, ahead of every mutation, and `_mutate` writes only
+    the value `apply` returns. The message names the open run's id, outcome and batch size, both
+    ways forward as commands (close it, or deliberately re-plan it), and - when the run is
+    mid-close - that a close attempt already ran against it and what it left outstanding, so the
+    operator is pointed at finishing the close rather than working around the one run most likely
+    to be worked around."""
+
+    def __init__(self, run_id, outcome, batch_size, close_attempts=None,
+                 repo_root: Path | str = ".", detail: str | None = None):
+        self.run_id = run_id
+        self.outcome = outcome
+        self.batch_size = batch_size
+        # The latest close attempt's outstanding count, or None when no close was attempted.
+        attempts = [a for a in (close_attempts or []) if isinstance(a, dict)]
+        self.close_attempts = attempts
+        self.outstanding = attempts[-1].get("outstanding") if attempts else None
+        root = str(repo_root)
+        lines = [
+            # A more specific reason than "disjoint" when the caller has one - a frozen
+            # judged batch, say. The run id and both ways forward still print either way.
+            (f"plan refused: run {run_id} is already open (outcome={outcome}) and {detail}"
+             if detail else
+             f"plan refused: run {run_id} is already open (outcome={outcome}, batch of "
+             f"{batch_size} unit(s)), and the batch just planned shares no unit with it. A "
+            f"project holds one run slot: a batch disjoint from the open run is NOT folded in, "
+            f"because the run carries one Sprint Goal and one closing verdict and a fused run "
+            f"can be judged against neither."),
+        ]
+        if self.outstanding is not None:
+            lines.append(
+                f"{run_id} is mid-close, not finished: a close attempt has already run against "
+                f"it and left {self.outstanding} item(s) outstanding. Finish that close rather "
+                f"than working around the run.")
+        lines.append("Two ways forward:")
+        lines.append("  close the open run, then plan this batch as its own run:")
+        lines.append(f"    sprint.py close --root {root}")
+        lines.append("  or re-plan the open run deliberately, folding this batch into it by "
+                     "planning a worklist that also names one of its units:")
+        lines.append(f"    sprint.py plan --worklist WORKLIST.txt --write --root {root}")
+        super().__init__("\n".join(lines))
+
+
+def path(repo_root: Path | str) -> Path:
+    return Path(repo_root) / REL
+
+
+def read(repo_root: Path | str) -> dict:
+    """The current run state, or `{}` when there is none.
+
+    Never fabricated: a run that was not opened has no start time, and this returns nothing
+    rather than inventing one. A file that EXISTS but does not parse RAISES - "unreadable"
+    is not the same fact as "absent", and reporting it as absent destroys the run it failed
+    to read."""
+    p = path(repo_root)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise RunStateError(f"cannot read the run state at {p}: {exc}") from exc
+    if not text.strip():
+        return {}
+    try:
+        state = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RunStateError(
+            f"the run state at {p} is not valid JSON ({exc}) - it holds the run's id, start "
+            f"time, approved batch and outcome, and nothing may overwrite it blind. Repair "
+            f"it, or delete it to start a fresh run (the run it described is then "
+            f"unrecoverable, which is the point of saying so out loud)") from exc
+    if not isinstance(state, dict):
+        raise RunStateError(
+            f"the run state at {p} is not an object (got {type(state).__name__})")
+    return state
+
+
+def write(repo_root: Path | str, state: dict) -> dict:
+    """Persist the state atomically (a crash mid-write must not truncate a run's identity).
+    Anything mutating an EXISTING state goes through `_mutate`, which holds the lock."""
+    p = path(repo_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    sdlc_md.atomic_write(p, json.dumps(state, indent=2))
+    return state
+
+
+def archive_dir(repo_root: Path | str) -> Path:
+    return Path(repo_root) / ARCHIVE_REL
+
+
+def archive_path(repo_root: Path | str, run_id: str) -> Path:
+    return archive_dir(repo_root) / f"{run_id}.json"
+
+
+def archive(repo_root: Path | str, state: dict | None = None) -> Path | None:
+    """Copy a run's record to its own file, so a closed run stays readable after the next
+    one opens. Returns the path written, or None when there is no run to archive.
+
+    Keyed by `run_id` and rewritten in place, so archiving the same run twice leaves one
+    record, not two - the boundary archives at close and the next open archives again as a
+    safety net, and neither may double-count. A run with no `run_id` (nobody opened it) is
+    NOT archived: a record with no identity cannot be joined to anything later."""
+    state = read(repo_root) if state is None else state
+    run_id = state.get("run_id")
+    if not run_id:
+        return None
+    p = archive_path(repo_root, run_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    sdlc_md.atomic_write(p, json.dumps(state, indent=2))
+    return p
+
+
+def archived(repo_root: Path | str) -> list[dict]:
+    """Every archived run, oldest first. An unreadable record is SKIPPED rather than raising:
+    unlike the live file, a damaged archive entry cannot cause a close to overwrite a real
+    run's identity, so failing the whole read would lose the intact records for nothing."""
+    d = archive_dir(repo_root)
+    if not d.is_dir():
+        return []
+    out = []
+    for p in sorted(d.glob("*.json")):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(rec, dict) and rec.get("run_id"):
+            out.append(rec)
+    # Chronological, and the CYCLE INDEX breaks a tie before the run id does. Two cycles of a
+    # fast run start inside the same second, and `short_ulid` is not monotonic within one - so
+    # ordering on the id alone reads a rolling run's cycles back out of order, which is exactly
+    # the sequence the archive exists to preserve.
+    def _index(rec: dict) -> int:
+        """The cycle index, or 0 when it is absent, not a dict, or not a number.
+
+        Coerced defensively rather than with a bare `int()`: this runs inside the SORT KEY,
+        which sits outside the try/except above, so one malformed record raised and lost
+        every intact one - precisely what this function's contract says it will not do.
+        AttributeError is caught too: `cycle` is JSON, so it can be a string or a list, and
+        the first repair caught only the one variant its test happened to exercise.
+        """
+        try:
+            return int((rec.get("cycle") or {}).get("index") or 0)
+        except (ArithmeticError, AttributeError, TypeError, ValueError):
+            # ArithmeticError covers OverflowError: json round-trips Infinity by default, so
+            # this module can WRITE a value int() then refuses. Each repair here has caught
+            # only the shapes its own test exercised; the exception set is now the whole
+            # family rather than a list of the ones seen so far.
+            return 0
+
+    def _started(rec: dict) -> str:
+        """The start time as a STRING. A non-string `started_at` would otherwise raise from
+        the tuple comparison itself, outside `_index` entirely - the same contract breach
+        one level out."""
+        value = rec.get("started_at")
+        return value if isinstance(value, str) else ""
+
+    def _rid(rec: dict) -> str:
+        """The run id as a STRING. It is the final tie-break, so a non-string reaches the
+        tuple comparison only when started_at and the index both tie - rare, and it raised."""
+        value = rec.get("run_id")
+        return value if isinstance(value, str) else ""
+
+    out.sort(key=lambda r: (_started(r), _index(r), _rid(r)))
+    return out
+
+
+def read_archived(repo_root: Path | str, run_id: str) -> dict:
+    """One archived run by id, or `{}` when it was never archived."""
+    p = archive_path(repo_root, run_id)
+    try:
+        rec = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def tracked_path(repo_root: Path | str, run_id: str) -> Path:
+    return Path(repo_root) / TRACKED_REL / f"{run_id}.json"
+
+
+#: An absolute path, as a record stores one: one line, from the filesystem root, whose first
+#: segment is a single word with another segment after it (`/home/x/...`, `C:\...`). Prose
+#: that merely starts with a slash (`/sdlc-studio status ...`) is not one.
+_ABSOLUTE_PATH = re.compile(r"^(?:/[^/\s]+/|[A-Za-z]:[\\/])[^\n]*$")
+
+
+def portable(value, repo_root: Path | str):
+    """`value` with every absolute path made portable: a path inside the repository becomes
+    repo-relative, any other becomes `sha256:<12 hex>` of itself.
+
+    A run record carries the home directory and session transcript ids (`plan`, every token
+    stamp's `source`, `unit_actuals.*.start_source`). No figure prints them, and the one thing
+    read from them - which stamps share a session - survives a digest. Idempotent, so a record
+    read back through it is unchanged. `sprint_report.build_report` reads a run record through it
+    for every page it marks so, so such a page's figures are the same whichever copy of the
+    record they were derived from."""
+    if isinstance(value, dict):
+        return {k: portable(v, repo_root) for k, v in value.items()}
+    if isinstance(value, list):
+        return [portable(v, repo_root) for v in value]
+    if not isinstance(value, str) or not _ABSOLUTE_PATH.match(value):
+        return value
+    for base in dict.fromkeys((Path(repo_root).absolute(), Path(repo_root).resolve())):
+        try:
+            return Path(value).relative_to(base).as_posix()
+        except ValueError:
+            continue
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def file_tracked(repo_root: Path | str, state: dict) -> Path:
+    """File a run's record at `tracked_path`, through `portable`: still running when the close
+    files it, sealed when `sign` does. Returns the path."""
+    p = tracked_path(repo_root, state["run_id"])
+    p.parent.mkdir(parents=True, exist_ok=True)
+    sdlc_md.atomic_write(p, json.dumps(portable(state, repo_root), indent=2) + "\n")
+    return p
+
+
+def read_tracked(repo_root: Path | str, run_id: str) -> dict:
+    """The tracked record of `run_id`, or `{}` when none is filed. RAISES `RunStateError` on
+    one that does not parse: a damaged signed record is not the same fact as an absent one."""
+    p = tracked_path(repo_root, run_id)
+    try:
+        rec = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RunStateError(f"the tracked run record at {p} cannot be read: {exc}") from exc
+    if not isinstance(rec, dict):
+        raise RunStateError(f"the tracked run record at {p} is not an object")
+    return rec
+
+
+def awaiting_signature(repo_root: Path | str) -> list[dict]:
+    """The tracked run records whose run the close filed and nobody has signed: a record that
+    names a report and whose outcome is still running. Every clone holds them, so whether a
+    run is open is no longer a fact about the machine that closed it. RAISES `RunStateError`
+    on a record that does not parse (`read_tracked`): an unreadable record could be the open
+    one, and is never read as absent."""
+    d = Path(repo_root) / TRACKED_REL
+    out = []
+    for p in sorted(d.glob("*.json")) if d.is_dir() else []:
+        rec = read_tracked(repo_root, p.stem)
+        if rec.get("outcome") == RUNNING and rec.get("report"):
+            out.append(rec)
+    return out
+
+
+def sealed_elsewhere(live: dict, record: dict) -> bool:
+    """Whether `record`, the tracked record of the run `live` holds, carries a signature made in
+    another checkout that this copy has not moved past: the record is sealed and signed, and
+    `live` is the same run, still open, recording no more reopens than the record. A run signed
+    here and then reopened here records one reopen more than its record, so its reopen is never
+    discarded; a signature this copy kept through an earlier reopen says nothing about whether
+    the record is newer, so it is not compared."""
+    rid = record.get("run_id")
+    if not rid or rid != live.get("run_id"):
+        return False
+    if record.get("outcome") not in CLOSED or not record.get("signature"):
+        return False
+    if live.get("outcome") != RUNNING:
+        return False
+    return len(live.get("reopened") or []) <= len(record.get("reopened") or [])
+
+
+def supersedes(live: dict, record: dict) -> bool:
+    """Whether `record`, the tracked record of the run `live` holds open, is newer than this
+    copy, so it is taken up rather than filed over: it records more reopens than `live`
+    (another checkout reopened and re-closed the run since this copy last wrote it), or it is
+    sealed and signed with no fewer (`sealed_elsewhere`). A copy that has reopened past the
+    record is the newer one, and is never discarded."""
+    if not record.get("run_id") or record.get("run_id") != live.get("run_id"):
+        return False
+    if live.get("outcome") != RUNNING:
+        return False
+    if len(record.get("reopened") or []) > len(live.get("reopened") or []):
+        return True
+    return sealed_elsewhere(live, record)
+
+
+def adopt_tracked(repo_root: Path | str, record: dict) -> dict:
+    """Make a tracked run record this checkout's live run state, under the lock: the run was
+    closed, or signed, in another checkout. A different run held here and already closed is
+    archived first, as `open_run` archives it; a different run held here and still OPEN is
+    refused (`RunStateError`), because adopting would discard it."""
+    rid = record.get("run_id")
+
+    def apply(state: dict) -> dict:
+        held = (state or {}).get("run_id")
+        if held and held != rid:
+            if state.get("outcome") == RUNNING:
+                raise RunStateError(
+                    f"this checkout holds {held}, still open, so {rid} cannot be taken up "
+                    f"here without discarding it - close or stop {held} first")
+            archive(repo_root, state)
+        return dict(record)
+
+    adopted = _mutate(repo_root, apply)
+    if adopted.get("outcome") in CLOSED:
+        archive(repo_root, adopted)
+    return adopted
+
+
+def is_open(repo_root: Path | str) -> bool:
+    """True when a run is open (recorded and not yet closed)."""
+    return read(repo_root).get("outcome") == RUNNING
+
+
+def _blank() -> dict:
+    """The record for a run nobody opened. `run_id`, `started_at` and the token baseline are
+    None, and stay None: a close that invented a start time - or a baseline - would put a
+    false fact in the one file the next reader trusts. An unopened run says so."""
+    return {"schema": SCHEMA, "run_id": None, "started_at": None, "ended_at": None,
+            "outcome": RUNNING, "goal": None, "batch": [], "plan": None, "handoff": None,
+            TOKEN_BASELINE: None, TOKEN_STAMPS: [],
+            DELEGATED: [],
+            # Seeded empty like its siblings: `reopened` is part of the documented shape, and a
+            # field that only appears after a reopen would make every reader test for it.
+            "reopened": [],
+            # Likewise `batch_changes`: the drop/add ledger is part of the shape from the start, so
+            # a reader never has to test for its presence - it is [] until the batch is first mutated.
+            "batch_changes": [],
+            # Likewise the run's `rulings` count (`record_ruling`), [] until the first ruling.
+            "rulings": []}
+
+
+def _mutate(repo_root: Path | str, fn) -> dict:
+    """Read-modify-write the run state under the shared advisory lock.
+
+    The single mutation path. Every writer goes through it, so a writer cannot read the
+    state, be overtaken, and then write its stale copy back over the other's keys. It is
+    the same advisory lock the id allocator and the finding filer take, for the same
+    reason."""
+    with sdlc_md.allocation_lock(repo_root):
+        state = read(repo_root)          # inside the lock; a corrupt file still raises
+        return write(repo_root, fn(state))
+
+
+def _union(existing, incoming) -> list[str]:
+    """The approved batch, accumulated: first-approval order, no duplicates. An approved
+    unit is never removed by a later, narrower plan."""
+    out = [sdlc_md.norm_id(b) for b in (existing or [])]
+    seen = set(out)
+    for b in incoming:
+        n = sdlc_md.norm_id(b)
+        if n not in seen:
+            out.append(n)
+            seen.add(n)
+    return out
+
+
+# The artefacts a run carries only once its CLOSE has run. A run holding any of them is history
+# even if its `outcome` string was never moved off `running`, so the next plan mints a fresh run
+# rather than accumulating a new batch onto the finished one.
+#
+# BOTH entries are written BY the close chain. `sprint_goal_verdict` used to be here and is not,
+# because it is written BEFORE the close by `sprint goal-verdict`: a run that has been judged has
+# not thereby been closed, and treating the two as one fact left every run with a window - between
+# its verdict and its close - in which its units were still at Review and the slot guard had
+# already stood down. BG0527 caught it live, on a run whose own pre-flight reported twenty unmet
+# prerequisites while `disjoint_refusal` returned None for a disjoint batch. Opening the next
+# sprint there would have replaced the state and stranded twelve units with no close, no cascade
+# and no record that one was owed.
+#
+# `close_attempts` is excluded for the same reason and was already reasoned about that way: a run
+# whose only close artefact is a FAILED close attempt is still `running`, so it stays open and
+# protected - "the run most likely to be worked around". A recorded goal verdict with no close is
+# that same run one step earlier, and the list simply stopped one item short.
+_CLOSE_ARTEFACTS = ("ended_at", "handoff")
+
+
+def _mint_run_id(repo_root: Path | str, outgoing: dict | None = None) -> str:
+    """A run id no run in this project has already used.
+
+    `short_ulid` is 6 timestamp characters - roughly a 17-minute bucket - plus 2 random ones, so
+    two mints inside one bucket collide with probability about 1 in 1,024, and its own docstring
+    names the allocator's glob-retry as the true backstop. The RUN id never went through one: it
+    was minted and used. That surfaced as a commit gate failing at random on an unchanged tree,
+    but the real exposure is that two runs could share an identity, and the telemetry, archive
+    and velocity records all join on it.
+
+    So the ALLOCATOR provides what the generator cannot. Checked against every archived run (the
+    register of what this project has opened) and the run being replaced, retried on a clash and
+    extended on a persistent one - the same shape `sdlc_md.mint_v3_id` uses for artefact ids.
+
+    EVERY candidate is checked, including the extended one. An unchecked final fallback would be
+    exactly the luck this allocator exists to replace: drive both generators constant and the old
+    one returned a duplicate while the docstring above claimed uniqueness by construction. When
+    even the extended suffix cannot produce a free id, that is a broken generator rather than an
+    unlucky one, so this RAISES: returning a known-duplicate id would silently merge two runs'
+    telemetry, archive and velocity records, which is the data problem the whole allocator exists
+    to prevent.
+    """
+    taken = {r.get("run_id") for r in archived(repo_root)}
+    # Not dead, and deliberately kept: `open_run` archives the outgoing run before minting, so
+    # this is usually redundant - but only while the archive write SUCCEEDS. An archive that
+    # could not be written (a read-only or full `.local`) leaves the register without the run
+    # being replaced, and this is then the only thing standing between the new run and its
+    # predecessor's identity. Pinned directly by test rather than through `open_run`.
+    taken.add((outgoing or {}).get("run_id"))
+    for _ in range(16):
+        rid = f"RUN-{sdlc_md.short_ulid()}"
+        if rid not in taken:
+            return rid
+    for _ in range(16):
+        rid = f"RUN-{sdlc_md.new_ulid()[:12]}"   # extend the suffix on a persistent clash
+        if rid not in taken:
+            return rid
+    raise RuntimeError(
+        "could not mint a run id no run in this project already holds: 32 candidates, from both "
+        "the short and the extended generator, were all already taken. That is a broken id "
+        "generator, not bad luck - refusing to hand back a duplicate, because the telemetry, "
+        "archive and velocity records all join on the run id")
+
+
+def _is_spent(state: dict) -> bool:
+    """True when the run is finalised: a terminal outcome, or a close artefact recorded while
+    the outcome string still says `running`. A judged run is history regardless of the string.
+
+    `close_attempts` is deliberately NOT a close artefact (see `_CLOSE_ARTEFACTS`): a run whose
+    only close artefact is a FAILED close attempt is still `running`, so it stays open and
+    protected - the disjoint guard covers it rather than exempting it, which is the run most
+    likely to be worked around."""
+    if state.get("outcome") != RUNNING or not state.get("run_id"):
+        return True
+    return any(state.get(k) for k in _CLOSE_ARTEFACTS)
+
+
+def _disjoint(state: dict, batch) -> bool:
+    """True when `batch` shares no unit with an OPEN run that already holds one. False for a
+    spent run (the next plan mints fresh), an empty incoming batch, and an open run with nothing
+    approved yet (there is nothing to be disjoint from). Ids are normalised on both sides so a
+    spelling difference is never read as disjointness."""
+    if batch is None or _is_spent(state):
+        return False
+    existing = {sdlc_md.norm_id(b) for b in (state.get("batch") or [])}
+    incoming = {sdlc_md.norm_id(b) for b in batch}
+    return bool(existing) and not (existing & incoming)
+
+
+def disjoint_refusal(repo_root: Path | str, batch) -> "DisjointBatchError | None":
+    """The refusal `open_run` would raise for planning `batch` against the open run, or None
+    when it would accept. PURE - reads the state, writes nothing - so a caller can refuse before
+    writing any sibling artefact (the sprint plan, the forecast log) that the refusal should not
+    leave behind. `open_run` enforces the same rule inside its lock; this only pre-empts it."""
+    state = read(repo_root)
+    if not _disjoint(state, batch):
+        return None
+    return DisjointBatchError(state.get("run_id"), state.get("outcome"),
+                              len({sdlc_md.norm_id(b) for b in (state.get("batch") or [])}),
+                              close_attempts=state.get("close_attempts"), repo_root=repo_root)
+
+
+#: The slug length past which the harness truncates a folder name and appends a hash.
+_HARNESS_SLUG_MAX = 200
+
+
+def harness_project_slug(repo_root: Path | str) -> str:
+    """The folder name the harness files a project's transcripts under, inside `projects/`.
+
+    The resolved path with EVERY UTF-16 code unit outside [A-Za-z0-9] mapped to `-` (`.` and `_`
+    included, `-` itself kept), so a repo at `my_app.v2` reads `-...-my-app-v2`; mapping `/`
+    alone missed it. A character outside the BMP is two code units and so two dashes. One
+    definition, read by the meter here and by anything that points the meter at a transcript
+    folder (the eval harness's worker command). Untruncated: past `_HARNESS_SLUG_MAX` the
+    harness shortens it and appends a hash, and `_harness_transcript_dir` finds that folder by
+    the `cwd` its transcript records rather than by re-deriving the hash."""
+    return re.sub(r"[^A-Za-z0-9]", lambda m: "--" if ord(m.group()) > 0xFFFF else "-",
+                  str(Path(repo_root).resolve()))
+
+
+def _newest_transcript(folder: Path) -> Path | None:
+    """The most recently modified `.jsonl` in `folder`. One whose `stat` fails (a dangling or
+    self-looping link) is skipped, as an unreadable transcript is when its `cwd` is read."""
+    files = []
+    for f in folder.glob("*.jsonl"):
+        try:
+            files.append((f.stat().st_mtime, f))
+        except OSError:
+            continue
+    return sorted(files, key=lambda t: t[0])[-1][1] if files else None
+
+
+def _records_cwd(transcript: Path, cwd: str) -> bool:
+    """True when the first record in `transcript` carrying a `cwd` names `cwd`."""
+    try:
+        with transcript.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and isinstance(rec.get("cwd"), str):
+                    return rec["cwd"] == cwd
+    except (OSError, UnicodeDecodeError):
+        return False
+    return False
+
+
+def _harness_transcript_dir(repo_root: Path | str) -> Path:
+    """The folder under `~/.claude/projects` holding this repo's transcripts. The slug folder
+    when it exists or the slug is short enough to be the harness's name for it; for a slug the
+    harness truncated, the folder whose newest transcript records this repo as its `cwd` (the
+    most recent when several do). A folder recording any other `cwd` is never chosen."""
+    projects = Path.home() / ".claude" / "projects"
+    slug = harness_project_slug(repo_root)
+    d = projects / slug
+    if d.is_dir() or len(slug) <= _HARNESS_SLUG_MAX or not projects.is_dir():
+        return d
+    cwd = str(Path(repo_root).resolve())
+    hits = []
+    for folder in projects.iterdir():
+        newest = _newest_transcript(folder) if folder.is_dir() else None
+        if newest is not None and _records_cwd(newest, cwd):
+            hits.append((newest.stat().st_mtime, folder))
+    return max(hits)[1] if hits else d
+
+
+def price(components: dict) -> int:
+    """`components` priced in input-equivalent tokens from `TOKEN_WEIGHTS`, read now."""
+    return round(sum(int(components.get(c) or 0) * TOKEN_WEIGHTS[c] for c in TOKEN_COMPONENTS))
+
+
+def _zero() -> dict:
+    return dict.fromkeys(TOKEN_COMPONENTS, 0)
+
+
+def _counted(components: dict) -> int:
+    """input + output + cache write: the sum every reading before D0390 headlined."""
+    return sum(int(components.get(c) or 0) for c in TOKEN_COMPONENTS if c != "cache_read")
+
+
+def _usage_components(usage: dict) -> dict:
+    """One usage record's components. RAISES on a malformed value: the caller refuses the read.
+
+    The cache write is split by duration under `cache_creation`. A write the split does not
+    account for, as in a transcript written before the harness recorded it, is booked at five
+    minutes, the API's default duration, so the total is never short of what was written."""
+    split = usage.get("cache_creation")
+    split = split if isinstance(split, dict) else {}
+    five = int(split.get("ephemeral_5m_input_tokens") or 0)
+    hour = int(split.get("ephemeral_1h_input_tokens") or 0)
+    written = int(usage.get("cache_creation_input_tokens") or 0)
+    return {"input": int(usage.get("input_tokens") or 0),
+            "output": int(usage.get("output_tokens") or 0),
+            "cache_write_5m": five + max(0, written - five - hour),
+            "cache_write_1h": hour,
+            "cache_read": int(usage.get("cache_read_input_tokens") or 0)}
+
+
+class _MeterError(Exception):
+    """Why a transcript gives no reading. Its text is the reason the caller reports."""
+
+
+def _line_record(line: str, path: Path):
+    """The `(message id, timestamp, components, model)` of one transcript line carrying usage,
+    or None for a line that is not JSON or carries none. RAISES `_MeterError` naming the file
+    on a malformed usage value, and AttributeError on JSON that is not an object."""
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return None
+    msg = rec.get("message")
+    usage = (msg.get("usage") if isinstance(msg, dict) else None) or rec.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    model = (msg.get("model") if isinstance(msg, dict) else None) or rec.get("model")
+    try:
+        parts = _usage_components(usage)
+    except (ArithmeticError, AttributeError, TypeError, ValueError) as exc:
+        # A malformed usage value REFUSES the whole read rather than skipping the
+        # record. Skipping would return a total that is quietly short, and a short
+        # baseline inflates the delta measured against it - a wrong number, which is
+        # the expensive failure here. Not-attributable is the cheap one.
+        raise _MeterError(
+            f"transcript {path.name} carries a malformed usage record "
+            f"({type(exc).__name__}: {exc}) - the total cannot be trusted, so no "
+            f"figure is reported") from exc
+    msg_id = msg.get("id") if isinstance(msg, dict) else None
+    return (msg_id if isinstance(msg_id, str) and msg_id else None, rec.get("timestamp"), parts,
+            model.strip() if isinstance(model, str) and model.strip() else None)
+
+
+def _lines_records(chunk: bytes, path: Path) -> list:
+    """The usage records of the transcript lines in `chunk`, split and decoded as a file opened
+    as UTF-8 text splits and decodes them."""
+    lines = io.TextIOWrapper(io.BytesIO(chunk), encoding="utf-8")
+    return [r for r in (_line_record(line, path) for line in lines) if r is not None]
+
+
+def _probe(fh, end: int) -> str:
+    """The digest of the first and the last `MEMO_PROBE_BYTES` bytes of `fh` before `end`."""
+    fh.seek(0)
+    head = fh.read(min(end, MEMO_PROBE_BYTES))
+    fh.seek(max(0, end - MEMO_PROBE_BYTES))
+    return hashlib.sha256(head + b"\0" + fh.read(min(end, MEMO_PROBE_BYTES))).hexdigest()
+
+
+def _held_groups(fh, st, entry: dict) -> dict | None:
+    """`{(message id, model): components}`, what the memo `entry` holds for the file open as
+    `fh` (`st` its stat), when it is the file the entry was read from, grown or unchanged.
+    None, and the file is read whole, when its device or inode differ, it is shorter than the
+    bytes last read, the bytes at either end of the span last parsed differ (`_probe`), or the
+    entry is malformed."""
+    try:
+        if ((entry["dev"], entry["ino"]) != (st.st_dev, st.st_ino)
+                or entry["size"] > st.st_size or _probe(fh, entry["offset"]) != entry["probe"]):
+            return None
+        groups = {}
+        for msg_id, model, row in entry["records"]:
+            if len(row) != len(TOKEN_COMPONENTS):
+                return None
+            groups[(msg_id, model)] = [int(v) for v in row]
+        return groups
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+
+
+def _file_records(path: Path, side: str, out: list, memo: dict | None = None) -> dict | None:
+    """Append one `(side, message id, timestamp, components, model)` per usage record of the
+    transcript at `path`. RAISES `_MeterError` naming the file on a malformed or unreadable one.
+
+    `memo` is None for a whole read, which returns None. Otherwise it maps each path the last
+    reading parsed to what that file held then (`_held_groups`), only the bytes after the last
+    newline that reading parsed are parsed now, and this file's entry for the next reading is
+    returned. The records are then collapsed: one per message id and model, its components the
+    largest of its records', and one per model for the records with no id, their sum, each
+    with no timestamp. `_aggregate` reads them as it reads the records they collapse, given no
+    `until`. A last line with no newline is appended as itself and parsed again next time,
+    since the harness may still be writing it.
+
+    No `cwd` check is applied, and none may be: a subagent run in a worktree records the
+    worktree as its `cwd`, and its spend is the session's all the same."""
+    try:
+        with path.open("rb") as fh:
+            entry = memo.get(str(path)) if memo is not None else None
+            st = os.fstat(fh.fileno())
+            held = _held_groups(fh, st, entry) if isinstance(entry, dict) else None
+            start = entry["offset"] if held is not None else 0
+            fh.seek(start)
+            data = fh.read()
+            cut = data.rfind(b"\n") + 1
+            parsed = _lines_records(data[:cut], path)
+            tail = _lines_records(data[cut:], path)
+            if memo is None:
+                out.extend((side, *r) for r in parsed + tail)
+                return None
+            groups = dict(held or {})
+            for msg_id, _at, parts, model in parsed:
+                row = [parts[c] for c in TOKEN_COMPONENTS]
+                was = groups.get((msg_id, model))
+                groups[(msg_id, model)] = row if was is None else [
+                    a + b if msg_id is None else max(a, b) for a, b in zip(was, row)]
+            if held is None or cut or start + len(data) != entry["size"]:
+                entry = {"dev": st.st_dev, "ino": st.st_ino, "size": start + len(data),
+                         "offset": start + cut, "probe": _probe(fh, start + cut),
+                         "records": [[m, model, row] for (m, model), row in groups.items()]}
+    except (ArithmeticError, AttributeError, OSError, TypeError, ValueError) as exc:
+        # The whole family, not the shapes seen so far. This transcript format is the harness's,
+        # not this project's, and it has already moved once (hence the two-shape probe above).
+        # `archived()._index` in this same file records the same lesson from its own repairs.
+        raise _MeterError(f"transcript {path} unreadable ({type(exc).__name__}: {exc})") from exc
+    out.extend((side, m, None, dict(zip(TOKEN_COMPONENTS, row)), model)
+               for (m, model), row in groups.items())
+    out.extend((side, *r) for r in tail)
+    return entry
+
+
+def _collect(main: Path, memo: dict | None = None) -> dict:
+    """Every usage record of the session whose transcript is `main`, and of its subagents.
+
+    `note` is None when the subagent transcripts were read, and otherwise says why none were:
+    the directory is absent, or holds no file in the layout this reader knows. Either way the
+    reading is the main thread's alone and says so; it is never a zero for the subagents.
+
+    `memo` is the last reading's memo, or None for a whole read. Given one, the records are
+    collapsed (`_file_records`), and the result's `memo` is this reading's: an entry for each
+    file it read, and for no other."""
+    records: list = []
+    fresh = {str(main): _file_records(main, "main", records, memo)}
+    folder = main.parent / main.stem / SUBAGENTS_DIR
+    files = sorted(folder.glob(SUBAGENT_GLOB)) if folder.is_dir() else []
+    for f in files:
+        fresh[str(f)] = _file_records(f, "subagents", records, memo)
+    note = (None if files else
+            f"no subagents directory at {folder}" if not folder.is_dir() else
+            f"the subagents directory {folder} holds no {SUBAGENT_GLOB} transcript, a layout "
+            f"this reader does not know")
+    return {"source": main, "records": records, "files": len(files), "note": note,
+            "memo": fresh if memo is not None else None}
+
+
+@functools.cache
+def _reader_key() -> str | None:
+    """The digest of this module's source, which a memo is bound to: a memo another version of
+    the reader wrote is discarded, since that version may read a line differently. None when
+    the source cannot be read, and then nothing is memoised."""
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _memo_path(repo_root: Path | str) -> Path | None:
+    """Where `repo_root`'s meter memo lives (`METER_MEMO_REL`), or None, and nothing is
+    memoised, when the root has no `sdlc-studio/` directory or `_reader_key` is None."""
+    root = Path(repo_root)
+    return root / METER_MEMO_REL if (root / "sdlc-studio").is_dir() and _reader_key() else None
+
+
+def _load_memo(path: Path | None) -> dict | None:
+    """The memo at `path` as `_file_records` takes it: {} when it is absent, unreadable, or
+    written by another version of the reader; None when `path` is None."""
+    if path is None:
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    ours = isinstance(doc, dict) and doc.get("reader") == _reader_key()
+    return doc["files"] if ours and isinstance(doc.get("files"), dict) else {}
+
+
+def _save_memo(path: Path | None, before: dict | None, after: dict | None) -> None:
+    """Write `after`, the memo of the reading just taken, when it differs from `before`, the
+    memo it started from. One that cannot be written is skipped, and the reading stands."""
+    if path is None or after is None or after == before:
+        return
+    try:
+        sdlc_md.atomic_write(path, json.dumps({"reader": _reader_key(), "files": after},
+                                              separators=(",", ":")))
+    except OSError:
+        pass
+
+
+def _aggregate(collected: dict, until=None) -> dict:
+    """The reading `collected` gives, ONCE per assistant message, of the records at or before
+    `until` (a datetime) when it is given. RAISES `_MeterError` when a record cannot be placed
+    against `until`, or when nothing carries usage.
+
+    The harness writes one record per content block of a message (thinking, text, each tool
+    call) and repeats the message's usage on every one under the same `message.id`, so summing
+    records billed a message once per block. One reading per id is kept, the LARGEST
+    of each component across its repeats: an earlier record can carry a smaller output count
+    than the message's last. A record with no id is counted by itself: nothing tells two of them
+    apart. An id is booked to the side, main thread or subagents, it was first read on."""
+    per_message: dict[str, tuple[str, dict]] = {}
+    msg_model: dict[str, str] = {}
+    sides = {"main": _zero(), "subagents": _zero()}
+    by_model: dict[str, dict] = {}
+    models: set[str] = set()
+    seen = False
+    for side, msg_id, at, parts, model in collected["records"]:
+        if until is not None:
+            moment = sdlc_md.parse_iso8601(at) if at else None
+            if moment is None:
+                raise _MeterError(
+                    f"a usage record in {collected['source'].name}'s transcripts carries no "
+                    f"timestamp, so the records up to the stamp cannot be told from the ones "
+                    f"after it")
+            if moment > until:
+                continue
+        seen = True
+        if model:
+            models.add(model)
+        if msg_id is None:
+            split = by_model.setdefault(model or "", _zero())
+            for c in TOKEN_COMPONENTS:
+                sides[side][c] += parts[c]
+                split[c] += parts[c]
+            continue
+        msg_model.setdefault(msg_id, model or "")
+        held = per_message.get(msg_id)
+        per_message[msg_id] = (side, parts) if held is None else (
+            held[0], {c: max(held[1][c], parts[c]) for c in TOKEN_COMPONENTS})
+    for msg_id, (side, parts) in per_message.items():
+        split = by_model.setdefault(msg_model[msg_id], _zero())
+        for c in TOKEN_COMPONENTS:
+            sides[side][c] += parts[c]
+            split[c] += parts[c]
+    both = {c: sides["main"][c] + sides["subagents"][c] for c in TOKEN_COMPONENTS}
+    if not seen or _counted(both) <= 0:
+        raise _MeterError(
+            f"transcript {collected['source'].name} carries no usage records" if until is None
+            else f"transcript {collected['source'].name} no longer holds a usage record up to "
+                 f"the stamp's time, so the records the stamp read are gone")
+    with_agents = collected["note"] is None
+    return {"tokens": _counted(both), "priced": price(both), "components": both,
+            "main": sides["main"], "subagents": sides["subagents"] if with_agents else None,
+            "includes_subagents": with_agents, "subagent_files": collected["files"],
+            "models": models, BY_MODEL: by_model}
+
+
+def session_tokens(repo_root: Path | str, transcripts_dir: Path | str | None = None) -> dict:
+    """The CURRENT session's token reading, from the store of the harness running it, and from
+    that one store alone (`token_meters`, whose docstring gives the selection order).
+
+    The reading names its `harness` and carries cache reads as `cache_read`, outside `tokens`;
+    `transcripts_dir` reaches Claude's reader and its store probe only. {"tokens": None,
+    "reason"} when no reading can be had, and the caller must SAY which it got.
+
+    It lives in this module rather than in `retro` because `open_run` has to stamp the baseline
+    itself: `open_run` is the only place that knows a fresh run is being minted, and `retro`
+    imports this module, so the reader has to sit at the lower layer. `retro.harness_tokens`
+    wraps it, so both the baseline and the close read one definition, and one selection.
+    """
+    claude = types.SimpleNamespace(
+        read=lambda root, env: claude_tokens(root, transcripts_dir, env),
+        store=lambda root, env: _claude_store(root, transcripts_dir, env))
+    return token_meters.read(repo_root, claude)
+
+
+def _claude_store(repo_root: Path | str, transcripts_dir, env) -> str | None:
+    """The directory holding this repo's Claude Code transcripts, when it holds one."""
+    d = Path(transcripts_dir or env.get(TRANSCRIPTS_ENV) or _harness_transcript_dir(repo_root))
+    return str(d) if d.is_dir() and _newest_transcript(d) is not None else None
+
+
+def claude_tokens(repo_root: Path | str, transcripts_dir: Path | str | None = None,
+                  env=None) -> dict:
+    """Claude Code's reader: the CURRENT session's reading, from its transcript and from the
+    transcript of every subagent it ran. `env` is where `TRANSCRIPTS_ENV` is read from, the
+    process environment by default.
+
+    The harness records usage per message; the most recently modified session file is the one
+    running this call, and its subagents' files sit beside it (`SUBAGENTS_DIR`). Each message is
+    counted ONCE (`_aggregate`). The reading carries each component - input, output, cache
+    write at 5 minutes and at 1 hour, cache read - over both, and split into `main` and
+    `subagents`. `tokens` is input + output + cache write; `priced` weighs every component,
+    cache reads included, from `TOKEN_WEIGHTS` (D0390). A session whose subagents directory is
+    absent or reshaped reads the main thread alone, `subagents` None, and its basis says so.
+    A reading that gives a figure, under a `repo_root` holding `sdlc-studio/`, leaves its memo
+    at `METER_MEMO_REL` there, and the next parses only the bytes appended since
+    (`_file_records`).
+
+    Returns {"tokens", "priced", "components", "main", "subagents", "includes_subagents",
+    "source", "model", "basis", "cache_read", ...} on success, {"tokens": None, "reason"} when
+    no reading can be had.
+    """
+    env = os.environ if env is None else env
+    d = transcripts_dir or env.get(TRANSCRIPTS_ENV)
+    if not d:
+        d = _harness_transcript_dir(repo_root)
+    d = Path(d)
+    if not d.is_dir():
+        return {"tokens": None, "reason": f"no harness transcript directory at {d}"}
+    src = _newest_transcript(d)     # a dangling or self-looping link is skipped, not raised
+    if src is None:
+        return {"tokens": None, "reason": f"no session transcript (*.jsonl) in {d}"}
+    memo_path = _memo_path(repo_root)
+    memo = _load_memo(memo_path)
+    try:
+        collected = _collect(src, memo)
+        reading = _aggregate(collected)
+    except _MeterError as exc:
+        return {"tokens": None, "reason": str(exc)}
+    _save_memo(memo_path, memo, collected["memo"])
+    return _reading(reading, src, collected["note"])
+
+
+def agent_transcript_tokens(repo_root: Path | str, agent_id: str,
+                            transcripts_dir: Path | str | None = None, env=None) -> dict:
+    """ONE subagent's reading: its own transcript, `agent-<agent_id>.jsonl` in the CURRENT
+    session's subagents directory (the session `claude_tokens` reads), each message counted once
+    and each component priced from `TOKEN_WEIGHTS` (`_aggregate`).
+
+    Returns {"tokens", "priced", "components", "source"}, or {"priced": None, "reason",
+    "searched"} when no reading can be had: `searched` is the directory looked in, and `reason`
+    names the agent id and that directory. An id that is not a plain name (letters, digits, `_`
+    and `-`) names no transcript, so no path is built from it."""
+    env = os.environ if env is None else env
+    d = Path(transcripts_dir or env.get(TRANSCRIPTS_ENV) or _harness_transcript_dir(repo_root))
+    main = _newest_transcript(d) if d.is_dir() else None
+    if main is None:
+        return {"priced": None, "searched": str(d),
+                "reason": f"no session transcript (*.jsonl) in {d}, so agent {agent_id!r} has "
+                          f"no subagents directory to be read from"}
+    folder = main.parent / main.stem / SUBAGENTS_DIR
+    plain = bool(re.fullmatch(r"[A-Za-z0-9_-]+", agent_id or ""))
+    path = folder / f"agent-{agent_id}.jsonl" if plain else None
+    if path is None or not path.is_file():
+        return {"priced": None, "searched": str(folder),
+                "reason": f"agent {agent_id!r} has no transcript agent-{agent_id}.jsonl in "
+                          f"{folder}"}
+    records: list = []
+    try:
+        _file_records(path, "subagents", records)
+        agg = _aggregate({"source": path, "records": records, "files": 1, "note": None})
+    except _MeterError as exc:
+        return {"priced": None, "searched": str(folder),
+                "reason": f"agent {agent_id!r}'s transcript in {folder} gives no reading: {exc}"}
+    return {"tokens": agg["tokens"], "priced": agg["priced"],
+            "components": dict(agg["components"]), BY_MODEL: agg[BY_MODEL],
+            "source": str(path)}
+
+
+def _reading(agg: dict, src: Path, note: str | None) -> dict:
+    """An `_aggregate` result as the meter reports it: its model and its basis sentence."""
+    models = agg.pop("models")
+    # One model reports as itself; more than one reports as SESSION_MODEL_MIXED, never one
+    # picked from the set, so a sprint run across two models is booked to neither's rate rather
+    # than the wrong one's. A subagent's model counts: its spend is in the reading.
+    model = (next(iter(models)) if len(models) == 1 else
+             SESSION_MODEL_MIXED if models else None)
+    # Both sentences say what `tokens` is and what the priced figure adds: the cache reads that
+    # `tokens` leaves out are most of a run's bill, and only the priced figure carries them.
+    counted = ("tokens is input + output + cache write, cache reads excluded, and the priced "
+               "figure weighs every component, cache reads included, in input-equivalent tokens")
+    if note is None:
+        basis = (f"current-session transcript usage, once per message, over the main thread and "
+                 f"{agg['subagent_files']} subagent transcript(s): {counted}")
+    else:
+        basis = (f"current-session transcript usage, once per message, MAIN THREAD only: "
+                 f"{note}, so a subagent the session ran is not in this reading and it is a "
+                 f"LOWER BOUND on what the session cost; {counted}")
+    return {**agg, METER: METER_BASIS, "source": str(src), "model": model, "basis": basis,
+            CACHE_READ: agg["components"]["cache_read"]}
+
+
+def _priced_fields(cap: dict) -> dict:
+    """The fields a stamp carries from a priced reading: from a Claude reading on `METER_BASIS`,
+    its price, components and basis mark; from another harness's reading that prices every
+    component, its price and components, and no `METER` mark, which names Claude's transcript
+    counting. None from a reading lacking them (a Claude reader stubbed in a test, or another
+    harness's unpriced one), whose stamp is then read as a legacy one."""
+    comps = cap.get("components")
+    if not isinstance(comps, dict):
+        return {}
+    if harness_of(cap) != CLAUDE:
+        if not (_count(cap.get("priced"))
+                and all(_count(comps.get(c)) for c in TOKEN_COMPONENTS)):
+            return {}
+        return {"priced": cap["priced"], "components": dict(comps),
+                "subagents": bool(cap.get("includes_subagents")), **_split_fields(cap)}
+    if cap.get(METER) != METER_BASIS:
+        return {}
+    return {"priced": cap.get("priced"), "components": dict(comps),
+            "subagents": bool(cap.get("includes_subagents")), METER: METER_BASIS,
+            **_split_fields(cap)}
+
+
+def _count(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _split_fields(cap: dict) -> dict:
+    """What a stamp carries for the dollar figure: the reading's components per model
+    (`BY_MODEL`) and its `PREMIUM_REQUESTS`, each only when the reading states it. A reading
+    naming one model and no split is that model's whole; one naming `SESSION_MODEL_MIXED` with no
+    split carries none, so it is never priced at one model's rate."""
+    out: dict = {}
+    split = cap.get(BY_MODEL)
+    if isinstance(split, dict) and all(
+            isinstance(v, dict) and all(_count(v.get(c)) for c in TOKEN_COMPONENTS)
+            for v in split.values()):
+        out[BY_MODEL] = {str(m): {c: int(v[c]) for c in TOKEN_COMPONENTS}
+                         for m, v in split.items()}
+    elif cap.get("model") and cap.get("model") != SESSION_MODEL_MIXED:
+        out[BY_MODEL] = {str(cap["model"]): {c: int(cap["components"][c])
+                                             for c in TOKEN_COMPONENTS}}
+    if _count(cap.get(PREMIUM_REQUESTS)):
+        out[PREMIUM_REQUESTS] = cap[PREMIUM_REQUESTS]
+    return out
+
+
+def _reach_fields(cap: dict) -> dict:
+    """What a stamp carries of a reading another harness than Claude took: whether delegated
+    agents' spend is in it, and the sentence its reader gave for what it counted, so a total
+    formed from the stamps later states that reader's basis rather than Claude's. Nothing from a
+    Claude reading, whose stamp says it through `_priced_fields` and reads as it always did."""
+    if harness_of(cap) == CLAUDE:
+        return {}
+    return {"subagents": bool(cap.get("includes_subagents")), "basis": cap.get("basis")}
+
+
+def rederive(source: str, ats: list) -> dict:
+    """`{at: row}`: the reading of the transcript `source`, and of its subagents, up to each of
+    `ats`, under `METER_BASIS` - one pass over the files for every time asked.
+
+    Each row is a `REDERIVED` stamp whose `REDERIVES` is that time, or one with `tokens` None
+    and the reason no reading could be had: the transcript is gone, a record cannot be placed in
+    time, or it no longer holds any record up to that time. Never raises."""
+    base = {"kind": REDERIVED, "source": source, METER: METER_BASIS}
+    rows: dict = {}
+    path = Path(str(source))
+    try:
+        if not path.is_file():
+            raise _MeterError(f"the transcript {source} it was read from cannot be opened")
+        collected = _collect(path)
+    except _MeterError as exc:
+        return {at: {**base, REDERIVES: at, "tokens": None, "reason": str(exc)} for at in ats}
+    for at in ats:
+        until = sdlc_md.parse_iso8601(at) if at else None
+        try:
+            if until is None:
+                raise _MeterError("the stamp records no time to read the transcript up to")
+            got = _reading(_aggregate(collected, until), path, collected["note"])
+        except _MeterError as exc:
+            rows[at] = {**base, REDERIVES: at, "tokens": None, "reason": str(exc)}
+            continue
+        rows[at] = {**base, REDERIVES: at, "tokens": got["tokens"], **_priced_fields(got)}
+    return rows
+
+
+def _session_rows(state: dict, source: str) -> list[dict]:
+    """Every reading `state` holds of Claude's meter `source`: its stamps and its legacy
+    baseline. Only a Claude transcript is re-derived, so no other harness's reading is here."""
+    rows = [s for s in state.get(TOKEN_STAMPS) or []
+            if isinstance(s, dict) and str(s.get("source") or "") == source
+            and harness_of(s) == CLAUDE]
+    legacy = state.get(TOKEN_BASELINE)
+    if (isinstance(legacy, dict) and str(legacy.get("source") or "") == source
+            and harness_of(legacy) == CLAUDE):
+        rows.append(legacy)
+    return rows
+
+
+def _rederivations(state: dict, stamp: dict | None) -> list[dict]:
+    """The `REDERIVED` rows a new stamp on `METER_BASIS` owes: one per time at which any of the
+    run's sessions, the new stamp's own included, holds a reading on an earlier basis (a stamp,
+    or the legacy baseline) and no re-derivation of it yet, each carrying the new stamp's `at`.
+    Taken when the first current-basis reading lands, while the transcripts still hold the
+    records."""
+    if not stamp or stamp.get(METER) != METER_BASIS:
+        return []
+    state = state or {}
+    owed: list[dict] = []
+    sources = [str(s.get("source")) for s in state.get(TOKEN_STAMPS) or []
+               if isinstance(s, dict) and s.get("source")]
+    for source in dict.fromkeys([*sources, str(stamp.get("source") or "")]):
+        rows = _session_rows(state, source)
+        done = {r.get(REDERIVES) for r in rows if r.get("kind") == REDERIVED}
+        ats = list(dict.fromkeys(
+            r.get("at") for r in rows
+            if r.get(METER) != METER_BASIS and isinstance(r.get("tokens"), int)
+            and r.get("at") and r.get("at") not in done))
+        if ats:
+            owed += [{**row, "at": stamp.get("at")} for row in rederive(source, ats).values()]
+    return owed
+
+
+def _append_stamp(state: dict, stamp: dict, owed: list[dict]) -> None:
+    """Append `stamp` to `state`'s stamps, after the `owed` re-derivations not already there."""
+    rows = list(state.get(TOKEN_STAMPS) or [])
+    have = {(str(r.get("source")), r.get(REDERIVES)) for r in rows
+            if isinstance(r, dict) and r.get("kind") == REDERIVED}
+    rows += [r for r in owed if (str(r.get("source")), r.get(REDERIVES)) not in have]
+    rows.append(stamp)
+    state[TOKEN_STAMPS] = rows
+
+
+def _session_baseline(repo_root: Path | str) -> dict | None:
+    """The token meter reading to stamp on a run being minted, or None.
+
+    `{"tokens": N, "source": <transcript path>, "at": <iso>}`, with the priced fields and the
+    `METER` basis when the reading carries them. The SOURCE is half the record: the delta is
+    only meaningful against the same session file, so a close that happens in a later session
+    can tell that this baseline is not its own rather than subtracting a number from an
+    unrelated meter.
+
+    None whenever the meter cannot be read - including a session whose transcript carries no
+    usage yet, whose true baseline is zero. That is a deliberate false negative: the run then
+    reports NOT ATTRIBUTABLE, and losing a measurement is the cheap failure here while
+    publishing a wrong one is the expensive one. Never raises: a plan must not fail because a
+    transcript was unreadable.
+    """
+    try:
+        cap = session_tokens(repo_root)
+    except (ArithmeticError, AttributeError, OSError, TypeError, ValueError):
+        # Backstop, deliberately the whole family: `session_tokens` is meant to return rather
+        # than raise, but "a plan must not fail because a transcript was unreadable" has to hold
+        # even when that contract is broken. A narrower clause here let a TypeError from one
+        # malformed record abort `sprint plan --write` entirely, so no run was minted at all.
+        return None
+    if not cap.get("tokens"):
+        return None
+    return {"tokens": int(cap["tokens"]), "source": cap.get("source"),
+            "at": sdlc_md.now_iso8601(), HARNESS: cap.get(HARNESS),
+            CACHE_READ: cap.get(CACHE_READ), **_priced_fields(cap), **_reach_fields(cap)}
+
+
+def _stamp(repo_root: Path | str, kind: str, transcripts_dir: Path | str | None = None):
+    """One reading of the session meter, or None when it cannot be read.
+
+    Never raises, for `_session_baseline`'s reason: neither a plan nor a report may fail
+    because a transcript was unreadable, and a missing stamp is reported as missing.
+    """
+    try:
+        cap = session_tokens(repo_root, transcripts_dir)
+    except (ArithmeticError, AttributeError, OSError, TypeError, ValueError):
+        return None
+    if not cap.get("tokens"):
+        return None
+    return {"tokens": int(cap["tokens"]), "source": cap.get("source"),
+            "at": sdlc_md.now_iso8601(), "kind": kind, "model": cap.get("model"),
+            HARNESS: cap.get(HARNESS), CACHE_READ: cap.get(CACHE_READ), **_priced_fields(cap),
+            **_reach_fields(cap)}
+
+
+def stamp_tokens(repo_root: Path | str, kind: str,
+                 transcripts_dir: Path | str | None = None) -> dict | None:
+    """APPEND a meter reading to the open run's stamp list. Returns the stamp, or None.
+
+    Appends - never overwrites. Rewriting one baseline at report time would make the delta
+    zero and the run report no cost at all, while a check that merely asserts a stamp exists
+    still passed. The earlier stamps are what the later ones are measured against, so losing
+    one loses a session's whole spend. Each reading the run holds on an earlier counting basis,
+    in any session, is re-derived beside it (`_rederivations`), and is itself left as it was.
+    """
+    stamp = _stamp(repo_root, kind, transcripts_dir)
+    if stamp is None:
+        return None
+    owed = _rederivations(read(repo_root), stamp)
+
+    def apply(state: dict) -> dict:
+        state = state or _blank()
+        _append_stamp(state, stamp, owed)
+        return state
+
+    _mutate(repo_root, apply)
+    return stamp
+
+
+#: The session's spend by role, as `sprint cost --anatomy` reads it at the close, recorded on the
+#: close's own reading (`stamp_cost_roles`). The report states it from here and never from the
+#: live transcript, which grows after the close, so a page filed at the close re-derives to the
+#: same table at sign.
+COST_ROLES = "cost_roles"
+_ROLE_KEYS = ("role", "agents", "calls", "priced", "share", "split", "first_context",
+              "avg_context")
+
+
+def _cost_roles(repo_root: Path | str, transcripts_dir, source) -> dict:
+    """The current session's anatomy (`cost_anatomy.anatomy`), kept to the cells the report
+    states: `{"source", "subagent_files", "roles", "total"}`, or `{"reason"}` when it cannot be
+    had or reads a session other than `source`, the one the meter just read. Never raises: a
+    closing reading is not lost because the anatomy could not be taken."""
+    try:
+        from lib import cost_anatomy  # noqa: PLC0415 - it imports this module
+        got = cost_anatomy.anatomy(repo_root, transcripts_dir)
+    except Exception as exc:  # noqa: BLE001 - AnatomyError, or a reader that cannot load
+        return {"reason": f"the spend by role could not be read: {exc}"}
+    name = Path(str(got.get("source"))).name
+    if not source or name != Path(str(source)).name:
+        return {"reason": f"the session the anatomy read, {name}, is not the one this reading's "
+                          f"meter read, so its spend by role is not this run's"}
+    t = got.get("total") or {}
+    return {"source": Path(name).stem, "subagent_files": got.get("subagent_files"),
+            "roles": [{k: r.get(k) for k in _ROLE_KEYS} for r in got.get("roles") or []],
+            "total": {k: t.get(k) for k in ("agents", "calls", "priced")}}
+
+
+def stamp_cost_roles(repo_root: Path | str,
+                     transcripts_dir: Path | str | None = None) -> dict | None:
+    """Record the current session's spend by role (`_cost_roles`) on the open run's newest
+    reading, the one the close has just stamped, and return it; None when the run holds no
+    reading. A separate call from `stamp_tokens`, whose reading parses only what the last one
+    did not: the anatomy reads the whole session, so only the close pays for it, once."""
+    stamps = (read(repo_root) or {}).get(TOKEN_STAMPS) or []
+    if not stamps or not isinstance(stamps[-1], dict):
+        return None
+    at, source = stamps[-1].get("at"), stamps[-1].get("source")
+    got = _cost_roles(repo_root, transcripts_dir, source)
+
+    def apply(state: dict) -> dict:
+        for s in reversed((state or {}).get(TOKEN_STAMPS) or []):
+            if isinstance(s, dict) and s.get("at") == at and s.get("source") == source:
+                s[COST_ROLES] = got
+                break
+        return state
+
+    _mutate(repo_root, apply)
+    return got
+
+
+#: What a run token total is, said once so every caller inherits the sentence. A reading of the
+#: main thread alone, which every reading before subagent transcripts were read was, and a
+#: session that wrote to the run without a closing stamp contributes nothing, so that figure can
+#: only ever be a floor. Both sentences are the Claude transcript's: a total another harness
+#: metered states its own reader's basis instead (`_total_basis`).
+TOKEN_TOTAL_BASIS = ("the sum of the per-session meter deltas - a LOWER BOUND: the transcript "
+                     "records main-thread usage only, and a session with no closing stamp "
+                     "contributes nothing")
+#: The same, for a total whose every session closed on a reading of the main thread and its
+#: subagents (D0390).
+TOKEN_TOTAL_BASIS_SUBAGENTS = ("the sum of the per-session meter deltas, each reading the main "
+                               "thread and every subagent transcript once per message; a "
+                               "session with no closing stamp contributes nothing")
+
+
+def _one_basis(source: str, rows: list[dict], failed: dict,
+               rebase: bool) -> tuple[list[dict], int, str | None]:
+    """`(rows, rebased, why)`: one session's readings, all on the run's one counting basis.
+
+    In a run holding no reading on `METER_BASIS` (`rebase` False) a session is read as it always
+    was: a page filed from those readings re-derives unchanged. Once the run holds one, in any
+    session, each earlier-basis reading is read through its `REDERIVED` row instead, and
+    `rebased` counts the moments re-derived. One with no re-derivation gives `why`, and no
+    total: the difference of two counting bases is not a spend, and neither is their sum."""
+    if not rebase:
+        return [r for r in rows if r.get("kind") != REDERIVED], 0, None
+    live = [r for r in rows if r.get(METER) == METER_BASIS and r.get("kind") != REDERIVED]
+    legacy = [r for r in rows if r.get(METER) != METER_BASIS]
+    redone = {r.get(REDERIVES): r for r in rows if r.get("kind") == REDERIVED}
+    owed = [r for r in legacy if r.get("at") not in redone]
+    if owed:
+        reasons = sorted({failed.get((source, r.get("at")))
+                          or "no re-derivation of it was recorded" for r in owed})
+        return rows, 0, (
+            f"{len({r.get('at') for r in owed})} reading(s) of {source} were taken on an "
+            f"earlier counting basis and "
+            f"cannot be re-derived under the current one ({'; '.join(reasons)}), and the "
+            f"difference of two counting bases is not a spend")
+    moments = {r.get("at") for r in legacy}
+    return live + [redone[r.get("at")] for r in legacy], len(moments), None
+
+
+def _priced_delta(spans: list[list[dict]]) -> dict:
+    """The priced half of a run total: each component's delta and its price, summed over the
+    covered sessions' `spans`, and whether every one closed on a reading holding its subagents.
+
+    `priced` is None, never 0, with `priced_reason`, when a reading lacks its components: a
+    stamp written before the meter priced them. It is formed from the stamped components, never
+    from `tokens` times a constant."""
+    comps = _zero()
+    by_model: dict[str, dict] = {}
+    premium = None
+    for rows in spans:
+        if not all(isinstance(r.get("components"), dict) for r in rows):
+            n = sum(1 for s in spans for r in s if not isinstance(r.get("components"), dict))
+            return {"priced": None, "components": None, "includes_subagents": False,
+                    BY_MODEL: None, PREMIUM_REQUESTS: None,
+                    "priced_reason": (f"{n} meter reading(s) were written before the meter "
+                                      f"priced each component, so the run's priced cost cannot "
+                                      f"be formed from them; its input + output + cache-write "
+                                      f"total is unchanged")}
+        span = _zero()
+        for c in TOKEN_COMPONENTS:
+            vals = [int(r["components"].get(c) or 0) for r in rows]
+            span[c] = max(0, max(vals) - min(vals))
+            comps[c] += span[c]
+        _split_delta(rows, span, by_model)
+        # Over the readings that carry a count: one taken before the field existed, such as
+        # a legacy baseline folded beside the open stamp, carries none and is left out.
+        asked = [r[PREMIUM_REQUESTS] for r in rows if _count(r.get(PREMIUM_REQUESTS))]
+        if len(asked) >= 2:
+            premium = (premium or 0) + max(asked) - min(asked)
+    return {"priced": price(comps), "components": comps, "priced_reason": None,
+            BY_MODEL: by_model, PREMIUM_REQUESTS: premium,
+            "includes_subagents": bool(spans) and all(
+                bool(max(rows, key=lambda r: r["tokens"]).get("subagents")) for rows in spans)}
+
+
+def _split_delta(rows: list[dict], span: dict, by_model: dict) -> None:
+    """Add one session's per-model delta to `by_model`: each model's component, last reading
+    less first, from the readings' `BY_MODEL` splits, a model a reading's split does not name
+    read as 0 there. A session whose readings do not all carry a split, or whose per-model
+    deltas do not sum to its `span` in every component, books its whole `span` under the one
+    model its readings name, else under `SESSION_MODEL_MIXED`, which no price covers. The second
+    catches a split `_split_fields` synthesised from a name that changed within the span:
+    read per name, it would book the opening reading's whole history as spend under the name
+    that left and the closing reading's whole total under the name that came."""
+    if all(isinstance(r.get(BY_MODEL), dict) for r in rows):
+        delta = {}
+        for m in sorted({m for r in rows for m in r[BY_MODEL]}):
+            vals = {c: [int((r[BY_MODEL].get(m) or {}).get(c) or 0) for r in rows]
+                    for c in TOKEN_COMPONENTS}
+            delta[m] = {c: max(0, max(v) - min(v)) for c, v in vals.items()}
+        if all(sum(d[c] for d in delta.values()) == span[c] for c in TOKEN_COMPONENTS):
+            for m, d in delta.items():
+                got = by_model.setdefault(m, _zero())
+                for c in TOKEN_COMPONENTS:
+                    got[c] += d[c]
+            return
+    named = {r.get("model") for r in rows if r.get("model")}
+    key = named.pop() if len(named) == 1 else SESSION_MODEL_MIXED
+    got = by_model.setdefault(key, _zero())
+    for c in TOKEN_COMPONENTS:
+        got[c] += span[c]
+
+
+def price_table(repo_root: Path | str | None, filed: dict | None = None):
+    """`(table, error)`: the price table a dollar figure is formed from. `filed` is a table a
+    page carried (`table_record`), read back so a re-derivation prices with the prices it was
+    filed with; else the shipped table with the project's `pricing` block over it. `error` is the
+    refusal's text when that table cannot be read, and the table is then None."""
+    try:
+        if isinstance(filed, dict) and isinstance(filed.get("models"), dict):
+            return prices.PriceTable(
+                models={m: prices._entry(dict(e), f"the page's price table, {m}", m)
+                        for m, e in filed["models"].items()},
+                stale_after_days=int(filed["stale_after_days"]),
+                origin="the price table the page was filed with"), None
+        return prices.load(repo_root), None
+    except (prices.PriceTableError, KeyError, TypeError, ValueError) as exc:
+        return None, str(exc)
+
+
+def table_record(table) -> dict:
+    """The price table as a page carries it, every entry whole, so `price_table` reads back
+    the prices the page was formed from."""
+    return {"stale_after_days": table.stale_after_days,
+            "models": {m: {**{c: getattr(p, c) for c in prices.COMPONENTS},
+                           "effective": p.effective.isoformat(), "source": p.source}
+                       for m, p in sorted(table.models.items())}}
+
+
+def usd(by_model: dict | None, table, today=None) -> dict:
+    """The estimated US dollar cost of a per-model split (`BY_MODEL`), each model priced from
+    its own components by `prices.cost`: `{usd, covered, models, unpriced, effective, stale,
+    reason}`. A model the table does not price, `SESSION_MODEL_MIXED` among them, is listed in
+    `unpriced` with its share of the priced tokens and is never summed in as $0; `covered` is the
+    share of the split's priced tokens the dollar figure prices. `usd` is None, with `reason`,
+    when nothing is priced. `stale` is `prices.stale` on `today` (default: today)."""
+    out = {"usd": None, "covered": None, "models": [], "unpriced": [], "reason": None,
+           "effective": None, "stale": None}
+    if table is not None:
+        newest = table.newest_effective
+        out.update(effective=newest.isoformat() if newest else None,
+                   stale=prices.stale(table, today))
+    if not by_model:
+        out["reason"] = "the reading carries no per-model split of its components"
+        return out
+    weighed = {m: price(c) for m, c in by_model.items()}
+    whole = sum(weighed.values())
+    total = 0.0
+    for m in sorted(by_model):
+        if not weighed[m]:
+            continue
+        got = (prices.Cost(None, m, "not priced: the reading spans more than one model and "
+                                    "carries no per-model split")
+               if m == SESSION_MODEL_MIXED or table is None else
+               prices.cost(m or None, by_model[m], table))
+        if got.usd is None:
+            out["unpriced"].append({"model": m or "no model named", "priced": weighed[m],
+                                    "share": weighed[m] / whole if whole else None,
+                                    "reason": got.unpriced})
+        else:
+            total += got.usd
+            out["models"].append({"model": m, "usd": got.usd, "priced": weighed[m]})
+    covered = sum(r["priced"] for r in out["models"])
+    out["covered"] = covered / whole if whole else None
+    if out["models"]:
+        out["usd"] = total
+    else:
+        out["reason"] = ("no model the reading names is in the price table: "
+                         + "; ".join(f"{u['model']} ({u['reason']})" for u in out["unpriced"])
+                         if out["unpriced"] else "the reading holds no priced tokens")
+    return out
+
+
+def rebased_note(total: dict) -> str:
+    """What a reader is told of a run total whose earlier-basis readings were re-derived: how
+    many, and on what rule (`total["rebased"]`); "" when it re-derived none. Said once, so the
+    total's basis and every surface that states the total say the same."""
+    n = int(total.get("rebased") or 0)
+    return (f"{n} reading(s) taken on an earlier counting basis were re-derived from the "
+            f"transcript, up to the moment each was taken, under the current one" if n else "")
+
+
+def _opening(row: dict, opening: set) -> bool:
+    """Is `row` one of its session's OPENING readings: the open stamp, the legacy baseline
+    folded beside it, or the re-derivation of either (`opening` holds their times)?"""
+    if row.get("kind") == REDERIVED:
+        return row.get(REDERIVES) in opening
+    return row.get("kind") in (OPEN_STAMP, TOKEN_BASELINE)
+
+
+def _meters(spans: list[list[dict]]) -> list[dict]:
+    """Each covered session's `harness`, its reader's own `basis` and whether delegated agents'
+    spend is in it (`includes_subagents`), read off its closing reading, once per distinct
+    answer; [] over a run Claude alone metered, whose basis `TOKEN_TOTAL_BASIS` and its sibling
+    state as they always did. A Claude session in a run another harness also metered is named
+    by its transcript's reach, since its stamps carry no sentence of their own."""
+    if all(harness_of(rows[0]) == CLAUDE for rows in spans):
+        return []
+    out: list[dict] = []
+    for rows in spans:
+        close = max(rows, key=lambda r: r["tokens"])
+        sub = bool(close.get("subagents"))
+        basis = (close.get("basis") if harness_of(rows[0]) != CLAUDE else
+                 "Claude transcript usage, " + ("the main thread and every subagent transcript"
+                                                if sub else "the main thread only"))
+        got = {HARNESS: harness_of(rows[0]), "includes_subagents": sub,
+               "basis": basis if isinstance(basis, str) and basis.strip()
+               else "its reader's basis was not recorded with the reading"}
+        if got not in out:
+            out.append(got)
+    return out
+
+
+def _total_basis(includes: bool, rebased: int, meters: list[dict] | None = None) -> str:
+    """The total's basis sentence: Claude's two as they always read, or, over a run another
+    harness metered (`meters`), each reader named with its own basis, and a LOWER BOUND only
+    when a reading leaves delegated agents' spend out."""
+    if meters:
+        read = "; ".join(f"{m[HARNESS]}: {m['basis']}" for m in meters)
+        text = (f"the sum of the per-session meter deltas, each as its harness's reader counted "
+                f"it ({read})" + ("; delegated agents' spend is in every reading" if includes
+                                  else " - a LOWER BOUND: delegated agents' spend is not in "
+                                       "every reading")
+                + "; a session with no closing stamp contributes nothing")
+    else:
+        text = TOKEN_TOTAL_BASIS_SUBAGENTS if includes else TOKEN_TOTAL_BASIS
+    note = rebased_note({"rebased": rebased})
+    return f"{text}; {note}" if note else text
+
+
+def _meter_key(row: dict) -> tuple[str, str]:
+    """The meter a reading was taken from: its harness and its source."""
+    return harness_of(row), str(row.get("source") or "")
+
+
+def run_token_total(state: dict, current: dict | None = None,
+                    current_path: str | None = None) -> dict:
+    """What the run spent, from its stamps: the SUM of the per-session deltas.
+
+    `{"tokens", "priced", "components", "priced_reason", "includes_subagents", "rebased",
+    "sessions", "session_count", "uncovered", "model", "shape", "basis", "reason"}`, and over a
+    measured total `meters` (`_meters`), which is [] unless a harness other than Claude read a
+    covered session. `tokens` is None only
+    when no reading can be had at all, and the `reason` then says why - it is never 0, because a
+    run whose meter could not be read did not cost nothing. `priced` and `components` are the
+    priced delta and each component's delta (`_priced_delta`); `includes_subagents` says every
+    covered session closed on a reading that holds its subagents' spend, so a delegated total
+    supplied for them is already in it. A run Claude alone metered answers by the priced rule
+    (`_priced_delta`); a run another harness metered answers by each session's closing reading's
+    `subagents` flag, which that harness's reader gave (`_reach_fields`).
+
+    Each term is `last - first` WITHIN one transcript, so every subtraction is of two readings
+    of the same meter, and on ONE counting basis (`_one_basis`). That is the rule
+    `retro.run_attributed_tokens` enforces by refusing a cross-session baseline; summing per
+    session keeps it and still reports a run closed across sessions, which is the shape that
+    read `not attributable` before.
+
+    `shape` names which record was read - `stamps` or the LEGACY single `session_token_baseline`
+    - so an older run is reported rather than refused, and the reader can tell which it got. For
+    the legacy shape a `current` reading (a `session_tokens` result) supplies the closing end of
+    the one delta available; without it the baseline alone is reported as the opening reading.
+    An opening reading on an earlier basis is then re-derived from `current_path`, the file
+    `current` was read from, when the caller passes `current` with its source made `portable`
+    (a digest no file is named by). `rebased` counts the readings re-derived (`rebased_note`).
+    """
+    every = [s for s in (state.get(TOKEN_STAMPS) or []) if isinstance(s, dict)]
+    failed = {(str(s.get("source") or ""), s.get(REDERIVES)): s.get("reason") for s in every
+              if s.get("kind") == REDERIVED and not isinstance(s.get("tokens"), int)}
+    # The run is read on ONE basis: the current one as soon as any of its readings, or any
+    # re-derivation, is on it. A re-derivation travels with its session and is stamped with the
+    # reading that caused it, so a subset of sessions, or a window, decides the same way.
+    rebase = any(s.get(METER) == METER_BASIS for s in every)
+    stamps = [s for s in every if s.get("source") and isinstance(s.get("tokens"), int)]
+    if stamps:
+        # A session is ONE harness's one store: two harnesses' readings are never paired, even
+        # under one source string, and a reading naming no harness is Claude's (`harness_of`).
+        by_session: dict[tuple[str, str], list[dict]] = {}
+        for s in stamps:
+            by_session.setdefault(_meter_key(s), []).append(s)
+        # A run OPENED before stamping shipped, and stamped later, records its opening reading
+        # in the legacy baseline and nowhere else. That reading is of the SAME meter as the
+        # session's stamps - `open_run` took it from the same transcript - so it belongs in that
+        # session's readings, and dropping it prices the run at the span between whichever
+        # stamps happen to exist. Folded only into a session the stamps already name: a baseline
+        # from another transcript is a reading of another meter, and their difference is not a
+        # spend.
+        legacy = state.get(TOKEN_BASELINE)
+        folded = (isinstance(legacy, dict) and isinstance(legacy.get("tokens"), int)
+                  and _meter_key(legacy) in by_session)
+        if folded:
+            by_session[_meter_key(legacy)].append({**legacy, "tokens": int(legacy["tokens"]),
+                                                   "source": str(legacy["source"]),
+                                                   "kind": TOKEN_BASELINE})
+        models = sorted({s["model"] for s in stamps if s.get("model")})
+        model = models[0] if len(models) == 1 else (SESSION_MODEL_MIXED if models else None)
+        shape = ("stamps" if not folded else
+                 f"stamps, with the opening reading taken from the legacy {TOKEN_BASELINE} "
+                 f"this run predates the open stamp")
+        total, covered, uncovered, spans, rebased = 0, [], [], [], 0
+        for (harness, src), rows in by_session.items():
+            opening = {r.get("at") for r in rows if r.get("kind") in (OPEN_STAMP, TOKEN_BASELINE)}
+            # The counting bases are the Claude reader's: another harness's session is read as
+            # its stamps stand.
+            rows, redone, why = _one_basis(src, rows, failed, rebase and harness == CLAUDE)
+            src = src if harness == CLAUDE else f"{src} ({harness})"
+            if why:
+                return {"tokens": None, "priced": None, "components": None,
+                        "priced_reason": why, "includes_subagents": False, "rebased": 0,
+                        "sessions": [], "session_count": 0, "uncovered": [], "shape": shape,
+                        "model": model, "basis": TOKEN_TOTAL_BASIS,
+                        "reason": f"not attributable: {why}"}
+            rebased += redone
+            if len(rows) < 2 or all(_opening(r, opening) for r in rows):
+                # ONE reading covers no delta, and nor do the run's opening readings alone: the
+                # plan-time baseline and the open stamp are one moment read twice, and their
+                # difference, 0, is not a spend. Named, never guessed at and never dropped
+                # silently: an unqualified total over a partially stamped run is a partial one.
+                uncovered.append(src)
+                continue
+            total += max(0, max(r["tokens"] for r in rows) - min(r["tokens"] for r in rows))
+            covered.append(src)
+            spans.append(rows)
+        if not covered:
+            # NO session carries a closing reading, so no delta is measurable anywhere. `total` is
+            # still at its 0 initialiser here, and returning it would publish a cost of zero and
+            # a rate of zero per point for the shape EVERY run carries between `open_run`'s
+            # stamp and the next one - which is the outcome AC1's own mutant describes and the
+            # output AC3 forbids by name. Zero tokens and no reading are different facts.
+            why = (f"{len(uncovered)} session(s) carry no closing meter reading - a single "
+                   f"reading, or only the run's opening ones, its open stamp and the baseline "
+                   f"beside it - so no delta can be measured: {', '.join(sorted(uncovered))}")
+            return {"tokens": None, "priced": None, "components": None, "priced_reason": why,
+                    "includes_subagents": False, "rebased": 0, "sessions": [],
+                    "session_count": 0, "uncovered": sorted(uncovered), "shape": shape,
+                    "model": model, "basis": TOKEN_TOTAL_BASIS, "reason": why}
+        priced, meters = _priced_delta(spans), _meters(spans)
+        # Another harness's reader says itself whether delegated agents' spend is in its
+        # reading, and its stamps carry that answer: it is read from them, not from the priced
+        # components, which a stamp carries only from a priced reading (`_priced_fields`).
+        includes = (all(m["includes_subagents"] for m in meters) if meters
+                    else priced["includes_subagents"])
+        return {"tokens": total, **priced, "includes_subagents": includes, "meters": meters,
+                "rebased": rebased, "sessions": sorted(covered),
+                "session_count": len(covered), "uncovered": sorted(uncovered), "shape": shape,
+                "reason": None, "model": model, "basis": _total_basis(includes, rebased, meters)}
+    base = state.get(TOKEN_BASELINE)
+    if isinstance(base, dict) and isinstance(base.get("tokens"), int):
+        shape = f"the legacy single {TOKEN_BASELINE} (one reading, not a stamp list)"
+        if (isinstance(current, dict) and isinstance(current.get("tokens"), int)
+                and current.get("source") == base.get("source")
+                and harness_of(current) == harness_of(base)):
+            rebased = 0
+            if current.get(METER) == METER_BASIS and base.get(METER) != METER_BASIS:
+                # The closing reading is on the current basis and the opening one is not: the
+                # opening one is re-derived, never subtracted across bases. It is read from the
+                # file `current` was read from, the same meter, since a source made portable
+                # names no file, and it keeps the source as the record holds it.
+                src, at = str(base.get("source")), base.get("at")
+                redone = rederive(str(current_path or src), [at])[at]
+                if not isinstance(redone.get("tokens"), int):
+                    why = (f"the opening reading was taken on an earlier counting basis and "
+                           f"cannot be re-derived under the current one ({redone.get('reason')})")
+                    return {"tokens": None, "priced": None, "components": None,
+                            "priced_reason": why, "includes_subagents": False, "rebased": 0,
+                            "sessions": [str(current.get("source") or "")], "session_count": 0,
+                            "uncovered": [], "shape": shape, "model": None,
+                            "basis": TOKEN_TOTAL_BASIS, "reason": f"not attributable: {why}"}
+                base = {**redone, "source": src}
+                rebased = 1
+            ends = [{**base, "tokens": int(base["tokens"])}, {**current, "subagents": bool(
+                current.get("includes_subagents", current.get("subagents")))}]
+            priced, meters = _priced_delta([ends]), _meters([ends])
+            includes = (all(m["includes_subagents"] for m in meters) if meters
+                        else priced["includes_subagents"])
+            return {"tokens": max(0, int(current["tokens"]) - int(base["tokens"])), **priced,
+                    "includes_subagents": includes, "meters": meters,
+                    "rebased": rebased, "sessions": [str(base["source"])], "session_count": 1,
+                    "uncovered": [],
+                    "shape": shape, "model": current.get("model"), "reason": None,
+                    "basis": _total_basis(includes, rebased, meters)}
+        why = (f"only an opening reading of {base['tokens']} is recorded, from "
+               f"{base.get('source')}, and no closing reading of that same meter "
+               f"is available - the difference of two meters is not a spend")
+        return {"tokens": None, "priced": None, "components": None, "priced_reason": why,
+                "includes_subagents": False, "rebased": 0,
+                "sessions": [str(base.get("source") or "")],
+                "session_count": 0, "uncovered": [str(base.get("source") or "")],
+                "shape": shape, "model": None, "basis": TOKEN_TOTAL_BASIS, "reason": why}
+    why = "the run carries no meter stamp and no session token baseline"
+    return {"tokens": None, "priced": None, "components": None, "priced_reason": why,
+            "includes_subagents": False, "rebased": 0, "sessions": [], "session_count": 0,
+            "uncovered": [], "shape": "none", "model": None, "basis": TOKEN_TOTAL_BASIS,
+            "reason": why}
+
+
+def cost_components(total: dict) -> str:
+    """The components of a priced total as a reader meets them, the input + output +
+    cache-write sum first: `input + output + cache write N (input a, output b, ...)`."""
+    comps = total.get("components") or {}
+    return (f"input + output + cache write {_counted(comps):,} ("
+            + ", ".join(f"{COMPONENT_NAMES[c]} {int(comps.get(c) or 0):,} x{TOKEN_WEIGHTS[c]:g}"
+                        for c in TOKEN_COMPONENTS) + ")")
+
+
+#: The commit the run's delivery is measured FROM. Stamped when the run opens, on the run
+#: state, rather than in a loose file nothing owns - the old `sprint-base-ref.txt` was written
+#: once and never rewritten, so it held a sha two weeks older than the run that read it.
+#:
+#: This is what decides whether a finding is a REGRESSION this unit caused or something that
+#: was already true. A base ref a fortnight early folds other people's commits into "this
+#: unit's diff", so unrelated work reads as new and blocks the review - and, worse, a defect
+#: the unit really did introduce can read as pre-existing and be waved through.
+BASE_REF = "base_ref"
+
+
+def _head_sha(repo_root: Path | str) -> str:
+    """HEAD at the moment the run opens, or "" when git cannot answer.
+
+    Empty rather than a guess: a consumer must be able to tell "not recorded" from a sha, and
+    an invented ref would be worse than none.
+    """
+    import subprocess  # noqa: PLC0415 - only this path shells out
+    try:
+        out = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def base_ref(repo_root: Path | str) -> str:
+    """The open run's recorded base ref, or "" when none was recorded.
+
+    A consumer that needs it must REFUSE on "", never fall back to a default or to HEAD: the
+    whole defect was a ref nobody owned being silently believed.
+    """
+    return str((read(repo_root) or {}).get(BASE_REF) or "")
+
+
+
+def unit_run_base_ref(repo_root: Path | str, unit: str) -> str:
+    """The base ref of the run whose APPROVED BATCH names `unit`, open or CLOSED, or "".
+
+    The ref belongs to the unit's run, not to whether that run is still open: the terminal
+    transitions fire at `sprint close --apply-signoff`, after the run is stamped ended, and a
+    reader that took only an open run's ref would refuse every story at its own close. A run
+    whose batch does not name the unit is never read - its ref is about other work.
+    """
+    try:
+        state = read(repo_root) or {}
+    except RunStateError:
+        return ""     # unreadable is reported by the run's own readers; here it is "no run names it"
+    want = sdlc_md.norm_id(unit)
+    batch = [sdlc_md.norm_id(str(u)) for u in (state.get("batch") or [])]
+    if want not in batch:
+        return ""
+    return str(state.get(BASE_REF) or "")
+
+
+def has_state(repo_root: Path | str) -> bool:
+    """Whether a run-state file exists at all - a project that never opened a run has none."""
+    return path(repo_root).exists()
+
+
+def open_run(repo_root: Path | str, batch: list[str] | None = None, goal: str | None = None,
+             plan: str | None = None) -> dict:
+    """Open a run, or re-plan the OPEN one.
+
+    Re-running `sprint plan --write` must not restart the clock: an already-open run keeps
+    its `run_id` and `started_at`, and its batch ACCUMULATES (see the module docstring - a
+    narrowing re-cut must not silently discard work the run was approved to do). A run that
+    has been CLOSED - or judged but left `running`, an inconsistent state - is history: the
+    next open mints a fresh run with a fresh batch, so a handoff can never be re-attributed
+    to the run after it.
+
+    A FRESH run is stamped with the session's token baseline (see TOKEN_BASELINE). A re-plan
+    is not: the baseline belongs to the moment the run started, and moving it forward mid-run
+    would silently discount everything spent before the re-cut.
+
+    A DISJOINT batch against an OPEN run is REFUSED (`DisjointBatchError`), not fused: one
+    project holds one run slot, and a batch sharing no unit with the open run cannot join it
+    without stranding the run's goal verdict. The refusal is raised before any mutation, so the
+    state file is byte-identical afterwards. An overlapping re-plan is unaffected.
+    """
+    def apply(state: dict) -> dict:
+        if _is_spent(state):
+            # ARCHIVE BEFORE BLANKING. This is the last moment the finished run exists: the
+            # next statement replaces it. `close_run` normally archived it already and this
+            # rewrites the same key, but a run judged and left `running` never reached a
+            # close, and without this its record would be destroyed here unrecorded.
+            archive(repo_root, state)
+            # Minted AFTER the archive above, so the run being replaced is already in the
+            # register the new id is checked against.
+            state = {**_blank(), "run_id": _mint_run_id(repo_root, state),
+                     "started_at": sdlc_md.now_iso8601(),
+                     BASE_REF: _head_sha(repo_root),
+                     TOKEN_BASELINE: _session_baseline(repo_root),
+                     # The FIRST stamp, appended by the same read. The legacy baseline is kept
+                     # beside it: every consumer of the old field goes on working, and a run
+                     # opened before the stamp list existed still reports (US0844 AC4).
+                     TOKEN_STAMPS: [s for s in [_stamp(repo_root, OPEN_STAMP)] if s]}
+        elif _disjoint(state, batch):
+            # The run is OPEN (not spent) and this batch shares no unit with it: a second sprint
+            # the one run slot cannot hold. Refused here, ahead of every write - inside the lock,
+            # on the state just read - so nothing is minted, nothing is archived, and the state
+            # file is untouched. An overlapping re-plan falls through and accumulates below.
+            raise DisjointBatchError(
+                state.get("run_id"), state.get("outcome"),
+                len({sdlc_md.norm_id(b) for b in (state.get("batch") or [])}),
+                close_attempts=state.get("close_attempts"), repo_root=repo_root)
+        if batch is not None:
+            merged = _union(state.get("batch"), batch)
+            # A JUDGED batch is FROZEN. The goal verdict was recorded against a specific set of
+            # units, so growing that set afterwards makes the verdict describe work it never
+            # saw - which is the harm BG0188 named, arriving by the overlapping door instead of
+            # the disjoint one. An identical re-plan is still a no-op and still allowed; only a
+            # batch that would CHANGE is refused. Found by an independent seat, which showed the
+            # earlier `_CLOSE_ARTEFACTS` membership had been masking this path rather than
+            # covering it: before, an overlapping re-plan minted a fresh run instead.
+            if state.get("sprint_goal_verdict") and merged != (state.get("batch") or []):
+                added = [b for b in merged if b not in (state.get("batch") or [])]
+                raise DisjointBatchError(
+                    state.get("run_id"), state.get("outcome"),
+                    len({sdlc_md.norm_id(b) for b in (state.get("batch") or [])}),
+                    close_attempts=state.get("close_attempts"), repo_root=repo_root,
+                    detail=(f"this run's Sprint Goal has already been JUDGED, so its batch is "
+                            f"frozen: adding {', '.join(added)} would make that verdict describe "
+                            f"work it never saw. Close the run, then plan these as their own."))
+            state["batch"] = merged
+        if goal is not None:
+            state["goal"] = goal
+        if plan is not None:
+            state["plan"] = plan
+        return state
+
+    return _mutate(repo_root, apply)
+
+
+def update(repo_root: Path | str, **fields) -> dict:
+    """Merge fields into the run state. Unknown keys are kept: this is the extension point,
+    and a silently-dropped field is a lie the next reader inherits. With no run open the
+    fields land on a blank record (no fabricated start time). Locked: see `_mutate`."""
+    if "outcome" in fields:
+        _check_outcome(fields["outcome"])
+
+    def apply(state: dict) -> dict:
+        state = state or _blank()
+        state.update(fields)
+        return state
+
+    return _mutate(repo_root, apply)
+
+
+def drop_from_batch(repo_root: Path | str, unit_id: str, reason: str) -> dict:
+    """Remove a unit from the OPEN run's approved batch and record the change.
+
+    Drop judges THIS BATCH: the unit leaves `batch`, so the done-gate and sign-off lanes - which
+    read `batch` - stop demanding it, while its own status is left untouched. That is the whole
+    distinction from `Deferred`, which judges the WORK: a Deferred unit keeps its place in the
+    batch and still blocks the close. Every drop is recorded in `batch_changes` (action, id,
+    reason, timestamp) so the batch a sprint DELIVERED can always be reconstructed against the
+    batch it was PLANNED with. A drop needs a reason - it is recorded, not silent - and an open
+    run to drop from; it never fabricates one."""
+    if not (reason or "").strip():
+        raise RunStateError("a batch drop needs a reason - it is recorded, not silent")
+    norm = sdlc_md.norm_id(unit_id)
+
+    def apply(state: dict) -> dict:
+        if (state or {}).get("outcome") != RUNNING:
+            raise RunStateError(
+                "no open run to drop from - `sprint batch drop` needs a running sprint")
+        batch = state.get("batch") or []
+        kept = [b for b in batch if sdlc_md.norm_id(b) != norm]
+        if len(kept) == len(batch):
+            raise RunStateError(f"{norm} is not in the open batch - nothing to drop")
+        state["batch"] = kept
+        state["batch_changes"] = list(state.get("batch_changes") or []) + [
+            {"action": "drop", "id": norm, "reason": reason.strip(), "at": sdlc_md.now_iso8601()}]
+        return state
+
+    return _mutate(repo_root, apply)
+
+
+def add_to_batch(repo_root: Path | str, unit_id: str, reason: str = "") -> dict:
+    """Add a unit to the OPEN run's approved batch and record the change.
+
+    The added unit is then held to the same gates as the rest - the done-gate reads `batch`, so
+    appending to it IS subjecting the unit to the gate. Idempotent on the batch (an id already
+    present is not duplicated), but every call is recorded in `batch_changes` so the history stays
+    honest. Needs an open run to add to."""
+    norm = sdlc_md.norm_id(unit_id)
+
+    def apply(state: dict) -> dict:
+        if (state or {}).get("outcome") != RUNNING:
+            raise RunStateError(
+                "no open run to add to - `sprint batch add` needs a running sprint")
+        batch = [sdlc_md.norm_id(b) for b in (state.get("batch") or [])]
+        already = norm in batch
+        if not already:
+            batch.append(norm)
+            _snapshot_added(repo_root, state, norm)
+        state["batch"] = batch
+        entry = {"action": "add", "id": norm, "at": sdlc_md.now_iso8601()}
+        # STORED, not dropped. The flag was accepted and silently discarded, so an operator who
+        # recorded a reason got a ledger entry that did not carry it - a flag that lies is worse
+        # than one that refuses, because nothing tells you it went nowhere.
+        if (reason or "").strip():
+            entry["reason"] = reason.strip()
+        if already:
+            entry["note"] = "already in batch"
+        state["batch_changes"] = list(state.get("batch_changes") or []) + [entry]
+        return state
+
+    return _mutate(repo_root, apply)
+
+
+def appetite_record(*, accepted_units: int, accepted_minutes: float,
+                    standing_units: int, standing_minutes: float) -> dict:
+    """The run's appetite record: the ACCEPTED pair the breaker stops on, AND the STANDING one it
+    was measured against (the sprint capacity), with the overage flagged when the accepted exceeds
+    the standing on either axis. Pure - the plan folds this into its single atomic run-state write,
+    and `record_appetite` writes it directly. Keeps `units`/`minutes` as the accepted pair the
+    existing appetite readers (loop_guard, handoff) already use, so this is additive."""
+    acc_u, acc_m = int(accepted_units or 0), float(accepted_minutes or 0)
+    std_u, std_m = int(standing_units or 0), float(standing_minutes or 0)
+    return {
+        "units": acc_u, "minutes": acc_m,
+        "standing_units": std_u, "standing_minutes": std_m,
+        # over on EITHER axis is an overage: a batch that fits the clock but not the unit
+        # count was still accepted past its standing appetite, and the trace must say so.
+        "over_appetite": acc_u > std_u or acc_m > std_m,
+    }
+
+
+def record_appetite(repo_root: Path | str, *, accepted_units: int, accepted_minutes: float,
+                    standing_units: int, standing_minutes: float) -> dict:
+    """Write the run's appetite record (see `appetite_record`): the accepted appetite and the
+    standing one it was measured against, so the DECISION to accept an over-appetite batch survives
+    the decision itself - the record must never read as though the batch fitted when it was made to
+    fit by raising the ceiling."""
+    return update(repo_root, appetite=appetite_record(
+        accepted_units=accepted_units, accepted_minutes=accepted_minutes,
+        standing_units=standing_units, standing_minutes=standing_minutes))
+
+
+def resize_appetite(repo_root: Path | str, *, units: int | None = None,
+                    minutes: float | None = None, reason: str = "") -> dict:
+    """Resize the ACCEPTED appetite on an open run, keeping the STANDING pair untouched.
+
+    A run that turns out bigger than planned has two honest endings and one dishonest one. It can
+    stop at the planned ceiling, or the ceiling can be raised on the record - and the third, an
+    appetite quietly rewritten so the close reports a run that fitted, is the one this must not
+    allow. So the standing pair the batch was measured against is preserved and `over_appetite` is
+    recomputed against it: raising the accepted number MAKES the overage true rather than hiding it.
+
+    A reason is compulsory. The number alone says a ceiling moved and not why, and the why is the
+    whole content of the decision.
+    """
+    if units is None and minutes is None:
+        raise RunStateError("resize needs --units or --minutes - a resize that changes neither "
+                            "number is not a decision")
+    if not (reason or "").strip():
+        raise RunStateError("resize needs --reason - a ceiling that moved with no stated why is "
+                            "a number nobody can audit at the close")
+
+    def apply(state: dict) -> dict:
+        if (state or {}).get("outcome") != RUNNING:
+            raise RunStateError(
+                "no open run to resize - `sprint appetite resize` needs a running sprint")
+        ap = dict(state.get("appetite") or {})
+        before = {"units": int(ap.get("units") or 0), "minutes": float(ap.get("minutes") or 0)}
+        # The STANDING pair is what the batch was sized against. Where a run never recorded one -
+        # an older run, or a plan that declared no appetite - the pre-resize accepted pair becomes
+        # the standing one, so the first raise is still measured against something real rather
+        # than against zero, which would report every run as over.
+        std_u = int(ap.get("standing_units") or before["units"])
+        std_m = float(ap.get("standing_minutes") or before["minutes"])
+        new = appetite_record(
+            accepted_units=before["units"] if units is None else int(units),
+            accepted_minutes=before["minutes"] if minutes is None else float(minutes),
+            standing_units=std_u, standing_minutes=std_m)
+        state["appetite"] = new
+        state["appetite_changes"] = list(state.get("appetite_changes") or []) + [{
+            "action": "resize", "at": sdlc_md.now_iso8601(), "reason": reason.strip(),
+            "from": before, "to": {"units": new["units"], "minutes": new["minutes"]},
+        }]
+        return state
+
+    return _mutate(repo_root, apply)
+
+
+def appetite_overage(repo_root: Path | str) -> dict | None:
+    """The recorded over-appetite as `{units, minutes}` of `{accepted, standing}`, or None for an
+    ordinary run. None is the signal that DISTINGUISHES an accepted overage from a run that simply
+    fitted - without it the field would mean nothing (US0359 AC3). Only the axes actually over are
+    flagged `over`, so a reader sees WHICH ceiling was raised."""
+    ap = read(repo_root).get("appetite") or {}
+    if not ap.get("over_appetite"):
+        return None
+    acc_u, std_u = int(ap.get("units") or 0), int(ap.get("standing_units") or 0)
+    acc_m, std_m = float(ap.get("minutes") or 0), float(ap.get("standing_minutes") or 0)
+    return {
+        "units": {"accepted": acc_u, "standing": std_u, "over": acc_u > std_u},
+        "minutes": {"accepted": acc_m, "standing": std_m, "over": acc_m > std_m},
+    }
+
+
+#: Units a lane was BRIEFED on and has not returned from. A lane that dies mid-flight leaves
+#: real code in the working tree behind a unit still marked Ready, and a restart cannot tell a
+#: delivered unit from an untouched one - one restarted lane was dispatched onto three units
+#: whose repair was already present, with no signal, and a partial edit reached a commit that
+#: way. The revision row is written BEFORE the work, so it cannot answer this; only a marker
+#: taken at dispatch and cleared at return can.
+IN_FLIGHT = "lanes_in_flight"
+
+
+def record_lane_start(repo_root: Path | str, unit: str) -> dict | None:
+    """Mark a unit as dispatched to a lane. Returns the entry, or None when no run is open."""
+    uid = sdlc_md.norm_id(unit)
+    if not uid or not read(repo_root).get("run_id"):
+        return None
+    entry = {"unit": uid, "started_at": sdlc_md.now_iso8601()}
+
+    def apply(state: dict) -> dict:
+        rows = [r for r in (state.get(IN_FLIGHT) or []) if r.get("unit") != uid]
+        state[IN_FLIGHT] = rows + [entry]
+        return state
+
+    _mutate(repo_root, apply)
+    return entry
+
+
+def record_lane_return(repo_root: Path | str, unit: str) -> bool:
+    """Clear a unit's in-flight marker. True when one was cleared."""
+    uid = sdlc_md.norm_id(unit)
+    found = any(r.get("unit") == uid for r in lanes_in_flight(repo_root))
+
+    def apply(state: dict) -> dict:
+        state[IN_FLIGHT] = [r for r in (state.get(IN_FLIGHT) or []) if r.get("unit") != uid]
+        return state
+
+    if found:
+        _mutate(repo_root, apply)
+    return found
+
+
+def lanes_in_flight(repo_root: Path | str) -> list[dict]:
+    """Units dispatched to a lane that never returned - the tree may already carry their work."""
+    return [r for r in (read(repo_root).get(IN_FLIGHT) or []) if isinstance(r, dict)]
+
+
+def _elapsed_seconds(started_at: str | None, ended_at: str | None) -> int | None:
+    """Seconds between two ISO-8601 stamps, or None when either is absent or unparseable.
+
+    Unparseable is UNMEASURED, never 0 - a stamp the parser cannot read says nothing about how
+    long the round took, and answering 0 would be an invented measurement."""
+    if not started_at or not ended_at:
+        return None
+    a = sdlc_md.parse_iso8601(started_at)
+    b = sdlc_md.parse_iso8601(ended_at)
+    if a is None or b is None:
+        return None
+    delta = int((b - a).total_seconds())
+    return delta if delta >= 0 else None
+
+
+#: How a multi-clause Sprint Goal is split. A goal is one sentence by convention, and its
+#: clauses are what the operator actually wrote as separable commitments. Semicolons and
+#: dashes always separate. Commas separate ONLY when the sentence also carries `, and ` - the
+#: Oxford-list shape an operator uses to enumerate commitments. Without that marker a comma is
+#: ordinary punctuation inside one clause, and splitting on it would shred a single commitment
+#: into three nobody made.
+# A semicolon needs no space before it (`thing; another` is the usual spelling); a dash
+# does, or a hyphenated word would separate two clauses out of one.
+_CLAUSE_HARD = re.compile(r"\s*;\s+|\s-\s+")
+_CLAUSE_LIST = re.compile(r"\s*,\s+(?:and\s+)?")
+_OXFORD = re.compile(r",\s+and\s+")
+
+
+#: An author's OWN clause numbering - `(1)`, `(2)`, ... - which outranks every punctuation
+#: heuristic below it. Two or more, in ascending order, or the text is not numbered.
+_MARKER = re.compile(r"\((\d+)\)\s*")
+
+
+def _numbered_clauses(body: str) -> list[str] | None:
+    """`body` split at its own `(n)` markers, or None when it carries no usable numbering.
+
+    Requires TWO OR MORE markers running in ASCENDING order. One marker is a parenthetical, not
+    a list, and markers out of order are a coincidence of punctuation rather than an enumeration
+    - both fall through to the heuristic, which is what the unnumbered case has always used.
+
+    The marker is STRIPPED from the clause it opens and the PREAMBLE before the first one is
+    DISCARDED. Both follow from what a clause is for: a seat records a verdict against it, and
+    the reader matches on the exact string, so a clause carrying `(1) ` is a key nobody will
+    type. A preamble is framing, and a run cannot meet framing.
+    """
+    hits = list(_MARKER.finditer(body))
+    if len(hits) < 2:
+        return None
+    numbers = [int(h.group(1)) for h in hits]
+    if any(b <= a for a, b in zip(numbers, numbers[1:])):
+        return None
+    bounds = [h.end() for h in hits] + [len(body)]
+    starts = [h.start() for h in hits][1:] + [len(body)]
+    out = [body[bounds[i]:starts[i]].strip(" .;-") for i in range(len(hits))]
+    return [c for c in out if c] or None
+
+
+def goal_clauses(goal: str | None) -> list[str]:
+    """A Sprint Goal as its clauses, in order. One clause for a single-clause goal.
+
+    A goal reached in two parts of three is a real and common outcome, and collapsing it to one
+    word forces the closer to overstate or understate.
+
+    The author's OWN numbering wins where it exists. Before that, this split on every prose
+    comma the moment an Oxford comma appeared anywhere in the text, so a goal whose author had
+    numbered five commitments came back as fifteen fragments - one of them a bare artefact id -
+    and the close's clause panel judged fragments nobody had committed to. Across every round
+    this project had recorded, no seat had ever managed to answer per clause, because the keys
+    are the clause strings and nobody could predict them.
+
+    For a goal carrying no such numbering the heuristic below is UNCHANGED. That is a choice
+    between two available repairs, and the rejected one is recorded because it reads as the more
+    principled: making a bare comma stop being a boundary would be closer to what this docstring
+    promises, but it re-clauses every goal already stored and every close that reads them, for a
+    benefit nothing here can measure. Numbering-wins moved two of the forty-two stored goals.
+    """
+    text = " ".join(str(goal or "").split())
+    if not text:
+        return []
+    head, sep, tail = text.partition(": ")
+    body = tail if sep and len(head) < 80 else text
+    if numbered := _numbered_clauses(body):
+        return numbered
+    splitter = _CLAUSE_LIST if _OXFORD.search(body) else _CLAUSE_HARD
+    parts = [p.strip(" .;-") for p in splitter.split(body) if p and p.strip(" .;-")]
+    return parts if len(parts) > 1 else [text]
+
+
+#: How many words of a goal reach a filename. Long enough to tell two sprints apart at a
+#: glance, short enough that the name stays a name - a 200-character filename is one nothing
+#: displays in full and every tool truncates differently.
+_NAME_SLUG_WORDS = 8
+
+
+def sprint_name(run_id: str, goal: str | None = None) -> str:
+    """A sprint's display name: `sprint-<run id>-<goal slug>`, or the bare id when no goal.
+
+    The RUN ID stays first and canonical. A goal can be reworded - it routinely is, between the
+    plan and the close - and a name that resolved only through its slug would orphan every
+    reference to that sprint the moment it changed. The slug is decoration on a stable id, and
+    `run_id_from_name` reads the id back out of any spelling.
+
+    A run with NO recorded goal is named by its id alone. Inventing a slug for a goal nobody
+    wrote is the same class of error as reporting an unmeasured figure as zero."""
+    rid = str(run_id or "").strip()
+    if not rid:
+        raise ValueError("a sprint name needs a run id - the id is the canonical half")
+    words = " ".join(str(goal or "").split()).split(" ")[:_NAME_SLUG_WORDS]
+    tail = sdlc_md.slug(" ".join(words))
+    return f"sprint-{rid}-{tail}" if tail else f"sprint-{rid}"
+
+
+_RUN_ID_IN_NAME = re.compile(r"(RUN-[0-9A-Za-z]+)", re.I)
+
+
+def run_id_from_name(name: str) -> str | None:
+    """The run id inside a sprint name, whatever the slug says - or None.
+
+    This is what makes a reworded goal harmless: the slug in an old filename may describe a
+    goal nobody uses any more, and the sprint still resolves."""
+    m = _RUN_ID_IN_NAME.search(str(name or ""))
+    return m.group(1).upper() if m else None
+
+
+def record_goal_verdict(repo_root: Path | str, verdict: str, note: str = "",
+                        clauses: list[dict] | None = None) -> dict:
+    """Record the closing review's Sprint Goal verdict beside the goal it judges. Returns the
+    record written.
+
+    It carries no round count: the per-unit rounds live in the verdict ledger
+    (`critic.delivery_rounds`). The run-level round ledger it once read lost its only writer when
+    the sprint-level review verb was retired, so it stamped 0 on every verdict and refused any
+    note that named a count."""
+    record = {"verdict": verdict, "note": note}
+    if clauses:
+        # Per-clause verdicts, recorded BESIDE the single word rather than instead of it: the
+        # one-word verdict is what every existing reader consumes, and a clause list is what
+        # makes `partial` mean something specific rather than "not entirely".
+        record["clauses"] = clauses
+    update(repo_root, sprint_goal_verdict=record)
+    return record
+
+
+def delegated_records(state: dict) -> list[dict]:
+    """Every SUPPLIED delegated total on a run record, in the order they landed.
+
+    Pure over a state dict, because the close already holds one and re-reading the file would
+    let the two answers drift. A malformed entry is skipped rather than raising: these are cost
+    records, and one bad entry must not make the run unreadable to the close that needs the
+    rest. A record whose `tokens` is not a positive number carries no total and is not one.
+    """
+    recs = (state or {}).get(DELEGATED)
+    if not isinstance(recs, list):
+        return []
+    out = []
+    for r in recs:
+        if not isinstance(r, dict):
+            continue
+        t = r.get("tokens")
+        if isinstance(t, bool) or not isinstance(t, int) or t <= 0:
+            continue
+        out.append(r)
+    return out
+
+
+def delegated_total(state: dict) -> int:
+    """The supplied delegated spend on a run, or 0 when none was supplied.
+
+    0 here means NOTHING WAS SUPPLIED, which is not the same fact as no delegation happening -
+    which is exactly why the figure it is added to is published as a lower bound rather than as
+    the run's cost."""
+    return sum(r["tokens"] for r in delegated_records(state))
+
+
+def unit_agent_totals(state: dict) -> dict[str, dict]:
+    """Per unit, the delegated totals tagged to it: `{unit: {"tokens", "minutes", "agents",
+    "timed", "priced", "priced_agents"}}`. `priced` sums the priced cost of the `priced_agents`
+    records read from an agent's transcript, None when none was.
+
+    A unit's own agents' reported spend, never a span on the main-thread meter, which counts the
+    traffic of every unit open beside it. `minutes` sums the `timed` records that carried minutes,
+    None when none did; the page reads it as the unit's minutes whenever `timed` is above 0,
+    naming `timed` of `agents` when fewer agents supplied minutes than were tagged
+    (`sprint_report.AGENT_MINUTES_RULE`; a page filed before the rule read it only when
+    `timed == agents`). A view of `delegated_records` by unit: the records count once, in `delegated_total`, and these sums are
+    never added to the run's total beside them."""
+    out: dict[str, dict] = {}
+    for r in delegated_records(state):
+        uid = r.get("unit")
+        if not isinstance(uid, str) or not uid.strip():
+            continue
+        t = out.setdefault(sdlc_md.norm_id(uid),
+                           {"tokens": 0, "minutes": None, "agents": 0, "timed": 0,
+                            "priced": None, "priced_agents": 0, BY_MODEL: None})
+        t["tokens"] += r["tokens"]
+        t["agents"] += 1
+        p = r.get("priced")
+        if isinstance(p, int) and not isinstance(p, bool) and p >= 0:
+            t["priced"] = (t["priced"] or 0) + p
+            t["priced_agents"] += 1
+            # The record's own split, else its components under no model named, which no
+            # price covers: a record from before the split is never priced at a guessed rate.
+            split = r.get(BY_MODEL) if isinstance(r.get(BY_MODEL), dict) else (
+                {"": r["components"]} if isinstance(r.get("components"), dict) else {})
+            held = t[BY_MODEL] if t[BY_MODEL] is not None else {}
+            for m, comps in split.items():
+                got = held.setdefault(m, _zero())
+                for c in TOKEN_COMPONENTS:
+                    got[c] += int(comps.get(c) or 0)
+            t[BY_MODEL] = held
+        m = r.get("minutes")
+        if isinstance(m, (int, float)) and not isinstance(m, bool) and math.isfinite(m) and m > 0:
+            t["minutes"] = (t["minutes"] or 0) + m
+            t["timed"] += 1
+    return out
+
+
+def _page_filed(state: dict) -> bool:
+    """True when `sprint close` has filed the run's page and no `sprint reopen` has broken it.
+
+    The close leaves the outcome `running` until the sign, so the outcome alone cannot say the
+    page is filed; the run's `report`, the marker `sprint sign` reads, can. A reopen keeps that
+    id on the run and records it as the page it broke, so a run reopened since its page was
+    filed is open again until the next close files a new one.
+
+    A page reopened before it was signed is re-filed by the next close under its own id, so a
+    reopen from `running` takes the id off the run: an id back on it is the re-close's."""
+    report = sdlc_md.norm_id(state.get("report") or "")
+    if not report:
+        return False
+    reopens = [r for r in state.get("reopened") or [] if isinstance(r, dict)]
+    if not reopens or reopens[-1].get("from_outcome") == RUNNING:
+        return True
+    return sdlc_md.norm_id(reopens[-1].get("report") or "") != report
+
+
+def record_delegated_tokens(repo_root: Path | str, tokens, agent: str = "",
+                            note: str = "", unit: str = "", minutes=None,
+                            reading: dict | None = None,
+                            provenance: str = SUPPLIED) -> dict | None:
+    """Record one delegated agent's SUPPLIED token total against the open run.
+
+    Returns the record, or None when no run is open - a spend counted against a run with no
+    identity could not be joined to anything later, so it is not counted at all. A run whose
+    outcome is no longer running is sealed: its page is derived from it, so a late total would
+    move a signed figure. A run whose page the close has filed (`_page_filed`) is closed to a
+    late total in the same way before it is signed. Nothing is recorded into either and one
+    line on stderr says so - a warning, not a refusal.
+
+    A non-positive or non-integer total RAISES rather than being recorded: the whole point of
+    this record is that it is a real figure an agent reported, and a 0 recorded here would be
+    added into a published total as though a delegated agent had cost nothing. `unit` tags the
+    record to the unit the agent worked on and `minutes` is the agent's own reported duration,
+    a positive number when given; `unit_agent_totals` reads them as that unit's actuals.
+
+    `reading` is the agent's own transcript reading (`agent_transcript_tokens`), or one lane run
+    session's (`lanes.run_reading`): its priced cost, its components, its per-model split and its
+    file land on the record beside the total, and `provenance` says whether the total was
+    supplied or read from that transcript. A lane session's reading carries its split where
+    the CLI named its models; one with none, a lane record written before the split among
+    them, is booked under the one model it names, and under none when it names none
+    (`unit_agent_totals` then prices it nowhere). A transcript is read whole, so a
+    later reading of the same file for the same unit REPLACES the earlier record rather than
+    adding to it, which would count the earlier messages twice.
+    """
+    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0:
+        raise ValueError(f"a delegated token total must be a positive integer, got {tokens!r} - "
+                         f"an absent or zero total is not a measurement of a delegated agent")
+    if minutes is not None and (isinstance(minutes, bool) or not isinstance(minutes, (int, float))
+                                or not math.isfinite(minutes) or minutes <= 0):
+        raise ValueError(f"a delegated agent's minutes must be a positive finite number, got "
+                         f"{minutes!r}")
+    state = read(repo_root)
+    if not state.get("run_id"):
+        return None
+    if state.get("outcome") != RUNNING:
+        print(f"WARNING the delegated total of {tokens:,} tokens was not recorded: run "
+              f"{state['run_id']} is sealed (outcome {state.get('outcome')}), so a late total "
+              f"would move its signed page", file=sys.stderr)
+        return None
+    if _page_filed(state):
+        print(f"WARNING the delegated total of {tokens:,} tokens was not recorded: run "
+              f"{state['run_id']} is closed (its page {state.get('report')} is filed), so a "
+              f"late total would move the page before it is signed", file=sys.stderr)
+        return None
+    entry = {"tokens": tokens, "agent": agent, "note": note,
+             "provenance": provenance, "recorded_at": sdlc_md.now_iso8601()}
+    if unit:
+        entry["unit"] = sdlc_md.norm_id(unit)
+    if minutes is not None:
+        entry["minutes"] = float(minutes)
+    if reading:
+        # A lane run session's reading (`lanes.run_reading`) with no split names its session's
+        # one model: its components are booked under that model, so the unit's dollars price
+        # the session at its own rate rather than under no model named.
+        model = reading.get("model")
+        split = reading.get(BY_MODEL) or (
+            {model: dict(reading["components"])}
+            if isinstance(model, str) and model.strip() else None)
+        entry.update(priced=reading["priced"], components=dict(reading["components"]),
+                     transcript=reading["source"], **({BY_MODEL: split} if split else {}))
+
+    def superseded(r: dict) -> bool:
+        return (bool(reading) and r.get("transcript") == entry["transcript"]
+                and r.get("unit") == entry.get("unit"))
+
+    def apply(state: dict) -> dict:
+        state = state or _blank()
+        existing = state.get(DELEGATED)
+        state[DELEGATED] = ([r for r in existing if isinstance(r, dict) and not superseded(r)]
+                            if isinstance(existing, list) else []) + [entry]
+        return state
+
+    _mutate(repo_root, apply)
+    return entry
+
+
+def _check_outcome(outcome: str) -> None:
+    if outcome not in OUTCOMES:
+        raise ValueError(f"unknown run outcome {outcome!r} - expected one of "
+                         f"{', '.join(OUTCOMES)}")
+
+
+def reopen_run(repo_root: Path | str, reason: str) -> dict:
+    """Reopen the closed run so evidence that belongs to it can still be recorded.
+
+    This exists because the close's own refusal named it and it did not exist. The documented
+    two-invocation flow is: close once to produce the sign-off brief, then close again with
+    `--apply-signoff`. But the first invocation SEALS the run, and the sprint-level review the
+    sign-off needs cannot be recorded against a sealed run - the refusal says so and offers
+    "or reopen it", a remedy with no implementation. The sequence the close documents therefore
+    could not be completed.
+
+    Deliberately NOT a general undo:
+
+    * The reason is mandatory and recorded on the state, so a reopen is always attributable.
+      A run that can be silently reopened is a run whose closure means nothing.
+    * The archived record written at close is left ALONE. It is the evidence of what was
+      claimed at that moment, and rewriting history to match a later correction is the
+      failure this whole project is built to refuse.
+    * The outcome and end time are cleared, so nothing reads a reopened run as still closed,
+      and `reopened` records that it happened.
+    """
+    if not (reason or "").strip():
+        raise ValueError("reopen needs a reason - an unattributable reopen makes every close "
+                         "provisional")
+
+    def apply(state: dict) -> dict:
+        state = state or _blank()
+        if not state.get("run_id"):
+            raise ValueError("no run to reopen")
+        # A run the close has filed a page for is closed even though its outcome stays
+        # `running` until the sign: its reopen breaks that page as a sealed run's does.
+        if state.get("outcome") == RUNNING and not _page_filed(state):
+            raise ValueError(f"{state['run_id']} is already open - nothing to reopen")
+        history = list(state.get("reopened") or [])
+        history.append({"at": sdlc_md.now_iso8601(),
+                        # The RUN this record belongs to. The record is archived and read back
+                        # beside others, so one that does not name its own run leaves a reader
+                        # holding a date and a reason with nothing to attach them to.
+                        "run_id": state.get("run_id"),
+                        "from_outcome": state.get("outcome"),
+                        "was_ended_at": state.get("ended_at"),
+                        # WHAT was broken, not just when. The signature is over one report, so
+                        # a re-open record that does not name it leaves a reader unable to say
+                        # which page stopped describing the tree. The signature itself is left
+                        # ALONE for the same reason the archive is: what was signed, and when
+                        # it was broken, must both stay readable afterwards.
+                        "report": state.get("report"),
+                        "reason": reason.strip()})
+        state["reopened"] = history
+        if state.get("outcome") == RUNNING:
+            # Unsigned, so the next close re-files the page in place under the same id: the id
+            # leaves the run until it does, and `sprint sign` has no broken page to sign.
+            state["report"] = None
+        state["outcome"] = RUNNING
+        state["ended_at"] = None
+        return state
+
+    return _mutate(repo_root, apply)
+
+
+def close_run(repo_root: Path | str, outcome: str, handoff: str | None = None) -> dict:
+    """Close the run with its outcome (and the handoff that documents it). Idempotent - a
+    second close re-stamps the outcome rather than raising. Every field an earlier caller
+    added survives, and a run nobody opened closes onto a blank record rather than a
+    fabricated one."""
+    _check_outcome(outcome)
+    if outcome == RUNNING:
+        raise ValueError(f"{RUNNING!r} is not a close outcome - expected one of "
+                         f"{', '.join(CLOSED)}")
+
+    def apply(state: dict) -> dict:
+        state = state or _blank()
+        state["outcome"] = outcome
+        state["ended_at"] = sdlc_md.now_iso8601()
+        if handoff is not None:
+            state["handoff"] = handoff
+        return state
+
+    state = _mutate(repo_root, apply)
+    # The record is final here, so keep it: the next `open_run` overwrites the live file, and
+    # a closed run that only ever existed there is a sprint whose evidence expires.
+    archive(repo_root, state)
+    # A run the close filed as awaiting its signature awaits nothing once it ends, by whichever
+    # route, so its tracked record follows it; a record nobody filed is not created here. A
+    # write that fails leaves the record awaiting, which refuses the next plan and names it:
+    # the safe direction.
+    rid = state.get("run_id")
+    if rid and tracked_path(repo_root, rid).is_file():
+        with contextlib.suppress(RunStateError, OSError):
+            if read_tracked(repo_root, rid).get("outcome") == RUNNING:
+                file_tracked(repo_root, state)
+    return state
+
+
+# --- lean loop: rulings (EP0260) ---
+RULINGS = "rulings"
+
+
+def record_ruling(repo_root: Path | str, did: str | None, by: str, seat: str | None = None,
+                  subject: str | None = None, kind: str = "ruling") -> bool:
+    """Append one ruling to the OPEN run's `rulings` list: who answered a question (`persona`
+    or `operator`), and whether it was a new ruling or a precedent `cited`. False, and nothing
+    written, when no run is open - a ruling made between runs belongs to no run.
+
+    A run whose page the close has filed (`_page_filed`) is closed to a late ruling as it is to
+    a late total: the page's Rulings figure is derived from this list, so counting it
+    would move the page before it is signed. The decision row stands; only the count is
+    withheld, one line on stderr says so, and False is returned. A `sprint reopen` counts again.
+    """
+    if not is_open(repo_root):
+        return False
+    entry = {"id": did, "by": by, "seat": seat, "subject": subject, "kind": kind}
+    filed: list[dict] = []
+
+    def apply(state: dict) -> dict:
+        if state.get("outcome") == RUNNING:
+            if _page_filed(state):
+                filed.append(state)
+            else:
+                state[RULINGS] = [*(state.get(RULINGS) or []), entry]
+        return state
+
+    _mutate(repo_root, apply)
+    if filed:
+        print(f"WARNING {did or 'the ruling'} was not counted against run {filed[0]['run_id']}: "
+              f"it is closed (its page {filed[0].get('report')} is filed), so a late ruling "
+              f"would move the page before it is signed", file=sys.stderr)
+        return False
+    return True
+
+
+# --- lean loop: plan snapshot and close (EP0260) ---
+#: The plan's forecast, written when the plan is approved and never overwritten after:
+#: `{"units": {id: {"planned_points", "forecast_tokens", "forecast_minutes", "added"}},
+#: "rates": {"tokens_per_point": {"value", "source"}, "minutes_per_point": {...}}}`. None means
+#: not measured. A unit that joins later gets its own row marked `added`, so the approved plan's
+#: totals stay what was approved.
+PLAN_SNAPSHOT = "plan_snapshot"
+#: What a one-pass close could not settle, `[{"source": str, "detail": str}]`: each failed chain
+#: step, gate lane, unanswered checklist item and report hold, handed over on the report.
+CLOSE_KNOWN_ISSUES = "close_known_issues"
+
+
+def forecast_row(points, rates: dict, added: bool = False) -> dict:
+    """One unit's forecast: its points times each rate, None where either is not measured."""
+    def times(key: str):
+        rate = ((rates or {}).get(key) or {}).get("value")
+        return None if points is None or rate is None else points * rate
+
+    tokens, minutes = times("tokens_per_point"), times("minutes_per_point")
+    return {"planned_points": points,
+            "forecast_tokens": None if tokens is None else int(round(tokens)),
+            "forecast_minutes": None if minutes is None else round(float(minutes), 1),
+            "added": added}
+
+
+def _unit_points(repo_root: Path | str, unit_id: str):
+    found = sdlc_md.find_by_id(repo_root, unit_id)
+    return sdlc_md.read_points(sdlc_md.read_text_safe(found[0]) or "") if found else None
+
+
+def record_plan_snapshot(repo_root: Path | str, points: dict, rates: dict) -> dict:
+    """Write the forecast for each unit not already in the snapshot; rows written are kept.
+
+    The first write IS the plan. A unit a later re-plan brings in is marked `added`, and the
+    rates stay the ones the plan was approved on."""
+    def apply(state: dict) -> dict:
+        state = state or _blank()
+        snap = state.get(PLAN_SNAPSHOT) or {}
+        first = not snap
+        snap_rates = snap.get("rates") or rates
+        units = dict(snap.get("units") or {})
+        for uid, pts in points.items():
+            units.setdefault(sdlc_md.norm_id(uid), forecast_row(pts, snap_rates, added=not first))
+        state[PLAN_SNAPSHOT] = {"units": units, "rates": snap_rates}
+        return state
+
+    return _mutate(repo_root, apply)
+
+
+def _snapshot_added(repo_root: Path | str, state: dict, unit_id: str) -> None:
+    """Give a unit added to an open run its own forecast row, at the plan's rates. In place."""
+    snap = state.get(PLAN_SNAPSHOT)
+    if not snap or unit_id in (snap.get("units") or {}):
+        return
+    snap["units"] = {**(snap.get("units") or {}),
+                     unit_id: forecast_row(_unit_points(repo_root, unit_id),
+                                           snap.get("rates") or {}, added=True)}
+
+
+def plan_points(repo_root: Path | str) -> dict:
+    """Each snapshot unit's points as planned and as its Points field reads now:
+    `{id: {"planned": int|None, "current": int|None}}`."""
+    snap = read(repo_root).get(PLAN_SNAPSHOT) or {}
+    return {uid: {"planned": row.get("planned_points"), "current": _unit_points(repo_root, uid)}
+            for uid, row in (snap.get("units") or {}).items()}
+
+
+def plan_totals(snapshot: dict) -> dict:
+    """The approved plan's totals - rows marked `added` excluded. A figure any row lacks is
+    None, never a partial sum."""
+    rows = [r for r in ((snapshot or {}).get("units") or {}).values() if not r.get("added")]
+
+    def total(key: str):
+        vals = [r.get(key) for r in rows]
+        return None if any(v is None for v in vals) else sum(vals)
+
+    return {"units": len(rows), "points": total("planned_points"),
+            "tokens": total("forecast_tokens"), "minutes": total("forecast_minutes")}

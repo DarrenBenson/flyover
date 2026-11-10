@@ -1,0 +1,4779 @@
+#!/usr/bin/env python3
+"""SDLC Studio critic-verdict record.
+
+The independent non-author critic judges each unit's diff against the
+AC intent. Its verdict used to be ephemeral, so nothing could confirm the critic
+actually ran. Here it is a committed, append-only record
+(`sdlc-studio/reviews/critic-verdicts.md`), so the conformance gate can require it:
+"the critic ran" becomes a deterministic, auditable signal - the cheap part of
+the deferred Stop-Hook, with no harness dependency.
+
+Each verdict now stamps both the reviewer and the author (the authoring seat /
+delegation id that produced the diff and tests). The conformance gate hard-fails any
+unit whose reviewer id equals its author id, or that has no recorded author - a
+self-review never clears the Done gate. This independence floor holds for generic
+workers too, not only persona-framed ones. Pure stdlib.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import re
+import shlex
+import sys
+from pathlib import Path, PurePosixPath
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import run_state, sdlc_md  # noqa: E402
+
+APPROVE, REJECT = "APPROVE", "REJECT"
+#: The only words a verdict row may carry. Every writer checks this one tuple.
+VERDICTS = (APPROVE, REJECT)
+# Visible grandfather marker for units closed before the independence gate existed
+# (under the prior risk-scaled policy that permitted light-tier self-review). Stamped
+# once by the migration; never produced by the sprint loop. See is_pre_gate.
+PRE_GATE = "pre-gate"
+# Every verdict is a DELIVERY verdict: the post-implementation critic the conformance
+# `critiqued` stage reads. Plan review is retired, and no command records or briefs one; the
+# `plan-review` phase survives only as an internal parameter, so the historical plan ledger
+# stays readable.
+PHASES = ("delivery", "plan-review")
+_FILE = {"delivery": "critic-verdicts.md", "plan-review": "plan-review-verdicts.md"}
+# Delivery header is byte-identical to the original (a freshly created delivery log must not
+# change); the historical plan-review log has its own title and eighth column.
+_TABLE = ("| Unit | Verdict | Reviewer | Author | Date | Brief | Tier | Issues |\n"
+          "| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+#: The review depths. `full` is the adversarial pass - mutations, boundaries, silent-failure
+#: paths, claims verified by execution. `light` is the bounded pass a low-risk unit earns.
+TIERS = ("full", "light")
+#: What an operator's explicit `--tier` records, so their choice is distinguishable from a
+#: derived one. A tier nobody chose and a tier somebody chose are different facts about a
+#: review, and a record that cannot tell them apart cannot be used to judge the derivation.
+EXPLICIT_SUFFIX = " (explicit)"
+#: The band-to-tier table, declared ONCE. `route.estimate` bands every unit trivial / low /
+#: medium / high / extreme; only the bottom two earn the bounded pass. Measured over this
+#: repository's 1,171 stories and bugs the split is 183 light to 988 full, which is what makes
+#: this a gate rather than a config key wearing the appearance of one.
+BAND_TIER = {"trivial": "light", "low": "light",
+             "medium": "full", "high": "full", "extreme": "full"}
+#: An unresolvable band tiers FULL. Unknown risk fails towards the deeper review, because the
+#: cost of a needless full pass is tokens and the cost of a needless light one is a defect.
+UNKNOWN_BAND_TIER = "full"
+#: The sections each tier's brief carries, named by the `--- NAME ---` heading it prints. The
+#: brief renders a section only when its tier lists it here; UNIT DIFF also needs a run naming
+#: the unit and declared Affects. Light drops the files' history and the claim inventory.
+TIER_SECTIONS = {
+    "full": ("VERIFY COMMAND", "UNIT DIFF", "FILE HISTORY", "CLAIM INVENTORY",
+             "STANDING REVIEW PRACTICES"),
+    "light": ("VERIFY COMMAND", "UNIT DIFF", "STANDING REVIEW PRACTICES"),
+}
+#: The tool calls each tier's brief states as its budget. Stated, not enforced: nothing counts a
+#: reviewer's calls yet.
+TIER_TOOL_BUDGET = {"full": 40, "light": 15}
+#: The line cap on the brief's UNIT DIFF per tier, when the project's `review.brief_diff_lines`
+#: sets none. Declared here once; config-defaults.yaml mirrors it and a test holds the two equal.
+BRIEF_DIFF_LINES = {"full": 400, "light": 150}
+#: The historical plan-review table's shape. Its eighth cell named the pre-code artefact a plan
+#: review judged; nothing writes a kind or reads one now, so the cell is kept only because the
+#: file on disk has it.
+_PLAN_TABLE = ("| Unit | Verdict | Reviewer | Author | Date | Brief | Kind | Issues |\n"
+               "| --- | --- | --- | --- | --- | --- | --- | --- |\n")
+_HEADERS = {
+    "delivery": (
+        "# Critic Verdicts\n\n"
+        "> Append-only. The independent non-author critic's verdict per unit.\n"
+        "> APPROVE = ready; REJECT = repair before Done. Latest row per unit wins.\n"
+        "> Reviewer must differ from Author - a self-review never clears the Done gate.\n\n"
+        + _TABLE),
+    "plan-review": (
+        "# Plan-Review Verdicts\n\n"
+        "> Append-only. The independent non-author plan reviewer's verdict per unit -\n"
+        "> the pre-implementation AC-vs-spec check. Latest row per unit wins.\n"
+        "> Reviewer must differ from the plan author - a self-review never clears the gate.\n\n"
+        + _PLAN_TABLE),
+}
+
+
+def _header(phase: str) -> str:
+    return _HEADERS[phase]
+
+
+HEADER = _HEADERS["delivery"]
+#: The seven-column shape both logs shared before either grew its eighth column. Still the
+#: reader for any row written then - and the row is complete, not damaged: it simply predates
+#: the distinction its phase now records.
+_COLS = ("unit", "verdict", "reviewer", "author", "date", "brief", "issues")
+_DELIVERY_COLS = ("unit", "verdict", "reviewer", "author", "date", "brief", "tier", "issues")
+_PLAN_COLS = ("unit", "verdict", "reviewer", "author", "date", "brief", "kind", "issues")
+#: Each phase's own eight-column shape. The two logs diverge because they record different
+#: facts - a delivery verdict has a review DEPTH, a plan review has an ARTEFACT - and forcing
+#: one schema on both would put a meaningless column in each.
+_COLS_BY_PHASE = {"delivery": _DELIVERY_COLS, "plan-review": _PLAN_COLS}
+
+
+
+#: Written beside a fingerprint in the Brief cell by an earlier `record` when the fingerprint
+#: matched no brief the repo could then produce. Nothing writes it now; `_brief_key` still reads
+#: a historical row carrying it as unbriefed.
+UNMATCHED_MARK = "unmatched"
+
+
+_REJOINDER_MARK = "\n\n--- RE-REVIEW (rejoinder) ---"
+
+
+def rejoinder_fingerprint(text: str, phase: str = "delivery") -> str:
+    """The fingerprint a rejoinder brief carries: its BASE brief plus its phase, never the prior
+    verdict quoted beneath. The base is what identifies the seat and the unit's state at this
+    round; the quoted prior is the seat's own earlier words, which the ledger holds as fields
+    and no reader could re-render byte for byte - so a fingerprint over the whole text would be
+    one no re-review could reproduce."""
+    base = text.split(_REJOINDER_MARK, 1)[0]
+    return brief_fingerprint(base + f"\n<rejoinder:{phase}>")
+
+
+def brief_fingerprint(brief_text: str) -> str:
+    """A stable short digest of the brief a seat was given.
+
+    Recorded beside a verdict so a hand-written prompt is DETECTABLE rather than assumed absent.
+    RUN-01KYX375 measured what that distinction is worth: four hand-written prompts returned
+    eight sprawling repo-wide findings, while the same units re-briefed from this tool returned
+    one precise finding each with zero pre-existing noise - and nothing in the record told the
+    two apart.
+
+    Content-addressed and stable, never clock- or random-seeded: a fingerprint that differs
+    between two identical briefs can never be compared, which would make the field decorative.
+
+    The file-history section is left out: it moves when another unit sharing a file lands, so
+    digesting it would change the fingerprint between briefing and recording.
+    """
+    import hashlib  # noqa: PLC0415 - local; only this path needs it
+    import reconcile  # noqa: PLC0415 - sibling; the section's renderer owns its shape
+    normalised = " ".join(reconcile.strip_file_history(brief_text or "").split())
+    if not normalised:
+        return ""
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:12]
+
+def verdicts_path(repo_root: Path | str, phase: str = "delivery") -> Path:
+    return Path(repo_root) / "sdlc-studio" / "reviews" / _FILE[phase]
+
+
+#: A run of backticks that opens or closes a code span. NOT a single backtick: markdown
+#: pairs a run of N with the next run of exactly N, so a ``double`` span's opener is two.
+#: A backslash-escaped backtick is excluded - `\\`` is a literal backtick, needs no partner,
+#: and reading it as a delimiter refused values markdown holds perfectly well.
+_TICK_RUN = re.compile(r"(?<!\\)`+")
+#: An underscore that is not already escaped. The lookbehind is what makes the pass
+#: idempotent, and idempotence is not a nicety here: every value that goes back through this
+#: function - a re-recorded verdict, a closure quoting a finding - was being escaped again,
+#: which is how the repair record came to carry hundreds of doubled escapes.
+_BARE_UNDERSCORE = re.compile(r"(?<!\\)_")
+#: The point straight after a `]` or a `)` where a run of backslashes (often none) meets an
+#: opening bracket. Raw, a finding quoting a regex (`[A-Z][A-Z]`) or a reversed link
+#: (`(state)[2]`) is read as a link, and markdownlint refuses the ledger (MD052, MD011) at the
+#: next commit that touches it. One backslash is added there, so the bracket is escaped and a
+#: run the author typed (`[a-z]\[q]`) stays one longer than written, never confused with an
+#: escape the writer added. A lone `[new]` tag is no such link, so it is written as typed.
+_LINKING_BRACKET = re.compile(r"(?<=[\])])(?=\\*\[)")
+#: The escapes `_escape_outside_spans` writes, which the ledger's readers undo: `\\_`, and the
+#: one backslash added at a `_LINKING_BRACKET` point.
+_MD_ESCAPED = re.compile(r"\\_|(?<=[\])])\\(?=\\*\[)")
+
+
+def _scan_ticks(text: str) -> tuple[list[tuple[int, int]], list[int]]:
+    """The code spans in `text`, and the offset of every backtick run nothing closes.
+
+    Markdown pairs a run of N backticks with the NEXT run of exactly N. The single-backtick
+    pattern this replaces could not see that: it read the two backticks opening a ``double``
+    span as a complete empty span, so the span's own contents were escaped as prose and the
+    identifier came out with backslashes in it - the very corruption this function exists to
+    prevent, in the one shape nobody had written a case for.
+    """
+    runs = [(m.start(), m.end()) for m in _TICK_RUN.finditer(text)]
+    spans: list[tuple[int, int]] = []
+    paired: set[int] = set()
+    i = 0
+    while i < len(runs):
+        width = runs[i][1] - runs[i][0]
+        close = next((j for j in range(i + 1, len(runs))
+                      if runs[j][1] - runs[j][0] == width), None)
+        if close is None:
+            i += 1
+            continue
+        spans.append((runs[i][0], runs[close][1]))
+        paired.update({i, close})
+        i = close + 1
+    return spans, [runs[i][0] for i in range(len(runs)) if i not in paired]
+
+
+def _outside_spans(text: str, fn) -> str:
+    """`text` with `fn` applied to every stretch outside a code span, each interior kept."""
+    out, last = [], 0
+    for start, end in _scan_ticks(text)[0]:
+        out.append(fn(text[last:start]))
+        out.append(text[start:end])
+        last = end
+    out.append(fn(text[last:]))
+    return "".join(out)
+
+
+def _escape_outside_spans(text: str) -> str:
+    """Escape underscores, and a bracket that would open a link, leaving every code span alone."""
+    return _outside_spans(text, lambda t: _LINKING_BRACKET.sub(
+        r"\\", _BARE_UNDERSCORE.sub(r"\\_", t)))
+
+
+def _unescape(text: str) -> str:
+    """The escapes `_clean` writes, undone: `\\_`, and the backslash added before a linking `[`."""
+    return _MD_ESCAPED.sub(lambda m: m.group(0)[1:], text)
+
+
+def _unescape_outside_spans(text: str) -> str:
+    """The inverse of `_escape_outside_spans`: a ledger cell's text as its author wrote it."""
+    return _outside_spans(text, _unescape)
+
+
+#: How much of the value to quote either side of the stray backtick. A LEADING excerpt was
+#: useless: 71% of this repo's review-ledger findings cells run past 120 characters, and in
+#: every corpus row this rule refuses, the first 120 characters hold no backtick at all - so
+#: the message quoted text that could not be the fault and named a remedy for it.
+_EXCERPT_RADIUS = 60
+
+
+def _excerpt(text: str, at: int) -> str:
+    """`text` around offset `at`, elided at both ends, so the quote holds the stray."""
+    start, end = max(0, at - _EXCERPT_RADIUS), min(len(text), at + _EXCERPT_RADIUS + 1)
+    return ("..." if start else "") + text[start:end] + ("..." if end < len(text) else "")
+
+
+def _edge_whitespace_span(text: str) -> tuple[int, str, str] | None:
+    """The first code span markdownlint's MD038 refuses: its offset, the span, and the edge.
+
+    Every span is judged, not only the first. The interior is read after CommonMark's padding
+    rule - one space removed from each end when both ends are a space and the interior is not
+    all spaces - because that is what renders, and what MD038 measures. Whatever remains that
+    begins or ends in whitespace is refused, a tab included. An all-space interior is admitted:
+    MD038 passes it and CommonMark keeps its spaces, so it records what it says.
+
+    Padding the span is no remedy, which is why this is a refusal. One space each side is
+    stripped on render, so the edge space is lost; two or more each side still raises MD038.
+    """
+    for start, end in _scan_ticks(text)[0]:
+        width = _TICK_RUN.match(text, start).end() - start
+        interior = text[start + width:end - width]
+        if not interior.strip(" "):
+            continue
+        if interior.startswith(" ") and interior.endswith(" "):
+            interior = interior[1:-1]
+        first, last = interior[:1].isspace(), interior[-1:].isspace()
+        if first or last:
+            edge = ("leading and trailing edges" if first and last
+                    else "leading edge" if first else "trailing edge")
+            return start, text[start:end], edge
+    return None
+
+
+def _clean(value: str) -> str:
+    """A free-text value as a ledger cell: escaped for its CONTEXT, and refused if unwritable.
+
+    Four rules, and each was learned from a blocked commit:
+
+    The underscore escape applies OUTSIDE code spans only. Markdown does not process a
+    backslash inside a span, so escaping there wrote the backslash into the record - every
+    identifier a reviewer named came out wrong in the three files this project uses as its
+    account of what review found.
+
+    The pipe and newline substitutions apply EVERYWHERE, span interiors included. These rows
+    are built by f-string rather than by a row joiner, so this function is the only thing
+    standing between a reviewer's piped shell command and a forged column.
+
+    An ODD number of backticks is REFUSED rather than balanced. An unbalanced span turns the
+    rest of the row into code and markdownlint then refuses the whole file, so the value cannot
+    be written as it stands - but rewriting a reviewer's words to make them fit is a worse
+    answer than telling the author while they can still edit. Refusing also catches the caller
+    that TRUNCATED a quotation mid-span, which balancing would have silently papered over.
+
+    A code span whose rendered interior begins or ends in whitespace is REFUSED for the same
+    reason: markdownlint's MD038 refuses it, and the next commit touching the ledger is blocked
+    by a row its committer did not write. Every writer that cleans through here inherits it.
+    """
+    text = str(value or "")
+    # Parity over the DELIMITER backticks only. A backslash-escaped backtick is a literal
+    # one and never opened a span, so counting it refused values markdown writes correctly.
+    # Odd parity always leaves a run unpaired, which is the one this message points at.
+    unclosed = _scan_ticks(text)[1]
+    if unclosed and sum(len(m.group(0)) for m in _TICK_RUN.finditer(text)) % 2:
+        at = unclosed[0]
+        raise ValueError(
+            f"refused: the value carries an odd number of backticks, so its last code span "
+            f"never closes and markdownlint refuses the file it is written into. Close the "
+            f"span or drop the stray backtick - it is not balanced here, because rewriting "
+            f"what a reviewer wrote is worse than refusing it. The stray is at character "
+            f"{at} of {len(text)}, here: {_excerpt(text, at)!r}")
+    text = text.replace("|", "/").replace("\n", " ").strip()
+    # Judged AFTER the newline substitution: a span broken across lines renders the break as a
+    # space, so its edge is only visible once the row's own shape has been applied.
+    if (found := _edge_whitespace_span(text)) is not None:
+        at, span, edge = found
+        raise ValueError(
+            f"refused: the code span {span!r} carries whitespace on its {edge}, and "
+            f"markdownlint (MD038) refuses the file it is written into. Padding cannot carry "
+            f"that space either: CommonMark strips one space from each side of a padded span, "
+            f"so no code span holds a value whose first or last character is whitespace. "
+            f"Quote the value without the space and say in prose that it has one, or move the "
+            f"literal out of the span. The span starts at character {at} of {len(text)}.")
+    return _escape_outside_spans(text)
+
+
+def record_verdict(repo_root: Path | str, unit: str, verdict: str,
+                   reviewer: str = "independent-critic", author: str = "",
+                   issues: str = "", phase: str = "delivery", brief: str = "",
+                   tier: str | None = None, tier_explicit: bool = False,
+                   ruling: str | None = None) -> Path:
+    """Append a critic verdict for a unit (creating the table if absent).
+
+    `author` is the authoring seat / delegation instance id that produced the diff
+    and tests. It is recorded alongside the reviewer so the conformance gate can prove
+    reviewer != author - independence you cannot verify is independence you do not have.
+    `phase` is internal and defaults to `delivery`, the only phase any command records.
+
+    A DELIVERY verdict is held to the review rounds here, so every writer is: `round_refusal`
+    refuses it with nothing written, and a REJECT at the cap carries the unit (`carry_at_cap`).
+    A carry that fails raises `CarryFailed`, whose message says the REJECT row WAS written.
+    """
+    path, _round, bug = _record(repo_root, unit, verdict, reviewer, author, issues, phase,
+                                brief, tier, tier_explicit, ruling)
+    if bug:
+        print(carried_notice(unit, bug), file=sys.stderr)
+    return path
+
+
+def _record(repo_root, unit, verdict, reviewer, author, issues="", phase="delivery", brief="",
+            tier=None, tier_explicit=False, ruling=None) -> tuple[Path, int | None, str | None]:
+    """Write the verdict, then carry the unit if it is a REJECT at the cap: the ledger path,
+    the row's round in its delivery (None off the delivery phase) and the carried bug's id
+    (None when nothing was carried)."""
+    path, _row = _write_verdict(repo_root, unit, verdict, reviewer, author, issues, phase,
+                                brief, tier, tier_explicit, ruling)
+    if phase != "delivery":
+        return path, None, None
+    rounds = delivery_rounds(repo_root, unit)
+    return path, len(rounds), _carry_if_capped(repo_root, unit, verdict, path, rounds)
+
+
+def _write_verdict(repo_root, unit, verdict, reviewer, author, issues, phase, brief,
+                   tier, tier_explicit, ruling=None) -> tuple[Path, str]:
+    """Check and write one verdict row, returning the ledger path AND the row it wrote. A
+    delivery verdict's round is checked under the ledger lock, so two writers cannot both take
+    the last round."""
+    if str(verdict or "").upper() not in VERDICTS:
+        raise ValueError(f"{verdict!r} is not a verdict - expected one of {', '.join(VERDICTS)}")
+    if phase not in PHASES:
+        raise ValueError(f"unknown critic phase {phase!r} - expected one of {PHASES}")
+    path = verdicts_path(repo_root, phase)
+    # BOTH ids floored to `-`, not just the author. The reviewer had no floor, which is what let
+    # an empty value reach the ledger; `is_independent` then read `"" != "alice"` as True and the
+    # row passed as independently reviewed. Flooring here means the empty case is visible in the
+    # log as well as refused by the predicate - a reader can see the cell is blank rather than
+    # meeting a row that merely looks unremarkable.
+    if phase == "delivery" and tier is not None and tier not in TIERS:
+        raise ValueError(f"unknown review tier {tier!r} - expected one of {', '.join(TIERS)}")
+    # ABSENT is `-`, not a defaulted `full`. A verdict recorded without a tier genuinely cannot
+    # say at what depth it was taken, and reading absence as `full` would let every historical
+    # row claim a depth nobody recorded - the exact over-claim the Brief column was added to
+    # stop. The historical plan ledger's eighth cell (its Kind) takes `-` the same way.
+    recorded = (f"{tier}{EXPLICIT_SUFFIX if tier_explicit else ''}"
+                if tier and phase == "delivery" else "-")
+    extra_cell = f"{_clean(recorded)} | "
+    row = (f"| {sdlc_md.norm_id(unit)} | {verdict.upper()} | {_clean(reviewer) or '-'} | "
+           f"{_clean(author) or '-'} | "
+           f"{sdlc_md.now_date()} | {_clean(brief) or '-'} | {extra_cell}"
+           f"{_clean(issues) or '-'} |\n")
+    if phase == "delivery":
+        _mark_review_base(repo_root, unit)
+    with _ledger_lock(path):
+        past_cap = (phase == "delivery" and bool(ruling)
+                    and len(delivery_rounds(repo_root, unit)) >= review_ceiling(repo_root))
+        if phase == "delivery" and (why := round_refusal(repo_root, unit, reviewer, verdict,
+                                                         ruling)):
+            raise ValueError(why)
+        if not path.exists():
+            sdlc_md.atomic_write(path, _header(phase))
+        _ensure_brief_column(path)
+        _ensure_eighth_column(path, "Kind" if phase == "plan-review" else "Tier")
+        _write_verdict_row(path, row)
+        if past_cap:
+            _append_ruling(path, unit, ruling, reviewer)
+        elif ruling:
+            print(f"note: {sdlc_md.norm_id(unit)} was below the review cap, so ruling "
+                  f"{str(ruling).strip().upper()} was not needed and is not recorded",
+                  file=sys.stderr)
+    return path, row
+
+
+def _append_ruling(path: Path, unit: str, ruling: str, reviewer: str) -> None:
+    """Record, below the table, the ruling that authorised the round just written: the row by
+    its identity, and the delivery round it was. Called under the ledger lock, after the row."""
+    root = path.parents[2]
+    uid = sdlc_md.norm_id(unit)
+    rows = read_verdicts(root)
+    record = _RULING_PREFIX + " ".join(
+        f"{key}={_ruling_value(value)}" for key, value in zip(_RULING_KEYS, (
+            uid, _row_keys(rows)[-1], len(delivery_rounds(root, uid)),
+            str(ruling).strip().upper(), reviewer or "-", sdlc_md.now_date())))
+    text = path.read_text(encoding="utf-8")
+    # The section alone decides the note: a verdict row's issues may quote the phrase.
+    heading = re.search(rf"^{re.escape(SUPERSEDE_HEADING)}[ \t]*$", text, re.M)
+    with path.open("a", encoding="utf-8") as fh:  # append-only, below the table
+        fh.write(_RECORDS_INTRO if heading is None
+                 else "\n" if _RULING_MARK in text[heading.end():] else "\n" + _RULING_NOTE)
+        fh.write(record + "\n")
+
+
+def _ledger_lock(path: Path):
+    """The lock every write to a review ledger holds, so parallel reviewers lose no row. Every
+    ledger lives at `<root>/sdlc-studio/reviews/`, so the root's shared lock serves them all."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return sdlc_md.allocation_lock(path.parents[2])
+
+
+@contextlib.contextmanager
+def provisional_verdict(repo_root: Path | str, unit: str, verdict: str, reviewer: str,
+                        author: str, issues: str = "", pending=None, brief: str = ""):
+    """Record a delivery verdict that stands only if the block's transition lands.
+
+    `transition set --verdict` writes the verdict before the gated transition, because a gate
+    may read it. When the block raises while `pending()` is still true - the unit still at its
+    from-status, so the transition was refused - the row is withdrawn, and a ledger the row
+    created is removed, so a refused close leaves no verdict behind; a withdrawal the lock
+    times out names the row it leaves and lets the refusal through. A raise after the status
+    write landed keeps the row: the unit's new status stands on it. A REJECT at the cap is
+    carried once the row stands, as `record_verdict` carries it."""
+    path = verdicts_path(repo_root)
+    existed = path.exists()
+    path, row = _write_verdict(repo_root, unit, verdict, reviewer, author, issues, "delivery",
+                               brief, None, False)
+    try:
+        yield path
+    except BaseException:
+        if pending is not None and not pending():
+            try:
+                if bug := _carry_if_capped(repo_root, unit, verdict, path):
+                    print(carried_notice(unit, bug), file=sys.stderr)
+            except CarryFailed as exc:
+                print(f"error: {exc}", file=sys.stderr)
+            raise
+        try:
+            with _ledger_lock(path):
+                text = path.read_text(encoding="utf-8")
+                at = text.rfind(row)
+                if at >= 0:
+                    text = text[:at] + text[at + len(row):]
+                if not existed and text == _header("delivery"):
+                    path.unlink()
+                else:
+                    sdlc_md.atomic_write(path, text)
+        except sdlc_md.AllocationLockTimeout as exc:
+            # the refusal below is the reason; the row it leaves behind is the damage to name
+            print(f"error: the provisional {verdict.upper()} row for {sdlc_md.norm_id(unit)} "
+                  f"could not be withdrawn and still stands; remove that row from {path} "
+                  f"once the lock is free - {exc.reason}",
+                  file=sys.stderr)
+        raise
+    if bug := _carry_if_capped(repo_root, unit, verdict, path):
+        print(carried_notice(unit, bug), file=sys.stderr)
+
+
+def _ensure_brief_column(path: Path) -> None:
+    """Widen a pre-Brief verdict table in place, padding existing rows with `-`.
+
+    The table header is written once, when the log is created, so a log that predates the
+    Brief column keeps a six-column header while new rows carry seven cells - which is not a
+    valid markdown table, and markdownlint MD056 refuses the commit.
+
+    This pads rather than rewrites: every recorded cell keeps its value and its position, and
+    the added cell is `-`, the same ABSENT marker a hand-written prompt records. That is the
+    honest value for these rows, because a verdict taken before the column existed genuinely
+    cannot say which brief produced it. The log stays append-only in the sense that matters -
+    no judgement anybody recorded is altered or removed.
+    """
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if not line.lstrip().startswith("| Unit |"):
+            continue
+        if "| Brief |" in line:
+            return
+        lines[i] = line.replace("| Issues |", "| Brief | Issues |", 1)
+        if i + 1 < len(lines) and set(lines[i + 1].strip()) <= set("|-: "):
+            lines[i + 1] = lines[i + 1].replace("| --- |", "| --- | --- |", 1)
+        for j in range(i + 2, len(lines)):
+            if not lines[j].lstrip().startswith("|"):
+                break
+            cells = sdlc_md.table_cells(lines[j])
+            if len(cells) != 6:
+                continue
+            body = lines[j].rstrip("\n").rstrip()
+            body = body[:-1].rstrip() if body.endswith("|") else body
+            head, _, last = body.rpartition("|")
+            lines[j] = f"{head}| - |{last.rstrip()} |\n"
+        sdlc_md.atomic_write(path, "".join(lines))
+        return
+
+
+def _ensure_eighth_column(path: Path, name: str) -> None:
+    """Widen a seven-column verdict table in place, padding existing rows with `-`.
+
+    ONE migration for both logs, because they grew their eighth column for the same reason and
+    would otherwise carry two copies of this loop (LL0016). `name` is `Kind` on the historical
+    plan-review log and `Tier` on the delivery one; `-` is what a row written before the column
+    honestly means, because a verdict taken then cannot say what the column records.
+
+    The header is written once, when a log is created, so a log that predates the column keeps a
+    seven-column header while new rows carry eight - not a valid markdown table, and markdownlint
+    MD056 refuses the commit.
+
+    This PADS rather than rewrites: every recorded cell keeps its value and its position. This
+    sprint already watched a column added to VELOCITY.md shift every historical row, so that the
+    estimate column read back the actual - the same mistake, one file over.
+    """
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if not line.lstrip().startswith("| Unit |"):
+            continue
+        if f"| {name} |" in line:
+            return
+        lines[i] = line.replace("| Issues |", f"| {name} | Issues |", 1)
+        if i + 1 < len(lines) and set(lines[i + 1].strip()) <= set("|-: "):
+            lines[i + 1] = lines[i + 1].replace("| --- |", "| --- | --- |", 1)
+        for j in range(i + 2, len(lines)):
+            if not lines[j].lstrip().startswith("|"):
+                break
+            if len(sdlc_md.table_cells(lines[j])) != 7:
+                continue
+            body = lines[j].rstrip("\n").rstrip()
+            body = body[:-1].rstrip() if body.endswith("|") else body
+            head, _, last = body.rpartition("|")
+            lines[j] = f"{head}| - |{last.rstrip()} |\n"
+        sdlc_md.atomic_write(path, "".join(lines))
+        return
+
+
+def _write_verdict_row(path: Path, row: str) -> None:
+    """Add a verdict row, keeping the table one contiguous block.
+
+    With no supersession section present this is a plain O_APPEND write, byte-identical to
+    what it has always done. Once records have been added below the table, the row goes in
+    after the last table line instead, so the table does not acquire a paragraph in the
+    middle of it. Nothing already written is removed or altered either way.
+    """
+    text = path.read_text(encoding="utf-8")
+    if SUPERSEDE_HEADING not in text:
+        with path.open("a", encoding="utf-8") as fh:  # append-only
+            fh.write(row)
+        return
+    lines = text.splitlines(keepends=True)
+    table = [i for i, line in enumerate(lines) if line.lstrip().startswith("|")]
+    if not table:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(row)
+        return
+    last = table[-1]
+    if not lines[last].endswith("\n"):
+        lines[last] += "\n"
+    lines.insert(last + 1, row)
+    sdlc_md.atomic_write(path, "".join(lines))
+
+
+def _ledger_text(path: Path) -> str:
+    """The ledger's text, read once while the file is unchanged (`decisions.read_once`)."""
+    import decisions  # noqa: PLC0415 - lazy: decisions.py owns the file memo
+    return decisions.read_once(path, "text", lambda: path.read_text(encoding="utf-8"))
+
+
+def read_verdicts(repo_root: Path | str, phase: str = "delivery") -> list[dict]:
+    """All recorded verdicts for `phase`, in order, as
+    {unit, verdict, reviewer, author, date, issues} plus the supersession annotation
+    {superseded, superseded_reason, superseded_by, superseded_at}.
+
+    Reads both the current 6-column rows and any legacy 5-column rows (no Author) that
+    pre-date the independence gate; a legacy row's author is the empty string. A retired
+    row is still returned, marked - dropping it would lose the record that it happened,
+    which is the reason the log is append-only in the first place.
+
+    The ledger is parsed once while it is unchanged (`decisions.read_once`), and each caller
+    gets its own copy of every row.
+    """
+    path = verdicts_path(repo_root, phase)
+    if not path.exists():
+        return []
+    import decisions  # noqa: PLC0415 - lazy: decisions.py owns the file memo
+    rows = decisions.read_once(path, "rows", lambda: tuple(_parse_verdicts(repo_root, phase)))
+    return [dict(row) for row in rows]
+
+
+def _parse_verdicts(repo_root: Path | str, phase: str) -> list[dict]:
+    path = verdicts_path(repo_root, phase)
+    out: list[dict] = []
+    for line in _ledger_text(path).splitlines():
+        cells = sdlc_md.table_cells(line)  # escaped-pipe-aware
+        if not cells or cells[0] in ("Unit",):
+            continue
+        if len(cells) == 8:
+            out.append(dict(zip(_COLS_BY_PHASE[phase], cells)))
+        elif len(cells) == 7:
+            row = dict(zip(_COLS, cells))
+            if phase == "delivery":
+                # A tier is UNKNOWN on such a row, never `full`. Absent and full are different
+                # facts, and only absent is true of a verdict taken before the column existed.
+                row["tier"] = ""
+            out.append(row)
+        elif len(cells) == 6:  # pre-brief: Unit, Verdict, Reviewer, Author, Date, Issues.
+            # Read, never rewritten. Every verdict recorded before the brief column existed is a
+            # real judgement somebody made, and dropping it to "unparseable" would retire the
+            # adversarial record wholesale. Its brief is ABSENT rather than empty, which is the
+            # same thing a hand-written prompt records - correct, because that is exactly what
+            # those rows cannot distinguish about themselves.
+            older = dict(zip(("unit", "verdict", "reviewer", "author", "date", "issues"), cells))
+            older["brief"] = ""
+            if phase == "delivery":
+                older["tier"] = ""
+            out.append(older)
+        elif len(cells) == 5:  # legacy: Unit, Verdict, Reviewer, Date, Issues
+            legacy = dict(zip(("unit", "verdict", "reviewer", "date", "issues"), cells))
+            legacy["author"] = ""
+            if phase == "delivery":
+                legacy["tier"] = ""
+            out.append(legacy)
+        else:
+            # A row that is neither current (6 cols) nor legacy (5) - a torn write from a
+            # crash mid-append. Surface it: silently dropping a verdict is a false "no
+            # verdict" signal at the gate. Report and skip, never swallow.
+            print(f"warning: malformed row in {path} ({len(cells)} cells, expected 6 or 5), "
+                  f"skipped: {' | '.join(cells)[:100]}", file=sys.stderr)
+    rows = _number_rounds(_annotate_superseded(out, read_supersessions(repo_root, phase)))
+    if phase == "delivery":
+        rulings = {r["row"]: r["ruling"] for r in read_round_rulings(repo_root) if r["row"]}
+        if rulings:
+            for row, key in zip(rows, _row_keys(rows)):
+                if key in rulings:
+                    row["ruling"] = rulings[key]
+    return rows
+
+
+def row_identity(row: dict) -> str:
+    """A delivery verdict row's identity: a digest of its eight parsed cells, `-` and empty
+    reading the same, so a row written before a column existed already has one.
+
+    Not the raw line, which a table re-pad changes, and not a stored Run column, which no
+    historic row could carry. Two rows with the same cells share an identity; the ledger holds
+    exact duplicates, so a caller counting identities counts a multiset."""
+    import hashlib  # noqa: PLC0415 - local; only this path needs it
+    cells = [str(row.get(col) or "").strip() for col in _DELIVERY_COLS]
+    return hashlib.sha256("\x1f".join("" if c == "-" else c for c in cells)
+                          .encode("utf-8")).hexdigest()[:16]
+
+
+def _number_rounds(rows: list[dict]) -> list[dict]:
+    """Stamp each row with its `round`: its ordinal among the unit's live rows in this ledger.
+
+    Derived rather than stored. The ledger is append-only and one reviewer records one row per
+    round, so the round IS the row's position; a stored copy could only disagree with it. A
+    superseded row records an event ruled not to have happened, so it is no round (`None`).
+    """
+    seen: dict[str, int] = {}
+    for row in rows:
+        if is_superseded(row):
+            row["round"] = None
+            continue
+        unit = sdlc_md.norm_id(row.get("unit", ""))
+        seen[unit] = seen.get(unit, 0) + 1
+        row["round"] = seen[unit]
+    return rows
+
+
+def delivery_rounds(repo_root: Path | str, unit: str, state: dict | None = None) -> list[dict]:
+    """The live delivery verdict rows of `unit`'s CURRENT delivery, oldest first, each `round`
+    numbered from 1 within it.
+
+    In an open run holding the unit: the rows written since the run first reviewed it (its
+    `REVIEW_BASE`), so a unit carried out of an earlier run starts again at round 1. Outside
+    one: the rows since the APPROVE that closed the previous delivery. A final APPROVE closes
+    the current delivery rather than starting the next, so its rounds still count against a
+    further verdict: outside a run nothing else marks where a new delivery began."""
+    uid = sdlc_md.norm_id(unit)
+    rows = [r for r in read_verdicts(repo_root) if sdlc_md.norm_id(r.get("unit", "")) == uid]
+    # A caller holding a run's own record (the report of a sealed run) counts against THAT
+    # run's base whether or not it is still open: a figure that moved when the run sealed would
+    # invalidate the very page the seal signs.
+    given = state is not None and uid in ((state or {}).get(run_state.REVIEW_BASE) or {})
+    state = state if state is not None else (run_state.read(repo_root) or {})
+    if given or run_state.batch_holds(state, uid):
+        base = (state.get(run_state.REVIEW_BASE) or {}).get(uid)
+        rows = [r for r in rows[base:] if not is_superseded(r)] if isinstance(base, int) else []
+    else:
+        rows = [r for r in rows if not is_superseded(r)]
+        closed = [i for i, r in enumerate(rows[:-1])
+                  if str(r.get("verdict") or "").upper() == APPROVE]
+        rows = rows[closed[-1] + 1:] if closed else rows
+    return [{**r, "round": n} for n, r in enumerate(rows, 1)]
+
+
+def _mark_review_base(repo_root: Path | str, unit: str) -> None:
+    """Fix `unit`'s REVIEW_BASE at its row count now, before its first review in the open run
+    holding it. A no-op outside such a run, or once the base is fixed."""
+    uid = sdlc_md.norm_id(unit)
+    state = run_state.read(repo_root) or {}
+    if run_state.batch_holds(state, uid) and uid not in (state.get(run_state.REVIEW_BASE) or {}):
+        run_state.mark_review_base(repo_root, uid, sum(
+            1 for r in read_verdicts(repo_root) if sdlc_md.norm_id(r.get("unit", "")) == uid))
+
+
+def review_rounds(repo_root: Path | str, unit: str, state: dict | None = None) -> int:
+    """How many review rounds `unit`'s current delivery has recorded (`delivery_rounds`)."""
+    return len(delivery_rounds(repo_root, unit, state))
+
+
+def unit_review_rounds(repo_root: Path | str, unit: str, phase: str = "delivery") -> list[dict]:
+    """Every LIVE recorded verdict for one unit, oldest first - the unit's review ROUNDS.
+
+    `verdict_for` answers "where does this unit stand", which is one row. Escalation asks a
+    different question: how many times has this been round, and did it converge? That needs the
+    sequence, so a superseded row is dropped (a named authoriser ruled it did not happen) while
+    every surviving round is kept.
+    """
+    want = sdlc_md.norm_id(unit)
+    return [r for r in read_verdicts(repo_root, phase)
+            if sdlc_md.norm_id(r.get("unit", "")) == want and not is_superseded(r)]
+
+
+def seat_verdicts(repo_root: Path | str, unit: str, phase: str = "delivery") -> dict:
+    """The LATEST verdict each reviewing seat gave on a unit, as `{reviewer: VERDICT}`.
+
+    A split panel is a different escalation from a repeatedly-rejecting one: seats that
+    disagree need the operator to break the tie, not another repair round. Latest per seat,
+    because a seat that rejected and then approved has resolved its own objection.
+    """
+    out: dict = {}
+    for row in unit_review_rounds(repo_root, unit, phase):
+        who = str(row.get("reviewer") or "").strip()
+        if who:
+            out[who] = str(row.get("verdict") or "").strip().upper()
+    return out
+
+
+def verdict_for(repo_root: Path | str, unit: str, phase: str = "delivery"):
+    """The latest LIVE recorded verdict for a unit in `phase`, or None. Defaults to the
+    delivery log, so the conformance `critiqued` gate is unaffected by plan-review rows.
+
+    A superseded row is skipped: it records an event that a named authoriser has ruled did
+    not happen, so acting on it would be acting on a known-false fact. A unit whose only row
+    is superseded therefore has NO verdict, which is different from having an approval.
+
+    EXCEPT a NEGATIVE one, which needs a PRINCIPAL-grade supersession to retire. The grade
+    required scales with the direction the mistake fails. Retiring an approval weakly loses an
+    approval, and a gate with one fewer approval refuses - it fails closed. Retiring a REJECT
+    weakly deletes the one record that blocks the unit, and the gate then reports it covered by
+    an independent pass. `record_supersession` refuses to write such a record, but a hand
+    append walks round the tool, and a plain truthiness test on the flag honoured it: an author
+    could retire the review blocking their own work with one line naming themselves as
+    authoriser and `-` as boundary. `_is_principal_superseded` was already written as the
+    read-time backstop for exactly that, and only the sign-off gate consulted it - so the two
+    gates enforced different independence rules, and the weaker one was the one guarding the
+    honesty check.
+    """
+    seen = _live_verdict_rows(repo_root, unit, phase)
+    latest = seen[-1] if seen else None
+    unanswered = _unanswered_rejects(seen)
+    # THE LATEST unanswered REJECT, and the tie-break is load-bearing rather than incidental:
+    # reporting the EARLIEST instead leaves 18 units non-conformant rather than 19, and the unit
+    # it drops is US0671 - the first one this bug's own Steps to Reproduce names as masked. The
+    # reading that gives the tidier number is the one that hides the example.
+    return unanswered[-1] if unanswered else latest
+
+
+def _live_verdict_rows(repo_root: Path | str, unit: str, phase: str = "delivery") -> list[dict]:
+    """The unit's verdict rows a reader may act on, oldest first - THE supersession rule.
+
+    A superseded row is dropped, except a REJECT whose supersession is not principal-grade
+    (`verdict_for` states why). `verdict_for` and `standing_rejects` both read this, so the
+    reader that says whether a unit carries a rejection and the reader that says whether it is
+    answered cannot hold two copies of the rule: a second copy simplified to "is it superseded"
+    passed the whole suite and let an author-superseded REJECT through the transition guard
+    while `coverage_state` read the unit unreviewed.
+    """
+    target = sdlc_md.norm_id(unit)
+    out: list[dict] = []
+    for v in read_verdicts(repo_root, phase):
+        if sdlc_md.norm_id(v["unit"]) != target:
+            continue
+        if v.get("superseded") and ((v.get("verdict") or "").upper() != REJECT
+                                    or _is_principal_superseded(repo_root, unit, v)):
+            continue
+        out.append(v)
+    return out
+
+
+#: The day the same-reviewer round rule (`round_refusal`) shipped. An APPROVE recorded on or
+#: after it answers only its own reviewer's REJECT; before it, seats were named per round, so
+#: the brief fingerprint is the only key that pairs a round-2 APPROVE with its REJECT.
+ROUND_RULE_SHIPPED = "2026-09-23"
+#: The first day no delivery REJECT could be answered by a `critic.py repair` row: the verb was
+#: retired on 2026-09-25, the day of the last repair row, so a REJECT dated that day or earlier
+#: could still be. A unit that reached Done over such a REJECT passed the gate of its day, and
+#: `conformance.verdict_half_ok` reads it as critiqued by the REJECT's own date, never by the
+#: frozen ledger. Nothing that judges current work reads it.
+REPAIR_VERB_RETIRED = "2026-09-26"
+
+
+def _unanswered_rejects(rows: list[dict]) -> list[dict]:
+    """Every REJECT in one unit's rows that no LATER APPROVE has answered, oldest first.
+
+    A REJECT is answered by an APPROVE from the SAME reviewer at a later round: round 2 is the
+    round-1 reviewer re-checking the fixes (`round_refusal` refuses any other reviewer), so the
+    key is (unit, reviewer, round). The brief fingerprint is a second key for an APPROVE dated
+    before that rule (`ROUND_RULE_SHIPPED`), whose seats were named per round (`qa-seat-<epic>`
+    against `qa-seat-close-r2`); dropping it would reopen the historical units it pairs. After
+    the rule a fingerprint answers nothing, so no invented `--brief` can retire another seat's
+    REJECT. An absent fingerprint matches nothing.
+    """
+    out = []
+    for i, r in enumerate(rows):
+        if not str(r.get("verdict") or "").upper().startswith(REJECT):
+            continue
+        fp, who = _brief_key(r), _id(r.get("reviewer", ""))
+        if any(str(l.get("verdict") or "").upper().startswith(APPROVE)
+               and ((who and _id(l.get("reviewer", "")) == who)
+                    or (fp and _brief_key(l) == fp
+                        and str(l.get("date") or "") < ROUND_RULE_SHIPPED))
+               for l in rows[i + 1:]):
+            continue
+        out.append(r)
+    return out
+
+
+def _brief_key(row: dict) -> str:
+    """A verdict row's brief fingerprint, or `""` when it has none.
+
+    The ledger writes `-` for an absent brief (`_clean(brief) or '-'` at the write site), so the
+    empty string this check was originally written against is a state `record` has never
+    produced and `if not fp` never fired.
+
+    A historical cell `record` MARKED unmatched is not provenance either: its fingerprint matched
+    no brief the repo could produce when it was recorded. Reading it as briefed would let two
+    marked rows sharing a value pair and answer a rejection. Nothing writes the mark any more,
+    but the rows that carry it stay in the ledger.
+    """
+    cell = str(row.get("brief") or "").strip(" -")
+    return "" if UNMATCHED_MARK in cell.split() else cell
+
+
+def standing_rejects(repo_root: Path | str, unit: str, phase: str = "delivery") -> list[dict]:
+    """The REJECT rows a reader should NAME for this unit, oldest first, or `[]` for none.
+
+    Every rejection no later same-brief APPROVE retired; and when one did retire them all, the
+    latest REJECT still, because this answers "which rejection is this about", never "is it
+    answered". A same-brief APPROVE the unit's own author recorded retires the row here and in
+    `verdict_for`, yet `coverage_state` reads the unit `unreviewed` - so a caller asks that for
+    the answer and this for the name. A superseded REJECT counts unless the supersession is
+    principal-grade - read through `_live_verdict_rows`, the one copy of that rule
+    `verdict_for` reads too.
+    """
+    live = _live_verdict_rows(repo_root, unit, phase)
+    rejects = [v for v in live if str(v.get("verdict") or "").upper().startswith(REJECT)]
+    return _unanswered_rejects(live) or rejects[-1:]
+
+
+# --- Supersession (a verdict row retired by addition) ----------------------------------
+# A verdict row can record an event that did not happen - a reviewer mis-entered, a verdict
+# filed against the wrong unit. The log's authority comes from nobody editing it, so the
+# correction is made by ADDING a record that retires the row, never by deleting the row or
+# widening it with another column (the row parser reads 6 or 5 cells and warns on anything
+# else, so a 7th column would turn every row into a torn-write warning). The record is
+# written below the table as prose for the same reason: a pipe-delimited erratum would be
+# read as a malformed verdict.
+SUPERSEDE_HEADING = "## Supersessions"
+_SUPERSEDE_INTRO = (
+    "\n" + SUPERSEDE_HEADING + "\n\n"
+    "> Appended, never edited in place. Each record retires one verdict row above: the row\n"
+    "> stays in the table and every reader marks it superseded, so the log is corrected by\n"
+    "> addition. Prose, not a table - the row parser reads every pipe-delimited line here.\n\n")
+#: Record fields, in write order. Also the parse boundary: a value runs to the next of these
+#: keys, so a reason containing punctuation (or a semicolon-separated agent id) stays whole.
+#: `row-brief` is written only when the supersession names the row's brief (`--brief`).
+_SUPERSEDE_KEYS = ("unit", "row-date", "row-verdict", "row-reviewer", "row-author",
+                   "row-brief", "authorised-by", "boundary", "reason", "recorded")
+_SUPERSEDE_COLS = ("unit", "row_date", "row_verdict", "row_reviewer", "row_author",
+                   "row_brief", "authorised_by", "boundary", "reason", "recorded")
+_SUPERSEDE_PREFIX = "SUPERSEDED "
+
+
+def _supersede_value(value: str, escape: bool = True) -> str:
+    """One field of a supersession record: single-line, pipe-free (so no reader mistakes it
+    for a table row), and with any embedded ` key=` sequence defused to ` key:` so free prose
+    cannot forge a field boundary. `escape` off for a value copied from a table cell, which
+    already carries the markdown escaping `_clean` applies - doubling it would store a value
+    that no longer reads back as what the row says."""
+    out = _clean(value) if escape else value.replace("|", "/").replace("\n", " ").strip()
+    for key in _SUPERSEDE_KEYS:
+        out = out.replace(f" {key}=", f" {key}:")
+    return " ".join(out.split())
+
+
+def _supersede_field(body: str, key: str) -> str:
+    boundary = "|".join(re.escape(k) for k in _SUPERSEDE_KEYS)
+    m = re.search(rf"(?:^|\s){re.escape(key)}=(.*?)(?=\s(?:{boundary})=|$)", body)
+    # The writer escapes outside code spans only (`_clean`), so the reader does too.
+    return _unescape_outside_spans(m.group(1).strip()) if m else ""
+
+
+#: A round past `review.max_rounds` that an accepted decision authorised is recorded as one
+#: `RULING` line in the same appended section as the supersession records. The row itself keeps
+#: its eight cells, so no row's identity moves, and the record names the row by that identity
+#: (`row_identity`), so its ruling stays with it when an earlier row is superseded and the
+#: positions shift. The supersession reader takes only its own prefix, and this one only its own.
+_RULING_PREFIX = "RULING "
+_RULING_KEYS = ("unit", "row", "round", "ruling", "reviewer", "recorded")
+#: The appended section's introduction when a ruling record is the first thing in it.
+_RECORDS_INTRO = (
+    "\n" + SUPERSEDE_HEADING + "\n\n"
+    "> Appended, never edited in place. A SUPERSEDED record retires one verdict row above, and\n"
+    "> a RULING record names the decision that authorised a review round past the cap. Prose,\n"
+    "> not a table - the row parser reads every pipe-delimited line here.\n\n")
+#: Written once before the first ruling record in a section whose introduction (the
+#: supersession writer's) speaks of supersessions only. Both texts carry `_RULING_MARK`, which is
+#: how the writer knows the section already explains its ruling records.
+_RULING_NOTE = ("> A RULING record names the accepted decision that authorised one review round "
+                "past the cap, and the row it authorised.\n\n")
+_RULING_MARK = "RULING record names"
+
+
+def _ruling_value(value: str) -> str:
+    """One field of a ruling record: single-line, pipe-free, with any embedded ` key=` defused,
+    so a reviewer id cannot forge a field (`qa seat unit=BG0002` stays one reviewer). Whitespace
+    is folded FIRST: a tab or newline before `recorded=` is a field boundary to the reader, so
+    defusing only ` key=` before folding left it live."""
+    out = " ".join(_clean(str(value)).split())
+    for key in _RULING_KEYS:
+        out = out.replace(f" {key}=", f" {key}:")
+    return out
+
+
+def _ruling_field(body: str, key: str) -> str:
+    boundary = "|".join(re.escape(k) for k in _RULING_KEYS)
+    m = re.search(rf"(?:^|\s){re.escape(key)}=(.*?)(?=\s(?:{boundary})=|$)", body)
+    return _unescape_outside_spans(m.group(1).strip()) if m else ""
+
+
+def _row_keys(rows: list[dict]) -> list[str]:
+    """Each row's ruling key: its `row_identity` and how many earlier rows share it
+    (`<identity>#<n>`). The ledger holds exact duplicates, which share an identity, so the
+    identity alone would carry a ruling onto every copy; the table is append-only, so a row's
+    place among its copies never moves."""
+    seen: dict[str, int] = {}
+    keys = []
+    for row in rows:
+        ident = row_identity(row)
+        keys.append(f"{ident}#{seen.get(ident, 0)}")
+        seen[ident] = seen.get(ident, 0) + 1
+    return keys
+
+
+def read_round_rulings(repo_root: Path | str) -> list[dict]:
+    """Every ruling that authorised a delivery round past the cap, as {unit, row, round, ruling,
+    reviewer, recorded}, in the order written. `row` is the authorised row's key (`_row_keys`)."""
+    path = verdicts_path(repo_root, "delivery")
+    if not path.exists():
+        return []
+    out = []
+    for line in _ledger_text(path).splitlines():
+        stripped = line.strip()
+        if stripped.startswith(_RULING_PREFIX):
+            body = stripped[len(_RULING_PREFIX):]
+            out.append({k: _ruling_field(body, k) for k in _RULING_KEYS})
+    return out
+
+
+def ruling_refusal(repo_root: Path | str, unit: str, ruling: str) -> str | None:
+    """Why `ruling` does not authorise a further round on `unit`, or None when it does.
+
+    It must be a decision the log reads as standing and accepted (`decisions.standing`, so one
+    a later decision supersedes is refused before `backfill` flips its cell) whose SUBJECT is
+    the unit: the first artefact id its text names, read with the toolkit's shared id grammar
+    (`CITED_ID_RE`: both id eras, dashed or not, any case, any family), so a decision that only
+    mentions the unit (D0354 names BG0989 and BG0994 beside its subject BG0993) authorises
+    nothing for it. And it must not already have authorised a round on this unit: one ruling,
+    one round."""
+    import decisions  # noqa: PLC0415 - lazy: decisions.py owns the decisions log's reader
+    uid = sdlc_md.norm_id(unit)
+    did = str(ruling or "").strip().upper()
+    found = decisions.standing(repo_root, did)
+    if found is None:
+        return f"ruling {did or '(none)'} is not a decision in sdlc-studio/decisions.md"
+    status, text = found
+    if status != "accepted":
+        return f"ruling {did} is {status or 'not accepted'}, not accepted"
+    first = sdlc_md.CITED_ID_RE.search(text)
+    subject = sdlc_md.norm_id(first.group(1)) if first else ""
+    if subject != uid:
+        return (f"ruling {did} is about {subject or 'no unit'}, not {uid}: a decision "
+                f"authorises a round on the unit it names first")
+    used = [r for r in read_round_rulings(repo_root)
+            if sdlc_md.norm_id(r["unit"]) == uid and r["ruling"].upper() == did]
+    if used:
+        return (f"ruling {did} already authorised round {used[0]['round']} of {uid}: one "
+                f"ruling authorises one round")
+    return None
+
+
+def read_supersessions(repo_root: Path | str, phase: str = "delivery") -> list[dict]:
+    """Every supersession record in `phase`'s log, in order, as {unit, row_date, row_verdict,
+    row_reviewer, row_author, row_brief, authorised_by, boundary, reason, recorded}. A record
+    written before `row-brief` existed, or without `--brief`, has an empty `row_brief`."""
+    path = verdicts_path(repo_root, phase)
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    for line in _ledger_text(path).splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(_SUPERSEDE_PREFIX):
+            continue
+        body = stripped[len(_SUPERSEDE_PREFIX):]
+        out.append({col: _supersede_field(body, key)
+                    for col, key in zip(_SUPERSEDE_COLS, _SUPERSEDE_KEYS)})
+    return out
+
+
+def _supersession_index(records: list[dict]) -> dict:
+    """Supersession records grouped by NORMALISED unit id, with their join keys pre-computed.
+
+    The join was a cross-product: every row walked every record, and every comparison
+    normalised four ids. Over this repository - 848 verdict rows against 32 records - that is
+    27,136 comparisons per annotation, and the ledger is annotated on EVERY lookup, so a single
+    whole-workspace conformance run made 16,837,139 of them and 37 million id normalisations
+    A record retires a row of ITS OWN unit or of none, so the unit is the index. Each key holds
+    its records in written order, because a record naming a brief retires only the row carrying
+    it (`_retires_brief`), so the first record under a key need not be the one that applies.
+    """
+    index: dict = {}
+    for rec in records:
+        key = (sdlc_md.norm_id(rec.get("unit", "")),
+               rec.get("row_date", ""),
+               (rec.get("row_verdict", "") or "").upper(),
+               _id(rec.get("row_reviewer", "")))
+        index.setdefault(key, []).append(rec)
+    return index
+
+
+def _supersede_brief(value: str | None) -> str:
+    """A Brief cell as a supersession compares it: whitespace folded, case-folded, and `-` for
+    a row with no brief, which the ledger writes as `-` or, on a pre-brief row, leaves empty."""
+    return " ".join(str(value or "").split()).casefold() or "-"
+
+
+def _retires_brief(rec: dict, row: dict) -> bool:
+    """True when a record's brief, if it names one, is the row's. A record with no `row-brief`
+    names none, so it retires every row its other fields match, as it always has."""
+    named = (rec.get("row_brief") or "").strip()
+    return not named or _supersede_brief(named) == _supersede_brief(row.get("brief"))
+
+
+def _annotate_superseded(rows: list[dict], records: list[dict]) -> list[dict]:
+    """Mark each row a supersession record retires. Every row carries the `superseded*` keys,
+    so a reader never has to tell 'live' from 'field absent'."""
+    index = _supersession_index(records)
+    for row in rows:
+        rec = next((r for r in index.get((sdlc_md.norm_id(row.get("unit", "")),
+                                           row.get("date", ""),
+                                           (row.get("verdict", "") or "").upper(),
+                                           _id(row.get("reviewer", ""))), ())
+                    if _retires_brief(r, row)), None)   # first applicable record wins
+        row["superseded"] = rec is not None
+        row["superseded_reason"] = rec["reason"] if rec else ""
+        row["superseded_by"] = rec["authorised_by"] if rec else ""
+        row["superseded_boundary"] = rec.get("boundary", "") if rec else ""
+        row["superseded_at"] = rec["recorded"] if rec else ""
+    return rows
+
+
+def is_superseded(verdict: dict | None) -> bool:
+    """True when a verdict row has been retired by a recorded supersession."""
+    return bool(verdict) and bool(verdict.get("superseded"))
+
+
+def _adversarial_worker_ids(repo_root: Path | str, unit: str,
+                            exclude_row: dict | None = None) -> set[str]:
+    """Every reviewer id that did adversarial or review WORK on the unit in-session: the
+    reviewers on its verdict and sprint-level-review rows OTHER than the one under correction.
+    A principal wrongly named on a single verdict row appears in NONE of these - a reviewer of
+    record signs off; they do not file a second verdict - which is the recordable distinction
+    between a mis-attribution and an author retiring a true verdict. `exclude_row` is the
+    verdict row a supersession is about: its own reviewer is not counted FROM that row, so the
+    party the correction concerns cannot veto their own correction. The retired evidence ledger
+    is not read: one verdict ledger says who reviewed a unit.
+    Superseded rows are read RAW here: independence is about who touched the unit, and this set is
+    what decides whether a supersession may retire that fact - it cannot depend on the answer."""
+    target = sdlc_md.norm_id(unit)
+    ids: set[str] = set()
+    for ph in PHASES:
+        for v in read_verdicts(repo_root, ph):
+            if sdlc_md.norm_id(v["unit"]) != target:
+                continue
+            if exclude_row is not None and _matches_row(v, exclude_row):
+                continue
+            ids.add(_id(v["reviewer"]))
+    for sr in sprint_reviews(repo_root):
+        if target in _covered_ids(sr):
+            ids.add(_id(sr["reviewer"]))
+    ids.discard("")
+    return ids
+
+
+def _matches_row(row: dict, other: dict) -> bool:
+    """Two verdict rows are the same row: same date, reviewer and verdict for one unit."""
+    return (row.get("date", "") == other.get("date", "")
+            and _id(row.get("reviewer", "")) == _id(other.get("reviewer", ""))
+            and (row.get("verdict", "") or "").upper() == (other.get("verdict", "") or "").upper())
+
+
+def record_supersession(repo_root: Path | str, unit: str, date: str, reason: str,
+                        authorised_by: str, boundary: str, reviewer: str | None = None,
+                        verdict: str | None = None, phase: str = "delivery",
+                        brief: str | None = None) -> Path:
+    """Retire one verdict row by appending a supersession record naming it.
+
+    The row is identified by unit and date, narrowed with `reviewer`, `verdict` and `brief`
+    (the row's Brief cell, `-` for none) when a unit carries more than one row that day. A
+    record written with `brief` carries the row's cell as `row-brief`, so it retires that row
+    and not another sharing its unit, date, verdict and reviewer. Refusals, all loud and all
+    writing nothing:
+
+    - no row matches, or more than one does - a correction pointing at nothing (or at an
+      unspecified one of several) is a false erratum; the refusal for several names each
+      one's brief fingerprint;
+    - no authoriser, or no `boundary` (the separate trust boundary the authoriser acted in) -
+      superseding can retire an independence attribution, so it is held to the sign-off's own
+      rule: a correction with no recorded boundary is a hand edit with extra steps;
+    - an authoriser who is the row's own AUTHOR, or who did in-session review work on the unit
+      (a reviewer on any other verdict or frozen sprint-review row) - a party the
+      author controls cannot authorise retiring the review that blocks it. The row's own wrongly
+      named reviewer is NOT refused on that row alone: a row naming the wrong reviewer is exactly
+      the case this exists for, and the person wrongly named is the one who can rule the pass
+      never ran - provided they did no other reviewing work on the unit;
+    - no reason.
+    """
+    if phase not in PHASES:
+        raise ValueError(f"unknown critic phase {phase!r} - expected one of {PHASES}")
+    if not (reason or "").strip():
+        raise ValueError("a supersession needs a --reason - retiring a recorded event "
+                         "without stating why is the quiet rewrite this log exists to prevent")
+    if not (authorised_by or "").strip():
+        raise ValueError("a supersession needs --authorised-by naming who authorised it - "
+                         "an unauthorised correction to an append-only log is a hand edit "
+                         "with extra steps")
+    if not (boundary or "").strip():
+        raise ValueError("a supersession needs --boundary naming the separate trust boundary "
+                         "its authoriser acted in - superseding can retire an independence "
+                         "attribution, so it is held to the signature's own rule")
+    target, want_date = sdlc_md.norm_id(unit), (date or "").strip()
+    candidates = [v for v in read_verdicts(repo_root, phase)
+                  if sdlc_md.norm_id(v["unit"]) == target and v["date"] == want_date]
+    if reviewer:
+        candidates = [v for v in candidates if _id(v["reviewer"]) == _id(reviewer)]
+    if verdict:
+        candidates = [v for v in candidates if v["verdict"].upper() == verdict.upper()]
+    if (brief or "").strip():
+        candidates = [v for v in candidates
+                      if _supersede_brief(v.get("brief")) == _supersede_brief(brief)]
+    if not candidates:
+        dates = sorted({v["date"] for v in read_verdicts(repo_root, phase)
+                        if sdlc_md.norm_id(v["unit"]) == target})
+        seen = f"rows dated {', '.join(dates)}" if dates else "no rows at all"
+        raise ValueError(f"no {phase} verdict row for {target} dated {want_date!r} "
+                         f"(that unit has {seen}) - a supersession that points at nothing "
+                         f"is a false erratum; nothing written")
+    if len(candidates) > 1:
+        unused = [flag for flag, given in (("--reviewer", reviewer), ("--verdict", verdict),
+                                           ("--brief", (brief or "").strip())) if not given]
+        hint = (f"narrow it with {' or '.join(unused)}" if unused else
+                "they agree on every field supersede narrows by, so no record can retire one "
+                "of them alone")
+        briefs = ", ".join(str(v.get("brief") or "").strip() or "-" for v in candidates)
+        raise ValueError(
+            f"{len(candidates)} {phase} verdict rows match {target} dated {want_date}, with "
+            f"brief fingerprints {briefs} - {hint}; retiring an unspecified one of several is "
+            f"not a correction")
+    row = candidates[0]
+    if _id(authorised_by) == _id(row["author"]):
+        raise ValueError(
+            f"authoriser {authorised_by!r} is the row's own author - the party that wrote "
+            f"the row cannot authorise retiring it; name an authoriser outside it")
+    if _id(authorised_by) in _adversarial_worker_ids(repo_root, unit, exclude_row=row):
+        raise ValueError(
+            f"authoriser {authorised_by!r} did in-session review work on {target} (a reviewer "
+            f"on another verdict or sprint-review row) - a party the author "
+            f"controls cannot authorise retiring the review, on the sign-off's independence "
+            f"rule; name a principal in a separate trust boundary")
+    path = verdicts_path(repo_root, phase)
+    row_brief = (_supersede_value(str(row.get("brief") or "").strip() or "-", escape=False)
+                 if (brief or "").strip() else "")
+    record = _SUPERSEDE_PREFIX + " ".join(
+        f"{key}={value}" for key, value in zip(_SUPERSEDE_KEYS, (
+            sdlc_md.norm_id(row["unit"]), row["date"], row["verdict"].upper(),
+            _supersede_value(row["reviewer"], escape=False),
+            _supersede_value(row["author"] or "-", escape=False), row_brief,
+            _supersede_value(authorised_by), _supersede_value(boundary),
+            _supersede_value(reason), sdlc_md.now_date()))
+        if key != "row-brief" or value)
+    with _ledger_lock(path):
+        text = path.read_text(encoding="utf-8")
+        with path.open("a", encoding="utf-8") as fh:  # append-only, below the table
+            fh.write(_SUPERSEDE_INTRO if SUPERSEDE_HEADING not in text else "\n")
+            fh.write(record + "\n")
+    return path
+
+
+# --- Ledger rows ------------------------------------------------------------------------
+# One verdict ledger (`critic-verdicts.md`) says whether a unit was reviewed. The evidence
+# ledger (`critic-evidence.md`) and the per-unit sign-off ledger are frozen history that nothing
+# reads; the operator signs the run once at `sprint sign`.
+
+
+def _append_row(path: Path, header: str, cells: tuple[str, ...]) -> Path:
+    with _ledger_lock(path):
+        if not path.exists():
+            sdlc_md.atomic_write(path, header)
+        with path.open("a", encoding="utf-8") as fh:  # append-only
+            fh.write("| " + " | ".join(cells) + " |\n")
+    return path
+
+
+def _read_rows(path: Path, cols: tuple[str, ...]) -> list[dict]:
+    """The table's DATA rows. The markdown header is identified by matching the whole cell
+    tuple against the declared column names, not by a first-column literal: the previous
+    check knew only `Unit`, so a table led by any other column (the sprint-review table's
+    `Base`) returned its own header as data. Matching every column generalises to each table
+    this serves and cannot lapse when the next one is added."""
+    if not path.exists():
+        return []
+    header = tuple(c.strip().lower() for c in cols)
+    out: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        cells = sdlc_md.table_cells(line)  # escaped-pipe-aware
+        # A row SHORT by trailing columns is read, with those columns absent. Every column this
+        # family has ever gained was appended, so a short row is one written before the newest
+        # column and is complete for its own era. Requiring an exact width dropped such a row
+        # entirely - which for the sign-off log would have silently un-signed every unit signed
+        # before the Capacity column, and the two-role gate would have started refusing them.
+        #
+        # Short by ANY number, not by one. The bound was `len(cols) - 1`, which tolerated a
+        # single era of appends and no more: two columns added in one change made every older
+        # row unreadable, on every consuming project's ledger at upgrade. The floor is two
+        # cells because a row must at least name a unit and one field to be a row at all.
+        if not cells or not (2 <= len(cells) <= len(cols)):
+            continue
+        if tuple(c.strip().lower() for c in cells) == header[:len(cells)]:
+            continue
+        row = dict(zip(cols, cells))
+        for missing in cols[len(cells):]:
+            row[missing] = ""
+        out.append(row)
+    return out
+
+
+def split_items(text: str) -> list[str]:
+    """Split a channel string into items on an UNESCAPED `;`, unescaping as it goes.
+
+    A SCANNER, not a lookbehind. `(?<!\\\\);` cannot tell a backslash that escapes the semicolon
+    from one that is itself escaped, so a value ending in a real backslash silently swallowed the
+    item after it - the same silence this function exists to end, one layer down.
+
+    Prose is a poor container for records and the structured file paths exist for that reason,
+    but the flag form has to keep working, so a value that needs a semicolon can escape it.
+    """
+    out, buf, i, n = [], [], 0, len(text or "")
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] in ";\\":
+            buf.append(text[i + 1])          # an escaped `;` or an escaped `\`
+            i += 2
+            continue
+        if ch == ";":
+            item = "".join(buf).strip()
+            if item:
+                out.append(item)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    item = "".join(buf).strip()
+    if item:
+        out.append(item)
+    return out
+
+
+#: Where a FINDING starts on a new line of a returned block: its origin tag, behind an optional
+#: list bullet and the tool's own `BLOCKING:` label.
+_FINDING_START = re.compile(
+    r"[ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)?(?:BLOCKING\s*:\s*)?"
+    r"\[\s*(?:regression|new|pre[- ]existing)\s*\]", re.IGNORECASE)
+_ANY_ORIGIN_TAG = re.compile(r"\[\s*(?:regression|new|pre[- ]existing)\s*\]", re.IGNORECASE)
+_LEADING_BULLET = re.compile(r"^(?:[-*+]|\d+[.)])[ \t]+")
+_OPENERS, _CLOSERS = "([{", ")]}"
+
+
+def _split_block_findings(text: str) -> list[str]:
+    """A returned block's findings, as the reviewer wrote them.
+
+    Two passes. First, an origin tag after an unescaped `;` or a line break ALWAYS starts a new
+    finding, whatever brackets or backticks surround it, so no tag can be swallowed into the
+    finding before it: a bracket or a backtick left open in one finding once held every later
+    finding open, origin tags included, and a regression vanished from the record. A quoted tag
+    is written with `\\;` before it (the contract says so); left bare it starts a finding of its
+    own, which fails closed. Then, within each finding, a `;` ends it unless brackets or a code
+    span that open and close INSIDE that finding enclose it, where it is the reviewer's own
+    punctuation in the evidence (`(x.json:69; also in the parent commit)`). Code spans are found
+    as the ledger finds them (`_scan_ticks`). Anything else is `split_items`' own split, so
+    untagged text after a bare `;` is still its own finding and still refused as unclassified.
+    """
+    out: list[str] = []
+    for segment in _tag_led_segments(text or ""):
+        out.extend(_split_within_finding(segment))
+    return out
+
+
+def _tag_led_segments(text: str) -> list[str]:
+    """`text` cut at each unescaped `;` or line break that an origin tag follows. Escapes are
+    left as written, so the second pass still reads them."""
+    segments, start, i, n = [], 0, 0, len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n and text[i + 1] in ";\\":
+            i += 2
+            continue
+        if text[i] in ";\n" and _FINDING_START.match(text, i + 1):
+            segments.append(text[start:i])
+            start = i + 1
+        i += 1
+    segments.append(text[start:])
+    return segments
+
+
+def _split_within_finding(segment: str) -> list[str]:
+    """One tag-led segment, split at each `;` no bracket pair or code span inside it encloses."""
+    n = len(segment)
+    held = [False] * n
+    for start, end in _scan_ticks(segment)[0]:
+        held[start:end] = [True] * (end - start)
+    stack: list[tuple[int, str]] = []
+    for k, ch in enumerate(segment):
+        if held[k]:
+            continue
+        if ch in _OPENERS:
+            stack.append((k, ch))
+        elif ch in _CLOSERS and stack and _OPENERS.index(stack[-1][1]) == _CLOSERS.index(ch):
+            opened = stack.pop()[0]
+            held[opened:k + 1] = [True] * (k + 1 - opened)
+    out, buf, i = [], [], 0
+
+    def close() -> None:
+        item = _LEADING_BULLET.sub("", "".join(buf).strip())
+        if item:
+            out.append(item)
+
+    while i < n:
+        ch = segment[i]
+        if ch == "\\" and i + 1 < n and segment[i + 1] in ";\\":
+            buf.append(segment[i + 1])
+            i += 2
+            continue
+        if ch == ";" and not held[i]:
+            close()
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    close()
+    return out
+
+
+def _escape_item(item: str) -> str:
+    """`item` written so `split_items` reads it back as ONE item, unchanged: each `;` escaped,
+    and each backslash doubled where `split_items` would read it as an escape, including one at
+    the end, which the `; ` joining the next item would otherwise turn into an escaped `;`."""
+    return re.sub(r"\\(?=[;\\]|$)", r"\\\\", item).replace(";", "\\;")
+
+
+def _is_principal_superseded(repo_root: Path | str, unit: str, row: dict) -> bool:
+    """True when a verdict row's attribution is retired by a PRINCIPAL-authorised supersession -
+    the only kind that stops the row's reviewer counting toward independence. This re-checks the
+    recorded supersession at READ time (record_supersession refuses at write time, but a
+    hand-appended record walks round the tool):
+    the correction must name a boundary, its authoriser must not be the row's own author, and the
+    authoriser must not itself have done in-session review work on the unit (judged excluding this
+    row). An author-reachable or boundary-less correction retires the VERDICT but not the fact
+    that the named reviewer acted, so the gate keeps counting them."""
+    if not row.get("superseded"):
+        return False
+    if not (row.get("superseded_boundary") or "").strip():
+        return False
+    authoriser = _id(row.get("superseded_by", ""))
+    if not authoriser or authoriser == _id(row.get("author", "")):
+        return False
+    return authoriser not in _adversarial_worker_ids(repo_root, unit, exclude_row=row)
+
+
+def session_reviewer_ids(repo_root: Path | str, unit: str) -> set[str]:
+    """Every reviewer id recorded on the unit's verdict and sprint-level-review rows.
+    A principal drawn from this set is a reviewer signing off its own review (or the author's
+    proxy), and `sprint sign` refuses it: the reviewer of record must differ from BOTH the
+    author and the adversarial reviewer, per-unit or sprint-scope alike.
+
+    A superseded row STILL CONTRIBUTES unless the supersession was PRINCIPAL-authorised
+    (`_is_principal_superseded`). Superseding retires a VERDICT; it cannot un-make the historical
+    fact that the named reviewer acted - so an author-reachable correction leaves the reviewer
+    counting. That closes the bypass an unconditional exclusion opened (author supersedes the
+    REJECT blocking it, its seat drops out, its own subagent signs off - refused, superseded,
+    accepted, measured end to end). The one attribution that IS retired is a principal's
+    correction of a MIS-FILED row - a reviewer wrongly named who did no other reviewing work -
+    which is what un-strands the unit the incident stranded."""
+    target = sdlc_md.norm_id(unit)
+    ids: set[str] = set()
+    for phase in PHASES:  # BOTH verdict phases - a plan-review seat is still the author's spawn
+        for v in read_verdicts(repo_root, phase):
+            if sdlc_md.norm_id(v["unit"]) != target:
+                continue
+            if _is_principal_superseded(repo_root, unit, v):
+                continue  # a principal-authorised correction retires the attribution too
+            ids.add(_id(v["reviewer"]))
+    for sr in sprint_reviews(repo_root):  # a sprint-level review covering this unit
+        if target in _covered_ids(sr):
+            ids.add(_id(sr["reviewer"]))
+    ids.discard("")
+    return ids
+
+
+# --- Sprint-level review (frozen: read, never written) -----------------------------------
+# A closing full-diff pass once covered a batch at once, recorded as one row naming the units.
+# No verb writes the ledger now: a unit is reviewed by its own delivery verdict. It is the only
+# record that some historical Done units were reviewed, so it is still READ, frozen - a row dated
+# before `REPAIR_VERB_RETIRED` covers the units it names, and a later row covers nothing
+# (`sprint_reviews`). Coverage NEVER overrides a per-unit REJECT.
+_SPRINT_FILE = "sprint-review-record.md"
+_SPRINT_COLS = ("base", "reviewer", "author", "verdict", "date", "units", "findings")
+
+
+def sprint_review_path(repo_root: Path | str) -> Path:
+    return Path(repo_root) / "sdlc-studio" / "reviews" / _SPRINT_FILE
+
+
+#: A goal clause's possible verdicts. `partial` exists because a goal with more than one clause
+#: is routinely reached in part, and collapsing that to achieved-or-missed forces the closer to
+#: overstate or understate. The vocabulary is closed: an unrecognised verdict is refused rather
+#: than stored, or the close would report a word nothing downstream can read.
+GOAL_VERDICTS = ("achieved", "partial", "missed")
+
+
+def goal_panel(repo_root: Path | str, clauses: list[str], seats: list[str], author: str,
+               verdicts: dict | None = None) -> dict:
+    """A per-clause verdict on the Sprint Goal from a panel of seats the AUTHOR IS NOT ON.
+
+    The author is REFUSED from the panel rather than warned about. A warning is advice, and the
+    whole value of the judgement is that it was not made by the person whose work is being
+    judged - the two-role rule at close exists for the same reason, and a goal verdict the
+    author signed is the one place that rule was never applied.
+
+    Each clause carries the EVIDENCE the panel relied on, not only its word. A verdict with no
+    evidence behind it cannot be reviewed later, and this project has twice recorded a
+    completion claim that reading the evidence would have refused.
+    """
+    clauses = [c.strip() for c in (clauses or []) if str(c).strip()]
+    if not clauses:
+        raise ValueError("a goal panel needs at least one clause to judge - a goal nobody broke "
+                         "into clauses is judged as one clause, never as none")
+    panel = [s.strip() for s in (seats or []) if str(s).strip()]
+    if not panel:
+        raise ValueError("a goal panel needs at least one seat - an empty panel returns a "
+                         "verdict nobody gave")
+    if not (author or "").strip():
+        raise ValueError("a goal panel needs the AUTHOR named, so it can prove the author is "
+                         "not on it - an unnamed author cannot be excluded")
+    conflicted = [s for s in panel if _id(s) == _id(author)]
+    if conflicted:
+        raise ValueError(
+            f"goal panel refused: {', '.join(conflicted)} is the author - a panel including the "
+            f"author is the author marking their own homework, which is the one thing this "
+            f"judgement exists to prevent. Convene seats outside the authoring context")
+    supplied = verdicts or {}
+    # A key matching no clause is REFUSED, not dropped. `supplied.get(clause)` is keyed by the
+    # stripped clause text, so a key differing by case or a trailing space took a seat's
+    # `missed` and silently made it an unanswered `partial` - the same class as an unrecognised
+    # verdict word, which this function already refuses rather than ignores.
+    unmatched = [k for k in supplied if k not in clauses]
+    if unmatched:
+        raise ValueError(
+            f"goal panel refused: verdict key(s) {unmatched!r} match no clause of this goal "
+            f"({clauses!r}) - a key that matches nothing drops the verdict behind it without "
+            f"a word, which is how a `missed` becomes a `partial`")
+    out: list[dict] = []
+    for clause in clauses:
+        given = supplied.get(clause) or {}
+        rows = []
+        for seat in panel:
+            entry = given.get(seat)
+            if entry is None:
+                rows.append({"seat": seat, "verdict": None, "evidence": ""})
+                continue
+            if isinstance(entry, str):
+                entry = {"verdict": entry, "evidence": ""}
+            v = str(entry.get("verdict", "")).strip().lower()
+            if v not in GOAL_VERDICTS:
+                raise ValueError(
+                    f"{seat} returned {entry.get('verdict')!r} for {clause!r} - a clause verdict "
+                    f"must be one of {', '.join(GOAL_VERDICTS)}")
+            rows.append({"seat": seat, "verdict": v,
+                         "evidence": str(entry.get("evidence", "")).strip()})
+        answered = [r for r in rows if r["verdict"]]
+        if not answered:
+            verdict = None
+        elif all(r["verdict"] == "achieved" for r in answered):
+            verdict = "achieved"
+        elif all(r["verdict"] == "missed" for r in answered):
+            verdict = "missed"
+        else:
+            # Disagreement is PARTIAL, never the majority word. A clause one seat says was
+            # missed is not achieved because two others disagree; reporting the majority would
+            # let a dissent vanish into a number.
+            verdict = "partial"
+        out.append({"clause": clause, "verdict": verdict, "seats": rows,
+                    "evidence": [r["evidence"] for r in rows if r["evidence"]],
+                    "unanswered": [r["seat"] for r in rows if not r["verdict"]]})
+    # None when NOTHING was answered. This function raises on an empty seat list precisely
+    # because "an empty panel returns a verdict nobody gave", and then returned `partial` for a
+    # panel where no seat answered a single clause - which is the same verdict nobody gave,
+    # reached by a different route.
+    answered = [c for c in out if c["verdict"]]
+    overall = (None if not answered
+               else "achieved" if all(c["verdict"] == "achieved" for c in out)
+               else "missed" if all(c["verdict"] == "missed" for c in out)
+               else "partial")
+    return {"author": author, "panel": panel, "clauses": out, "verdict": overall}
+
+
+#: Priorities that describe a defect a release cannot carry. Read as a FLOOR: a defect at
+#: one of these blocks a close whatever the clause reasoning says, because "the goal was met
+#: anyway" is not an answer to a user who cannot work around it.
+#: Priority and severity words ordered MOST SEVERE FIRST, across the vocabularies projects
+#: actually use. One ordering rather than a list of blocking words: a flat list has to remember
+#: every synonym, and the one this shipped with remembered `p0/p1/critical/blocker` while this
+#: corpus files 104 `Severity: High` bugs and an adversarial reviewer writes `major`. Every one
+#: of them was leavable.
+#: TIERS, not a flat order: `high` and `major` are the same severity written by two different
+#: readers (a bug filer and an adversarial reviewer), and an ordering that puts one below the
+#: other makes the cut depend on which word someone happened to type.
+PRIORITY_TIERS = (
+    ("p0", "sev0", "blocker", "critical"),
+    ("p1", "sev1", "high", "major"),
+    ("p2", "sev2", "medium", "moderate", "normal"),
+    ("p3", "sev3", "low", "minor", "trivial", "nice-to-have"),
+)
+PRIORITY_ORDER = tuple(word for tier in PRIORITY_TIERS for word in tier)
+
+#: The default cut, INCLUSIVE: every word at or above it blocks. A project moves the cut with
+#: `review.blocking_priority` in `.config.yaml` - one value to set, rather than a list to keep
+#: in step with its own vocabulary.
+BLOCKING_CUT = "high"
+
+
+def blocking_priorities(repo_root: Path | str | None = None) -> tuple:
+    """Every priority word at or above this project's blocking cut.
+
+    DERIVED from `PRIORITY_ORDER` and one cut, so a project that files High/Medium/Low and one
+    that files P0..P3 are both covered without either being enumerated here. An unrecognised
+    cut falls back to the shipped default rather than to an empty floor: a floor nobody
+    configured must not silently become no floor at all."""
+    cut = BLOCKING_CUT
+    if repo_root is not None:
+        declared = sdlc_md.project_override(repo_root, "review.blocking_priority", None)
+        if declared and _normalise_priority(str(declared)) in PRIORITY_ORDER:
+            cut = _normalise_priority(str(declared))
+    depth = next(i for i, tier in enumerate(PRIORITY_TIERS) if cut in tier)
+    return tuple(word for tier in PRIORITY_TIERS[:depth + 1] for word in tier)
+
+
+_PRIORITY_DECORATION = re.compile(r"[^a-z0-9-]+")
+
+
+def _normalise_priority(value: str) -> str:
+    """`"High (severity)"`, `" **P1** "`, `"Sev-1"` -> the bare word the ordering knows.
+
+    A decorated field value compared raw is a value that never matches, which is half of why
+    the floor never fired."""
+    text = _PRIORITY_DECORATION.sub(" ", str(value or "").strip().lower()).strip()
+    for token in text.split():
+        # Both spellings of a hyphenated tier word: `sev-1` and `sev1`, `nice-to-have` intact.
+        # Trying only one is how half a vocabulary goes unrecognised.
+        for candidate in (token.strip("-"), token.replace("-", "")):
+            if candidate in PRIORITY_ORDER:
+                return candidate
+    return text.split()[0] if text.split() else ""
+
+
+#: Kept as the shipped default for callers that ask for the constant. Derived, never typed.
+BLOCKING_PRIORITIES = blocking_priorities(None)
+
+
+def judge_defects_against_goal(defects: list[dict], clauses: list[str],
+                               repo_root: Path | str | None = None) -> dict:
+    """Which open defects BLOCK a close and which can be left, judged against the goal.
+
+    `{blocking, leavable}`. A defect blocks when it falsifies a goal clause - it names one, or
+    an explicit `falsifies` says so - or when its priority is one a release cannot carry.
+    Everything else is LEAVABLE and recorded with its priority and the reasoning, never
+    silently dropped: the decision to ship with a known defect is a decision, and one nobody
+    wrote down is indistinguishable from not having noticed.
+
+    The severity floor exists because a clause argument can be made for almost anything. A
+    defect at P0/P1 blocks whatever the reasoning says.
+    """
+    lowered = [c.strip().lower() for c in (clauses or []) if str(c).strip()]
+    floor = blocking_priorities(repo_root)
+    blocking, leavable = [], []
+    for d in defects or []:
+        priority = _normalise_priority(d.get("priority") or d.get("severity") or "")
+        named = str(d.get("falsifies") or "").strip().lower()
+        clause = next((c for c in lowered if named and (named in c or c in named)), None)
+        if clause is None and named:
+            clause = named          # names a clause this goal does not carry: still a claim
+        if clause:
+            blocking.append({**d, "why": f"falsifies the goal clause: {clause}"})
+        elif priority in floor:
+            blocking.append({**d, "why": f"priority {priority} - a defect a release cannot "
+                                         f"carry blocks the close whatever the clause "
+                                         f"reasoning says"})
+        else:
+            leavable.append({**d, "why": f"falsifies no goal clause; priority "
+                                         f"{priority or 'unstated'} - recorded leavable, not "
+                                         f"dropped"})
+    return {"blocking": blocking, "leavable": leavable}
+
+
+def sprint_reviews(repo_root: Path | str) -> list[dict]:
+    """The frozen batch-review rows that still count: those dated before `REPAIR_VERB_RETIRED`.
+
+    THE one read of the ledger, so every reader - conformance, the close, the sign, the report
+    and `sprint_review_for` - applies the same date licence. The ledger's last row predates the
+    constant, so it reuses the repair ledger's day rather than pinning a second one. An undated
+    row, or one dated on or after the constant, covers nothing: no verb writes one now, and a
+    hand-appended row cannot mint coverage for new work.
+    """
+    return [r for r in _read_rows(sprint_review_path(repo_root), _SPRINT_COLS)
+            if _dated_before(r.get("date"), REPAIR_VERB_RETIRED)]
+
+
+def _dated_before(cell, day: str) -> bool:
+    """True when a row's Date cell is an ISO date strictly before `day`; blank or unparseable
+    reads False, so an undated row is never taken for history."""
+    when = str(cell or "").strip()[:10]
+    return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", when)) and when < day
+
+
+#: Two REJECTs on one unit is the point at which the repair has stopped converging.
+PANEL_REJECT_LIMIT = 2
+
+
+def review_rounds_across_ledgers(repo_root: Path | str, unit: str,
+                                 phase: str = "delivery") -> list[dict]:
+    """Every recorded adversarial round on one unit, from BOTH ledgers, oldest first.
+
+    A unit's rounds live in two files and the question "has this stopped converging" spans them:
+    `critic.py record` appends to `critic-verdicts.md`, and the frozen batch ledger
+    (`sprint-review-record.md`, read through `sprint_reviews`) still holds historical batch rows
+    naming the unit. Escalation once read the first only, so two batch REJECT rounds on one unit
+    escalated nothing.
+
+    Deliberately NOT folded into `unit_review_rounds`, which feeds `seat_verdicts` and the
+    coverage predicate. Those ask "which seat holds what verdict on this unit" - a per-unit
+    question a batch row cannot answer, because a batch reviewer reviewed a span rather than a
+    seat's slice of one unit. Two questions, two readers, and the difference is stated here so
+    the next reader does not merge them by tidiness.
+    """
+    want = sdlc_md.norm_id(unit)
+    rows = list(unit_review_rounds(repo_root, unit, phase))
+    if phase == "delivery":
+        for row in sprint_reviews(repo_root):
+            named = {sdlc_md.norm_id(u) for u in str(row.get("units") or "").split()}
+            if want in named:
+                rows.append({"unit": want, "verdict": row.get("verdict"),
+                             "reviewer": row.get("reviewer"), "date": row.get("date"),
+                             "ledger": "sprint-review"})
+    rows.sort(key=lambda r: str(r.get("date") or ""))
+    return rows
+
+
+def panel_escalation(rounds: list, seat_verdicts: dict) -> tuple[bool, str]:
+    """Whether a unit must go to the operator, and why.
+
+    Never waits. Human-in-the-lead means the decision reaches the operator; it does not mean the
+    machine blocks on input that will not arrive. An escalation that waits is indistinguishable
+    from a hang, and unattended that is exactly what it becomes. Nor does it claim to NOTIFY:
+    nothing sends it anywhere, so `escalation_notice` names where the operator reads it.
+
+    Lives here, beside the ledgers it judges, so the command that records a round - `critic
+    record`, the one verdict writer - consults one rule rather than a copy of it.
+
+    `sprint.panel_escalation` delegates here and now has no production caller of its own - it is
+    kept as a named shim because tests and any consuming project may still reach for it.
+    """
+    verdicts = [str(v).upper() for v in (rounds or [])]
+    # CONVERGENCE ENDS THE ESCALATION, and it is checked before anything else.
+    #
+    # Both escalations below read the WHOLE history, so once two REJECTs existed they fired on
+    # every later record for that unit - including the APPROVE that resolved them. The ordinary
+    # reject-fix-approve loop, which is the process working, reported "the repair is not
+    # converging" at the moment it demonstrably had. Eight units did this in one run: every one
+    # had a round-1 REJECT with substantive findings, a revision, and a round-2 approval.
+    #
+    # It also explains the sibling defect: a second ROUND is a different context reviewing a
+    # revised unit, not a panel SPLIT within one round. Reading the latest verdict tells the two
+    # apart without having to reconstruct round boundaries from free-text reviewer names.
+    #
+    # A notice that fires after it has been answered is one readers learn to scroll past, and
+    # then it is not there for the unit that genuinely stalled.
+    if verdicts and verdicts[-1] == APPROVE:
+        return (False, "")
+    rejects = sum(1 for v in verdicts if v == REJECT)
+    if rejects >= PANEL_REJECT_LIMIT:
+        return (True, f"the panel rejected this unit twice ({rejects} REJECTs) - the repair is "
+                      f"not converging. The run continues to its handoff; nothing waits on a "
+                      f"reply.")
+    seats = {k: str(v).upper() for k, v in (seat_verdicts or {}).items() if v}
+    if len(set(seats.values())) > 1:
+        # The disagreement IS the signal. Resolving it by majority discards precisely the
+        # information the panel was convened to produce, and does so where nobody sees it.
+        dissent = sorted(k for k, v in seats.items() if v == REJECT)
+        agree = sorted(k for k, v in seats.items() if v != REJECT)
+        return (True, f"the panel split: {', '.join(dissent) or 'some seats'} rejected while "
+                      f"{', '.join(agree) or 'others'} approved. The disagreement is the "
+                      f"finding, so it is not resolved by majority - both sides are named here "
+                      f"for the operator.")
+    return (False, "")
+
+
+def escalation_notice(repo_root: Path | str, unit: str, phase: str = "delivery") -> str:
+    """The escalation line for one unit, or "" - the whole check in one call.
+
+    Both recording commands call THIS rather than assembling the rounds themselves, because the
+    defect being repaired was precisely that the caller assembled them from the wrong ledger.
+
+    It says where the operator READS it, because nothing sends it to them: a unit carried at
+    the cap is on the sprint report's `Dropped, held and carried over` row and in the bug that
+    holds its findings; any other escalation is in this output and the verdict ledger.
+    """
+    rounds = [str(r.get("verdict") or "")
+              for r in review_rounds_across_ledgers(repo_root, unit, phase)]
+    escalate, why = panel_escalation(rounds, seat_verdicts(repo_root, unit, phase))
+    if not escalate:
+        return ""
+    uid = sdlc_md.norm_id(unit)
+    bug = carried_by(repo_root, uid) if phase == "delivery" else None
+    where = (f"The operator reads it on the sprint report, in its `{NOT_DELIVERED_ROW}` row, "
+             f"and in {bug}, which holds the findings; nothing is sent to them."
+             if bug else
+             f"Nothing sends it on: the operator reads it here and in the verdict ledger "
+             f"(`critic.py show --unit {uid}`).")
+    return f"  ESCALATED for the operator - {uid}: {why} {where}"
+
+
+#: The sprint report row a carried unit is listed on (`sprint_report._ck_not_delivered`).
+NOT_DELIVERED_ROW = "Dropped, held and carried over"
+
+
+# One reviewer, at most this many rounds per unit: round 1 reviews, round 2 re-checks the fixes.
+# A unit still rejected at the cap is carried as a known issue rather than reviewed again.
+DEFAULT_REVIEW_CEILING = 2
+
+
+def review_ceiling(repo_root: Path | str) -> int:
+    """The review round cap (`review.max_rounds`), or the shipped default of 2.
+
+    A non-integer or non-positive setting falls back to the default: a cap of 0 would refuse
+    the first round and leave no way to review anything."""
+    raw = sdlc_md.project_override(repo_root, "review.max_rounds", DEFAULT_REVIEW_CEILING)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_REVIEW_CEILING
+    return value if value > 0 else DEFAULT_REVIEW_CEILING
+
+
+def round_refusal(repo_root: Path | str, unit: str, reviewer: str,
+                  verdict: str | None = None, ruling: str | None = None) -> str | None:
+    """Why a further delivery `verdict` on `unit` by `reviewer` must not be written, or None.
+
+    Two rules: no round past the cap, and a round after a REJECT comes from the reviewer who
+    rejected, because it re-checks that reviewer's findings. Shared by every command that
+    writes a delivery verdict, so the rules cannot differ between them.
+
+    ONE verdict passes the cap: on a CARRIED unit (`carried_by`), an APPROVE from a reviewer
+    whose REJECT still stands unanswered. It answers that REJECT, the carry's only exit
+    (`REJECT_EXITS`); refusing it left `--force` as the only way to close an approved unit.
+    Any other verdict past the cap - another reviewer's, a REJECT, or one on a unit never
+    carried - is refused, and on a carried unit the refusal names who can discharge it, unless
+    `ruling` names an accepted decision authorising this unit one more round
+    (`ruling_refusal`); the round is then judged by the same rejecting-reviewer rule as any
+    other. Every writer of a delivery verdict asks here, so the rules cannot differ between
+    them; only `critic.py record` passes a ruling, so a round past the cap is written there."""
+    prior = delivery_rounds(repo_root, unit)
+    cap = review_ceiling(repo_root)
+    uid = sdlc_md.norm_id(unit)
+    authorised = bool(ruling) and len(prior) >= cap and ruling_refusal(repo_root, uid, ruling) is None
+    if len(prior) >= cap and not authorised:
+        at_cap = (f"{uid} has {len(prior)} review round(s) recorded, at the cap of {cap} "
+                  f"(`review.max_rounds`)")
+        if ruling:
+            return f"{at_cap}. {ruling_refusal(repo_root, uid, ruling)}"
+        bug = carried_by(repo_root, uid)
+        owed = [r.get("reviewer") or "" for r in
+                _unanswered_rejects(_live_verdict_rows(repo_root, uid, "delivery"))]
+        if bug and owed:
+            if (str(verdict or "").upper() == APPROVE
+                    and any(same_identity(w, reviewer or "") for w in owed)):
+                return None
+            names = ", ".join(dict.fromkeys(owed))
+            return (f"{at_cap}. {uid} was {CARRIED_REASON} ({bug} holds the findings), so the "
+                    f"one verdict past the cap it accepts is an APPROVE from {names}, whose "
+                    f"REJECT it carried: that APPROVE answers the REJECT and discharges the "
+                    f"carry. No other reviewer's verdict, and no further REJECT, is recorded")
+        return (f"{at_cap}. A unit still rejected at the cap is carried as a known issue, not "
+                f"reviewed again")
+    last = prior[-1] if prior else None
+    if (last and str(last.get("verdict") or "").upper() == REJECT
+            and not same_identity(last.get("reviewer", ""), reviewer or "")):
+        return (f"round {len(prior) + 1} of {uid} re-checks the fixes to "
+                f"{last.get('reviewer')}'s REJECT, so it must be recorded by "
+                f"{last.get('reviewer')}, not {reviewer}")
+    return None
+
+
+CARRIED_REASON = "carried at the review cap"
+#: The two ways a standing REJECT ends, named by every refusal that holds one.
+REJECT_EXITS = ("a round-2 APPROVE from the reviewer who rejected, or carrying the unit at the "
+                "review cap: that reviewer's round-2 REJECT, recorded in the open run, files the "
+                "findings as a bug and drops the unit from the batch, so the run closes without "
+                "it. A carried unit is still refused Done: it is delivered again in a later run "
+                "and reaches Done on an APPROVE from the reviewer who rejected it (the same "
+                "reviewer id), which the review cap admits however many rounds that run "
+                "recorded")
+
+
+class CarryFailed(RuntimeError):
+    """A REJECT at the cap WAS written, and carrying the unit then failed. Not a refusal: the
+    row stands, so no writer may report the verdict as unwritten."""
+
+
+def carried_notice(unit: str, bug: str) -> str:
+    return (f"  {sdlc_md.norm_id(unit)} {CARRIED_REASON}: {bug} holds the findings, and the "
+            f"unit leaves the open run's batch so the run continues")
+
+
+def _carry_if_capped(repo_root: Path | str, unit: str, verdict: str, path: Path,
+                     rounds: list[dict] | None = None) -> str | None:
+    """Carry `unit` when the delivery verdict just written is a REJECT at the cap: the bug's
+    id, or None when nothing is carried. Raises `CarryFailed` naming the written row."""
+    if str(verdict or "").upper() != REJECT:
+        return None
+    rounds = delivery_rounds(repo_root, unit) if rounds is None else rounds
+    if not rounds or len(rounds) < review_ceiling(repo_root):
+        return None
+    try:
+        return carry_at_cap(repo_root, unit, rounds[-1])
+    except Exception as exc:  # noqa: BLE001 - any failure here follows a written row
+        raise CarryFailed(
+            f"{sdlc_md.norm_id(unit)}'s round {len(rounds)} REJECT WAS written to {path}, but "
+            f"carrying it at the review cap failed: {exc}. The unit stays in the open run's "
+            f"batch with that REJECT unanswered: file its findings as a bug and drop it from "
+            f"the batch (`sprint batch drop`) by hand") from exc
+
+
+def carry_at_cap(repo_root: Path | str, unit: str, row: dict) -> str | None:
+    """File the findings of a REJECT recorded at the cap as a bug, and drop the unit from the
+    open run's batch naming it. Returns the bug id, or None when no open run holds the unit:
+    there is then no run to keep going, and the REJECT stands against the unit as it is. The
+    run keeps going: the unit becomes a known issue instead of a third round."""
+    uid = sdlc_md.norm_id(unit)
+    if not run_state.batch_holds(run_state.read(repo_root) or {}, uid):
+        return None
+    import file_finding  # noqa: PLC0415 - needed only when a unit is carried
+    issues = str(row.get("issues") or "").strip(" -") or "(the REJECT itemised no findings)"
+    # The fix lands where the unit did, at the unit's own size: the filer refuses a bug that
+    # `sprint plan` could not size or place, and a planned unit carries both.
+    found = sdlc_md.find_by_id(repo_root, uid)
+    text = sdlc_md.read_text_safe(found[0]) if found else ""
+    # Named in its file's spelling: `uid` is the comparison key, and a title, slug or prose
+    # naming it would name an id no file carries.
+    disp = sdlc_md.display_id(repo_root, unit)
+    acs, verify = carried_criteria(disp, text, row)
+    res = file_finding.file_finding(repo_root, "bug", f"{disp} did not converge in review: "
+                                    f"round {row.get('round')} REJECT findings", {
+        "affects": sdlc_md.extract_field(text, "Affects") or "",
+        "points": sdlc_md.extract_field(text, "Points") or "",
+        "acs": acs,
+        "verify": verify,
+        "severity": "Medium",
+        "summary": (f"{disp} was rejected at round {row.get('round')}, the review cap, by "
+                    f"{row.get('reviewer')}, so it was carried as a known issue rather than "
+                    f"reviewed again. The findings still open: {issues}"),
+        "steps": f"1. Read the round {row.get('round')} REJECT of {disp} in the verdict ledger.",
+        "fix": f"Fix each finding above, then deliver {disp} again in a later run.",
+    }, counted=False)  # a review outcome, not a new finding: outside the triage session cap
+    bug = res["id"]
+    run_state.drop_from_batch(repo_root, uid, f"{CARRIED_REASON}: {bug}")
+    return bug
+
+
+#: How a carried finding's criterion is checked until its fix brings a test of its own.
+CARRIED_FINDING_CHECK = "manual - the independent review of the redelivery re-checks this finding"
+
+
+def carried_criteria(unit: str, text: str, row: dict) -> tuple[list[str], list[str]]:
+    """The carried bug's criteria and their verifiers, paired by position: `(acs, verify)`.
+
+    One criterion per finding of the carrying REJECT (its `;`-separated items, origin tag kept),
+    each stating that the finding no longer holds - what the reviewer found is what the bug is
+    about. Beneath them, the unit's own criteria (`verify_ac.criteria_blocks`, the one reader)
+    with their `Verify:` lines, which the redelivery must still pass: they make the bug
+    executable, so `sprint plan` takes it without hand grooming. A finding has no test of its own
+    until its fix is written, so its verifier says how it IS checked: `manual`, by the
+    independent review of the redelivery.
+    """
+    import verify_ac  # noqa: PLC0415 - needed only when a unit is carried
+    findings = [f for f in split_items(str(row.get("issues") or "").strip())
+                if f.strip(" -")]
+    acs = [f"The round {row.get('round')} REJECT finding no longer holds: {f}" for f in findings]
+    verify = [CARRIED_FINDING_CHECK] * len(acs)
+    for block in verify_ac.criteria_blocks(text):
+        acs.append(f"{unit} {block.ac_id} still passes: {block.title}")
+        verify.append(str(block.verifier or "").strip())
+    return acs, verify
+
+
+def carried_to(repo_root: Path | str, unit: str, reason: str,
+               state: dict | None = None) -> str | None:
+    """The bug a batch drop of `unit` carried its findings to, or None when the drop is not a
+    carry. `carry_at_cap` writes the reason; this is its one reader. A drop counts only when its
+    reason is `CARRIED_REASON: <bug>`, the unit's current delivery stands at the cap with a
+    REJECT as its last round, and the bug is on disk: a hand drop worded like a carry answers
+    no REJECT."""
+    bug = _carry_bug(repo_root, reason)
+    if not bug:
+        return None
+    rounds = delivery_rounds(repo_root, unit, state)
+    if (len(rounds) < review_ceiling(repo_root)
+            or str(rounds[-1].get("verdict") or "").upper() != REJECT):
+        return None
+    return bug
+
+
+def _carry_bug(repo_root: Path | str, reason: str) -> str | None:
+    """The bug a drop reason `CARRIED_REASON: <bug>` names, when that bug is on disk."""
+    prefix = f"{CARRIED_REASON}:"
+    reason = str(reason or "")
+    if not reason.startswith(prefix):
+        return None
+    bug = sdlc_md.norm_id(reason[len(prefix):].strip())
+    found = sdlc_md.find_by_id(repo_root, bug) if bug else None
+    return bug if found and found[1] == "bug" else None
+
+
+def carried_by(repo_root: Path | str, unit: str) -> str | None:
+    """The bug the latest carry of `unit` at the review cap filed, or None when it was never
+    carried. Read from the open run's batch drops AND every archived run's, because the carry's
+    exit - the rejecting reviewer's APPROVE - often comes in a later run, whose own batch drops
+    nothing. The drop's reason must name a bug on disk (`_carry_bug`), so a hand drop worded
+    like a carry carries nothing."""
+    uid = sdlc_md.norm_id(unit)
+    bug = None
+    for record in [*run_state.archived(repo_root), run_state.read(repo_root) or {}]:
+        for change in record.get("batch_changes") or []:
+            if (isinstance(change, dict) and change.get("action") == "drop"
+                    and sdlc_md.norm_id(str(change.get("id") or "")) == uid):
+                bug = _carry_bug(repo_root, change.get("reason")) or bug
+    return bug
+
+
+# The ORIGIN axis: does this finding predate the run's base ref? `ORIGIN_REGRESSION` means "this
+# unit's diff broke it", and the coverage gate reads `origin`.
+ORIGIN_REGRESSION = "regression"      # the diff broke something that worked at the base ref
+ORIGIN_NEW = "new"                    # the diff introduced a defect that did not exist
+ORIGIN_PRE_EXISTING = "pre-existing"  # already true of the tree at the base ref
+ORIGINS = (ORIGIN_REGRESSION, ORIGIN_NEW, ORIGIN_PRE_EXISTING)
+
+#: How a finding declares its origin in an `--issues` string: a leading `[origin]` tag on each
+#: semicolon-separated item. The findings channel is free text everywhere it is written, so the
+#: tag rides on the text rather than requiring a second parallel field the writers would have to
+#: keep in step.
+#: The optional `BLOCKING:` prefix is the TOOL's own doing, not the reviewer's: `--from-verdict`
+#: folds the block's BLOCKING section into the issues text, so an item that arrived correctly
+#: tagged reaches the parser behind that label. Refusing it would refuse a compliant reviewer
+#: for something the parser did to their answer.
+_ORIGIN_TAG = re.compile(
+    r"^\s*(?:BLOCKING\s*:\s*)?\[\s*(regression|new|pre[- ]existing)\s*\]\s*(.*)$",
+    re.IGNORECASE | re.DOTALL)
+
+#: What a clean pass says. An APPROVE finding nothing is the common case and must stay legal,
+#: or the rule is satisfiable by a gate that refuses every clean review.
+_NO_FINDINGS = ("", "-", "none", "none blocking", "no findings", "n/a", "na")
+
+
+def parse_findings(issues: str) -> list[dict]:
+    """Split an `--issues` string into findings, each with its declared `origin`.
+
+    An item with no `[origin]` tag comes back with `origin: None`, which is what
+    `unclassified_findings` refuses on. Absent is kept distinct from any real value: guessing
+    an origin is exactly the judgement the classification exists to force somebody to make.
+    """
+    text = (issues or "").strip()
+    if text.lower() in _NO_FINDINGS:
+        return []
+    out = []
+    # A recorded row carries `_clean`'s escapes (`\_`, and `\[` after a `]` or `)`; an origin
+    # tag is written raw). They were added to the whole cell last, so they come off it first,
+    # before the `;` split, and each finding reads as written.
+    for item in split_items(_unescape_outside_spans(text)):
+        m = _ORIGIN_TAG.match(item)
+        if m:
+            origin = m.group(1).lower().replace(" ", "-")
+            out.append({"origin": origin, "text": m.group(2).strip()})
+        else:
+            out.append({"origin": None, "text": item})
+    return out
+
+
+def unclassified_findings(issues: str) -> list[str]:
+    """The findings carrying no origin - the ones a close cannot price against a batch."""
+    return [f["text"] for f in parse_findings(issues) if f["origin"] is None]
+
+
+def blocking_findings(issues: str) -> list[dict]:
+    """Only regression and new. A pre-existing finding is reported, never blocking."""
+    return [f for f in parse_findings(issues)
+            if f["origin"] in (ORIGIN_REGRESSION, ORIGIN_NEW)]
+
+
+def non_blocking_findings(issues: str) -> list[dict]:
+    return [f for f in parse_findings(issues) if f["origin"] == ORIGIN_PRE_EXISTING]
+
+
+#: A finding that repeats a recorded failure class cites its code anywhere in its text, after
+#: the origin tag: `[new] the mutant was never applied [LC-003]`.
+LESSON_CITE_RE = re.compile(r"\[\s*(LC-\d{3,})\s*\]", re.IGNORECASE)
+
+
+def cited_lessons(repo_root: Path | str, state: dict) -> list[tuple[str, str, str]]:
+    """`(class code, unit, finding)` for each REJECT the run in `state` recorded whose findings
+    cite a lesson class, once per (code, unit); `finding` is the text of every finding that
+    cited it, so the class's hits carry the evidence and not only a pointer to it. Only a unit
+    the run reviewed counts - its rows past the `REVIEW_BASE` the run fixed - so an APPROVE, or
+    a REJECT an earlier run recorded, is never read as this run's repeat."""
+    found: dict[tuple[str, str], list[str]] = {}
+    for unit in (state or {}).get("batch") or []:
+        uid = sdlc_md.norm_id(unit)
+        if uid not in ((state or {}).get(run_state.REVIEW_BASE) or {}):
+            continue
+        for row in delivery_rounds(repo_root, uid, state):
+            if str(row.get("verdict") or "").upper() != REJECT:
+                continue
+            for f in parse_findings(row.get("issues") or ""):
+                for code in LESSON_CITE_RE.findall(f["text"]):
+                    texts = found.setdefault((code.upper(), uid), [])
+                    if f["text"] not in texts:
+                        texts.append(f["text"])
+    return [(code, uid, "; ".join(texts)) for (code, uid), texts in found.items()]
+
+
+# An acceptance criterion CORRECTED during delivery is a spec defect, not an ordinary revision.
+# Counting it as a normal edit hides the most expensive class of defect this project has found: a
+# criterion that specified the WRONG behaviour, which a passing test then defends (US0375 asked the
+# sign-off gate to ignore a superseded row - that IS the independence-gate bypass, and the test
+# asserted it as a requirement). An absence and a negative result are different facts: a story with
+# no AC amendment is not the same as one whose criterion was found wrong and fixed, and folding the
+# amendment into the ordinary-revision count erases the distinction the retro then cannot recover.
+AC_DEFECT = "ac-defect"
+ORDINARY_REVISION = "revision"
+
+# A change is an AC DEFECT when it says a criterion was CORRECTED - not merely touched. Adding,
+# rewording, renumbering or clarifying a criterion is an ordinary revision; a criterion that stated
+# the wrong behaviour and was amended is a spec failure. Detection needs BOTH a reference to a
+# criterion AND a correction-of-wrong-spec verb, so "reworded AC1 for clarity" stays ordinary; an
+# explicit `AC-DEFECT` tag an author sets is honoured directly. A trivial correction (a typo) is
+# excluded even when it carries a correction verb, so the class stays the expensive one.
+_AC_REF = re.compile(r"\b(?:AC\s*\d+|acceptance\s+criteri|criterion|criteria)\b", re.I)
+_CORRECTION = re.compile(r"\b(?:correct(?:ed|s|ion)?|amend(?:ed|s|ment)?|wrong|incorrect|"
+                         r"mis-?specified|misstated|found\s+wrong|specified\s+the\s+wrong)\b", re.I)
+_CLARIFY_ONLY = re.compile(r"\b(?:typo|whitespace|formatting|grammar|spelling|reworded?\s+for\s+"
+                           r"clarity|clarif\w*\s+wording)\b", re.I)
+_AC_DEFECT_TAG = re.compile(r"\bAC[-\s]?DEFECT\b", re.I)
+_REV_HEADING = re.compile(r"^##\s+Revision History\s*$", re.M | re.I)
+
+
+def classify_revision(change: str) -> str:
+    """Classify one Revision History change line as an AC DEFECT or an ordinary revision.
+
+    An explicit `AC-DEFECT` tag is honoured directly. Otherwise the change is an AC defect only
+    when it both references a criterion and carries a correction-of-wrong-spec verb, and is not a
+    purely cosmetic correction (a typo). Everything else - a clarification, a new criterion, a
+    reorder - is an ordinary revision. The point is to keep a wrong-spec correction from being
+    counted as a normal edit."""
+    text = change or ""
+    if _AC_DEFECT_TAG.search(text):
+        return AC_DEFECT
+    if _AC_REF.search(text) and _CORRECTION.search(text) and not _CLARIFY_ONLY.search(text):
+        return AC_DEFECT
+    return ORDINARY_REVISION
+
+
+def ac_defects(source: str | Path) -> list[dict]:
+    """The AC-defect rows in a story's Revision History - each an amendment that corrected a wrong
+    criterion, classified apart from the ordinary revisions beside it.
+
+    `source` is a story's text or a path to it. Returns one record per AC-defect row, each with its
+    date, author and the change text, so a caller (a retro, a close count) can report the AC defects
+    a unit carried without re-deriving the rule. Rows outside the Revision History section are
+    ignored - only the history table records amendments."""
+    text = Path(source).read_text(encoding="utf-8") if isinstance(source, Path) else str(source)
+    m = _REV_HEADING.search(text)
+    body = text[m.end():] if m else text
+    out: list[dict] = []
+    for table in sdlc_md.iter_tables(body):
+        header = [h.lower() for h in (table["header"] or [])]
+        if "change" not in header:
+            continue
+        ci = header.index("change")
+        di = header.index("date") if "date" in header else 0
+        ai = header.index("author") if "author" in header else 1
+        for _lineno, cells in table["rows"]:
+            if len(cells) <= ci:
+                continue
+            change = cells[ci]
+            if classify_revision(change) == AC_DEFECT:
+                out.append({
+                    "date": cells[di] if di < len(cells) else "",
+                    "author": cells[ai] if ai < len(cells) else "",
+                    "change": change,
+                    "class": AC_DEFECT,
+                })
+    return out
+
+
+# What must never reach a reviewer's brief, because it predicts a conclusion rather than
+# describing the work: the prior verdict words, severity labels that pre-grade what will be
+# found, a round number (which says "others already rejected this"), and any sentence asserting
+# what the reviewer is about to conclude. Checked mechanically, so a future edit that
+# reintroduces priming fails the suite rather than relying on a reader noticing.
+_PRIMING = (
+    (re.compile(r"\b(REJECT|APPROVE)\b"), "a prior verdict word"),
+    (re.compile(r"\b(MAJOR|MINOR|BLOCKING)\b"), "a severity label that pre-grades the finding"),
+    (re.compile(r"(?i)\bround\s*\d+\b"), "a round number"),
+    (re.compile(r"(?i)the pattern will continue|you will find|expect to find|"
+                r"as in the previous round"), "an asserted conclusion"),
+)
+
+# A probe is a thing the reviewer must RE-EXECUTE: a test path or node, or a file:line the
+# prior round mutated. These are facts, and they must survive into a re-review - the round-2
+# APPROVE this project trusts was earned by a reviewer re-running exactly these. What must not
+# survive is the prose around them.
+_PROBE = re.compile(r"(?:[\w./-]+\.(?:py|sh|ts|js|go|md)(?::\d+)?"
+                    r"(?:::[\w:]+)?|\b(?:pytest|jest|vitest|go test)\s+[\w./:-]+)")
+
+
+def neutrality_violations(text: str) -> list[str]:
+    """Every priming class present in `text`. Empty means the brief is neutral.
+
+    The RETURN CONTRACT is excluded before checking. It necessarily contains both verdict words
+    and the BLOCKING label, because it is the reply format the reviewer must follow - offering
+    the vocabulary as a required choice is not priming, and stripping it to satisfy this check
+    would break the contract. Priming is a prior verdict ASSERTED, which is what remains once
+    the contract is removed.
+
+    Mechanical by design: a reviewer's impression of neutrality is exactly the judgement this
+    exists to remove from the loop."""
+    body = (text or "").replace(_RETURN_CONTRACT, "")
+    return [why for rx, why in _PRIMING if rx.search(body)]
+
+
+def extract_probes(prior_verdict_text: str) -> list[str]:
+    """The probes a prior verdict named, as a bare list of things to re-execute.
+
+    Refuses loudly when none can be extracted. A re-review that silently dropped the
+    re-execution demand would approve against a brief WEAKER than the one it replaced, which
+    is worse than the priming this strips - so absence is an error, never an empty list."""
+    found, seen = [], set()
+    for m in _PROBE.finditer(prior_verdict_text or ""):
+        probe = m.group(0)
+        if probe not in seen:
+            seen.add(probe)
+            found.append(probe)
+    if not found:
+        raise ValueError(
+            "no probe could be extracted from the prior verdict - a re-review must carry the "
+            "checks to re-execute, and one that drops them silently is weaker than the review "
+            "it replaces. Name the tests and file:line mutants in the verdict, or run a fresh "
+            "review rather than a re-review.")
+    return found
+
+
+def neutral_brief(repo_root: Path | str, unit: str, seat: str, tier: str = "full",
+                  prior: str | None = None, round_number: int | None = None) -> str:
+    """The reviewer's brief, carrying the diff and risk surface but none of the framing that
+    predicts a conclusion.
+
+    `round_number` is accepted and deliberately NOT rendered: callers hold it, and silently
+    ignoring an argument would be worse than refusing one - this way the caller cannot leak it
+    by passing it. When `prior` is given, the probes it named travel as a neutral checklist;
+    the verdict prose, severity labels and conclusions around them do not."""
+    base = brief(repo_root, unit, seat, tier)
+    if prior is None:
+        return base
+    probes = extract_probes(prior)          # raises rather than dropping the demand
+    listed = "\n".join(f"  - {p}" for p in probes)
+    return (f"{base}\n\n--- CHECKS TO RE-EXECUTE ---\n\n"
+            f"Before concluding, re-execute each of the following and record what you observed. "
+            f"Re-apply each named mutant and confirm its killing test fails; re-run each named "
+            f"test. Confirm the tree is byte-identical afterwards.\n\n{listed}\n")
+
+
+def _covered_ids(row: dict) -> set[str]:
+    return {sdlc_md.norm_id(u) for u in re.split(r"[,\s]+", row.get("units", "")) if u.strip()}
+
+
+def sprint_review_for(repo_root: Path | str, unit: str):
+    """The latest frozen sprint-level review (`sprint_reviews`, dated before
+    `REPAIR_VERB_RETIRED`) whose covered-units list includes `unit`, or None."""
+    target = sdlc_md.norm_id(unit)
+    latest = None
+    for r in sprint_reviews(repo_root):
+        if target in _covered_ids(r):
+            latest = r
+    return latest
+
+
+#: The states a unit's independent review can be in. A REJECT is answered only by the rejecting
+#: reviewer's round-2 APPROVE, so a rejected unit is `unreviewed` until then: carried at the cap,
+#: it leaves the run's batch instead (`REJECT_EXITS`).
+COVERAGE_APPROVED = "approved"     # an APPROVE (or a REJECT whose findings are all pre-existing)
+COVERAGE_UNREVIEWED = "unreviewed"  # nobody looked, or looked and the answer is still open
+
+
+def coverage_state(repo_root: Path | str, unit: str, phase: str = "delivery") -> str:
+    """Which of the two states this unit's review is in: `approved` by an independent APPROVE
+    (or a frozen batch review covering a unit with no verdict of its own), else `unreviewed`. A
+    standing REJECT reads `unreviewed` whatever else is recorded beside it."""
+    row = verdict_for(repo_root, unit, phase)
+    # ONE authority, shared with `conformance.critiqued_unmet`. Answering this through
+    # `sprint_covers_independently` alone gave two answers to one question: that predicate
+    # refuses the PRE_GATE sentinel while `critiqued_unmet` honours it, so 75-odd grandfathered
+    # APPROVEs in this repo's own ledger started reading as REJECTED - a regression introduced
+    # by the very row that exists to make coverage honest.
+    per_unit_ok = (bool(row) and str(row.get("verdict") or "").upper() == APPROVE
+                   and (is_independent(row) or is_pre_gate(row)))
+    if per_unit_ok:
+        return COVERAGE_APPROVED
+    # No per-unit verdict at all: a frozen batch review naming the unit, dated before
+    # `REPAIR_VERB_RETIRED`, still covers it - the same licence every batch-ledger reader
+    # applies through `sprint_reviews`, so this and `sprint.review_coverage` cannot disagree.
+    if not row and sprint_covers_independently(repo_root, unit,
+                                               sprint_review_for(repo_root, unit)):
+        return COVERAGE_APPROVED
+    return COVERAGE_UNREVIEWED
+
+
+def coverage_counts(repo_root: Path | str, units, phase: str = "delivery") -> dict:
+    """`{approved: [...], unreviewed: [...]}` over `units`.
+
+    A PARTITION: every unit falls in exactly one state and the lists sum to the batch, so a unit
+    cannot fall through the classification into no count at all.
+    """
+    out = {COVERAGE_APPROVED: [], COVERAGE_UNREVIEWED: []}
+    for unit in units:
+        out[coverage_state(repo_root, unit, phase)].append(sdlc_md.norm_id(unit))
+    return out
+
+
+def sprint_covers_independently(repo_root: Path | str, unit: str, review: dict | None) -> bool:
+    """True when a sprint-level review covers `unit` with valid INDEPENDENT evidence.
+
+    Two shapes qualify, and the reviewer and author must be recorded and distinct in both:
+
+      - an APPROVE, and
+      - a REJECT whose findings are ALL tagged `[pre-existing]`, because only what this unit's
+        diff broke may hold its gate (reference-doctrine rule 19). The findings are still
+        reported; they are simply the repository's debt rather than this increment's.
+
+    An UNTAGGED finding never qualifies, and a REJECT with no itemised findings never
+    qualifies - the safe reading of an unexplained REJECT is that the reviewer had a reason
+    they did not write down.
+
+    This is the evidence half of the two-role gate satisfied at sprint scope; the per-unit
+    sign-off is still required separately."""
+    if not review:
+        return False
+    if (review.get("verdict") or "").upper() != APPROVE:
+        # A REJECT whose findings are ALL pre-existing still covers the unit. Only what this
+        # unit's diff broke may hold its gate; anything already true of the tree is the
+        # repository's debt, not this increment's, and a gate that no correct change can pass
+        # has stopped discriminating (reference-doctrine rule 19).
+        #
+        # Read through `blocking_findings`, so an UNTAGGED finding is not silently treated as
+        # harmless - it counts as neither blocking nor pre-existing here, and `record` refuses
+        # it upstream. The safe reading of "no findings at all on a REJECT" is that the
+        # reviewer rejected for a reason they did not itemise, so that still does not cover.
+        parsed = parse_findings(review.get("issues", ""))
+        if not parsed or blocking_findings(review.get("issues", "")):
+            return False
+        if any(f["origin"] != ORIGIN_PRE_EXISTING for f in parsed):
+            return False
+    # Through the ONE authority. This predicate used to test only non-empty-and-distinct, so it
+    # accepted the PRE_GATE sentinel that `is_independent` refuses; `sprint.review_coverage`
+    # compensated by AND-ing the second predicate on and `conformance` did not, which is how the
+    # same rule cleared Done in one module and refused it in the other.
+    return independence(review.get("reviewer", ""), review.get("author", ""))[0]
+
+
+def _id(value: str) -> str:
+    """Normalise an author/reviewer id for comparison: case-folded, stripped, with the
+    markdown escaping that `_clean` adds on write removed, so `Dani\\_Okafor` and
+    `dani_okafor` compare equal. The empty-cell placeholder `-` normalises to empty,
+    so a missing author is treated as no author, not a real id."""
+    out = _unescape(value or "").strip()
+    return "" if out == "-" else out.casefold()
+
+
+def same_identity(a: str, b: str) -> bool:
+    """True when two recorded ids name the same identity, under this module's normalisation.
+
+    Public because callers need it for questions that are NOT independence - "is this seat the
+    author?" when excluding the author from a goal panel, for instance. Without it those callers
+    reached into `_id`, and a caller holding the authority's private parts is a caller one step
+    from rebuilding the authority's judgement slightly differently.
+    """
+    return _id(a) == _id(b)
+
+
+def independence(reviewer: str, author: str) -> tuple[bool, str]:
+    """THE independence test: `(independent, reason)` for a reviewer/author pair.
+
+    One authority, because there were four - `is_independent`, `sprint_covers_independently`,
+    a sign-off predicate since retired, and a fourth hand-rolled inline in `sprint.py` reaching
+    into this module's private `_id`. Correctness depended on each caller remembering which combination to
+    AND, nothing checked that the four agreed, and twice they did not: one required a non-empty
+    reviewer and one did not (so an empty reviewer cleared the Done gate, since "" != "alice"),
+    and one refused the PRE_GATE sentinel while the module that actually gates Done accepted it.
+    A rule living in two implementations is a rule with two answers.
+
+    Every clause fails CLOSED and says which one failed, so a caller can report the reason
+    rather than a bare False.
+    """
+    rev, auth = _id(reviewer or ""), _id(author or "")
+    if not auth:
+        return False, "no author is recorded, so there is nobody the reviewer had to differ from"
+    if not rev:
+        # The clause that was missing. An empty reviewer is not equal to a recorded author, so
+        # `reviewer != author` alone returned True and the row passed as independently reviewed.
+        return False, "no reviewer is recorded, so nothing was independently reviewed"
+    if auth == PRE_GATE:
+        return False, (f"the author is the {PRE_GATE} migration sentinel, which grandfathers a "
+                       f"unit closed before the gate - it is not independence, and is_pre_gate "
+                       f"is the separate test for it")
+    if rev == auth:
+        return False, f"reviewer and author are the same identity ({rev}) - a self-review"
+    return True, ""
+
+
+def is_independent(verdict: dict | None) -> bool:
+    """True when a verdict was authored and reviewed by distinct identities.
+
+    Independence is the floor, not a persona feature: it holds for generic workers too. A
+    verdict with no recorded reviewer or author, or whose reviewer id equals its author id (a
+    self-review), is NOT independent and must not clear the Done gate. PRE_GATE is not real
+    independence either - `is_pre_gate` is the separate test for it.
+
+    Delegates to `independence`, which is the one authority.
+    """
+    if not verdict:
+        return False
+    return independence(verdict.get("reviewer", ""), verdict.get("author", ""))[0]
+
+
+def is_pre_gate(verdict: dict | None) -> bool:
+    """True for a unit closed BEFORE the independence gate, under the prior
+    risk-scaled policy (which permitted light-tier self-review). Marked by the
+    visible PRE_GATE author sentinel from the one-time migration - auditable in the
+    ledger, and never producible by the sprint loop (which stamps a real delegation
+    id). These are grandfathered as conformant; the gate applies to all work closed
+    after it."""
+    return bool(verdict) and _id(verdict.get("author", "")) == PRE_GATE
+
+
+def _declared_reviewers(repo_root: Path | str) -> list[tuple[str, str]]:
+    """(role, card person-name) pairs declared under personas/seats and
+    personas/amigos - the reviewers the project actually has."""
+    import re as _re
+    out: list[tuple[str, str]] = []
+    role_re = _re.compile(r"<!--\s*role:\s*([a-z][a-z0-9-]*)\s*-->", _re.I)
+    name_re = _re.compile(r"^#\s+([^-\n]+)", _re.M)
+    for sub in ("seats", "amigos"):
+        d = Path(repo_root) / "sdlc-studio" / "personas" / sub
+        if not d.is_dir():
+            continue
+        for card in sorted(d.glob("*.md")):
+            try:
+                text = card.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            rm = role_re.search(text)
+            nm = name_re.search(text)
+            if rm:
+                out.append((rm.group(1).lower(),
+                            (nm.group(1).strip() if nm else card.stem)))
+    return out
+
+
+def seat_for(repo_root: Path | str, reviewer: str) -> str | None:
+    """The declared seat ROLE this reviewer id stands in, or None for a seat-less reviewer.
+
+    Whole-word matching only: 'production' must not claim the product seat, while any token of
+    the seat holder's name ('sam') is a seat claim. None on a project that declares no
+    personas, because there is no seat to stand in - a headless consumer is not seat-less in
+    the sense a report should report, so callers distinguish the two by asking whether any seat
+    is declared at all.
+    """
+    import re as _re
+    words = set(_re.findall(r"[a-z0-9]+", (reviewer or "").lower()))
+    for role, name in _declared_reviewers(repo_root):
+        if role in words:
+            return role
+        if any(tok in words for tok in _re.findall(r"[a-z0-9]+", name.lower())):
+            return role
+    return None
+
+
+def _seat_drift_warning(repo_root: Path | str, reviewer: str) -> str | None:
+    """Advisory when the reviewer names no declared seat - the persona lens
+    drifting out of the critic loop must be visible, never silent. Silent on
+    projects that declare no personas (headless consumers still work)."""
+    declared = _declared_reviewers(repo_root)
+    if not declared:
+        return None
+    if seat_for(repo_root, reviewer) is not None:
+        return None
+    opts = ", ".join(f"{name} (role: {role})" for role, name in declared)
+    return (f"reviewer '{reviewer}' matches no declared seat - the critic "
+            f"should run as a review seat's render (declared: {opts}); see "
+            f"reference-workflow-personas.md")
+
+
+_RETURN_CONTRACT = """Return EXACTLY (raw data, no wrapper):
+VERDICT: APPROVE or REJECT
+ISSUES: <semicolon-separated findings, each one TAGGED with its origin and carrying
+        file:line evidence - or 'none'. Decide the origin by EXECUTION (`git log -S`, or
+        re-probe at the base ref), never by impression:
+          [regression]   this diff broke something that worked at the base ref
+          [new]          this diff introduced a defect that did not exist
+          [pre-existing] already true of the tree, or already recorded in an open Bug/CR
+                         (cite the id) - reported, and it does NOT hold the gate
+        e.g. ISSUES: [regression] verify_ac crashes on empty Affects (verify_ac.py:88);
+                     [pre-existing] BG0123 the gate is slow>
+        An origin tag after a ';' or a line break always starts a new finding, so write \\;
+        before a quoted tag, even inside a code span. Any other ';' ends a finding unless
+        brackets or a code span closed within that finding enclose it; write \\; to keep one.
+BLOCKING: <the subset that must be fixed before Done, or 'none'. Each item quotes the start
+          of its ISSUES finding (no tag needed), and that finding is recorded once, marked
+          blocking>"""
+
+
+# --- Standing review-brief practices ---------------------------------------------------
+# The practices that produced this project's highest-value findings, each a STANDING
+# instruction carried in every reviewer brief with the reason it exists beside it. Each was
+# improvised mid-sprint rather than drawn from anything shipped, so they depended on
+# whoever wrote the brief remembering them - the party the review exists to check. Woven into
+# every brief so they no longer do. `missing_practices` proves both halves are present: a
+# practice named without its reason is the half a fresh reviewer drops first.
+_REVIEW_PRACTICES_BLOCK = """--- STANDING REVIEW PRACTICES (each with the reason it exists) ---
+
+On a REPAIR review, rule each previous finding CLOSED, OVER-CLAIMED or MOVED - a general
+'review the repair' answer blurs the three into one impression, and a MOVED defect is one that
+survived, not one that closed.
+
+Mutate the author's TESTS, not only the code: a shape list drawn from the families where two
+implementations agree by construction passes every mutant while proving nothing, and reading
+the code never finds that.
+
+When a mutant SURVIVES, re-test its branch in ISOLATION before drawing any conclusion from it:
+a sibling guard masked a survivor three separate times in one sprint, and each time the truth
+appeared only when the branch was exercised alone - a survivor is evidence about the harness,
+not about the test.
+
+A repair that changes behaviour carries a test asserting that behaviour; where it does not,
+report the missing regression cover as a finding: an unpinned repair is one a later edit
+reverts with the suite still green, and a shipped repair was lost exactly that way.
+
+Mutate in an ISOLATED CHECKOUT of your own, never the author's working tree - in this harness,
+`Agent(isolation: 'worktree')`. Do NOT use `git stash` or `git checkout --` to clean up: both
+are tree-wide, so either one silently reverts a concurrent reviewer's mutant mid-run and a
+result reported SURVIVED may never have been on disk when its test ran. Four reviewers were
+once dispatched over one shared tree and a live mutant was left behind in it; it was caught
+only because the tree was otherwise clean, and over uncommitted work it would have been
+indistinguishable from that work.
+
+If you revert IN PLACE anyway - and the manual oracle is the case where a reviewer is most
+tempted to - the obligation is to SNAPSHOT THE BYTES FIRST and restore from that snapshot
+unconditionally, in a `finally`, before you report anything. Not `git checkout --`, which
+restores the COMMITTED state and destroys whatever was uncommitted: a reviewer following this
+procedure took a unit's base revision by hand in the author's working tree and roughly four
+hundred uncommitted lines were gone, with nothing able to bring them back. The rule
+existed and was broken anyway, so it is stated here, in the brief a reviewer actually reads,
+rather than only in the decision that records it."""
+
+# Each practice: (name, instruction-regex, reason-regex). Both must be present in a brief for
+# the practice to count as carried; the reason clause is the half worth keeping. Searched over
+# the whitespace-normalised brief, and `[^.]*` keeps each match inside one sentence so an
+# instruction in one place and a reason in another do not pair by accident.
+_BRIEF_PRACTICES = (
+    ("per-item repair verdict",
+     r"rule each previous finding[^.]*CLOSED[^.]*OVER-CLAIMED[^.]*MOVED",
+     r"blurs?[^.]*into one impression"),
+    ("mutate the author's tests",
+     r"mutate the author'?s TESTS[^.]*not only the code",
+     r"agree by construction"),
+    ("isolation re-test of a survivor",
+     r"re-test[^.]*in ISOLATION[^.]*before drawing any conclusion",
+     r"sibling guard[^.]*masked"),
+    ("regression cover for a repair",
+     r"changes behaviour carries a test[^.]*report the missing regression cover as a finding",
+     r"reverts with the suite still green"),
+    # The rule existed in reference-review.md and was enforced author-side only: `mutation.py
+    # run` refuses a target with uncommitted changes, which protects the AUTHOR, and nothing
+    # protected the tree from the REVIEWER. The brief is the one artefact guaranteed to reach a
+    # delegated reviewer, so a practice absent from it is held only by the dispatcher's memory.
+    ("isolated checkout for mutation",
+     r"ISOLATED CHECKOUT[^.]*never the author'?s working tree",
+     r"tree-wide[^.]*silently reverts a concurrent reviewer'?s mutant"),
+)
+
+#: The standing practices each tier carries, by name. Light keeps the two repair practices and
+#: the isolated checkout, which protects the author's tree, and drops the two mutation practices.
+TIER_PRACTICES = {
+    "full": tuple(name for name, _i, _r in _BRIEF_PRACTICES),
+    "light": ("per-item repair verdict", "regression cover for a repair",
+              "isolated checkout for mutation"),
+}
+
+# The four prose surfaces the claim-inventory first pass must cover. A pass that omits one
+# exempts it, and a Resolution is the artefact no test can fail - the cheapest thing in the
+# diff to check and the likeliest to be wrong.
+CLAIM_SURFACES = ("Resolutions", "docstrings", "comments", "CHANGELOG")
+_CLAIM_INVENTORY_BLOCK = """--- CLAIM INVENTORY (run this FIRST, before the logic review) ---
+
+Before reading the logic, enumerate every assertion the diff's prose makes across all four
+surfaces - Resolutions, docstrings, comments and CHANGELOG entries - and mark each TRUE, FALSE
+or UNVERIFIABLE against the code. A Resolution is the one artefact no test can fail, so it is
+the cheapest thing here to check and the likeliest to be wrong. A claim no command can settle
+is UNVERIFIABLE, reported as such and counted on trust, never assumed TRUE."""
+
+
+def _normalise_brief(text: str) -> str:
+    """Collapse whitespace so a practice or surface wrapped across brief lines still matches."""
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def missing_practices(brief_text: str) -> list[str]:
+    """The standing review practices a brief fails to carry, by name. Empty means every one is
+    present with its reason. A practice whose instruction is present but whose reason clause
+    is not still counts as missing - the reason is what survives into a fresh reviewer's head."""
+    body = _normalise_brief(brief_text)
+    absent = []
+    for name, instruction, reason in _BRIEF_PRACTICES:
+        if not (re.search(instruction, body, re.I) and re.search(reason, body, re.I)):
+            absent.append(name)
+    return absent
+
+
+def assert_brief_practices(brief_text: str, tier: str = "full") -> None:
+    """Refuse a brief missing any standing practice its tier carries (`TIER_PRACTICES`), naming
+    which. A brief that omits one leaves it to whoever wrote the brief to remember, which is how
+    each was improvised rather than shipped - so it is refused, never issued. A practice the tier
+    does not carry is never demanded, so a light brief is not refused for the mutation practices.
+
+    The roll-call in the message is DERIVED from `TIER_PRACTICES`, never written beside it: a
+    hand-listed roll-call goes stale the first time a practice is added, and then the refusal
+    describes a rule set the guard no longer enforces."""
+    carried = TIER_PRACTICES[tier]
+    absent = [name for name in missing_practices(brief_text) if name in carried]
+    if absent:
+        raise ValueError(
+            "reviewer brief is missing standing practice(s): " + "; ".join(absent)
+            + f" - each of {', '.join(carried)} is a standing instruction at the {tier} tier; a "
+              "brief that omits one is refused, not issued")
+
+
+def _practices_block(tier: str) -> str:
+    """The standing-practices block as `tier` carries it: `_REVIEW_PRACTICES_BLOCK` less each
+    paragraph stating a practice the tier does not carry. Read at call time, so the block a
+    test patches is the block rendered; at full it is the block unchanged."""
+    dropped = [instruction for name, instruction, _r in _BRIEF_PRACTICES
+               if name not in TIER_PRACTICES[tier]]
+    paras = _REVIEW_PRACTICES_BLOCK.split("\n\n")
+    return "\n\n".join(p for p in paras
+                       if not any(re.search(i, _normalise_brief(p), re.I) for i in dropped))
+
+
+def missing_claim_surfaces(brief_text: str) -> list[str]:
+    """The prose surfaces the claim-inventory pass fails to name, so removing one is detectable.
+    All four (Resolutions, docstrings, comments, CHANGELOG) must be named or the omitted one is
+    exempted from the pass."""
+    body = _normalise_brief(brief_text)
+    return [s for s in CLAIM_SURFACES if not re.search(re.escape(s), body, re.I)]
+
+
+def assert_brief_claim_pass(brief_text: str) -> None:
+    """Refuse a brief whose claim-inventory pass omits any of the four prose surfaces or the
+    TRUE/FALSE/UNVERIFIABLE vocabulary. A pass that omits a surface silently exempts it."""
+    absent = missing_claim_surfaces(brief_text)
+    if absent:
+        raise ValueError(f"claim-inventory pass omits prose surface(s): {', '.join(absent)} - "
+                         f"all four ({', '.join(CLAIM_SURFACES)}) must be enumerated or the "
+                         f"omitted one is exempt; refused")
+    body = _normalise_brief(brief_text)
+    # Only the missing words are named. A roll-call of all three names the present ones as if
+    # they were absent too, and the reader repairs a block that was never broken.
+    unnamed = [w for w in ("TRUE", "FALSE", "UNVERIFIABLE") if not re.search(rf"\b{w}\b", body)]
+    if unnamed:
+        raise ValueError(f"claim-inventory pass never names the ruling(s): {', '.join(unnamed)} "
+                         f"- a claim the pass cannot mark that way is left unruled; refused")
+
+
+# --- The author's self-check ---------------------------------------------------------------
+# The claim inventory and the mutation pass, turned on the author's own work before the brief
+# is handed over. Every instruction is READ from the brief's own texts - the claim-inventory
+# block and the practice to mutate the author's tests - so wherever the reviewer's brief carries
+# a pass, the author is told it in the same words, and the two cannot drift apart (LL0042). The
+# author runs both at every tier; a full-tier brief asks the reviewer for both as well.
+AUTHOR_SELF_CHECK_HEADING = ("--- AUTHOR SELF-CHECK (run it on your own work before handing the "
+                             "brief over) ---")
+_MUTATE_PRACTICE_LEAD = "Mutate the author's TESTS"
+
+
+def _paragraph(block: str, lead: str) -> str:
+    """The paragraph of `block` that starts with `lead`, on one line; "" when none does."""
+    for para in re.split(r"\n[ \t]*\n", block):
+        if para.strip().startswith(lead):
+            return " ".join(para.split())
+    return ""
+
+
+def author_self_check(repo_root: Path | str, unit: str) -> str:
+    """The section `critic.py brief` prints on stderr before its footer: the claim inventory and
+    the mutation pass, named over this unit's own surfaces and tests, for the author to run on
+    their own work before handing the brief over. A full-tier brief asks the reviewer for both
+    passes as well.
+
+    The surfaces are the commit message, every prose surface the brief's claim inventory names
+    (`CLAIM_SURFACES`) and each changelog fragment the unit's Affects declares - read from its
+    Affects, never from its id, because a carried bug ships its story's fragment. The mutation
+    targets are the test files its Affects declares."""
+    _affects, fragments, tests = _self_check_scope(repo_root, unit)
+    claims = " ".join("\n".join(_CLAIM_INVENTORY_BLOCK.splitlines()[1:]).split())
+    mutate = _paragraph(_REVIEW_PRACTICES_BLOCK, _MUTATE_PRACTICE_LEAD)
+    surfaces = [f"the {COMMIT_SURFACE}", *CLAIM_SURFACES, *fragments]
+    # The brief's instruction counts its own surfaces ("all four"), so it is printed under the
+    # prose surfaces it counts, and the commit message and fragments are held to it after.
+    prose = (", ".join(CLAIM_SURFACES[:-1]) + f" and {CLAIM_SURFACES[-1]}"
+             if len(CLAIM_SURFACES) > 1 else "".join(CLAIM_SURFACES))
+    lines = [AUTHOR_SELF_CHECK_HEADING,
+             "Run the two passes below first, so the review confirms the work rather than "
+             "finding what your own pass would have found. At the full review tier the "
+             "reviewer's brief asks for both passes too.",
+             "",
+             f"1. Claim inventory, over: {'; '.join(surfaces)}.",
+             (f"   The unit's changelog fragments: {', '.join(fragments)}." if fragments else
+              "   The unit's Affects declares no changelog fragment."),
+             f"   For {prose}, the brief's own instruction: {claims}",
+             f"   Rule each claim in the {COMMIT_SURFACE}"
+             f"{' and in each changelog fragment' if fragments else ''} the same way.",
+             "",
+             (f"2. Mutation pass, over: {', '.join(tests)}." if tests else
+              "2. Mutation pass: the unit's Affects declares no test file, so there is no test "
+              "of its own to mutate."),
+             f"   {mutate}",
+             "",
+             "3. Record both, bound to the content of the unit's Affects as it stands now:",
+             f"   critic.py self-check record --unit {sdlc_md.norm_id(unit)} --author <you> "
+             f"--claims CLAIMS.json --mutants MUTANTS.json",
+             "   CLAIMS.json lists each claim as {surface, claim, ruling}; MUTANTS.json lists "
+             "each mutant as {mutant, test, result, answer}, and is [] when the unit declares "
+             "no test file."]
+    return "\n".join(lines)
+
+
+def _self_check_scope(repo_root: Path | str, unit: str) -> tuple[list[str], list[str], list[str]]:
+    """The unit's Affects paths, the changelog fragments among them and the test files among
+    them. Both are read from its Affects, never from its id, because a carried bug ships its
+    story's fragment."""
+    found = sdlc_md.find_by_id(Path(repo_root), unit)
+    if not found:
+        raise ValueError(f"no artefact with id {unit!r} - the self-check needs a real unit")
+    import file_finding  # noqa: PLC0415 - sibling; its test-path convention is the family's
+    affects = sdlc_md.affects_files(sdlc_md.read_text_safe(found[0]))
+    fragments = [a for a in affects if a.startswith("changelog.d/") and a.endswith(".md")]
+    tests = [a for a in affects if file_finding.is_test_path(a)]
+    return affects, fragments, tests
+
+
+# --- The author's self-check, recorded ------------------------------------------------------
+# What the section above tells the author to run, stored once it has run. The record is
+# self-reported, so what it checks is its CONTENT: every claim ruled and none FALSE, the
+# required surfaces each carrying a claim, each mutant run against a test the unit declares,
+# and every survivor answered. It keeps a digest of the unit's Affects content and the commit
+# it was taken at, so a later edit by the author outside a merge commit reads as one of an
+# earlier diff, while a record of committed work survives another unit's later commit to a
+# shared file (`self_check_gap`). The log is committed, never under `.local`.
+SELF_CHECK_FILE = "author-self-checks.md"
+#: The surface every unit's claim inventory must cover; each declared fragment is the other.
+COMMIT_SURFACE = "commit message"
+MUTANT_RESULTS = ("killed", "survived")
+NO_TEST_DECLARED = "none - no test declared"
+_SELF_CHECK_COLS = ("unit", "author", "date", "claims", "mutants", "digest")
+_SELF_CHECK_HEADER = (
+    "# Author Self-Checks\n\n"
+    "> Append-only. The author's own claim inventory and mutation pass per unit, recorded by\n"
+    "> `critic.py self-check record` before a reviewer is briefed. The digest is over the\n"
+    "> content of the unit's Affects files, less the review tooling's own writes, when the row\n"
+    "> was written, followed by the commit it was taken at. A row is current when its digest\n"
+    "> matches that content now, or that content with each file that has no uncommitted edit\n"
+    "> read at its newest commit since the row's commit that is not another unit's (or at the\n"
+    "> row's commit when all are); a commit is another unit's when its subject names a unit id\n"
+    "> and none is this unit's. `critic.py brief` reads any other row as stale.\n\n"
+    "| Unit | Author | Date | Claims | Mutants | Digest |\n"
+    "| --- | --- | --- | --- | --- | --- |\n")
+_DIGEST_SKIP = (".git", "__pycache__")
+#: What the review tooling itself writes while a unit is reviewed: the self-check log
+#: (`self-check record`), the verdict log (`record`), and the runtime notes under
+#: `sdlc-studio/.local` (`brief` notes each fingerprint there, `record` fixes the review base).
+#: No unit's change is made of them, so the digest leaves them out; a unit declaring one, or a
+#: directory holding one, would otherwise be staled by every record and every brief.
+_REVIEW_TOOL_WRITES = frozenset(f"sdlc-studio/reviews/{name}"
+                                for name in (SELF_CHECK_FILE, _FILE["delivery"]))
+_REVIEW_TOOL_RUNTIME = "sdlc-studio/.local/"
+#: How the Digest cell names the commit a record was taken at: `<digest> at <commit>`. Inside
+#: the cell rather than a seventh column, so the committed log keeps one table width and no
+#: earlier row is rewritten. A row without it names no commit: it was recorded before the
+#: commit was kept, or outside a repository.
+_DIGEST_AT = " at "
+_DIGEST_CELL_RE = re.compile(r"(?P<digest>\S+)(?: at (?P<commit>[0-9a-f]{7,40}))?")
+
+
+def self_checks_path(repo_root: Path | str) -> Path:
+    return Path(repo_root) / "sdlc-studio" / "reviews" / SELF_CHECK_FILE
+
+
+def _review_tool_write(rel: str) -> bool:
+    """True for a path the review tooling writes (`_REVIEW_TOOL_WRITES`), relative to the root."""
+    return rel in _REVIEW_TOOL_WRITES or rel.startswith(_REVIEW_TOOL_RUNTIME)
+
+
+def _working_members(root: Path, rel: str) -> list[str]:
+    """The files one Affects path names in the working tree, relative to the root: the file
+    itself, or a declared directory's files beneath it, less the review tooling's own writes."""
+    path = root / rel
+    if path.is_dir():
+        found = (p for p in path.rglob("*") if p.is_file() and not any(
+            part in _DIGEST_SKIP for part in p.relative_to(path).parts))
+    else:
+        found = [path] if path.is_file() else []
+    members = (p.relative_to(root).as_posix() for p in found)
+    return sorted((m for m in members if not _review_tool_write(m)), key=PurePosixPath)
+
+
+def _content_digest(entries: list[tuple[str, list[tuple[str, bytes]]]]) -> str:
+    """The digest of each declared path with the files it names and their bytes, a path naming
+    none marked absent. Both views below feed it, so a match between them is a match of bytes."""
+    import hashlib  # noqa: PLC0415 - local; only the digest needs it
+    h = hashlib.sha256()
+    for rel, members in entries:
+        h.update(f"{rel}\0{len(members) if members else 'absent'}\0".encode("utf-8"))
+        for member, data in members:
+            h.update(f"{member}\0{len(data)}\0".encode("utf-8"))
+            h.update(data)
+    return h.hexdigest()[:16]
+
+
+def affects_digest(repo_root: Path | str, unit: str) -> str:
+    """A digest of the CONTENT of the unit's Affects files, as they stand: each path with its
+    bytes, a declared directory's files beneath it, and an absent path marked absent, so an edit
+    to any of them, or the creation of one, moves it. Sorted, so reordering Affects does not.
+    The review tooling's own writes are left out (`_REVIEW_TOOL_WRITES`)."""
+    root = Path(repo_root)
+    return _content_digest([
+        (rel, [(m, (root / m).read_bytes()) for m in _working_members(root, rel)])
+        for rel in sorted(set(_self_check_scope(root, unit)[0]))])
+
+
+class _GitUnreadable(RuntimeError):
+    """Git could not answer a question the own-change view asked of it."""
+
+
+def _git(root: Path, *args: str):
+    """`git -C <root> <args>` with bytes out, or None when git cannot be run at all. It runs
+    under the criteria runner's environment (`verify_ac._git_env`), which drops the variables a
+    hook exports that would make git answer for another repository; reusing it adds no copy of
+    that list for a test to hold equal to the others."""
+    import subprocess  # noqa: PLC0415 - local; only the own-change view runs git
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import verify_ac  # noqa: PLC0415 - sibling; its scrubbed environment is the shared one
+    try:
+        return subprocess.run(["git", "-C", str(root), "--literal-pathspecs", *args],
+                              capture_output=True, timeout=60, env=verify_ac._git_env(),
+                              check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _head_commit(root: Path) -> str:
+    """The commit the working tree is checked out at, abbreviated, or "" outside a repository."""
+    cp = _git(root, "rev-parse", "--short=12", "--verify", "--quiet", "HEAD")
+    return cp.stdout.decode("utf-8", "replace").strip() if cp and cp.returncode == 0 else ""
+
+
+def _rev_blob(root: Path, rev: str, rel: str) -> bytes | None:
+    """The bytes of `rel` (relative to the root) at `rev`, or None when it was absent there.
+    Absence is asked of `ls-tree`, so a failure raises rather than reading as absent."""
+    listed = _git(root, "ls-tree", "-z", "--name-only", rev, "--", rel)
+    if listed is None or listed.returncode != 0:
+        raise _GitUnreadable(f"git could not list {rel} at {rev}")
+    if not listed.stdout.strip(b"\0"):
+        return None
+    shown = _git(root, "show", f"{rev}:./{rel}")
+    if shown is None or shown.returncode != 0:
+        raise _GitUnreadable(f"git could not show {rel} at {rev}")
+    return shown.stdout
+
+
+def _names_another_unit(subject: str, uid: str) -> bool:
+    """True when a commit subject names a unit id and none of them is `uid`: the commit is
+    another unit's. A subject naming no id, or naming this unit, is not, so a commit under this
+    unit's id or under none is never read as another unit's."""
+    named = {sdlc_md.norm_id(m.group(0)) for m in sdlc_md.ID_SEARCH_RE.finditer(subject)}
+    return bool(named) and uid not in named
+
+
+def _own_change_digest(repo_root: Path | str, unit: str, base: str) -> str | None:
+    """`affects_digest` of the unit's Affects with the commits ANOTHER unit made since `base`
+    (the commit the record was taken at) set aside where they top a file's history. Another
+    unit's commit beneath one that is not stays, so a record of uncommitted work is still staled
+    by another unit's commit to that file landing before the author's own. None when it cannot
+    be judged: no repository, `base` not an ancestor of HEAD (as after a rebase or cherry-pick),
+    or git unable to answer, so the caller falls back to the content as it stands.
+
+    For each file, the commits since `base` that touched it are read newest first, and a commit
+    is another unit's when its subject names a unit id and none is this unit's
+    (`_names_another_unit`). The file's own content is its working-tree content when no commit
+    touched it, or when the newest that did is not another unit's, or when it differs from HEAD
+    (an uncommitted edit, which nothing attributes to another unit). Otherwise it is the content
+    after the newest commit that is not another unit's, or at `base` when every one was. A merge
+    commit lists no file here, so an edit made in one can be missed."""
+    root = Path(repo_root)
+    uid = sdlc_md.norm_id(unit)
+    affects = sorted(set(_self_check_scope(root, unit)[0]))
+    ancestor = _git(root, "merge-base", "--is-ancestor", base, "HEAD")
+    if not affects or ancestor is None or ancestor.returncode != 0:
+        return None
+    log = _git(root, "-c", "core.quotePath=false", "log", "--no-renames", "--topo-order",
+               "--relative", "--name-only", "--format=%x00%H %s", f"{base}..HEAD", "--", *affects)
+    if log is None or log.returncode != 0:
+        return None
+    touched: dict[str, list[tuple[str, bool]]] = {}
+    for chunk in log.stdout.decode("utf-8", "replace").split("\0")[1:]:
+        head, *names = chunk.split("\n")
+        sha, _, subject = head.partition(" ")
+        for name in filter(None, names):
+            touched.setdefault(name, []).append((sha, _names_another_unit(subject, uid)))
+
+    def own(member: str) -> bytes | None:
+        path = root / member
+        now = path.read_bytes() if path.is_file() else None
+        commits = touched.get(member, [])
+        if not commits or not commits[0][1] or _rev_blob(root, "HEAD", member) != now:
+            return now
+        sha = next((s for s, another in commits if not another), base)
+        return _rev_blob(root, sha, member)
+
+    entries = []
+    try:
+        for rel in affects:
+            prefix = PurePosixPath(rel).as_posix()
+            members = set(_working_members(root, rel)) | {
+                t for t in touched if (t == prefix or t.startswith(prefix + "/"))
+                and not _review_tool_write(t) and not any(
+                    part in _DIGEST_SKIP for part in PurePosixPath(t).parts)}
+            views = ((m, own(m)) for m in sorted(members, key=PurePosixPath))
+            entries.append((rel, [(m, data) for m, data in views if data is not None]))
+    except (_GitUnreadable, OSError):
+        return None
+    return _content_digest(entries)
+
+
+def _surface_key(label: str) -> str:
+    """A claim's surface label compared as written by hand: case, spacing and a leading "the"
+    do not matter, so "The commit message" is the commit message."""
+    key = " ".join(str(label or "").split()).lower()
+    return key[4:] if key.startswith("the ") else key
+
+
+def _entries(path: str, key: str) -> list:
+    """The list a claims or mutants file holds: a JSON list, or an object holding it under
+    `key`. Anything else is refused naming the file."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read {path} as JSON: {exc}") from None
+    if isinstance(data, dict):
+        data = data.get(key)
+    if not isinstance(data, list) or not all(isinstance(e, dict) for e in data):
+        raise ValueError(f"{path} is not a JSON list of {key} (or an object holding one under "
+                         f"{key!r}), each an object")
+    return data
+
+
+def check_self_check(repo_root: Path | str, unit: str, claims: list[dict],
+                     mutants: list[dict]) -> dict:
+    """The self-check judged on its content, raising ValueError naming the first cause it
+    refuses; otherwise the counts its row records.
+
+    Claims: each names a surface the author self-check section names, every one is ruled
+    through `validate_claim_inventory`, none is FALSE (the author corrects it before review),
+    at least one was checked (`summarise_claim_pass`: an all-UNVERIFIABLE inventory checked
+    nothing), and the commit message and each changelog fragment the unit's Affects declares
+    carry a claim. Docstrings, comments, Resolutions and CHANGELOG are named and optional, since
+    no command can tell which claims a diff's docstrings make.
+
+    Mutants: each names a test in a test file the unit's Affects declares and a result of
+    killed or survived, and a survivor carries an answer. A unit declaring no test file records
+    an empty list; one that declares a test file and lists no mutant is refused."""
+    _affects, fragments, tests = _self_check_scope(repo_root, unit)
+    required = [COMMIT_SURFACE, *fragments]
+    named = {_surface_key(s): s for s in (*required, *CLAIM_SURFACES)}
+    if not claims:
+        raise ValueError(f"the claims file lists no claim - inventory the claims made by "
+                         f"{', '.join(required)}")
+    keys, rulings, covered = [], {}, set()
+    for n, entry in enumerate(claims, 1):
+        surface, text = _surface_key(entry.get("surface")), str(entry.get("claim") or "").strip()
+        if surface not in named:
+            raise ValueError(f"claim {n} names the surface {entry.get('surface')!r}, which the "
+                             f"self-check does not name - use one of: {'; '.join(named.values())}")
+        if not text:
+            raise ValueError(f"claim {n} ({named[surface]}) states no claim")
+        key = f"{n} ({named[surface]}): {text}"
+        keys.append(key)
+        if (ruling := str(entry.get("ruling") or "").strip()):
+            rulings[key] = ruling
+        covered.add(surface)
+    validate_claim_inventory(keys, rulings)
+    if false := [k for k in keys if rulings[k].upper() == "FALSE"]:
+        raise ValueError(f"claim {false[0]!r} is ruled FALSE - correct the prose that makes it, "
+                         f"then rule it again; a FALSE claim is fixed before review, not recorded")
+    summary = summarise_claim_pass(rulings)
+    if not summary["verified"]:
+        raise ValueError(f"every one of the {summary['total']} claim(s) is ruled UNVERIFIABLE, "
+                         f"so the inventory checked nothing; settle at least one TRUE against "
+                         f"the code")
+    if skipped := [s for s in required if _surface_key(s) not in covered]:
+        raise ValueError(f"no claim from the {skipped[0]}, a surface this unit's self-check "
+                         f"requires (the commit message and each changelog fragment its "
+                         f"Affects declares: {', '.join(required)})")
+    counts = {r: 0 for r in MUTANT_RESULTS}
+    if tests and not mutants:
+        raise ValueError(f"the mutants file lists no mutant, and the unit declares "
+                         f"{', '.join(tests)} - mutate its own tests and list each result")
+    for n, entry in enumerate(mutants, 1):
+        name = str(entry.get("mutant") or "").strip()
+        label = f"mutant {n} ({name!r})" if name else f"mutant {n}"
+        test = str(entry.get("test") or "").strip()
+        result = str(entry.get("result") or "").strip().lower()
+        if not name:
+            raise ValueError(f"{label} names no production change")
+        test_file = test.split("::", 1)[0].removeprefix("./")
+        if test_file not in tests:
+            declared = ", ".join(tests) if tests else "no test file"
+            raise ValueError(f"{label} is checked against {test or 'no test'!r}, not a test file "
+                             f"the unit's Affects declares ({declared})")
+        if result not in MUTANT_RESULTS:
+            raise ValueError(f"{label} has result {result or 'none'!r} - expected one of "
+                             f"{', '.join(MUTANT_RESULTS)}")
+        if result == "survived" and not str(entry.get("answer") or "").strip():
+            raise ValueError(f"{label} survived and carries no answer - say why the test "
+                             f"cannot see it, or the test or bug that will")
+        counts[result] += 1
+    return {"claims": f"TRUE {summary['true']}, FALSE {summary['false']}, "
+                      f"UNVERIFIABLE {summary['unverifiable']}",
+            "mutants": (", ".join(f"{r} {counts[r]}" for r in MUTANT_RESULTS) if tests or mutants
+                        else NO_TEST_DECLARED)}
+
+
+def record_self_check(repo_root: Path | str, unit: str, claims: list[dict],
+                      mutants: list[dict], author: str = "") -> Path:
+    """Append the author's self-check for a unit to the committed log, once `check_self_check`
+    admits it, with the digest of its Affects content as it stands and the commit it was taken
+    at (none outside a repository). Nothing is written on a refusal."""
+    counts = check_self_check(repo_root, unit, claims, mutants)
+    digest, commit = affects_digest(repo_root, unit), _head_commit(Path(repo_root))
+    cells = (sdlc_md.norm_id(unit), _clean(author) or "-", sdlc_md.now_date(),
+             counts["claims"], counts["mutants"],
+             f"{digest}{_DIGEST_AT}{commit}" if commit else digest)
+    return _append_row(self_checks_path(repo_root), _SELF_CHECK_HEADER, cells)
+
+
+def read_self_checks(repo_root: Path | str) -> list[dict]:
+    """Every recorded self-check row, oldest first, its Digest cell read as `digest` and
+    `commit` ("" for a row recorded before the commit was kept, or outside a repository)."""
+    rows = _read_rows(self_checks_path(repo_root), _SELF_CHECK_COLS)
+    for row in rows:
+        cell = _DIGEST_CELL_RE.fullmatch(row["digest"].strip())
+        row["digest"], row["commit"] = ((cell["digest"], cell["commit"] or "") if cell
+                                        else (row["digest"].strip(), ""))
+    return rows
+
+
+# --- The author's self-check, required ------------------------------------------------------
+# `critic.py brief` asks for a recorded self-check of the diff it is about to brief. A project
+# chooses what a brief without one does: `block` refuses it, `report` prints it and names the
+# missing or stale record, `off` says nothing. `report` is the default, so a project upgrading
+# is not refused on its first review; a project that wants the gate sets `block`.
+AUTHOR_SELF_CHECK_MODES = ("off", "report", "block")
+AUTHOR_SELF_CHECK_DEFAULT = "report"
+
+
+def author_self_check_mode(repo_root: Path | str) -> str:
+    """The project's `review.author_self_check`: `off`, `report` (the default) or `block`.
+
+    An unrecognised value is refused by name, never read as `off`, so a typo cannot switch the
+    gate off silently. YAML reads a bare `off` as False, so False is `off`."""
+    raw = sdlc_md.project_override(repo_root, "review.author_self_check", None)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return AUTHOR_SELF_CHECK_DEFAULT
+    if raw is False:
+        return "off"
+    value = str(raw).strip().lower()
+    if value not in AUTHOR_SELF_CHECK_MODES:
+        raise ValueError(f"review.author_self_check is `{raw}`, which is not one of "
+                         f"{', '.join(AUTHOR_SELF_CHECK_MODES)} - refused rather than read as off")
+    return value
+
+
+def self_check_gap(repo_root: Path | str, unit: str) -> str | None:
+    """Why the unit has no current self-check, or None when one of its rows carries the digest
+    of its Affects content now, or of the own-change view from the commit the row was taken at
+    (`_own_change_digest`). Any matching row counts, so a diff restored to one already checked
+    needs no second record."""
+    uid = sdlc_md.norm_id(unit)
+    rows = [r for r in read_self_checks(repo_root) if sdlc_md.norm_id(r["unit"]) == uid]
+    if not rows:
+        return f"{uid} has no author self-check recorded"
+    digest = affects_digest(repo_root, unit)
+    if any(r["digest"] == digest for r in rows):
+        return None
+    own: dict[str, str | None] = {}
+    for row in rows:
+        if (base := row["commit"]) and base not in own:
+            own[base] = _own_change_digest(repo_root, unit, base)
+        if base and own[base] == row["digest"]:
+            return None
+    last = rows[-1]
+    return (f"the self-check recorded for {uid} on {last['date']} is stale: its digest "
+            f"{last['digest']} is of an earlier diff, and the unit's Affects content now digests "
+            f"to {digest}")
+
+
+def _self_check_gate(repo_root: Path | str, unit: str) -> str | None:
+    """Apply `review.author_self_check` before a brief is printed: under `block`, print the
+    author self-check section and raise the refusal; under `report`, return the notice to print
+    after that section; otherwise None."""
+    mode = author_self_check_mode(repo_root)
+    gap = self_check_gap(repo_root, unit) if mode != "off" else None
+    if not gap:
+        return None
+    record = f"`critic.py self-check record --unit {sdlc_md.norm_id(unit)}`"
+    if mode == "block":
+        print(author_self_check(repo_root, unit), file=sys.stderr)
+        raise ValueError(f"{gap} - run the self-check above, record it with {record}, then brief "
+                         f"again (review.author_self_check: block)")
+    return (f"\nauthor self-check: {gap} - record it with {record} before the review "
+            f"(review.author_self_check: report; `block` refuses the brief)")
+
+
+def tier_for(repo_root: Path | str, unit: str) -> str:
+    """The review depth this unit's RISK earns, derived from `route.estimate`'s band.
+
+    `route.py` says it in its own header - "Advisory only - no gate reads a tier" - and that has
+    been true since the score was built: a deterministic 0-100 difficulty with bands and a
+    confidence, stamped on every unit at plan time. This is its consumer. A unit whose blast
+    radius is small stops paying a large unit's review, which is the whole of CR0510's thesis in
+    one function.
+
+    Fails towards `full`: an unresolvable band, an unknown band name, an unreadable unit. The
+    cost of a needless full pass is tokens; the cost of a needless light one is a defect that
+    ships. That asymmetry decides the default, not neatness.
+    """
+    try:
+        import route  # noqa: PLC0415 - deferred; brief() must not pay for it unused
+        found = sdlc_md.find_by_id(Path(repo_root), unit)
+        if not found:
+            return UNKNOWN_BAND_TIER
+        band = route.estimate(Path(repo_root), found[0])["difficulty_band"]
+    except Exception:  # noqa: BLE001 - a difficulty read must never break a brief
+        return UNKNOWN_BAND_TIER
+    return BAND_TIER.get(band or "", UNKNOWN_BAND_TIER)
+
+
+def _lessons_block(root: Path) -> str:
+    """The failure classes injected at review (rule plus behaviour, at most five), and how a
+    finding that repeats one cites it. The class store is the only lesson source a review brief
+    carries: a seat told what has been repeating is the pass most likely to catch the repeat,
+    and a cited code is what lets the repeat be counted rather than written up again."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import lessons  # noqa: PLC0415 - sibling; deferred so only a brief pays for it
+    digest = lessons.phase_digest(root, "review")
+    lines = lessons.render_phase(digest)
+    if digest.get("lessons"):
+        lines.append("A finding that repeats one of these cites its class code after the origin "
+                     "tag, e.g. `[new] the mutant was never applied (x.py:12) [LC-NNN]`, so the "
+                     "repeat is counted on the class rather than written up again.")
+    return "\n".join(lines)
+
+
+def _shared_selector_block(path: Path) -> str:
+    """One advisory line per Verify selector two or more of this unit's criteria share, or "".
+
+    Advice, not a refusal: two criteria on one run cannot both discriminate, and the seat judging
+    them is the one who can say whether they assert one indivisible behaviour or need splitting.
+    Judged within this artefact only - a bug sharing its fixing story's selector is correct."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import verify_ac  # noqa: PLC0415 - sibling; the grouping is the lint's own
+    lines = []
+    for group in verify_ac.duplicate_verifiers([path]):
+        acs = [a.split(" ", 1)[-1] for a in group["acs"]]
+        names = ", ".join(acs[:-1]) + f" and {acs[-1]}"
+        lines.append(f"Advisory: {names} share one Verify selector (`{group['verifier']}`) - "
+                     f"two criteria on one run cannot both discriminate; judge whether each is "
+                     f"exercised on its own.")
+    return "".join(f"{ln}\n" for ln in lines)
+
+
+def _criteria_from_whole_file(text: str) -> str:
+    """The criteria of an artefact with NO `## Acceptance Criteria` section, as the runner reads
+    them: every block, wherever it sits. The brief rendered nothing for such an artefact while
+    `verify_ac run` executed all of it, so the two readers disagreed by construction; the shape
+    itself is refused by `validate check`, and until it is moved the seat sees what runs."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import verify_ac  # noqa: PLC0415 - sibling; the parser is the runner's own
+    blocks = verify_ac.parse_story(text)
+    if not blocks:
+        return ""
+    lines = text.splitlines()
+    out = []
+    for i, b in enumerate(blocks):
+        end = blocks[i + 1].heading_line if i + 1 < len(blocks) else len(lines)
+        for j in range(b.heading_line + 1, end):
+            if lines[j].startswith("## "):
+                end = j
+                break
+        out.append("\n".join(lines[b.heading_line:end]).rstrip())
+    return "\n\n".join(out)
+
+
+def _review_seat_card(root: Path, seat: str) -> Path:
+    """The seat's charter, by persona_resolve's one resolver: the project card whose declared
+    `role:` is the seat, else the shipped default, so a fresh project briefs its review on the
+    shipped team. The brief never judged a card's sections and does not start here; a seat with
+    no card anywhere is refused rather than briefed without a charter."""
+    import persona_resolve  # noqa: PLC0415 - sibling; one resolver for every seat reader
+    card = persona_resolve.resolve_card(root, seat)
+    if card is None:
+        roleless = "".join(f"; {p} declares no role"
+                           for p in persona_resolve.roleless_cards(root))
+        raise ValueError(f"no seat card for {seat!r} - neither the project nor the skill "
+                         f"carries one (seats: {', '.join(persona_resolve.seat_roster(root))}"
+                         f"{roleless})")
+    return card
+
+
+def _brief_criteria(text: str) -> str:
+    """The criteria a brief quotes, by the SAME heading rule as the runner's `criteria_blocks`:
+    case-insensitive, more words allowed."""
+    m = re.search(r"(?mi)^##\s+acceptance criteria\b[^\n]*\n(.*?)(?=^## |\Z)", text, re.S)
+    return (m.group(1).strip() if m else _criteria_from_whole_file(text)
+            or "(no Acceptance Criteria section - judge the diff against the unit's stated intent)")
+
+
+#: Where `critic.py brief` notes each brief it prints, so `record` can tell a verdict taken
+#: against a scope the unit has since outgrown. Runtime state: gitignored, and never judged.
+BRIEF_NOTES_REL = Path("sdlc-studio") / ".local" / "briefs.jsonl"
+
+
+def _brief_scope(root: Path, unit: str) -> dict:
+    """The two brief inputs a fix round moves: the unit's Affects and its criteria (digested)."""
+    found = sdlc_md.find_by_id(root, unit)
+    if not found:
+        raise ValueError(f"no artefact with id {unit!r}")
+    text = sdlc_md.read_text_safe(found[0])
+    return {"affects": sdlc_md.affects_files(text),
+            "criteria": brief_fingerprint(_brief_criteria(text))}
+
+
+def note_brief(root: Path | str, unit: str, seat: str, tier: str, fp: str,
+               rejoinder: bool, explicit: bool) -> None:
+    """Append what this brief was taken over. Best-effort: a brief is never refused for it."""
+    try:
+        row = {"fp": fp, "unit": sdlc_md.norm_id(unit), "seat": seat, "tier": tier,
+               "explicit": explicit, "rejoinder": rejoinder, **_brief_scope(Path(root), unit)}
+        path = Path(root) / BRIEF_NOTES_REL
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except (OSError, ValueError):
+        pass
+
+
+def _noted_row(root: Path | str, uid: str, fp: str | None = None) -> dict | None:
+    """The last brief note for `uid` (with fingerprint `fp`, when given), or None."""
+    try:
+        # `replace`: a stray byte costs the line it sits on, never the record that asked
+        lines = (Path(root) / BRIEF_NOTES_REL).read_text(encoding="utf-8",
+                                                         errors="replace").splitlines()
+    except OSError:
+        return None
+    noted = None
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(row, dict) and row.get("unit") == uid and row.get("fp")
+                and fp in (None, row["fp"])):
+            noted = row
+    return noted
+
+
+def noted_brief(root: Path | str, unit: str) -> str | None:
+    """The fingerprint of the last brief `critic.py brief` noted here for `unit`, or None."""
+    row = _noted_row(root, sdlc_md.norm_id(unit))
+    return str(row["fp"]) if row else None
+
+
+def rebrief_notice(root: Path | str, unit: str, fp: str) -> str | None:
+    """The warning for a verdict recorded against brief `fp` when the unit's Affects or criteria
+    have changed since that brief was printed, or None. A fingerprint no brief here noted (a
+    hand-written prompt, a brief taken in another clone) says nothing: it is stored, not judged.
+    """
+    uid = sdlc_md.norm_id(unit)
+    noted = _noted_row(root, uid, fp)
+    if noted is None:
+        return None
+    try:
+        now = _brief_scope(Path(root), uid)
+        changed = [name for key, name in (("affects", "Affects"), ("criteria", "criteria"))
+                   if noted.get(key) != now[key]]
+        if not changed:
+            return None
+        seat, explicit = noted["seat"], bool(noted["explicit"])
+        rejoinder = bool(noted.get("rejoinder"))
+        # A derived tier is derived again: the widening that moved the scope can move the band.
+        tier = noted["tier"] if explicit else tier_for(root, uid)
+        base = brief(root, uid, seat, tier)
+    except (KeyError, OSError, ValueError):
+        return None
+    # the way the footer printed it: a rejoinder's fingerprint is its base plus the phase
+    new = rejoinder_fingerprint(base) if rejoinder else brief_fingerprint(base)
+    again = f"critic.py brief --unit {uid} --seat {seat}"
+    if explicit:
+        again += f" --tier {tier}"
+    if rejoinder:
+        again += " --rejoinder <prior verdict file>"
+    return (f"warning: {uid} was briefed as {fp}, and its {' and '.join(changed)} changed "
+            f"since, so its brief is now {new}; this verdict was recorded against the earlier "
+            f"scope. Re-brief the seat: {again}")
+
+
+def affects_when_recorded(repo_root: Path | str, unit: str, verdict: dict) -> list[str] | None:
+    """The Affects `unit` declared at the parent of the commit that added `verdict`'s row to
+    the delivery ledger, or None when git cannot say.
+
+    That commit is the oldest whose change to the ledger moved the count of the row's brief
+    fingerprint (`git log -S`), searched from two days before the row's date; the oldest,
+    because a later row carrying the same fingerprint names the same brief. Its parent is read
+    so that a widening committed with the row counts as a widening. None for a row with no
+    fingerprint, a row not yet committed, a recording commit with no parent, a shallow clone
+    (its cut history can name a boundary commit, or a later one, as the recording commit), a
+    unit file absent at the parent, or no git.
+    """
+    from datetime import date, timedelta  # noqa: PLC0415 - only this question needs dates
+    root, fp = Path(repo_root), _brief_key(verdict)
+    found = sdlc_md.find_by_id(root, unit) if fp else None
+    if not found:
+        return None
+    args = ["log", f"-S{fp}", "--format=%H", "--reverse"]
+    if dated := re.match(r"\d{4}-\d{2}-\d{2}", str(verdict.get("date") or "").strip()):
+        try:  # the row is dated when `record` wrote it: the margin absorbs a time zone
+            args.append(f"--since={date.fromisoformat(dated.group(0)) - timedelta(days=2)}")
+        except ValueError:
+            pass
+    cp = _git(root, *args, "--", f"sdlc-studio/reviews/{_FILE['delivery']}")
+    commits = cp.stdout.decode("utf-8", "replace").split() if cp and cp.returncode == 0 else []
+    # Only `false` rules a cut history out; `true`, or no answer, fails towards full.
+    deep = _git(root, "rev-parse", "--is-shallow-repository") if commits else None
+    if deep is None or deep.stdout.strip() != b"false":
+        return None
+    try:  # `<commit>^` of a root commit names nothing, which `_rev_blob` raises on
+        blob = _rev_blob(root, f"{commits[0]}^",
+                         found[0].resolve().relative_to(root.resolve()).as_posix())
+    except (ValueError, _GitUnreadable):
+        return None
+    return None if blob is None else sdlc_md.affects_files(blob.decode("utf-8", "replace"))
+
+
+def under_depth_notice(repo_root: Path | str, unit: str) -> str | None:
+    """The warning for a unit whose latest live APPROVE is shallower than its risk band now
+    demands, as conformance judges it (`conformance.tier_covers`), or None."""
+    uid = sdlc_md.norm_id(unit)
+    approves = [r for r in _live_verdict_rows(repo_root, uid)
+                if str(r.get("verdict") or "").upper() == APPROVE]
+    if not approves:
+        return None
+    import conformance  # noqa: PLC0415 - deferred sibling: the one depth rule, never a second
+    row = approves[-1]
+    if conformance.tier_covers(repo_root, uid, row):
+        return None
+    return (f"warning: {uid}'s APPROVE by {row.get('reviewer')} on {row.get('date')} (brief "
+            f"{_brief_key(row) or '-'}) was taken at tier {row.get('tier')}, and its risk band "
+            f"now demands the full tier, so conformance does not count it. Brief the deeper "
+            f"review: critic.py brief --unit {uid} --seat <seat>")
+
+
+def brief_diff_cap(repo_root: Path | str, tier: str) -> int:
+    """The line cap on the brief's UNIT DIFF at `tier`: the project's
+    `review.brief_diff_lines.<tier>`, else `BRIEF_DIFF_LINES[tier]`. A setting that is not a
+    positive whole number falls back to the default."""
+    raw = sdlc_md.project_override(repo_root, "review.brief_diff_lines", None)
+    value = raw.get(tier) if isinstance(raw, dict) else None
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return BRIEF_DIFF_LINES[tier]
+
+
+def _git_text(root: Path, *args: str) -> bytes:
+    """`git <args>`'s stdout, or ValueError carrying the first line git wrote on stderr."""
+    cp = _git(root, *args)
+    if cp is None:
+        raise ValueError("git could not be run")
+    if cp.returncode != 0:
+        said = cp.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise ValueError(said[0] if said else f"git exited {cp.returncode}")
+    return cp.stdout
+
+
+def _unit_diff_section(root: Path, base: str, affects: list[str], tier: str) -> str:
+    """The UNIT DIFF section: each changed Affects file's `git diff <base> HEAD -- <file>`, in
+    git's order, held to the tier's line cap. Base to HEAD, never the working tree: a reviewer's
+    isolated checkout cannot see uncommitted work. Past the cap, one remainder line names each
+    file cut or left out, how many of its lines are not shown and the command that prints it."""
+    cap = brief_diff_cap(root, tier)
+    head = (f"--- UNIT DIFF (git diff {base} HEAD -- "
+            f"{' '.join(shlex.quote(a) for a in affects)}) ---")
+    lines: list[str] = []
+    left: list[tuple[str, int]] = []
+    try:
+        listed = _git_text(root, "diff", "--no-renames", "--name-only", "-z", base, "HEAD",
+                           "--", *affects)
+        for name in (os.fsdecode(n) for n in listed.split(b"\0") if n):
+            text = _git_text(root, "diff", "--no-color", "--no-ext-diff", base, "HEAD", "--",
+                             name).decode("utf-8", "replace")
+            own = text.split("\n")
+            if own[-1] == "":
+                own.pop()
+            room = max(cap - len(lines), 0)
+            lines.extend(own[:room])
+            if len(own) > room:
+                left.append((name, len(own) - room))
+    except ValueError as exc:
+        return f"{head}\n(git could not take this diff: {exc})"
+    if not lines:
+        return f"{head}\n(no committed change to these files since the base)"
+    body = "\n".join(lines)
+    if left:
+        named = "; ".join(f"{name}, {count} of its lines "
+                          f"(git diff {base} HEAD -- {shlex.quote(name)})" for name, count in left)
+        body += (f"\nDiff cut at the {cap}-line cap for the {tier} tier "
+                 f"(review.brief_diff_lines). Not shown: {named}")
+    return f"{head}\n{body}"
+
+
+def _verify_section(unit_id: str) -> str:
+    """The VERIFY COMMAND section: the one command that runs the unit's Verify lines, with
+    `--dry-run` so a reviewer's run writes nothing to the author's file."""
+    script = shlex.quote(str(Path(__file__).resolve().parent / "verify_ac.py"))
+    return ("--- VERIFY COMMAND (run it from the repo root; --dry-run writes nothing to the "
+            "unit's file) ---\n"
+            f"python3 {script} run --id {unit_id} --dry-run")
+
+
+def brief(repo_root: Path | str, unit: str, seat: str, tier: str = "full") -> str:
+    """The seat-review prompt, assembled deterministically.
+
+    The judgement stays with the seat; this is only the scaffolding every review
+    needs - charter, unit ACs, diff scope, tier, the command that runs the unit's
+    Verify lines, its diff since the run's base, and the exact return contract -
+    so no reviewer starts from a hand-typed, drift-prone brief. The optional
+    sections are the ones `TIER_SECTIONS[tier]` lists. Refuses an unknown unit,
+    seat or tier loudly.
+
+    Assembled inside `sdlc_md.corpus_cache()`, which `sprint.py lane brief` already holds around
+    the same file-history call, so the unit's `find_by_id` and the file history's corpus walk
+    share one read of each artefact type. The brief writes nothing, so the cache cannot serve it
+    a stale view; it closes as the brief returns or raises, and a cache the caller holds stays
+    open."""
+    with sdlc_md.corpus_cache():
+        return _brief(repo_root, unit, seat, tier)
+
+
+def _brief(repo_root: Path | str, unit: str, seat: str, tier: str) -> str:
+    """`brief`'s body, run with the corpus cache open."""
+    if tier not in TIERS:
+        raise ValueError(f"unknown review tier {tier!r} - one of {', '.join(TIERS)}")
+    sections = TIER_SECTIONS[tier]
+    root = Path(repo_root)
+    found = sdlc_md.find_by_id(root, unit)
+    if not found:
+        raise ValueError(f"no artefact with id {unit!r} - brief needs a real unit")
+    path, _type = found
+    text = sdlc_md.read_text_safe(path)
+    card = _review_seat_card(root, seat)
+    acs = _brief_criteria(text)
+    affects = sdlc_md.affects_files(text)
+    scope = (", ".join(affects) if affects
+             else "(no Affects declared - derive the scope from git status)")
+    # THE BASE COMMIT. "At the base ref" names nothing a reviewer can run; the run that holds
+    # this unit recorded one, so the brief prints the exact command. No run naming the unit, no
+    # command - a ref from a run about other work is not this unit's base.
+    base = run_state.unit_run_base_ref(root, unit)
+    if base:
+        files = " ".join(shlex.quote(a) for a in affects)
+        scope += (f"\nDiff against the run's base commit: git diff {base}"
+                  + (f" -- {files}" if files else ""))
+    else:
+        scope += ("\nNo run names this unit, so no base commit is recorded and this brief "
+                  "carries no diff of it.")
+    full_tier = tier == "full"
+    depth = ("Full adversarial pass: try to make each test FAIL (mutations), probe "
+             "boundaries and silent-failure paths, verify claims by EXECUTION, not reading."
+             if full_tier else
+             "Lighter independent pass (mechanical/doc-tier unit): check the change does "
+             "what its ACs say and nothing else; run the named suite once.")
+    # THE BOUNDED BRIEF. The claim-inventory pass reads every Resolution, docstring, comment and
+    # CHANGELOG line in scope and rules on each - a finding generator by construction, and the
+    # single largest block in this prompt. On a low-band unit it costs more than the unit does.
+    #
+    # Derived from the SAME `tier` value as the depth line above, deliberately: a brief that
+    # announced a lighter pass while carrying the full claim inventory would be two decisions
+    # where there is one, and they would disagree the first time either moved.
+    #
+    # Each optional section is rendered only when `TIER_SECTIONS[tier]` lists it, so the table
+    # is the one place a tier's contents are decided.
+    inventory = f"{_CLAIM_INVENTORY_BLOCK}\n\n" if "CLAIM INVENTORY" in sections else ""
+    practices = _practices_block(tier) if "STANDING REVIEW PRACTICES" in sections else ""
+    shared = _shared_selector_block(path)
+    unit_id = sdlc_md.norm_id(sdlc_md.extract_record_id(path.stem) or unit)
+    title = sdlc_md.extract_h1_title(text) or unit_id
+    # Printed in the file's spelling; `unit_id` stays the comparison key the reads below take.
+    shown = sdlc_md.extract_record_id(path.stem) or unit
+    verify = f"{_verify_section(shown)}\n\n" if "VERIFY COMMAND" in sections else ""
+    # THE UNIT'S OWN DIFF, so the seat spends its turns judging the change rather than finding
+    # it. Bounded to the Affects: with none declared there is no bound, so no diff.
+    diff = (f"{_unit_diff_section(root, base, affects, tier)}\n\n"
+            if base and affects and "UNIT DIFF" in sections else "")
+    # THE FILES' HISTORY: the delivered units that changed them and what their reviews caught,
+    # so the seat looks first for a repeat the record already holds. Light skips the corpus walk.
+    history = ""
+    if "FILE HISTORY" in sections:
+        import reconcile  # noqa: PLC0415 - sibling; the corpus walk is the already-delivered lane's
+        history = (f"--- FILE HISTORY ---\n"
+                   f"{reconcile.file_history_section(root, unit_id, affects)}\n")
+    return f"""You are the {seat} review seat. Read and adopt the charter at
+{card} (the review render). You did NOT author this diff; your job is
+independent judgement of it against the ACs below - they are law, your stance never
+overrides them.
+
+Repo root: {root.resolve()}
+
+Unit under review: {shown} - {title}
+Artefact: {path}
+
+Diff scope (the unit's declared Affects - inspect with git diff/status on these paths):
+{scope}
+
+Acceptance criteria (canonical - judge against THESE, not a paraphrase):
+{acs}
+{shared}
+{history}Review depth: {depth}
+Tool-call budget: {TIER_TOOL_BUDGET[tier]} tool calls at the {tier} tier; spend them judging the
+change, not finding it.
+
+{verify}{diff}{inventory}{practices}
+
+{_lessons_block(root)}
+
+{_RETURN_CONTRACT}"""
+
+
+def rejoinder_brief(repo_root: Path | str, unit: str, seat: str,
+                    prior_verdict_text: str, tier: str = "full") -> str:
+    """The re-review brief after a REJECT's repairs: the prior VERDICT/ISSUES/BLOCKING
+    quoted verbatim, the base brief refreshed (via the standard brief), the structural demand
+    to re-examine what the prior verdict named, and the return contract. A malformed
+    prior-verdict block is refused loudly - a rejoinder against a verdict that cannot be parsed
+    would re-review against a paraphrase. Validation is well-formedness only: an APPROVE prior
+    verdict is accepted too (a legitimate post-approval re-review)."""
+    parse_verdict_block(prior_verdict_text, strict=False)  # form only; ValueError on malformed
+    base = brief(repo_root, unit, seat, tier)
+    return f"""{base}
+
+--- RE-REVIEW (rejoinder) ---
+
+This is a RE-REVIEW after repairs to your prior verdict. Your prior verdict, verbatim:
+
+{prior_verdict_text.strip()}
+
+The author's repairs summary (if any) accompanies this brief separately. It is a CLAIM,
+not evidence: before you may approve, RE-EXECUTE the probes and mutants your prior
+verdict named - re-apply each mutant and watch its killing test FAIL, re-run each live
+probe - and confirm the tree is byte-identical after your mutations. A repair whose
+killing test cannot fail is vacuous; two such tests have shipped before.
+
+Then return the SAME contract as before:
+
+{_RETURN_CONTRACT}"""
+
+
+_VERDICT_LINE = re.compile(r"^\s*VERDICT:\s*(\S+)\s*$", re.M | re.I)
+_BLOCK_TOKENS = ("VERDICT", "ISSUES", "BLOCKING")
+
+
+def _block_field(text: str, token: str) -> str:
+    """The token's content: from `TOKEN:` to the next KNOWN token line or EOF.
+    Case-insensitive both ways, and bounded only by the contract's own tokens -
+    a wrapped continuation line starting `NOTE:` (or any other ALL-CAPS word)
+    belongs to the field, not to a phantom next one."""
+    boundary = "|".join(_BLOCK_TOKENS)
+    m = re.search(rf"^\s*{token}:\s*(.*?)(?=^\s*(?:{boundary}):\s|\Z)",
+                  text, re.M | re.S | re.I)
+    return m.group(1).strip() if m else ""
+
+
+def parse_verdict_block(text: str, strict: bool = True) -> tuple[str, str]:
+    """(verdict, issues) from a returned VERDICT/ISSUES/BLOCKING block.
+
+    Refuses (ValueError) a missing VERDICT line, a value outside APPROVE/REJECT,
+    or MORE THAN ONE verdict line - an ambiguous block must never be recorded as
+    a clean approval. An echoed copy of the return contract ("VERDICT: APPROVE or
+    REJECT") never matches the single-token verdict line; ISSUES/BLOCKING are read
+    from AFTER the verdict line, so an echo above it cannot leak placeholder text
+    into the record."""
+    matches = list(_VERDICT_LINE.finditer(text))
+    if not matches:
+        raise ValueError("no 'VERDICT:' line found in the block - the reviewer must "
+                         "return the VERDICT/ISSUES/BLOCKING contract")
+    if len(matches) > 1:
+        raise ValueError(f"{len(matches)} VERDICT lines found - an ambiguous block is "
+                         "refused, never resolved in the author's favour")
+    m = matches[0]
+    verdict = m.group(1).strip().upper()
+    if verdict not in ("APPROVE", "REJECT"):
+        raise ValueError(f"unknown verdict {verdict!r} - APPROVE or REJECT only")
+    after = text[m.end():]
+    issues = _block_field(after, "ISSUES")
+    blocking = _block_field(after, "BLOCKING")
+    if blocking and blocking.lower() != "none":
+        issues = _mark_blocking(issues, blocking, strict)
+    elif _ANY_ORIGIN_TAG.search(issues):
+        issues = "; ".join(_escape_item(f) for f in _split_block_findings(issues))
+    return verdict, issues
+
+
+def _finding_key(text: str) -> str:
+    """A finding or BLOCKING item reduced to what quoting compares: no label, tag or bullet,
+    case and spacing folded, trailing punctuation dropped."""
+    m = _ORIGIN_TAG.match(text)
+    body = m.group(2) if m else re.sub(r"^\s*BLOCKING\s*:\s*", "", text, flags=re.I)
+    body = _LEADING_BULLET.sub("", body.strip())
+    return re.sub(r"\s+", " ", body).strip(" .;:,").lower()
+
+
+def _blocking_items(blocking: str) -> list[str]:
+    """The BLOCKING section's items. Tagged items split as findings do; untagged ones are a
+    bulleted list (a bullet plus its wrapped lines) or a `;`-separated line."""
+    if _ANY_ORIGIN_TAG.search(blocking):
+        return _split_block_findings(blocking)
+    lines = blocking.splitlines()
+    if not any(_LEADING_BULLET.match(line.strip()) for line in lines):
+        return split_items(blocking)
+    items: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if _LEADING_BULLET.match(stripped):
+            items.append(_LEADING_BULLET.sub("", stripped))
+        elif stripped and items:
+            items[-1] += " " + stripped
+        elif stripped:
+            items.append(stripped)
+    return items
+
+
+_QUOTE_STOPWORDS = frozenset({"the", "and", "for", "with", "that", "this", "from", "its", "into",
+                              "are", "was", "has", "have", "been", "than", "then"})
+
+
+def _content_words(key: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9_./:`'-]+", key)
+            if len(w.strip("`'.:")) > 2 and w not in _QUOTE_STOPWORDS}
+
+
+def _quoted_finding(key: str, keys: list[str]) -> list[int]:
+    """The findings a BLOCKING item quotes, by the first test that matches any: the same text,
+    then the finding's start, then anywhere in it, then every content word of the item among
+    the finding's (a reviewer writes 'the vacuous killing test' for 'vacuous killing test at
+    test_x.py:10'). More than one index is ambiguous."""
+    words = _content_words(key)
+    for test in (lambda k: k == key, lambda k: k.startswith(key), lambda k: key in k,
+                 lambda k: bool(words) and words <= _content_words(k)):
+        hits = [i for i, k in enumerate(keys) if k and test(k)]
+        if hits:
+            return hits
+    return []
+
+
+def _mark_blocking(issues: str, blocking: str, strict: bool = True) -> str:
+    """ISSUES with each finding the BLOCKING section names marked `BLOCKING:` once.
+
+    The contract asks for BLOCKING as the SUBSET of ISSUES that must be fixed, so an untagged
+    item that quotes an ISSUES finding inherits that finding's origin and marks it, instead of
+    being recorded a second time. A tagged item that quotes no finding is recorded as its own
+    blocking finding, as before. An untagged item that quotes none, or quotes several, is
+    refused by name: guessing its origin, or which finding it meant, is the judgement the
+    classification exists to leave to the reviewer. Not `strict` (a block checked for its form
+    only, as a rejoinder's prior verdict is), such an item is folded in as an untagged
+    `BLOCKING:` finding, as it always was, and recording it is refused by the origin check.
+    """
+    has_issues = bool(issues) and issues.strip().lower() not in _NO_FINDINGS
+    findings = _split_block_findings(issues) if has_issues else []
+    keys = [_finding_key(f) for f in findings]
+    marked = [False] * len(findings)
+    extra: list[str] = []
+    for item in _blocking_items(blocking):
+        key = _finding_key(item)
+        if not key or key in _NO_FINDINGS:
+            continue
+        hits = _quoted_finding(key, keys)
+        if len(hits) == 1:
+            marked[hits[0]] = True
+        elif not strict and not (len(hits) == 0 and _ORIGIN_TAG.match(item)):
+            extra.append(f"BLOCKING: {item}")
+        elif len(hits) > 1:
+            raise ValueError(
+                f"BLOCKING item {item!r} quotes {len(hits)} ISSUES findings "
+                f"({'; '.join(findings[i] for i in hits)}) - quote enough of the one it means "
+                f"to tell them apart")
+        elif _ORIGIN_TAG.match(item):
+            extra.append(item if re.match(r"^\s*BLOCKING\s*:", item, re.I)
+                         else f"BLOCKING: {item}")
+        else:
+            raise ValueError(
+                f"BLOCKING item {item!r} quotes no ISSUES finding and carries no origin tag - "
+                f"quote the start of its ISSUES finding, or tag it [regression], [new] or "
+                f"[pre-existing]")
+    out = [f if not flag or re.match(r"^\s*BLOCKING\s*:", f, re.I) else f"BLOCKING: {f}"
+           for f, flag in zip(findings, marked)] + extra
+    return "; ".join(_escape_item(f) for f in out)
+
+
+# --- Per-item repair verdict -----------------------------------------------------------
+# A repair review rules each previous finding individually, so an aggregate 'the repair is
+# fine' can never cover findings the reviewer was shown as a set but never item by item.
+REPAIR_RULINGS = ("CLOSED", "OVER-CLAIMED", "MOVED")
+
+
+def enumerate_repair_findings(prior_findings: list[str]) -> str:
+    """Render the previous round's findings as a per-item checklist for a repair review, each
+    demanding its own CLOSED / OVER-CLAIMED / MOVED ruling. Refuses an empty list - a repair
+    review with nothing to rule on is not a repair review, and an aggregate answer about a set
+    never shown item by item is exactly what enumerating them forbids."""
+    items = [str(f).strip() for f in (prior_findings or []) if str(f).strip()]
+    if not items:
+        raise ValueError("a repair review needs the previous round's findings to enumerate - "
+                         "with none listed the reviewer answers in aggregate; refused")
+    lines = ["--- PER-ITEM REPAIR VERDICT (rule EACH previous finding below) ---", "",
+             "Rule each of the previous round's findings individually as CLOSED, OVER-CLAIMED "
+             "or MOVED. A general 'the repair is fine' answer is not accepted - every finding "
+             "carries its own ruling, and MOVED means the defect survived, not that it closed.",
+             ""]
+    for i, finding in enumerate(items, 1):
+        lines.append(f"{i}. {finding}")
+        lines.append("   ruling: ( CLOSED | OVER-CLAIMED | MOVED )")
+    return "\n".join(lines)
+
+
+def validate_repair_verdict(prior_findings: list[str], rulings: dict) -> bool:
+    """Refuse a repair-round verdict unless EVERY previous finding carries a ruling in
+    {CLOSED, OVER-CLAIMED, MOVED}. Raises ValueError naming the first unruled finding, or a
+    ruling outside the vocabulary. An unruled finding is never resolved in the repair's favour -
+    that is the aggregate answer this exists to refuse."""
+    seen = {str(k): str(v).strip().upper() for k, v in (rulings or {}).items()}
+    for finding in prior_findings:
+        key = str(finding)
+        ruling = seen.get(key, "")
+        if not ruling:
+            raise ValueError(f"finding not ruled: {key!r} - each previous finding carries its "
+                             f"own CLOSED/OVER-CLAIMED/MOVED ruling; an unruled finding is "
+                             f"refused, never taken as closed")
+        if ruling not in REPAIR_RULINGS:
+            raise ValueError(f"finding {key!r} has ruling {ruling!r} outside {REPAIR_RULINGS}")
+    return True
+
+
+def repair_open_findings(rulings: dict) -> list[str]:
+    """The findings still OPEN after a repair round: everything not CLOSED. A MOVED defect
+    survived - it moved, it did not close - and an OVER-CLAIMED repair claimed more than it did;
+    counting either as closed is how a repair masks the defect beside it."""
+    return [str(f) for f, r in (rulings or {}).items() if str(r).strip().upper() != "CLOSED"]
+
+
+# --- Claim inventory (prose assertions ruled TRUE / FALSE / UNVERIFIABLE) ---------------
+# The first pass of a review: enumerate every assertion the diff's prose makes and rule each,
+# before the logic review. A claim silently ruled TRUE because nothing contradicted it is the
+# failure this surfaces, so UNVERIFIABLE is its own category and an absent ruling is refused.
+CLAIM_RULINGS = ("TRUE", "FALSE", "UNVERIFIABLE")
+
+
+def validate_claim_inventory(claims: list[str], rulings: dict) -> bool:
+    """Refuse a claim inventory unless every enumerated claim carries a ruling in
+    {TRUE, FALSE, UNVERIFIABLE}. Raises ValueError naming the first unruled claim, or a ruling
+    outside the vocabulary. An absent ruling is refused, never defaulted to TRUE."""
+    seen = {str(k): str(v).strip().upper() for k, v in (rulings or {}).items()}
+    for claim in claims:
+        key = str(claim)
+        ruling = seen.get(key, "")
+        if not ruling:
+            raise ValueError(f"claim not ruled: {key!r} - every enumerated assertion carries a "
+                             f"TRUE/FALSE/UNVERIFIABLE ruling; an unruled claim is refused, "
+                             f"never assumed true")
+        if ruling not in CLAIM_RULINGS:
+            raise ValueError(f"claim {key!r} has ruling {ruling!r} outside {CLAIM_RULINGS}")
+    return True
+
+
+def summarise_claim_pass(rulings) -> dict:
+    """The claim pass summarised. Counts per category, how many claims rest on TRUST
+    (UNVERIFIABLE), how many were actually CHECKED against the code (TRUE or FALSE), and whether
+    the pass is VERIFIED. A pass is verified only when at least one claim was settled; a pass
+    whose every ruling is UNVERIFIABLE checked nothing, and must not read the same as one that
+    looked and found nothing wrong. Accepts a rulings dict or a bare iterable of rulings."""
+    values = rulings.values() if isinstance(rulings, dict) else (rulings or [])
+    counts = {r: 0 for r in CLAIM_RULINGS}
+    for v in values:
+        u = str(v).strip().upper()
+        if u in counts:
+            counts[u] += 1
+    checked = counts["TRUE"] + counts["FALSE"]
+    on_trust = counts["UNVERIFIABLE"]
+    return {"true": counts["TRUE"], "false": counts["FALSE"],
+            "unverifiable": on_trust, "on_trust": on_trust,
+            "checked": checked, "total": checked + on_trust,
+            "verified": checked > 0}
+
+
+def render_claim_pass(rulings) -> str:
+    """One line describing the claim pass, in which a checked round and an all-on-trust round
+    read differently. An all-UNVERIFIABLE pass renders NOT VERIFIED - nothing was settled - so
+    it cannot be mistaken for a clean pass that looked and found nothing."""
+    s = summarise_claim_pass(rulings)
+    if s["total"] == 0:
+        return "claim pass: no assertions enumerated"
+    if not s["verified"]:
+        return (f"claim pass: NOT VERIFIED - all {s['total']} claim(s) UNVERIFIABLE, nothing "
+                f"settled against the code; this round checked nothing")
+    trust = f", {s['on_trust']} on trust (UNVERIFIABLE)" if s["on_trust"] else ""
+    return (f"claim pass: {s['checked']} of {s['total']} checked "
+            f"(TRUE {s['true']}, FALSE {s['false']}){trust}")
+
+
+# ---------------------------------------------------------------------------
+# The consuming caller: a criterion for a mechanism names what will call it
+# ---------------------------------------------------------------------------
+# Four mechanisms shipped in one sprint reaching nothing: a hash whose digest could never match,
+# a selection computed by one hook and ignored by the one that runs the tests, a consumer whose
+# producer did not exist. Every one had passing tests and a green gate, because every criterion
+# described the function's own behaviour and none asked what would call it. Reviewing for it
+# afterwards costs a round; asking for it while the criterion is being written costs a sentence.
+#
+# So a criterion for a mechanism declares its consumer, and the declaration must RESOLVE - a
+# named caller that is nowhere in the tree is the same defect wearing an answer's clothes.
+
+#: The AC bullet an author writes to name the consumer. Read here and asked for by the shipped
+#: story template: a checker reading a different word from the one the template writes is exactly
+#: the drift that makes a field look answered and go unchecked.
+CALLER_FIELD = "Caller"
+
+#: No criterion names a consumer at all.
+CALLER_UNNAMED = "caller-unnamed"
+#: A consumer is named but does not resolve to anything in the tree.
+CALLER_UNRESOLVED = "caller-unresolved"
+#: The unit declares code, but every declared file was subtracted as its own proof, so the
+#: mechanism surface came out empty and the check cannot speak for the unit either way. Reported
+#: rather than skipped: a silent pass on a unit nothing judged is indistinguishable from a pass
+#: the unit earned, and that is how a vacuous criterion survived the check built to catch it.
+CALLER_INDETERMINATE = "caller-indeterminate"
+
+_CALLER_RE = re.compile(rf"^\s*[-*]\s*\*\*{CALLER_FIELD}s?:?\*\*:?\s*(.+?)\s*$", re.I)
+#: Path-, command- and identifier-shaped runs inside a declaration, so `the commit gate
+#: (tools/hooks/pre-commit)` offers `tools/hooks/pre-commit` to the resolver.
+_CALLER_TOKEN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
+
+#: The only directories a tree scan skips, and both are DERIVED content rather than source:
+#: git's object store and the interpreter's bytecode cache. Nothing else is excluded, because a
+#: list of "uninteresting" directories is a list of places a caller can hide.
+_TREE_SKIP = (".git", "__pycache__")
+
+
+def tree_index(repo_root: Path | str) -> dict:
+    """Every TRACKED file, indexed by relative path, file name and stem.
+
+    Tracked, not walked. A filesystem walk pulled in `node_modules` and every vendored artefact,
+    which turned the index into a general English vocabulary: against this repo it made
+    `unknown`, `nothing at all` and `the main loop` all resolve, while a real relative path did
+    not. An index whose failure mode is "everything matches" cannot judge anything, and it is
+    worst on exactly the vendored repositories this skill is aimed at.
+
+    Refuses an EMPTY result. A scan that found nothing is not the finding "no caller resolves
+    here" - it is a scan that did not answer.
+    """
+    root = Path(repo_root)
+    paths: set[str] = set()
+    names: set[str] = set()
+    stems: set[str] = set()
+    import subprocess as _sp
+    try:
+        proc = _sp.run(["git", "-C", str(root), "ls-files", "-z"],
+                       capture_output=True, text=True, timeout=30)
+        listing = [x for x in proc.stdout.split("\0") if x] if proc.returncode == 0 else []
+    except (OSError, _sp.SubprocessError):
+        listing = []
+    if not listing:
+        # git could not answer - a tree that is not a repository yet is a legitimate case, and
+        # a consuming project may run this before its first commit. Fall back to a walk, but
+        # keep the skip list: the vendored directories are what turned this index into an
+        # English vocabulary in the first place.
+        listing = [str(q.relative_to(root)) for q in root.rglob("*") if q.is_file()]
+    symbols: set[str] = set()
+    for rel in listing:
+        if any(part in _TREE_SKIP for part in Path(rel).parts):
+            continue
+        paths.add(rel)
+        names.add(Path(rel).name)
+        stems.add(Path(rel).stem)
+        if rel.endswith(".py"):
+            symbols |= _defined_symbols(root / rel)
+    if not paths:
+        raise ValueError(
+            f"tree_index of {root} found no tracked files - refusing to report that no caller "
+            f"resolves, which is what an unanswered scan would look like")
+    return {"paths": paths, "names": names, "stems": stems, "symbols": symbols}
+
+
+#: A `def` or `class` at any indentation in a tracked source file.
+_SYMBOL_DEF = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)", re.MULTILINE)
+
+
+def _defined_symbols(path: Path) -> set[str]:
+    """The function and class names a tracked source file defines.
+
+    A caller is very often named as a SYMBOL rather than a path - `cmd_lane -> lane_dispatch`
+    is how every lane story names its consumer - and requiring a path-shaped token made those
+    declarations unverifiable. They then passed only because an unrelated documentation
+    filename sat on the same line, which is the theatre the path rule was added to stop,
+    reappearing one step to the left.
+
+    Reads the source rather than importing it: an index that imports every tracked module to
+    ask what it defines runs arbitrary code to answer a naming question.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set()
+    return set(_SYMBOL_DEF.findall(text))
+
+
+def caller_resolves(index: dict, declaration: str) -> bool:
+    """Whether the consumer named by `declaration` resolves to something tracked in the tree.
+
+    A caller is named as a PATH or as a COMMAND, so a token must look like one: it carries a
+    separator, or a file extension, or it matches a tracked file's name or stem while being
+    more than an ordinary English word. A bare single word matched against every stem in the
+    tree is how `unknown` came to satisfy the rule this function exists to enforce.
+
+    Deliberately silent about intent: it proves the named thing EXISTS, never that it calls the
+    mechanism. The second question is the reviewer's.
+    """
+    for token in _CALLER_TOKEN.findall(declaration or ""):
+        cleaned = token.strip("./-")
+        if len(cleaned) < 3:
+            continue
+        # A path-shaped or extension-bearing token may match on its full form or its tail.
+        path_shaped = "/" in cleaned or "." in cleaned
+        if path_shaped:
+            if cleaned in index["paths"] or cleaned in index["names"] or cleaned in index["stems"]:
+                return True
+            tail = Path(cleaned).name
+            if tail and (tail in index["names"] or tail in index["stems"]):
+                return True
+            continue
+        # A bare word resolves only against a tracked file NAME (not a stem), and only when it
+        # is not a word ordinary prose would produce. `gate` and `review` are stems here; they
+        # are also the two most likely words in a sentence about a caller.
+        if cleaned in index["names"]:
+            return True
+        # ...or against a symbol a tracked source file DEFINES, which is how a caller is most
+        # often named. Guarded structurally, never by a word list: the token must also be
+        # code-shaped - carrying an underscore or an interior capital - so `main`, `run`,
+        # `report` and `review` stay unresolvable even though each is a real `def` somewhere.
+        # A list of forbidden English words is the enumerated-list defect this repo keeps
+        # re-filing; a shape rule cannot forget an entry.
+        code_shaped = "_" in cleaned or any(c.isupper() for c in cleaned[1:])
+        if code_shaped and cleaned in index.get("symbols", ()):
+            return True
+    return False
+
+
+def _ac_blocks_with_bodies(text: str) -> list[tuple[str, list[str]]]:
+    """`(AC id, body lines)` per criterion, using `verify_ac.criteria_blocks` for the block
+    boundaries - the SAME reader the verifier executes, so a criterion shape the runner
+    recognises is a criterion this check reads. A second AC parser here would let a unit be
+    judged against criteria the runner cannot see."""
+    import verify_ac  # noqa: PLC0415 - sibling; imported lazily so a record never pays for it
+    lines = text.splitlines()
+    blocks = verify_ac.criteria_blocks(text)
+    out: list[tuple[str, list[str]]] = []
+    for i, b in enumerate(blocks):
+        end = blocks[i + 1].heading_line if i + 1 < len(blocks) else len(lines)
+        out.append((b.ac_id, lines[b.heading_line:end]))
+    return out
+
+
+def caller_declarations(text: str) -> list[dict]:
+    """The consumers the unit's criteria declare, as `{ac, caller}` in criterion order."""
+    found: list[dict] = []
+    for ac_id, body in _ac_blocks_with_bodies(text):
+        for line in body:
+            m = _CALLER_RE.match(line)
+            if m:
+                found.append({"ac": ac_id, "caller": m.group(1).strip()})
+                break
+    return found
+
+
+def _verifier_names(line: str, rel: str) -> bool:
+    """Whether a Verify line NAMES this file.
+
+    Matched at path boundaries rather than by substring: a verifier reading
+    `tests/test_thing.py` does not name `src/thing.py`, and reading it as though it did
+    subtracts the mechanism from the unit and reports nothing about it. Both the declared path
+    and its basename count, because a verifier names a path inside a node id
+    (`pytest path/test_x.py::Class::test`) and a `./` or `.claude/` prefix must not make the
+    same file look like a different one.
+    """
+    for cand in (rel, Path(rel).name):
+        if re.search(rf"(?<![\w./-]){re.escape(cand)}(?![\w-])", line):
+            return True
+    return False
+
+
+def mechanism_files(text: str) -> list[str]:
+    """The declared files that are the unit's MECHANISM.
+
+    Derived by SUBTRACTION from what the unit itself declares: its `Affects`, less the files its
+    own verifiers name (those are its proof, not its mechanism) and less markdown (a document is
+    not a mechanism). Never a list of code extensions - such a list exempts the language nobody
+    thought of, which is the failure mode this project has paid for repeatedly.
+
+    One known miss, stated rather than hidden: a unit whose verifier reads the mechanism file
+    directly (a `grep` over the source it changes) subtracts that file as proof, so it is not
+    asked for a consumer. Widening the rule to keep it would have to guess which verbs are
+    tests, and a guess about the runner is how the two parsers diverge.
+    """
+    verify_lines = [line for _ac, body in _ac_blocks_with_bodies(text)
+                    for line in body if sdlc_md.VERIFY_RE.match(line)]
+    out: list[str] = []
+    for raw in sdlc_md.affects_files(text):
+        rel = raw.strip().strip("`")
+        if not rel or rel.endswith(".md"):
+            continue
+        if any(_verifier_names(line, rel) for line in verify_lines):
+            continue
+        out.append(rel)
+    return out
+
+
+def caller_findings(repo_root: Path | str, units: list[str]) -> list[dict]:
+    """Units adding a mechanism whose criteria name no consumer, or name one that does not exist.
+
+    A REPORT, not a gate: each finding is `{unit, kind, criteria, detail}` and names the criterion
+    it is about, because "this unit needs a caller" sends the author back to read all of them
+    while "AC1 describes a function with no consumer" points at the line to fix. A unit whose
+    declared surface is documentation, or is only its own tests, adds no mechanism and is not
+    asked for one - a check that fires on everything is not a check.
+    """
+    root = Path(repo_root)
+    index = tree_index(root)
+    findings: list[dict] = []
+    for raw in units or []:
+        uid = sdlc_md.norm_id(raw)
+        hit = sdlc_md.find_by_id(root, uid)
+        if not hit:
+            raise ValueError(f"no artefact with id {uid!r} - the caller check needs a real unit; "
+                             f"an id that resolves to nothing is not a unit with no findings")
+        text = sdlc_md.read_text_safe(Path(hit[0]))
+        mech = mechanism_files(text)
+        if not mech:
+            # A unit whose declared surface is documentation, or only its own tests, adds no
+            # mechanism and is legitimately not asked for one. A unit that DECLARED code and
+            # had every entry subtracted as its own proof is a different thing entirely: the
+            # subtraction emptied the surface, so the check judges nothing and would exit 0
+            # however the Caller declaration were written - delete it, or replace it with text
+            # naming no consumer, and the verdict is unchanged. That is a vacuous criterion,
+            # which is the exact defect this check exists to remove.
+            code = [f for f in sdlc_md.affects_files(text)
+                    if f.strip().strip("`") and not f.strip().strip("`").endswith(".md")]
+            if code:
+                findings.append({
+                    "unit": uid, "kind": CALLER_INDETERMINATE, "criteria": [],
+                    "detail": (f"{uid} declares {', '.join(code)} but every one of those files "
+                               f"is named by its own verifiers, so the mechanism surface is "
+                               f"empty and this check judges nothing. Point a criterion at the "
+                               f"behaviour rather than at the file, or declare the mechanism "
+                               f"the unit adds - a check that cannot fail is not evidence."),
+                })
+            continue
+        declared = caller_declarations(text)
+        surface = ", ".join(mech)
+        if not declared:
+            criteria = [ac for ac, _body in _ac_blocks_with_bodies(text)]
+            named = ", ".join(criteria) or "no criteria at all"
+            findings.append({
+                "unit": uid, "kind": CALLER_UNNAMED, "criteria": criteria,
+                "detail": (f"{uid} adds a mechanism ({surface}) and no criterion names the "
+                           f"caller that consumes it: {named} describe the function's own "
+                           f"behaviour only. A mechanism that reaches no caller is inert "
+                           f"however green its tests."),
+            })
+            continue
+        for d in declared:
+            if caller_resolves(index, d["caller"]):
+                continue
+            findings.append({
+                "unit": uid, "kind": CALLER_UNRESOLVED, "criteria": [d["ac"]],
+                "detail": (f"{uid} {d['ac']} names {d['caller']!r} as the consumer of "
+                           f"{surface}, and nothing in the tree resolves to it - naming a "
+                           f"caller that does not exist is not a way past the check."),
+            })
+    return findings
+
+
+def render_caller_findings(findings: list[dict]) -> list[str]:
+    """The lines a caller-check prints. An empty result says what it checked FOR rather than
+    printing nothing, so a run that found nothing cannot be told apart from one that never
+    looked."""
+    if not findings:
+        return ["caller check: every mechanism unit names a consumer that resolves"]
+    return [f"  {f['unit']} [{f['kind']}]: {f['detail']}" for f in findings]
+
+
+def cmd_caller_check(args: argparse.Namespace) -> int:
+    """Report the mechanism units whose criteria name no consumer, or an absent one. Returns 1
+    when there is something to report, so a hook or lane can act on it."""
+    try:
+        units = batch_units(args, "caller-check")
+        findings = caller_findings(args.root, units)
+    except BatchRefused as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        print(f"caller check refused: {exc}", file=sys.stderr)
+        return 2
+    for line in render_caller_findings(findings):
+        print(line)
+    # The SCOPE, always - a clean result has to name what it is clean over. The false
+    # measurement BG0386 records was a clean answer about one unit read as a clean batch, and
+    # the count is what would have shown the difference at the moment it was read.
+    print(f"caller-check: {len(findings)} finding(s) over {len(units)} unit(s)")
+    return 1 if findings else 0
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    try:
+        if getattr(args, "rejoinder", None):
+            src = args.rejoinder
+            prior = (sys.stdin.read() if src == "-"
+                     else Path(src).read_text(encoding="utf-8"))
+            explicit = args.tier is not None
+            tier = args.tier or tier_for(args.root, args.unit)
+            text = rejoinder_brief(args.root, args.unit, args.seat, prior, tier)
+            # The re-review brief carries the same blocks as the first one, so it is refused on
+            # the same terms and before anything reaches stdout.
+            assert_brief_practices(text, tier)
+            if "CLAIM INVENTORY" in TIER_SECTIONS[tier]:
+                assert_brief_claim_pass(text)
+            notice = _self_check_gate(args.root, args.unit)
+            print(text)
+            # the footer the delivery rejoinder never printed: a re-review's verdict needs the
+            # same provenance as the first one, and a fingerprint the reviewer can quote back
+            fp = rejoinder_fingerprint(text)
+            note_brief(args.root, args.unit, args.seat, tier, fp, rejoinder=True,
+                       explicit=explicit)
+            # A repair is the author's work too, so a re-review is preceded by the same check.
+            print(author_self_check(args.root, args.unit), file=sys.stderr)
+            if notice:
+                print(notice, file=sys.stderr)
+            how = "chosen" if explicit else "derived from the unit's risk band"
+            print(f"\nreview tier: {tier} ({how})\n"
+                  f"brief fingerprint: {fp}\n"
+                  f"  record the verdict with:  critic.py record --unit "
+                  f"{sdlc_md.display_id(args.root, args.unit)} --verdict <APPROVE|REJECT> "
+                  f"--brief {fp} --tier {tier}"
+                  f"{' --tier-explicit' if explicit else ''} ...", file=sys.stderr)
+        else:
+            # DERIVED unless the operator named one. `--tier` no longer defaults to `full`
+            # in the parser: a default there is indistinguishable from a choice, and the
+            # record has to be able to tell them apart to judge whether the derivation works.
+            explicit = args.tier is not None
+            tier = args.tier or tier_for(args.root, args.unit)
+            text = brief(args.root, args.unit, args.seat, tier)
+            # The checks run here, in the verb, and never inside `brief()`, which other readers
+            # also render through. Each tier is held to the practices and the claim inventory
+            # its tables say it carries, so a light brief is asked for neither the mutation
+            # practices nor the inventory. Refused
+            # before printing, so a deficient brief never reaches a reviewer and never earns a
+            # fingerprint.
+            assert_brief_practices(text, tier)
+            if "CLAIM INVENTORY" in TIER_SECTIONS[tier]:
+                assert_brief_claim_pass(text)
+            # The author's recorded self-check, judged here so a refusal under `block` reaches
+            # neither stdout nor the brief notes.
+            notice = _self_check_gate(args.root, args.unit)
+            print(text)
+            fp = brief_fingerprint(text)
+            note_brief(args.root, args.unit, args.seat, tier, fp, rejoinder=False,
+                       explicit=explicit)
+            # The author's self-check, on stderr so the brief a reviewer reads from a file
+            # carries none of it and its fingerprint is unmoved.
+            print(author_self_check(args.root, args.unit), file=sys.stderr)
+            if notice:
+                print(notice, file=sys.stderr)
+            # On stderr so the brief itself stays pipeable, and stated as the next command so
+            # a reviewer does not have to know the flag exists. The tier is carried INTO that
+            # command: a tier printed and not recorded is the state this whole flag was in.
+            how = "chosen" if explicit else "derived from the unit's risk band"
+            print(f"\nreview tier: {tier} ({how})\n"
+                  f"brief fingerprint: {fp}\n"
+                  f"  record the verdict with:  critic.py record --unit "
+                  f"{sdlc_md.display_id(args.root, args.unit)} --verdict <APPROVE|REJECT> "
+                  f"--brief {fp} --tier {tier}"
+                  f"{' --tier-explicit' if explicit else ''} ...", file=sys.stderr)
+    except (OSError, ValueError) as exc:
+        print(f"brief refused: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+class BatchRefused(ValueError):
+    """A batch invocation refused before anything was written."""
+
+
+def batch_units(args: argparse.Namespace, verb: str) -> list[str]:
+    """The units one invocation acts on, from `--unit`, `--units` or the open run.
+
+    Every supplied spelling accumulates and the result keeps its order without repeats. That
+    is deliberate and it is BG0386's defect stated as a contract: a repeated flag that keeps
+    only its last value answers about one unit while reporting on a batch, and the caller has
+    no way to see the difference.
+
+    `--from-run` reads the open run's approved batch. A run that is not open REFUSES; it never
+    degrades to the empty batch, because acting on nothing and reporting success is the same
+    false clean the count above exists to prevent."""
+    supplied: list[str] = []
+    for value in (getattr(args, "unit", None) or []):
+        supplied.extend(str(value).split(","))
+    for value in (getattr(args, "units", None) or []):
+        supplied.extend(str(value).split(","))
+    if getattr(args, "from_run", False):
+        state = run_state.read(args.root) or {}
+        batch = [str(u).strip() for u in (state.get("batch") or []) if str(u).strip()]
+        if not batch:
+            raise BatchRefused(
+                f"{verb} refused: --from-run was given but there is no open run with an "
+                f"approved batch to read. Name the units with --units, or open a run first")
+        supplied.extend(batch)
+    seen: set[str] = set()
+    units = [u for u in (s.strip() for s in supplied) if u and not (u in seen or seen.add(u))]
+    if not units:
+        raise BatchRefused(f"{verb} refused: name the unit(s) with --unit/--units, or "
+                           f"--from-run to take the open run's batch")
+    return units
+
+
+#: What each batch verb cannot write without. Held here rather than left to argparse alone so
+#: the refusal can name EVERY missing argument in one message: a caller who learns one flag per
+#: refusal pays a round-trip per flag, which is how one sign-off cost nineteen spawns.
+BATCH_REQUIRED: dict = {
+    "record": (("author", "--author"),),
+}
+
+
+def missing_arguments(args: argparse.Namespace, verb: str) -> list[str]:
+    """Every required argument of `verb` this invocation did not supply, in one list."""
+    return [flag for attr, flag in BATCH_REQUIRED.get(verb, ())
+            if not str(getattr(args, attr, "") or "").strip()]
+
+
+def _run_batch(args: argparse.Namespace, verb: str, write) -> int:
+    """Resolve the batch, refuse ONCE for anything missing, then write every unit.
+
+    Both refusals happen before the first write, so a bad invocation costs one message rather
+    than a half-written batch. After that a per-unit failure is reported and the remaining
+    units still run - stopping at the first would leave the caller unable to tell what landed -
+    and the exit code is non-zero, because a partially written batch reported as success is a
+    gap nobody looks for again."""
+    try:
+        units = batch_units(args, verb)
+    except BatchRefused as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if missing := missing_arguments(args, verb):
+        print(f"{verb} refused: missing required argument(s) {', '.join(missing)} - naming "
+              f"{len(units)} unit(s). Nothing was written", file=sys.stderr)
+        return 2
+    # EVERY id must resolve, before anything is written. `caller-check` and `refine seams` both
+    # refuse an unresolvable id in this same repo, for the stated reason that a silent skip
+    # ships a smaller tranche than approved - and the verb that writes the COMMITTED REVIEW
+    # LEDGER did not. `critic record --units US9998,US9999` wrote two verdicts for artefacts
+    # that do not exist and reported success.
+    # Only where the workspace CAN answer. A root with no artefact tree at all cannot resolve
+    # anything, and refusing there would fail on an unanswerable question rather than a wrong
+    # one - the same distinction `close_owed` draws between an absent baseline and a corrupt
+    # one. Where a tree exists, an id nothing resolves is a typo or a wrong workspace, and
+    # neither belongs in a permanent ledger row.
+    resolvable = any((Path(args.root) / rel).is_dir()
+                     for rel, _prefix in sdlc_md.ARTIFACT_TYPES.values())
+    unresolved = [u for u in units
+                  if resolvable and not sdlc_md.find_by_id(args.root, u)]
+    if unresolved:
+        print(f"{verb} refused: {len(unresolved)} id(s) resolve to no artefact on disk: "
+              f"{', '.join(unresolved)}. A verdict recorded against an id nothing resolves is "
+              f"a permanent row in the review ledger about a unit that does not exist",
+              file=sys.stderr)
+        return 2
+    written, failed = [], []
+    for unit in units:
+        try:
+            write(unit)
+        except (ValueError, OSError) as exc:
+            failed.append(unit)
+            print(f"{verb} refused for {unit}: {exc}", file=sys.stderr)
+        else:
+            written.append(unit)
+    print(f"{verb}: {len(written)} unit(s) written"
+          + (f" ({', '.join(written)})" if written else "")
+          + (f"; {len(failed)} REFUSED ({', '.join(failed)})" if failed else ""))
+    if not failed:
+        return 0
+    # Two different facts, two different codes. Nothing written is a REFUSAL (2) - the code
+    # the single-unit form has always returned for a bad identity, and the
+    # one a caller keys on. Something written alongside a refusal is a PARTIAL batch (1),
+    # which is neither: the caller has to look at what landed before deciding what to re-run.
+    return 2 if not written else 1
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    if getattr(args, "from_verdict", None):
+        if args.verdict or args.issues:
+            print("record refused: --from-verdict and an explicit --verdict/--issues are "
+                  "mutually exclusive - one source of truth per record", file=sys.stderr)
+            return 2
+        src = args.from_verdict
+        try:
+            raw = (sys.stdin.read() if src == "-"
+                   else Path(src).read_text(encoding="utf-8"))
+            verdict, issues = parse_verdict_block(raw)
+        except (OSError, ValueError) as exc:
+            print(f"record refused: {exc}", file=sys.stderr)
+            return 2
+        args.verdict, args.issues = verdict, issues
+    elif not args.verdict:
+        print("record refused: give --verdict, or --from-verdict FILE|- with the "
+              "reviewer's returned block", file=sys.stderr)
+        return 2
+
+    brief = (getattr(args, "brief", "") or "").strip()
+    if not brief and getattr(args, "brief_file", None):
+        try:
+            saved = Path(args.brief_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"record refused: {exc}", file=sys.stderr)
+            return 2
+        # Hashed the way the footer that printed it was. A saved REJOINDER's footer carries its
+        # base brief plus the phase, never the prior verdict quoted beneath, so hashing the
+        # whole file recorded a value no footer printed. A first-round brief is hashed whole,
+        # as its footer is.
+        brief = (rejoinder_fingerprint(saved) if _REJOINDER_MARK in saved
+                 else brief_fingerprint(saved))
+    # The origin axis asks what THIS UNIT'S DIFF did - regression, new, or already true of the
+    # tree, decided against the base ref.
+    if unclassified := unclassified_findings(args.issues):
+        listed = "; ".join(f"  - {f[:90]}" for f in unclassified)
+        print("record refused: these findings carry no origin, and an unsorted finding is the "
+              "one a close cannot price against the batch that caused it:\n"
+              f"{listed}\n"
+              "  Tag each with what THIS unit's diff did, decided by execution (`git log -S`, "
+              "or re-probe at the base ref) rather than by impression:\n"
+              "    [regression]   the diff broke something that worked at the base ref\n"
+              "    [new]          the diff introduced a defect that did not exist\n"
+              "    [pre-existing] already true of the tree - reported, and it does not block\n"
+              "  e.g. --issues \"[regression] verify_ac crashes on an empty Affects; "
+              "[pre-existing] BG0123 slow gate\"", file=sys.stderr)
+        return 2
+
+    carry_failed: list[str] = []
+
+    def write(unit: str) -> None:
+        note = ("" if _id(args.author) != _id(args.reviewer)
+                else "  (WARNING: self-review - blocked at the gate)")
+        try:
+            path, n, bug = _record(args.root, unit, args.verdict, args.reviewer, args.author,
+                                   args.issues, brief=brief,
+                                   tier=getattr(args, "tier", None),
+                                   tier_explicit=getattr(args, "tier_explicit", False),
+                                   ruling=getattr(args, "ruling", None))
+        except CarryFailed as exc:
+            carry_failed.append(unit)
+            print(f"record: {exc}", file=sys.stderr)
+            return
+        at = f" round {n}" if n is not None else ""
+        print(f"recorded {sdlc_md.norm_id(unit)} {args.verdict.upper()} "
+              f"[delivery]{at} -> {path}{note}")
+        if bug:
+            print(carried_notice(unit, bug))
+
+    rc = _run_batch(args, "record", write)
+    if carry_failed and rc == 0:
+        rc = 1
+    # Escalation is only a notice: the carry above already keeps the run going.
+    try:
+        recorded = batch_units(args, "record") if rc == 0 else []
+    except BatchRefused:
+        recorded = []
+    for unit in recorded:
+        if notice := escalation_notice(args.root, unit):
+            print(notice)
+        if brief and (moved := rebrief_notice(args.root, unit, brief)):
+            print(moved, file=sys.stderr)
+        if shallow := under_depth_notice(args.root, unit):
+            print(shallow, file=sys.stderr)
+    if drift := _seat_drift_warning(args.root, args.reviewer):
+        print(f"WARNING: {drift}", file=sys.stderr)
+    return rc
+
+
+#: Statuses that mean "delivered, awaiting the reviewer of record" - the state a sign-off EXISTS
+#: to resolve. Matched by name so a project renaming its review status keeps working.
+#:
+#: PUBLIC, because `sprint._awaits_signoff` reads it across a module boundary. It was reached
+#: through the private name behind a broad `except`, so deleting or tightening this predicate
+#: changed that caller's behaviour silently - it fell back to its own copy of the old rule.
+#: One owner, one name, and a caller that breaks loudly if it ever moves.
+def is_awaiting_signoff(status: str) -> bool:
+    return "review" in (status or "").strip().lower()
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    if getattr(args, "format", "text") == "json":
+        if args.unit:
+            print(json.dumps({"unit": args.unit, "verdict": verdict_for(
+                args.root, args.unit)}, indent=2))
+        else:
+            print(json.dumps(read_verdicts(args.root), indent=2))
+        return 0
+    if args.unit:
+        v = verdict_for(args.root, args.unit)
+        print(v if v else f"no verdict for {args.unit}")
+    else:
+        for v in read_verdicts(args.root):
+            print(f"{v['unit']} {v['verdict']} ({v['date']}){_superseded_suffix(v)}")
+    return 0
+
+
+def _superseded_suffix(verdict: dict) -> str:
+    """How a retired row reads in the listing: still shown, with why and on whose authority,
+    so a reader sees both that it was recorded and that it no longer counts."""
+    if not verdict.get("superseded"):
+        return ""
+    return (f"  SUPERSEDED {verdict.get('superseded_at', '')}: "
+            f"{verdict.get('superseded_reason', '')} "
+            f"(authorised by {verdict.get('superseded_by', '')})")
+
+
+def cmd_self_check_record(args: argparse.Namespace) -> int:
+    try:
+        claims = _entries(args.claims, "claims")
+        mutants = _entries(args.mutants, "mutants")
+        path = record_self_check(args.root, args.unit, claims, mutants, author=args.author)
+    except (OSError, ValueError) as exc:
+        print(f"self-check record refused: {exc}. Nothing was written.", file=sys.stderr)
+        return 2
+    row = read_self_checks(args.root)[-1]
+    taken = f" at {row['commit']}" if row["commit"] else ""
+    print(f"recorded the self-check for {row['unit']}: claims {row['claims']}; mutants "
+          f"{row['mutants']}; Affects digest {row['digest']}{taken} -> {path}")
+    return 0
+
+
+def cmd_supersede(args: argparse.Namespace) -> int:
+    import file_finding  # noqa: PLC0415 - the shared prose-fields loader, as elsewhere
+    try:
+        reason = file_finding.resolve_prose_fields(
+            getattr(args, "fields_file", None), {"reason": args.reason},
+            allowed=("reason",)).get("reason", "")
+        path = record_supersession(args.root, args.unit, args.date, reason,
+                                   args.authorised_by, args.boundary, reviewer=args.reviewer,
+                                   verdict=args.verdict, brief=args.brief)
+    except (OSError, ValueError) as exc:
+        print(f"supersede refused: {exc}", file=sys.stderr)
+        return 2
+    named = f" with brief {args.brief.strip()}" if (args.brief or "").strip() else ""
+    print(f"superseded the delivery verdict row for {sdlc_md.norm_id(args.unit)} "
+          f"dated {args.date}{named} -> {path}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="SDLC Studio critic-verdict record.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("record", help="Record a critic verdict for one unit or a batch.")
+    r.add_argument("--unit", action="append", metavar="ID",
+                   help="a unit id; repeatable, and a comma-separated list is accepted")
+    r.add_argument("--units", action="append", metavar="ID[,ID...]",
+                   help="unit ids for a whole batch in one invocation; repeatable")
+    r.add_argument("--from-run", dest="from_run", action="store_true",
+                   help="take the open run's approved batch as the scope; refused when no run is open")
+    r.add_argument("--verdict", choices=("approve", "reject", "APPROVE", "REJECT"),
+                   help="the verdict; or use --from-verdict to parse the reviewer's block")
+    r.add_argument("--from-verdict", dest="from_verdict", metavar="FILE|-",
+                   help="parse VERDICT/ISSUES/BLOCKING from a file (or stdin with -), refusing a malformed block")
+    r.add_argument("--reviewer", default="independent-critic")
+    r.add_argument("--author",
+                   help="the authoring seat or delegation id that produced the diff; a "
+                        "self-review (the same id as --reviewer) is recorded with a warning "
+                        "and never counts as the unit's independent review")
+    r.add_argument("--issues", default="",
+                   help="the findings, separated by ';', each tagged with what this unit's "
+                        "diff did: [regression], [new] or [pre-existing]; an untagged finding "
+                        "is refused, and only [regression] and [new] block. Write \\; to keep "
+                        "a semicolon inside one finding")
+    r.add_argument("--brief", default="",
+                   help="optional: the fingerprint `critic.py brief` printed for the prompt this "
+                        "seat was given, stored on the row as given")
+    r.add_argument("--brief-file", metavar="PATH",
+                   help="read the brief TEXT from a file and fingerprint it here, for a "
+                        "reviewer who saved the brief rather than its fingerprint")
+    r.add_argument("--ruling", metavar="DNNNN", default=None,
+                   help="an accepted decision authorising this unit one review round past "
+                        "`review.max_rounds`: it must name the unit first, and authorises one "
+                        "round, recorded beside the row")
+    r.add_argument("--tier", choices=TIERS, default=None,
+                   help="the depth this review was taken at, as `critic.py "
+                        "brief` reported it. A light verdict does not cover a unit the risk "
+                        "band tiers full; an absent tier is UNKNOWN and covers, so no "
+                        "historical verdict is retrospectively downgraded")
+    r.add_argument("--tier-explicit", action="store_true",
+                   help="mark the tier as an operator's choice rather than a derived one")
+    r.add_argument("--root", default=".")
+    r.set_defaults(func=cmd_record)
+    b = sub.add_parser("brief", help="Print the assembled seat-review prompt for a unit "
+                                     "(charter + ACs + scope + return contract).")
+    b.add_argument("--unit", required=True)
+    b.add_argument("--seat", required=True,
+                   help="the seat role: the project card declaring it under "
+                        "sdlc-studio/personas/seats/, else the shipped one")
+    b.add_argument("--tier", choices=TIERS, default=None,
+                   help="override the tier DERIVED from the unit's risk band. Omit it and the "
+                        "band decides: a low-band unit gets a bounded brief, a medium-or-worse "
+                        "one gets the full adversarial pass. An explicit choice is recorded as "
+                        "one, so the derivation can be judged against the reviews it produced")
+    b.add_argument("--rejoinder", metavar="FILE|-", default=None,
+                   help="emit the RE-REVIEW brief from the prior verdict file (or stdin "
+                        "with -): the diff scope re-rendered, the named probes and mutants "
+                        "demanded re-executed, and the delivery contract. The prior verdict is "
+                        "quoted verbatim, a fingerprint footer is printed on stderr; a "
+                        "malformed block is refused")
+    b.add_argument("--root", default=".")
+    b.set_defaults(func=cmd_brief)
+    cc = sub.add_parser("caller-check",
+                        help="Report units adding a mechanism whose criteria name no consuming "
+                             "caller, or name one that does not resolve in the tree.")
+    # `action="extend"` rather than the bare `nargs="+"` this had: with nargs alone a REPEATED
+    # `--unit A --unit B` keeps only B and argparse says nothing, so the command answered about
+    # one unit while reporting on a batch. That produced a false `caller-unnamed 5 -> 0` in a
+    # retro and two commit messages.
+    cc.add_argument("--unit", action="extend", nargs="+", metavar="ID",
+                    help="the unit ids to check; repeatable, and several may follow one flag")
+    cc.add_argument("--units", action="append", metavar="ID[,ID...]",
+                    help="unit ids as a comma-separated list; repeatable")
+    cc.add_argument("--from-run", dest="from_run", action="store_true",
+                    help="check the open run's approved batch; refused when no run is open")
+    cc.add_argument("--root", default=".")
+    cc.set_defaults(func=cmd_caller_check)
+    sp = sub.add_parser("supersede", aliases=["correct"],
+                        help="Retire a verdict row that records an event which did not "
+                             "happen, by appending a supersession record naming the row, "
+                             "the reason and the authoriser. The row itself stays.")
+    sp.add_argument("--unit", required=True)
+    sp.add_argument("--date", required=True, help="the retired row's Date cell")
+    sp.add_argument("--reason", default=None, help="why the row records something untrue")
+    sp.add_argument("--fields-file", dest="fields_file", metavar="FIELDS.json",
+                    help="read the reason from a JSON object ({\"reason\": \"...\"}) instead of "
+                         "--reason, so prose carrying shell metacharacters is stored verbatim "
+                         "rather than interpreted by the shell")
+    sp.add_argument("--authorised-by", dest="authorised_by", required=True,
+                    help="who authorised the correction - a principal independent of the "
+                         "author, never the row's own author nor an in-session reviewer")
+    sp.add_argument("--boundary", required=True,
+                    help="the separate trust boundary the authoriser acted in (operator "
+                         "console, another human, CI) - held to the independence rule the "
+                         "run's signature is held to")
+    sp.add_argument("--reviewer", default=None,
+                    help="narrow the match when the unit has several rows that date")
+    sp.add_argument("--verdict", default=None, help="narrow the match by the row's verdict")
+    sp.add_argument("--brief", default=None, metavar="FINGERPRINT",
+                    help="narrow the match by the row's Brief cell (`-` for a row with none), "
+                         "when rows share unit, date, reviewer and verdict")
+    sp.add_argument("--root", default=".")
+    sp.set_defaults(func=cmd_supersede)
+    sc = sub.add_parser("self-check",
+                        help="The author's own claim inventory and mutation pass, recorded "
+                             "before a reviewer is briefed.")
+    scs = sc.add_subparsers(dest="self_check_cmd", required=True)
+    scr = scs.add_parser("record",
+                         help="Record the author's self-check of a unit, refused unless every "
+                              "claim is ruled, none FALSE and one TRUE, the required surfaces "
+                              "are covered and every mutant is run against a declared test, "
+                              "bound to a digest of the content of the unit's Affects.")
+    scr.add_argument("--unit", required=True)
+    scr.add_argument("--claims", required=True, metavar="CLAIMS.json",
+                     help="a JSON list of {surface, claim, ruling}: the surface is the commit "
+                          "message, a changelog fragment the unit's Affects declares, or one of "
+                          "the brief's claim surfaces; the ruling TRUE, FALSE or UNVERIFIABLE")
+    scr.add_argument("--mutants", required=True, metavar="MUTANTS.json",
+                     help="a JSON list of {mutant, test, result, answer}: the test a "
+                          "`path::name` in a test file the unit's Affects declares, the result "
+                          "killed or survived, and an answer for every survivor; [] for a unit "
+                          "that declares no test file")
+    scr.add_argument("--author", default="",
+                     help="the authoring seat or delegation id that ran the self-check")
+    # SUPPRESS here, not ".": `add_global_root` re-points one level of subcommands and this one
+    # is nested a level below, so a "." default would overwrite `--root X self-check record`.
+    scr.add_argument("--root", default=argparse.SUPPRESS)
+    scr.set_defaults(func=cmd_self_check_record)
+    s = sub.add_parser("show", help="Show the latest verdict for a unit (or all).")
+    s.add_argument("--unit", default=None)
+    s.add_argument("--root", default=".")
+    sdlc_md.add_format_arg(s)
+    s.set_defaults(func=cmd_show)
+    sdlc_md.add_global_root(parser)
+    return parser
+
+
+#: The verbs that once took `--phase`.
+_PHASELESS_VERBS = ("record", "brief", "supersede", "correct", "show")
+
+#: Verbs removed from the parser, each refused BY NAME. Kept out of the parser itself so neither
+#: `--help` nor the derived command surface lists them.
+RETIRED_VERBS = {
+    "signoff": "the operator signs the run once with `sprint.py sign`, and no per-unit "
+               "sign-off row is written",
+    "signoff-brief": "the operator reads the run's report and signs it once with "
+                     "`sprint.py sign`",
+    "repair": "the repair ledger is gone, and a REJECT has two exits: " + REJECT_EXITS,
+    "evidence": "one verdict ledger says whether a unit was reviewed: record a per-unit "
+                "delivery verdict with `critic.py record`",
+    "sprint-review": "a batch review covers nothing new: record a per-unit delivery verdict "
+                     "with `critic.py record`",
+}
+
+
+def _verb(argv: list[str]) -> str:
+    """The subcommand: the first bare word that is not the value of a leading `--root`."""
+    return next((a for i, a in enumerate(argv) if not a.startswith("-")
+                 and (i == 0 or argv[i - 1] != "--root")), "")
+
+
+def _plan_phase_retired(argv: list[str]) -> str | None:
+    """The refusal for a `--phase` handed to a verdict verb, or None. Plan review is retired, so
+    every verdict is a delivery verdict and the flag has nothing left to choose. Named rather
+    than left to argparse, whose "unrecognized arguments" would not say why."""
+    verb = _verb(argv)
+    if verb in _PHASELESS_VERBS and any(a == "--phase" or a.startswith("--phase=")
+                                        for a in argv):
+        return (f"{verb} refused: plan review is retired - every verdict is a delivery "
+                f"verdict, so `--phase` is gone. Drop the flag; nothing was written.")
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if (verb := _verb(argv)) in RETIRED_VERBS:
+        print(f"error: `critic.py {verb}` is retired - {RETIRED_VERBS[verb]}. Nothing was "
+              f"written.", file=sys.stderr)
+        return 2
+    if why := _plan_phase_retired(argv):
+        print(why, file=sys.stderr)
+        return 2
+    args = build_parser().parse_args(argv)
+    # Resolve the root ONCE and write it back, so every verb below anchors on the tree the
+    # run belongs to. The family default `.` means "work it out from here", not "the cwd
+    # is the project": otherwise a run from a subdirectory acts on a stray tree and exits 0.
+    args.root = str(sdlc_md.resolve_root(args))
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+# ---------------------------------------------------------------------------
+# The plan critic (D0061 / RFC0050 option B)
+# ---------------------------------------------------------------------------
+# Every adversarial surface in this project runs AFTER code exists: the per-unit critic judges a
+# diff, the close runs a full-diff refutation, and every critic subcommand is post-build. The
+# planner's own checks are mechanical - shared-file clusters, ordering, capacity, origin drift -
+# and none of them asks whether the batch is the RIGHT batch. So the cheapest finding available,
+# "this unit does not need to be built", could only be reached by building it.
+
+#: The three lenses, fixed. Named here so a lens that finds nothing is still REPORTED: a lens
+#: that is silent because it found nothing and one that never ran are indistinguishable
+#: otherwise, which is the reporting failure this project has already repaired once elsewhere.
+PLAN_LENSES = ("scope", "risk", "efficiency")
+
+#: What each lens is for, printed with its result so a reader knows what the silence covers.
+PLAN_LENS_SUBJECT = {
+    "scope": "does each unit need to exist, or is it already served by the codebase, the "
+             "stdlib, or an installed dependency",
+    "risk": "does the batch's declared proof strategy match what the units actually touch",
+    "efficiency": "would refactoring the code or tests this batch touches pay for itself "
+                  "WITHIN the sprint, so an accepted cost is chosen rather than absorbed",
+}
+
+
+def plan_intensity(unit_count: int) -> str:
+    """How hard the pass works, scaled to batch size.
+
+    The pass spends tokens BEFORE any value is delivered, on a sprint length that is already the
+    standing complaint - so a two-unit batch must not pay for a forty-unit review. The rule is
+    stated rather than emergent, so a reader can predict it and argue with it.
+    """
+    if unit_count <= 5:
+        return "lite"
+    if unit_count <= 20:
+        return "full"
+    return "ultra"
+
+
+#: How many units each intensity examines individually. Beyond it the pass still runs, but it
+#: says what it did not look at - a bounded pass that reports only what it found reads as
+#: complete coverage, and a silent cap is how a partial sweep is mistaken for a full one.
+PLAN_INTENSITY_CAP = {"lite": 5, "full": 20, "ultra": 40}
+
+
+def plan_critique(units: list[str], findings: dict[str, list[dict]] | None = None) -> dict:
+    """The plan-critic result over `units`.
+
+    `findings` is what the lenses actually found, supplied by the caller that ran them - this
+    function owns the SHAPE of the answer, never the judgement. A lens missing from `findings`
+    is reported as NOT RUN; a lens present with an empty list is reported as having found
+    nothing. Those are different facts and the difference is the whole point.
+    """
+    found = findings or {}
+    intensity = plan_intensity(len(units))
+    cap = PLAN_INTENSITY_CAP[intensity]
+    examined = sorted(units)[:cap]
+    lenses = {}
+    for lens in PLAN_LENSES:
+        if lens not in found:
+            lenses[lens] = {"ran": False, "findings": []}
+        else:
+            lenses[lens] = {"ran": True, "findings": list(found[lens])}
+    return {
+        "intensity": intensity,
+        "examined": examined,
+        "skipped": sorted(set(units) - set(examined)),
+        "lenses": lenses,
+        "findings": [f for lens in PLAN_LENSES for f in lenses[lens]["findings"]],
+    }
+
+
+def render_plan_critique(rep: dict) -> list[str]:
+    """The block the planner prints. States the cap it worked under and what that cap skipped."""
+    lines = [f"  plan critic: intensity {rep['intensity']}, {len(rep['examined'])} unit(s) "
+             f"examined individually"]
+    if rep["skipped"]:
+        shown = ", ".join(rep["skipped"][:8])
+        more = f" (+{len(rep['skipped']) - 8} more)" if len(rep["skipped"]) > 8 else ""
+        lines.append(f"  plan critic: NOT examined individually under this intensity: "
+                     f"{shown}{more}")
+    for lens in PLAN_LENSES:
+        st = rep["lenses"][lens]
+        if not st["ran"]:
+            lines.append(f"  plan critic [{lens}]: NOT RUN - {PLAN_LENS_SUBJECT[lens]}")
+        elif not st["findings"]:
+            lines.append(f"  plan critic [{lens}]: ran, found nothing - "
+                         f"{PLAN_LENS_SUBJECT[lens]}")
+        else:
+            lines.append(f"  plan critic [{lens}]: {len(st['findings'])} finding(s)")
+    return lines
+
+
+def undispositioned_plan_findings(rep: dict) -> list[dict]:
+    """Findings with no disposition, or a disposition that records nothing.
+
+    The retro already enforces file-or-decline and silence is not an answer; the plan critic is
+    held to the same bar. A decline whose reason is a placeholder records that someone clicked
+    past it, which is worse than no record because it looks like a decision.
+    """
+    out = []
+    for f in rep.get("findings") or []:
+        disp = (f.get("disposition") or "").strip()
+        if not disp:
+            out.append(f)
+            continue
+        if disp.lower().startswith("declined"):
+            reason = disp.split(":", 1)[1].strip() if ":" in disp else ""
+            if not reason or "{{" in reason:
+                out.append(f)
+    return out

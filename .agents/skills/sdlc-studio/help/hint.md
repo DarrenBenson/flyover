@@ -1,0 +1,286 @@
+<!--
+Load when: /sdlc-studio hint or /sdlc-studio hint help
+Dependencies: SKILL.md (always loaded first)
+Related: None (standalone utility command)
+-->
+
+# /sdlc-studio hint - Next Step Suggestion
+
+## You can just ask
+
+SDLC Studio is model-invoked - say it in plain language:
+
+| Just say... | Runs |
+| --- | --- |
+| "What should I do next?" | `/sdlc-studio hint` |
+| "I'm stuck, where do I go from here?" | `/sdlc-studio hint` |
+| "What's the next step on this project?" | `/sdlc-studio hint` |
+| "Is anything blocking me?" | `/sdlc-studio hint` |
+| "Give me the big picture instead" | `/sdlc-studio status` |
+
+Get a single actionable next step based on current pipeline state.
+
+> **Deterministic helper.** `python3 "$CLAUDE_SKILL_DIR/scripts/status.py" hint --format json`
+> returns `{next_command, reason}` from the mechanical ladder. Apply judgement only for the
+> blocker and implement-vs-plan branches it flags. The text form adds `advisory:` lines beside
+> that answer - an abandoned guided-onboarding marker is one of them - and an advisory never
+> replaces the next step, it sits next to it.
+
+## Usage
+
+```
+/sdlc-studio hint                    # Get next recommended action
+```
+
+## How It Works
+
+Checks pipeline state in priority order and returns the first applicable action. Also detects blockers that may prevent progress.
+
+## Pre-flight: Version Check
+
+**First tool call:** `Glob: sdlc-studio/.version` (the schema may also live in
+`sdlc-studio/.config.yaml` - a fresh v3 project has only the config file)
+
+| Result | Action |
+| -------- | -------- |
+| No sdlc-studio/ directory | Proceed (new project) |
+| `schema_version` 2 or 3 (in .version or .config.yaml) | Proceed (current schemas) |
+| Both absent, or `schema_version` < 2 | Check `sdlc-studio/.local/upgrade-dismissed.json` |
+| └─ dismissed: true | Proceed |
+| └─ not dismissed | Prompt user (see below) |
+
+**Prompt if needed:**
+
+```
+question: "Project uses a superseded artefact schema. Upgrade to the current one?"
+header: "Upgrade"
+options:
+  - "Preview" → run upgrade --dry-run, then continue
+  - "Not now" → continue
+  - "Don't ask again" → write dismissal file, continue
+```
+
+**Output prefix:** Start response with `**Schema:** v2 ✓` / `**Schema:** v3 ✓` or
+`**Schema:** superseded (reason)`
+
+## Priority Logic
+
+**Guided onboarding pre-empts the ladder.** While an `init guided` walk is in progress, `hint`
+returns `init guided` and names the next onboarding stage, ahead of every row below - the guided
+flow drives the operator to a first plan, and the ordinary ladder only resumes once onboarding is
+complete or absent. Row 0 below records this; rows 1-17 are the ladder for a project past (or
+without) onboarding.
+
+| # | Condition | Suggested Action | Command |
+| --- | ----------- | ------------------ | --------- |
+| 0 | Guided onboarding in progress | Resume the guided walk (names the next stage) | `init guided` |
+| 1 | No PRD + existing code | Extract PRD from codebase | `prd generate` |
+| 2 | No PRD + no code | Create PRD interactively | `prd create` |
+| 3 | No TRD + existing code | Extract TRD from codebase | `trd generate` |
+| 4 | No TRD + no code | Create TRD interactively | `trd create` |
+| 5 | No TSD | Create test strategy | `tsd` |
+| 6 | No personas | Create personas | `persona` |
+| 7 | No epics | Generate epics | `epic` |
+| 8 | No stories | Generate stories | `story` |
+| 9 | Paused workflow | Resume workflow | `story implement --from-phase N` |
+| 10 | Starting new epic (no Done stories yet) | Review epic state and dependencies | `epic review --epic {id}` |
+| 11 | Stories in Ready (multiple, epic reviewed) | Preview epic workflow | `epic plan --epic {id}` |
+| 12 | Stories in Ready (single, epic reviewed) | Execute story workflow | `story implement --story {id}` (recommended) or `code plan --story {id}` (manual control) |
+| 13 | Stories in Draft (epic reviewed) | Execute story workflow | `story implement --story {id}` (recommended) or `code plan --story {id}` (manual control) |
+| 14 | Stories in Planned | Execute workflow | `story implement --story {id}` |
+| 15 | Stories in In Progress | Continue workflow or verify | `code verify` |
+| 16 | Stories in Review | Run tests | `code test --story {id}` |
+| 17 | All stories Done | Review epic | `epic review` |
+
+## Output Format
+
+### Standard Output
+
+```
+## Next Step
+
+**Action:** Generate user stories from epics
+**Run:** `/sdlc-studio story`
+**Why:** 3 epics ready, no stories yet
+```
+
+### Story Ready Output
+
+```
+## Next Step
+
+**Action:** Execute story workflow
+**Run:**
+  /sdlc-studio story implement --story US0004   Full workflow (recommended)
+  /sdlc-studio code plan --story US0004         Step-by-step (manual control)
+**Why:** US0004 is Ready
+```
+
+### With Blocker
+
+When an issue prevents smooth progress:
+
+```
+## Blocker
+
+**Issue:** 2 unresolved open questions in plan PL0001
+**Fix:** Edit sdlc-studio/plans/PL0001-*.md and check off resolved questions
+
+---
+
+## Next Step
+
+**Action:** Implement planned story
+**Run:** `/sdlc-studio code implement`
+**Why:** US0003 is planned and ready (blocked by above)
+```
+
+### All Complete
+
+```
+## Pipeline Complete
+
+All stories are done.
+**Run:** `/sdlc-studio prd review`
+**Why:** Check for new features or scope changes
+
+Also consider:
+- `/sdlc-studio test-spec review` to sync test coverage
+- `/sdlc-studio epic create` to start a new epic
+```
+
+## Blocker Detection
+
+Checked before returning hint:
+
+### Open Questions
+
+- Unresolved open questions in PRD
+- Unresolved open questions in implementation plans
+
+### Dependencies
+
+- Stories blocked by incomplete dependencies
+- Test specs blocked by missing stories
+
+### Quality Gates
+
+- Stories in Review with failing tests
+- Code check issues blocking merge
+
+### Workflow State
+
+- Paused story workflow (reports phase and error)
+- Paused epic workflow (reports story and phase)
+- Blocked stories in epic workflow
+
+## Examples
+
+### Early Pipeline
+
+```
+$ /sdlc-studio hint
+
+## Next Step
+
+**Action:** Generate PRD from codebase
+**Run:** `/sdlc-studio prd generate`
+**Why:** No PRD found, existing codebase detected
+```
+
+### Starting New Epic
+
+```
+$ /sdlc-studio hint
+
+## Next Step
+
+**Action:** Review epic state and dependencies
+**Run:** `/sdlc-studio epic review --epic EP0005`
+**Why:** EP0005 has no Done stories yet - check dependencies before starting
+```
+
+After epic review confirms dependencies are met, hint will suggest `story implement` or `code plan`.
+
+### Mid-Development
+
+```
+$ /sdlc-studio hint
+
+## Next Step
+
+**Action:** Execute story workflow
+**Run:**
+  /sdlc-studio story implement --story US0004   Full workflow (recommended)
+  /sdlc-studio code plan --story US0004         Step-by-step (manual control)
+**Why:** US0004, US0005 are Ready - starting with US0004
+```
+
+### Multiple Ready Stories
+
+```
+$ /sdlc-studio hint
+
+## Next Step
+
+**Action:** Preview epic workflow for multiple Ready stories
+**Run:** `/sdlc-studio epic plan --epic EP0002`
+**Why:** 5 stories in EP0002 are Ready - consider batch execution
+```
+
+### Paused Workflow
+
+```
+$ /sdlc-studio hint
+
+## Blocker
+
+**Issue:** Story workflow paused at phase 5 (Verify)
+**Story:** US0024 - Action Queue API
+**Error:** 2 tests failed
+**Fix:** Fix failing tests, then resume
+
+---
+
+## Next Step
+
+**Action:** Resume paused workflow
+**Run:** `/sdlc-studio story implement --story US0024 --from-phase 5`
+**Why:** Workflow paused - needs resume after fix
+```
+
+### With Blocker
+
+```
+$ /sdlc-studio hint
+
+## Blocker
+
+**Issue:** Unresolved open question in plan PL0002
+**Fix:** Answer question in sdlc-studio/plans/PL0002-user-auth.md:45
+
+---
+
+## Next Step
+
+**Action:** Execute different story workflow
+**Run:** `/sdlc-studio story implement --story US0003`
+**Why:** US0003 has no blockers and is ready
+```
+
+## Comparison with Status
+
+| Aspect | `hint` | `status` |
+| -------- | -------- | ---------- |
+| Output | Single next action | Full pipeline overview |
+| Suggested command | Yes, with explanation | Yes, based on top priority |
+| Detail | Minimal, actionable | Comprehensive |
+| Use case | "What do I do next?" | "What's the big picture?" |
+
+Both commands include a suggested `/sdlc-studio` command. The status command shows it at the end of the dashboard; hint provides more context about why that command is recommended.
+
+## See Also
+
+- `/sdlc-studio status` - Full pipeline overview
+- `/sdlc-studio story implement` - Full workflow (recommended)
+- `/sdlc-studio code plan` - Step-by-step (manual control)

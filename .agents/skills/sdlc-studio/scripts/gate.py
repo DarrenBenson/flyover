@@ -1,0 +1,3089 @@
+#!/usr/bin/env python3
+"""Portable, ecosystem-neutral CI quality gate.
+
+One command that runs the deterministic checks (conformance, reconcile drift, validate,
+constitution, integrity) over the artifact graph, prints a consolidated pass/fail, and
+exits non-zero only when a *blocking* check fails. No network, no CI/cloud assumption -
+runnable as a bare shell step in any CI (GitHub Actions, GitLab, Jenkins, a pre-commit
+hook). `--only` / `--skip` select checks. `--release` is the pre-tag form: the same gate plus
+an EXECUTING acceptance-criteria verify pass, as one exit code.
+
+Each check is a callable `fn(root) -> {"count": int, "blocking": bool, "detail": str}`;
+the registry is injectable so the aggregation logic is testable without a full repo.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import sdlc_md  # noqa: E402
+
+
+def _conformance(root: str, changed: bool = False,
+                 scope_ids: "set[str] | None" = None) -> dict:
+    import conformance
+    result = conformance.detect_conformance(root, changed=changed, scope_ids=scope_ids)
+    # A repo-global failure (one uncatalogued command, a missing index) is attributed ONCE
+    # rather than charged to every judged unit - but it must still block, or improving the
+    # report would quietly weaken the gate. Count it as its own finding. `changed` narrows the
+    # per-unit half ONLY: this sum keeps the repo-wide half at full strength, so scoping cannot
+    # become a way to pass a gate over a repo-wide failure.
+    n = result["summary"]["nonconformant"] + result["summary"].get("global_failures", 0)
+    # Name the remedies inline (the adopt_after cutoff + the verify_ac backfill) and flag
+    # whether the shape reads as pre-existing forward-only debt vs a fresh regression, so a
+    # grown-but-accepted count does not read as a new breakage.
+    return {"count": n, "blocking": True, "detail": conformance.remedy_detail(result)}
+
+
+def reconcile_drift_tally(root: "str | Path") -> dict:
+    """The reconcile lane's count of blocking drift on `root`, with what it set aside:
+    `{"count": int, "blocked": int, "settled": {kind: n}}`.
+
+    Public, and the ONE derivation: the lane below and `project upgrade` (which `migrate`
+    reports) both read it, so the number an upgrader is told is the number the gate then
+    fails on. The upgrade once summed `reconcile.detect_type` per type, two of the sweep's
+    sources, and named 2 items on a tree whose lane failed on 28.
+    """
+    import reconcile
+    rr = Path(root).resolve()
+    # ONE sweep, `reconcile.detect_all`, shared with `reconcile detect` itself - never a
+    # second list assembled here. This lane used to name two of the nine drift sources, and
+    # an enumerated list silently exempts what it forgot: `meta-index`, `epic-breakdown`
+    # (including ticked-early, the direction that masks unfinished work), `epic-points`,
+    # `link-asymmetry`, linked-epics and `undecomposed` were all invisible, so a tree on
+    # which `reconcile detect` exited 1 passed the pre-commit hook and CI. Sharing the sweep
+    # is what makes that unrepeatable: a detector added to the sweep is counted here the day
+    # it lands, with nobody having to remember this call site.
+    _per_type, drift = reconcile.detect_all(rr)
+    total = len(drift)
+    #
+    # Only the items apply can clear are COUNTED. One blocked behind another gate is real drift
+    # and is reported in the detail, but it does not block, because the committer who trips it is
+    # generally not the person who can clear it: an RFC waiting on an open decision needs that
+    # decision made (or an override recorded), which is somebody else's call on somebody else's
+    # timetable. Blocking every commit in the repo on a pending operator decision is friction that
+    # gets the gate bypassed, and a bypassed gate enforces nothing.
+    #
+    # NOT because such an item is unclearable - it plainly is clearable, and by a commit: the
+    # refusal message names both remedies. This is a friction trade, and the cost is real - a
+    # delivered request blocked behind a resolvable gate reports PASS, which is a narrowed form of
+    # the very bug this kind exists to kill. `reconcile detect` still exits 1 on it. Anyone
+    # widening this should weigh that cost, not assume there is nothing to weigh.
+    #
+    # DERIVED from the items, not from a second call to the one detector that happens to
+    # produce them today: `blocked_by` is the property that means "another gate owns this",
+    # and any future detector setting it is carved out automatically.
+    blocked = sum(1 for d in drift if d.get("blocked_by"))
+    total -= blocked
+    # Mechanical drift is REPORTED, never counted: its remedy has no judgement in it, and the
+    # commit hook applies it (`reconcile settle`) before this lane runs. Refusing over it only
+    # made people run the fix by hand and stage again. Exactly the items settle WOULD apply are
+    # exempt, as its own writers' dry runs say - not every item of a kind - so a meta index row,
+    # or a row `apply` cannot write, still blocks.
+    settled: dict[str, int] = {}
+    for d in reconcile.settled_items(rr, [d for d in drift if not d.get("blocked_by")]):
+        settled[d["kind"]] = settled.get(d["kind"], 0) + 1
+    total -= sum(settled.values())
+    return {"count": total, "blocked": blocked, "settled": settled}
+
+
+def _reconcile(root: str) -> dict:
+    tally = reconcile_drift_tally(root)
+    total, blocked, settled = tally["count"], tally["blocked"], tally["settled"]
+    detail = f"{total} drift item(s)"
+    if blocked:
+        detail += f" (+{blocked} awaiting another gate, not blocking)"
+    if settled:
+        kinds = ", ".join(f"{k} x{n}" for k, n in sorted(settled.items()))
+        detail += (f" (+{sum(settled.values())} mechanical, not blocking: {kinds} - "
+                   f"`reconcile.py settle` applies them)")
+    return {"count": total, "blocking": True, "detail": detail}
+
+
+def _index_derived(root: str) -> dict:
+    """Reports, never blocks: an index that is not a fixed point of `apply` is fixed by running
+    it, which the commit hook does (`reconcile settle`) rather than refusing the commit. What
+    `apply` cannot write - a structurally broken index, a row it declines - is counted by the
+    reconcile lane, which still blocks on it."""
+    import reconcile
+    issues = reconcile.index_derived_issues(Path(root).resolve())
+    return {"count": len(issues), "blocking": False,
+            "detail": ("; ".join(issues) + " - not blocking: `reconcile.py settle` regenerates "
+                       "what `apply` can write, and the reconcile lane blocks on the rest")
+            if issues else "indexes are derived output"}
+
+
+def _validate(root: str, changed: bool = False, names: "list[str] | None" = None) -> dict:
+    """Structural validation over the artefact tree.
+
+    `changed` narrows what is JUDGED to the artefacts in this working tree's diff, and `names`
+    (repo-relative paths) to exactly those, in place of the diff. Everything
+    is still checked and everything found is still counted somewhere: an untouched error lands
+    in the advisory tally and is named in the detail, so a scoped PASS states the debt it did
+    not judge instead of hiding it. A git probe that cannot answer judges the whole workspace.
+    """
+    import validate
+    rr = Path(root).resolve()
+    if names is not None:       # an explicit scope: the pushed range at the push boundary
+        scope = {(rr / n).resolve() for n in names}
+    else:
+        scope = validate.changed_artifact_paths(rr) if changed else None
+    errors = advisory = judged = untouched = 0
+    advisory_files: list[str] = []
+    for type_ in sdlc_md.ARTIFACT_TYPES:
+        for path in sdlc_md.artifact_files(type_, rr):
+            n = sum(1 for v in validate.validate_file(path, type_, rr)
+                    if v["severity"] == "error")
+            if scope is not None and path.resolve() not in scope:
+                untouched += 1
+                advisory += n
+                if n:
+                    advisory_files.append(path.name)
+            else:
+                judged += 1
+                errors += n
+    detail = f"{errors} validation error(s)"
+    if scope is not None:
+        detail += (f" over {judged} changed artefact(s); "
+                   f"{untouched} outside {'the pushed range' if names is not None else 'the diff'}"
+                   " not judged here")
+        if advisory:
+            detail += (f", {advisory} of them carrying an advisory error "
+                       f"({_name_list(advisory_files)})")
+        detail += " - `--release` judges the whole workspace"
+    elif changed:
+        detail += (" (no diff to scope to - a clean tree, or the git probe could not answer"
+                   " - so the WHOLE workspace was judged)")
+    return {"count": errors, "blocking": True, "detail": detail}
+
+
+def _constitution(root: str) -> dict:
+    import constitution
+    rep = constitution.check_constitution(root)
+    v = len(rep["violations"])
+    # Only blocking when the project opts in (constitution.enforce: true).
+    return {"count": v, "blocking": bool(rep["enforced"]),
+            "detail": (f"{v} violation(s)" + ("" if rep["enforced"] else " (advisory)"))
+            if rep["exists"] else "no constitution"}
+
+
+def _integrity(root: str) -> dict:
+    import integrity
+    e = integrity.detect_integrity(root)["summary"]["errors"]
+    return {"count": e, "blocking": True, "detail": f"{e} integrity error(s)"}
+
+
+def _duplicate_id(root: str) -> dict:
+    import next_id
+    import reconcile
+    files = next_id.detect_collisions(root)["count"]      # two files claim one id
+    rows = reconcile.detect_duplicate_rows(root)["count"]  # one index lists an id twice
+    total = files + rows
+    detail = f"{total} duplicate id(s)" + (f" ({files} file, {rows} index-row)" if total else "")
+    return {"count": total, "blocking": True, "detail": detail}
+
+
+def _provenance(root: str) -> dict:
+    import provenance
+    r = provenance.check(root)
+    n = len(r["findings"])
+    # `enforced` covers the ADVISORY class (an unstamped artefact). It does not cover a finding
+    # the checker itself marks blocking - an artefact it could not READ, which is a gap in the
+    # census rather than a missing stamp, and is blocking whatever the enforce setting says.
+    # Deriving from the findings keeps this lane and the checker on one answer.
+    unreadable = [f for f in r["findings"] if f.get("blocking")]
+    blocking = bool(r["enforced"] or unreadable)
+    detail = f"{n} unstamped artifact(s) ({'enforced' if r['enforced'] else 'advisory'})"
+    if unreadable:
+        detail += f"; {len(unreadable)} unreadable - the census could not see them"
+    return {"count": n, "blocking": blocking, "detail": detail}
+
+
+def _disclosure(root: str) -> dict:
+    import disclosure
+    r = disclosure.check(root)
+    n = len(r["findings"])
+    detail = "N/A (not the skill repo)" if not r["applicable"] else f"{n} advisory finding(s)"
+    return {"count": n, "blocking": False, "detail": detail}  # advisory: never blocks
+
+
+def _doc_freshness(root: str) -> dict:
+    import doc_freshness
+    r = doc_freshness.check(root)
+    n = len(r["findings"])
+    detail = "N/A (not the skill repo)" if not r["applicable"] else (
+        f"{n} stale LATEST.md claim(s)" if n else "LATEST.md fresh")
+    return {"count": n, "blocking": False, "detail": detail}  # advisory: never blocks
+
+
+def _doc_coverage(root: str) -> dict:
+    import doc_coverage
+    r = doc_coverage.check(root)
+    blocking = sum(1 for f in r["findings"] if f["blocking"])
+    advisory = len(r["findings"]) - blocking
+    detail = ("N/A (not the skill repo)" if not r["applicable"]
+              else f"{blocking} undocumented" + (f" (+{advisory} advisory)" if advisory else ""))
+    return {"count": blocking, "blocking": True, "detail": detail}
+
+
+def _doc_surface(root: str) -> dict:
+    """ADVISORY: enumerated verbs carrying no invocable form in the hand-written documentation.
+
+    Deliberately worded as VERBS. The `doc-coverage` lane beside this one already prints
+    "N undocumented" and counts SCRIPTS with no `reference-scripts.md` entry - a different
+    granularity of the same word, and two numbers a reader would otherwise have to reconcile
+    with nothing telling them they measure different things.
+    """
+    import doc_coverage
+    if not doc_coverage.is_skill_repo(root):
+        # Not applicable rather than unmeasurable. The measurement is DEFINED over the skill's own
+        # hand-written corpus, which a consuming project does not have - so asking and failing
+        # printed a permanent non-zero advisory naming an internal module, on every run, in every
+        # project. The sibling lane above answers the same question the same way.
+        return {"count": 0, "blocking": False, "detail": "N/A (not the skill repo)"}
+    try:
+        import command_audit
+        r = command_audit.verb_coverage(root)
+    except Exception as exc:  # noqa: BLE001 - an advisory lane must never break the gate
+        # COUNT 1, not 0. Zero is this lane's clean state, so a broken measurement reported as
+        # zero renders as perfect coverage with only the word `unreadable` to distinguish it -
+        # and a reader scanning counts never reads the word. The lane still does not block.
+        return {"count": 1, "blocking": False,
+                "detail": f"NOT MEASURED - command_audit.verb_coverage raised "
+                          f"{type(exc).__name__}: {exc}"}
+    return {"count": r["undocumented"], "blocking": False,
+            "detail": f"{r['undocumented']} of {r['verbs']} verbs carry no invocable form "
+                      f"({r['ratio']}% do)"}
+
+
+def _engagement_floor(root: str) -> dict:
+    """Blocking standard-gate lane: no shipped multi-file unit may reach a done outcome with no
+    planning artefact (an AC, a Verify line, or a linked plan). Deterministic - a source-file
+    count (declared Affects UNION the git cross-check) and a presence check, no model judgement.
+
+    Advisory, never blocking, when the project sets `engagement_floor: judgement` - the documented
+    project-global opt-out. A per-unit or project waiver, or the `adopt_after` cutoff, are the
+    other auditable ways past; a plain --skip deselects the lane visibly, it does not pass it.
+    """
+    import engagement_floor
+    result = engagement_floor.detect(root)
+    s = result["summary"]
+    # A forward cutoff (adopt_after above the highest existing id) silently disarms the whole
+    # floor - it must FAIL loudly, even in judgement mode, because it is a config error, not the
+    # sanctioned opt-out (that is judgement mode, which stays visible).
+    if s["cutoff_forward"]:
+        return {"count": 1, "blocking": True, "detail": engagement_floor.remedy_detail(result)}
+    blocking = result["mode"] != "judgement"
+    return {"count": s["violations"], "blocking": blocking,
+            "detail": engagement_floor.remedy_detail(result)}
+
+
+def changed_paths(root: str) -> list[str] | None:
+    """Repo-relative paths this working tree has changed against HEAD - staged, unstaged or
+    untracked. The ONE git changed-file idiom the script family shares: every lane that scopes
+    itself to a diff reads it from here, because two idioms drift and then two lanes disagree
+    about what "changed" means.
+
+    Returns None when git cannot answer: no git, no commit to diff against, or a `root` that is
+    not the repository top level (git would then report paths relative to some other root).
+
+    None means UNKNOWN, never "nothing changed". Every caller must degrade to the FULL check,
+    because a scope derived from an unanswered probe is an empty scope wearing a green tick -
+    which is worse than the slow check the scope exists to avoid.
+    """
+    import subprocess
+    rootp = Path(root)
+
+    def _git(*args):
+        return subprocess.run(["git", *args], cwd=str(rootp),
+                              capture_output=True, text=True, timeout=10)
+    names: list[str] = []
+    try:
+        top = _git("rev-parse", "--show-toplevel")
+        if top.returncode != 0:
+            return None
+        if Path(top.stdout.strip() or ".").resolve() != rootp.resolve():
+            return None
+        for cmd in (("diff", "--name-only", "HEAD"),
+                    ("ls-files", "--others", "--exclude-standard")):
+            proc = _git(*cmd)
+            if proc.returncode != 0:
+                return None
+            names.extend(proc.stdout.splitlines())
+    except Exception:  # noqa: BLE001 - a changed-file probe must never break the gate
+        return None
+    out: list[str] = []
+    for raw in names:
+        name = raw.strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def pushed_paths(root: str) -> list[str] | None:
+    """Repo-relative paths the commits being pushed change: every commit reachable from HEAD
+    and from no remote-tracking ref, which is what a push from this checkout sends.
+
+    The pre-push hook judges each pushed commit in a clean checkout whose only untracked entries
+    are the clone state it links in, so a lane scoped by `changed_paths` there judged nothing.
+    None when git cannot answer, on the same terms as `changed_paths`: UNKNOWN, never empty.
+    """
+    import subprocess
+    rootp = Path(root)
+    try:
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=str(rootp),
+                             capture_output=True, text=True, timeout=10)
+        if top.returncode != 0 or Path(top.stdout.strip() or ".").resolve() != rootp.resolve():
+            return None
+        proc = subprocess.run(["git", "log", "--format=", "--name-only", "HEAD", "--not",
+                               "--remotes"], cwd=str(rootp), capture_output=True, text=True,
+                              timeout=30)
+        if proc.returncode != 0:
+            return None
+    except Exception:  # noqa: BLE001 - a changed-file probe must never break the gate
+        return None
+    out: list[str] = []
+    for raw in proc.stdout.splitlines():
+        name = raw.strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _pushed_scope(root: str) -> list[str] | None:
+    """The push boundary's scope: the pushed range plus anything this tree changes on top of it.
+    None - judge the whole workspace - when the range is unknown or empty, because an empty diff
+    is not an empty scope."""
+    pushed = pushed_paths(root)
+    if not pushed:
+        return None
+    return pushed + [n for n in (changed_paths(root) or []) if n not in pushed]
+
+
+def _name_list(names: list[str], limit: int = 3) -> str:
+    """First `limit` names, then a count of the rest - a lane line must stay readable
+    without hiding how many it did not print."""
+    shown = ", ".join(Path(n).name for n in names[:limit])
+    return shown + (f" (+{len(names) - limit} more)" if len(names) > limit else "")
+
+
+# Lanes that read NOT-RUN (advisory) when their evidence file is absent. The
+# upgrade capability digest names these when they arrive in a version gap, so
+# a new integrity check cannot land silently as a benign-looking warn - a
+# registry test asserts every advisory-when-absent lane is declared here.
+# Empty now the mutation lane has left the gate: mutation testing is
+# `mutation.py run`, picked up on purpose, and no gate lane reads its report.
+ADVISORY_WHEN_ABSENT: dict[str, dict] = {}
+
+
+def hook_enablement_gap(root) -> str | None:
+    """The one-line warning when a tree SHIPS a tracked pre-commit gate that this clone has
+    not enabled - or None when there is nothing to say. Fires only where it means something:
+    a git work tree containing `.githooks/pre-commit` (never a consuming project, which has
+    no .githooks; never a non-git directory). Shared by the gate lane and the status
+    dashboard so the two surfaces cannot drift."""
+    import os
+    import subprocess
+    hook = Path(root) / ".githooks" / "pre-commit"
+    if not hook.is_file():
+        return None
+    # Scrub repo-redirecting env: gate/status may run from inside ANOTHER repo's hook, and an
+    # inherited GIT_DIR/GIT_WORK_TREE would silently make git answer for that repo, not root.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+    try:
+        inside = subprocess.run(["git", "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+                                capture_output=True, text=True, timeout=10, env=env)
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return None
+        cfg = subprocess.run(["git", "-C", str(root), "config", "core.hooksPath"],
+                             capture_output=True, text=True, timeout=10, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None  # git unavailable: nothing checkable, never a false alarm
+    val = cfg.stdout.strip() if cfg.returncode == 0 else ""
+    if val:
+        # Equivalent enabled spellings must read enabled: ".githooks", ".githooks/", or an
+        # absolute path to the same directory - git runs the hook under all of them.
+        if val.rstrip("/") == ".githooks":
+            return None
+        try:
+            if (Path(val).is_absolute()
+                    and Path(val).resolve() == (Path(root) / ".githooks").resolve()):
+                return None
+        except OSError:
+            pass
+    return ("tracked .githooks/pre-commit is NOT enabled in this clone (core.hooksPath "
+            "unset or elsewhere) - the commit gate is not running; fix: bash tools/enable-hooks.sh")
+
+
+def _window_staged(root: str):
+    """Repo-relative staged paths, or None when git could not be asked.
+
+    None is "I cannot tell", never "nothing is staged": the lane below refuses on it, because
+    reading an unanswerable index as an empty one would wave through exactly the commit this
+    guard exists to stop."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "-c", "core.quotepath=false",
+             "diff", "--cached", "--name-only"],
+            capture_output=True, text=True)
+    except OSError:
+        return None
+    if out.returncode != 0:
+        return None
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def _window(root: str) -> dict:
+    """Blocking standard-gate lane: a process has DECLARED that it is rewriting source files in
+    place, so this tree is being written to by somebody else right now.
+
+    CR0388, as corrected: a reviewer's shell redirect through a symlink farm overwrote live
+    source while the author was committing ceremony artefacts, and `git add -A` staged it. The
+    commit was refused only because the reverted file happened to break the suite - a rewrite
+    that left the suite GREEN would have been committed silently under a paperwork message. So
+    this lane does not look for mutants and does not lean on the suite: it reads the declaration.
+
+    It judges the STAGED PATHS, not the record's existence. A lane that failed on existence
+    alone froze the whole tree for a review's duration. The window scopes staging; it does not
+    stop work.
+
+    REFUSE rather than warn (D0053) for a path a window claims. A warning is what the observed
+    failure mode defeats: in a passing run it reads as noise, and the run that matters is
+    exactly the passing one. An open window claiming nothing staged is still REPORTED, so an
+    author running the gate learns of the concurrent writer before staging into it.
+
+    Discovery and parsing are `mutation`'s, so the rule that an unreadable record counts as OPEN
+    has ONE home rather than a copy here that could drift the safe way into 'closed'. This lane
+    is the only window check a commit runs: the pre-commit hook reaches it through the standard
+    gate and carries no copy of its own."""
+    import mutation
+    held = mutation.read_windows(root)
+    if not held:
+        return {"count": 0, "blocking": True, "detail": "no rewrite window is open"}
+    staged = _window_staged(root)
+    lines, claiming = [], 0
+    for win in held:
+        # The record's claims as `mutation.window_claims` normalised them - ONE reading rather
+        # than a second derivation here. What is DISPLAYED is what was MATCHED on, so a refusal
+        # can be checked on its face.
+        claims = win["paths"]
+        if staged is None:
+            hit = ["(the staged file list could not be read, so every path is treated "
+                   "as claimed)"]
+        else:
+            hit = [s for s in staged if any(_window_claims(c, s) for c in claims)]
+        note = (f"{win['owner']} has claimed {', '.join(claims)} since {win.get('opened_at')}")
+        if win.get("unreadable"):
+            note += f" ({win['detail']})"
+        if not hit:
+            lines.append(f"a rewrite window is OPEN - {note}; no staged path is claimed by it, "
+                         f"so this gate does not refuse. Stage named paths, never `git add -A`")
+            continue
+        # Counted per WINDOW, not as a boolean: the lane reads N records, and two writers
+        # claiming what this commit stages is worse news than one. A fixed 1 could not report
+        # the multi-writer case the reader was generalised to see.
+        claiming += 1
+        # Self-diagnosing, because this is the commit's only window check: the scoped-staging
+        # remedy, the owner's clearing command, and the record to delete once its owner is gone.
+        lines.append(f"a rewrite window is OPEN and claims a STAGED path - {note}; staged: "
+                     f"{', '.join(hit)}. A commit now stages whatever that process has left on "
+                     f"disk. Stage only unclaimed paths by name (`git add <path> ...`, never "
+                     f"`git add -A`), wait for it, or clear it: {win['clear_with']}; a record a "
+                     f"killed process left behind: rm {win.get('record_path', '')}")
+    return {"count": claiming, "blocking": True, "detail": "; ".join(lines)}
+
+
+def _window_claims(pattern, staged: str) -> bool:
+    """True when `pattern` covers the staged path. A claim this cannot INTERPRET (anything
+    that is not a string, an absolute path, or one that traverses out of this root) claims
+    EVERYTHING, because the record says a writer is active and a matcher that shrugged would
+    report it as harmless."""
+    import fnmatch
+    if not isinstance(pattern, str):
+        return True
+    pat = pattern.strip()
+    if pat.startswith("./"):
+        pat = pat[2:]
+    pat = pat.rstrip("/")
+    if pat in ("", "."):
+        return True
+    if pat.startswith("/"):
+        return True          # absolute: not comparable with a repo-relative staged path
+    if pat == ".." or pat.startswith("../") or "/../" in pat or pat.endswith("/.."):
+        # traversal: `tools/../tools/x.py` names a real file and matches nothing as a literal
+        # pattern. Claims are normalised at open time; a record already on disk carrying this
+        # spelling is read as claiming the tree rather than as claiming nothing.
+        return True
+    if staged.startswith(pat + "/"):
+        return True
+    return fnmatch.fnmatch(staged, pat)
+
+
+def _hook_enabled(root: str) -> dict:
+    gap = hook_enablement_gap(root)
+    return {"count": 0 if gap is None else 1, "blocking": False,
+            "detail": gap or "hook enabled (or no tracked hook in this tree)"}
+
+
+# Lanes whose FAILURES block must also block when they CRASH: a raised exception in
+# (say) validate or reconcile means the gate proved nothing about that lane, and a
+# green gate over an unproven blocking lane is the false-assurance class (LL0008).
+# Custom/injected checks not declared here stay contained (advisory-on-error), so one
+# buggy experimental check cannot brick the gate.
+BLOCKING_ON_ERROR = {
+    "conformance", "reconcile", "index-derived", "validate",
+    "integrity", "duplicate-id", "doc-coverage", "retro", "verify",
+    "lessons-summary", "lessons-validity", "review-legs",
+    "engagement-floor", "review-current", "window",
+    "changelog-fragments", "module-alone", "full-suite",
+}
+
+def _changelog(root: str) -> dict:
+    """The `changelog-fragments` lane in the STANDARD gate: CHANGELOG.md's own headings are
+    structurally sound, and `[Unreleased]` was not hand-edited while `changelog.d/` is live.
+
+    Both faults are COMMITTED, not tagged: a bad hand-insert reparents entries the moment it
+    lands, and waiting for a release cut would not catch it. So the lane binds here as well as
+    at the cut, where it gains the stray-fragment reading (`_changelog_fragments`). The stray
+    reading stays release-only - a fragment between releases is the normal state and the
+    standard gate must not nag about it."""
+    faults = _changelog_faults(root)
+    detail = ("; ".join(faults) if faults
+              else "CHANGELOG.md headings are sound and [Unreleased] is not hand-edited")
+    return {"count": len(faults), "blocking": True, "detail": detail}
+
+
+def _changelog_fragments(root: str) -> dict:
+    """The release form of the `changelog-fragments` lane: the standard changelog faults PLUS
+    no stray (uncomposed) fragment left at the cut - an entry silently missing from a release
+    is the LL0004 hole fragments exist to close."""
+    import changelog
+    faults = _changelog_faults(root)
+    strays = changelog.check(root)
+    if strays:
+        faults = faults + [f"{len(strays)} uncomposed fragment(s): "
+                           + ", ".join(p.name for p in strays)
+                           + " - run changelog.py compose before tagging"]
+    detail = "; ".join(faults) if faults else "no stray fragments; CHANGELOG.md headings sound"
+    return {"count": len(faults), "blocking": True, "detail": detail}
+
+
+def _changelog_faults(root: str) -> list[str]:
+    """The commit-time changelog faults shared by both gate modes: structural faults in
+    CHANGELOG.md's own `[Unreleased]` headings, plus a hand-edit of `[Unreleased]` staged
+    with no fragment consumed in the same commit."""
+    import changelog
+    return list(changelog.structure_errors(root)) + _changelog_hand_edit_faults(root)
+
+
+def _changelog_hand_edit_faults(root: str) -> list[str]:
+    """A staged edit that ADDS content to CHANGELOG.md's `[Unreleased]` section, in a repo
+    using `changelog.d/` fragments, with no fragment consumed in the same commit - the hand-
+    edit path the deterministic writer (`changelog.py compose`) exists to replace.
+
+    Reads the STAGED state (index vs HEAD), as the rewrite-window lane reads staged paths: it
+    judges what this commit is about to do, not the working tree. Only ADDITIONS to
+    `[Unreleased]` count, so a release cut (which moves entries OUT of it) and any edit to an
+    already-released section, the file header, or the section rename a cut performs stay
+    hand-editable and are never refused. The escape hatch: the same edit is allowed when the
+    commit also consumes a fragment (a staged deletion under `changelog.d/`, which is what
+    compose does), so the sanctioned path is never blocked by its own writes."""
+    root_p = Path(root)
+    if not (root_p / "changelog.d").is_dir():
+        return []  # the project has not adopted fragments: there is nothing to police
+    head = _git_show(root, "HEAD:CHANGELOG.md")
+    index = _git_show(root, ":CHANGELOG.md")
+    if head is None or index is None:
+        return []  # no git, no HEAD, or the path is absent from one side: invent no fault
+    if not _unreleased_gained_content(head.splitlines(), index.splitlines()):
+        return []
+    if _staged_consumes_fragment(root):
+        return []  # compose ran in this commit: the edit is the machine's, not a hand-edit
+    return ["CHANGELOG.md [Unreleased] was hand-edited (content added) while changelog.d/ is "
+            "live and no fragment is consumed in this commit - write the entry as a "
+            "changelog.d/ fragment and run `changelog.py compose`, do not edit [Unreleased] "
+            "by hand"]
+
+
+def _git_show(root: str, spec: str) -> str | None:
+    """`git show <spec>` under `root`, or None when git cannot answer (no repo, no such
+    object). None is 'cannot tell', never 'empty': the caller invents no fault on it."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "-C", str(root), "show", spec],
+                             capture_output=True, text=True)
+    except OSError:
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _unreleased_content_lines(lines: list[str]) -> list[str]:
+    """The non-blank, non-release-heading content lines under `## [Unreleased]` (subsection
+    headings and entries alike), by absolute file order. A `## ` release heading is a section
+    boundary, not content."""
+    import re
+    out, section = [], None
+    for ln in lines:
+        m = re.match(r"^## (.+?)[ \t]*$", ln)
+        if m:
+            section = m.group(1).strip()
+        if section != "[Unreleased]":
+            continue
+        s = ln.strip()
+        if not s or re.match(r"^## ", ln):
+            continue
+        out.append(s)
+    return out
+
+
+def _unreleased_gained_content(old_lines: list[str], new_lines: list[str]) -> bool:
+    """True when the staged `[Unreleased]` carries a content line the committed one did not -
+    an addition or an in-place edit. Set-difference by MULTISET, so a second `### Added` or a
+    duplicated bullet still reads as gained. Removal-only (a release cut moving entries down,
+    a deletion) leaves nothing gained, so those are not flagged."""
+    from collections import Counter
+    gained = Counter(_unreleased_content_lines(new_lines)) - Counter(_unreleased_content_lines(old_lines))
+    return bool(gained)
+
+
+def _staged_consumes_fragment(root: str) -> bool:
+    """True when this commit stages a DELETION under `changelog.d/` - the file-consuming half
+    of what `changelog.py compose` does, and the signal that an accompanying `[Unreleased]`
+    edit is the composer's write rather than a hand-edit."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "-C", str(root), "diff", "--cached", "--name-status"],
+                             capture_output=True, text=True)
+    except OSError:
+        return False
+    if out.returncode != 0:
+        return False
+    for ln in out.stdout.splitlines():
+        parts = ln.split("\t")
+        if len(parts) >= 2 and parts[0].startswith("D") and parts[-1].startswith("changelog.d/"):
+            return True
+    return False
+
+
+def _versions_strict(root: str) -> dict:
+    """Release-bound lane: the skill's version strings agree, CHANGELOG included.
+
+    Version consistency and the release gate used to be two commands, so a tag could be
+    cut from a green gate while the version check had never run - or had run and had its
+    exit code dropped on the floor. The pre-tag gate is one obligation with one exit code.
+
+    `--strict` is the flag that adds the CHANGELOG comparison, so it is the whole point of
+    running it here rather than the plain form.
+
+    Invoked as a SUBPROCESS, not imported: `check_versions.py` is a repo-only development
+    tool under `tools/`, while this gate ships to consuming projects. A project without it
+    is reported as not-applicable and never silently passed - a lane that cannot run must
+    say so, because an invented pass is the false-assurance class this gate refuses.
+    """
+    import subprocess  # noqa: PLC0415 - local: keep subprocess off the cold import path
+    checker = Path(root) / "tools" / "check_versions.py"
+    if not checker.is_file():
+        # `run_gate` derives status from `count`, so a not-applicable lane reports 0 and
+        # says N/A in its detail - the same idiom the doc-coverage lane uses off-repo.
+        # Never a silent pass: the detail states plainly that nothing was checked.
+        return {"count": 0, "blocking": False,
+                "detail": ("N/A - tools/check_versions.py is not present; the strict version "
+                           "check is a skill-development tool and does not apply here")}
+    try:
+        proc = subprocess.run([sys.executable, str(checker), "--strict", "--root", str(root)],
+                              capture_output=True, text=True, timeout=120, cwd=str(root))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"count": 1, "blocking": True,
+                "detail": f"could not run check_versions.py: {exc}"}
+    out = (proc.stdout + proc.stderr).strip()
+    if proc.returncode == 0:
+        return {"count": 0, "blocking": True, "detail": "version strings agree (CHANGELOG included)"}
+    first = out.splitlines()[0] if out else "see check_versions.py output"
+    return {"count": 1, "blocking": True,
+            "detail": f"version drift before a tag: {first}"}
+
+
+def _batch_size(root: str) -> dict:
+    """Advisory small-batch lane: flags a delivered unit whose CHANGE is an outlier for
+    its size - the AI batch-size failure mode (agents produce larger diffs faster; DORA
+    2024/25 ties undisciplined batch growth to degraded throughput and stability). The
+    sizing rule bounds the ESTIMATE (points <= 8); this lane bounds the DIFF.
+
+    Deliberately never blocking: a legitimate mechanical sweep (a rename, a migration) is
+    large and fine - the lane's job is visibility at review time, not a gate. Off until the
+    project sets thresholds (`batch_size.max_lines` / `batch_size.max_files`); measures the
+    OPEN RUN's batch units via their Refs-trailed / subject-named commits."""
+    from lib import run_state as _rs
+    max_lines = sdlc_md.project_override(root, "batch_size.max_lines", None)
+    max_files = sdlc_md.project_override(root, "batch_size.max_files", None)
+    if not max_lines and not max_files:
+        return {"count": 0, "blocking": False,
+                "detail": "off - set batch_size.max_lines / batch_size.max_files to enable "
+                          "(advisory diff-size visibility per delivered unit)"}
+    try:
+        state = _rs.read(root) or {}
+    except _rs.RunStateError:
+        return {"count": 0, "blocking": False,
+                "detail": "run state unreadable - nothing measured (the close gate owns that failure)"}
+    batch = state.get("batch") or []
+    if not batch:
+        return {"count": 0, "blocking": False, "detail": "no open run - nothing to measure"}
+    import subprocess
+    offenders: list[str] = []
+    measured = 0
+    for uid in batch:
+        uid = sdlc_md.norm_id(uid)
+        try:
+            # end-anchored trailer + literal parenthesised subject form (BRE: parens are
+            # literal), so US0001 never prefix-matches a Refs: US00013 trailer
+            shas = subprocess.run(
+                ["git", "log", "--format=%H", "--grep", f"Refs: {uid}$",
+                 "--grep", f"({uid})"],
+                cwd=root, capture_output=True, text=True, timeout=30).stdout.split()
+        except (OSError, subprocess.TimeoutExpired):
+            return {"count": 0, "blocking": False, "detail": "no readable git history"}
+        if not shas:
+            continue
+        lines = 0
+        files: set[str] = set()
+        for sha in shas:
+            out = subprocess.run(["git", "show", "--numstat", "--format=", sha],
+                                 cwd=root, capture_output=True, text=True, timeout=30).stdout
+            for row in out.splitlines():
+                parts = row.split("\t")
+                if len(parts) == 3:
+                    add, rem, name = parts
+                    if add.isdigit():
+                        lines += int(add)
+                    if rem.isdigit():
+                        lines += int(rem)
+                    files.add(name)
+        measured += 1
+        over = ((max_lines and lines > int(max_lines))
+                or (max_files and len(files) > int(max_files)))
+        if over:
+            found = sdlc_md.find_by_id(root, uid)
+            pts = sdlc_md.read_points(sdlc_md.read_text_safe(found[0])) if found else None
+            offenders.append(f"{uid} ({pts or '?'}pt): {lines} lines / {len(files)} file(s) "
+                             f"vs max {max_lines or '-'} lines / {max_files or '-'} file(s)")
+    skipped = len(batch) - measured
+    tail = f" ({measured} measured, {skipped} with no identifiable commits)" if skipped else ""
+    if offenders:
+        return {"count": len(offenders), "blocking": False,
+                "detail": "advisory - never blocks; outlier diff for its size: "
+                          + "; ".join(offenders) + tail}
+    return {"count": 0, "blocking": False,
+            "detail": f"{measured} measured unit(s) within batch thresholds{tail}"}
+
+
+def _conformance_scoped(root: str) -> dict:
+    """The pre-commit binding of the conformance lane: judge the units this commit touches."""
+    return _conformance(root, changed=True)
+
+
+def _validate_scoped(root: str) -> dict:
+    """The pre-commit binding of the validate lane: judge the artefacts this commit touches."""
+    return _validate(root, changed=True)
+
+
+def _validate_pushed(root: str) -> dict:
+    """The push boundary's binding of the validate lane: judge the artefacts the pushed commits
+    touch."""
+    names = _pushed_scope(root)
+    return _validate(root, names=names) if names is not None else _validate(root)
+
+
+def _conformance_pushed(root: str) -> dict:
+    """The push boundary's binding of the conformance lane: judge the stories the pushed commits
+    touch, the repo-wide stages at full strength."""
+    names = _pushed_scope(root)
+    if names is None:
+        return _conformance(root)
+    rel, _prefix = sdlc_md.ARTIFACT_TYPES["story"]
+    base = (Path(root) / rel).resolve()
+    ids: set[str] = set()
+    for name in names:
+        path = (Path(root) / name).resolve()
+        rid = (sdlc_md.extract_record_id(path.stem)
+               if path.parent == base and path.name != "_index.md" else None)
+        if rid:
+            ids.add(sdlc_md.norm_id(rid))
+    result = _conformance(root, scope_ids=ids)
+    result["detail"] += (f" (scope: the {len(ids)} story unit(s) the pushed commits touch; "
+                         "`--release` judges the whole workspace)")
+    return result
+
+
+#: The diff-scoped lanes rebound at the push boundary to the pushed range, so the hook's clean
+#: checkout judges what is being pushed rather than its empty working-tree diff.
+PUSHED_RANGE_LANES = {"conformance": _conformance_pushed, "validate": _validate_pushed}
+
+
+#: The two lanes the STANDARD gate scopes to the diff and `--release` restores to the whole
+#: workspace. One function per lane, called with `changed` set differently - not a second set of
+#: rules, so the scoped and the whole-workspace verdict can never come to disagree about what
+#: conformance or validity means. A commit is judged on what it changed; a tag is judged on
+#: everything, and the release lane says so by running exactly the same check unscoped.
+WHOLE_WORKSPACE_LANES = {"conformance": _conformance, "validate": _validate}
+
+def _release_rehearsal(root: str) -> dict:
+    """BOUNDARY lane: drive greenfield-init and a v4-upgrade end to end through the shipped CLI.
+
+    Every other lane here runs against THIS repository. The two situations a user is actually in
+    - a project that has just been created, and one being upgraded - are the two this repository
+    cannot occupy, and walking them by hand once turned up three consumer-facing defects that the
+    whole suite and every other lane had missed.
+
+    Bound to the release (tag) boundary only. It builds two fixture projects, minutes a push
+    should not pay; a guard whose cost is paid too often gets switched off, and then it guards
+    nothing.
+    """
+    import subprocess  # noqa: PLC0415 - local: only this lane spawns the harness
+    script = Path(root) / "tools" / "rehearse-release.sh"
+    if not script.exists():
+        return {"count": 0, "blocking": False, "detail": "N/A (no rehearsal harness in this repo)"}
+    proc = subprocess.run(["bash", str(script), "all"], cwd=root, capture_output=True,
+                          text=True, check=False)
+    if proc.returncode == 0:
+        return {"count": 0, "blocking": True, "detail": "greenfield and upgrade both complete"}
+    # Name the failing HALF. "the rehearsal failed" sends a reader to run it themselves to find
+    # out which path broke, and the two have entirely different owners.
+    lines = [ln for ln in (proc.stdout + proc.stderr).splitlines()
+             if ln.startswith("rehearsal FAILED")]
+    why = lines[-1] if lines else "the harness exited non-zero without naming a step"
+    return {"count": 1, "blocking": True, "detail": why.replace("rehearsal FAILED: ", "")}
+
+
+def _clip_reason(text: str, limit: int = 300) -> str:
+    """A refusal's reason line, clipped at a WORD boundary past `limit` - never mid-path, since a
+    path cut in half sends the reader to a file that does not exist."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    return (head.rsplit(" ", 1)[0] if " " in head else head) + " ..."
+
+
+def _full_suite(root: str) -> dict:
+    """PUSH-BOUNDARY lane: every test module of both suites, run ONCE.
+
+    Per-commit selection follows what a test module states about itself: its own path, its name,
+    its imports and loads (and those of one fixture test module it imports) and its
+    `test-census-subject` header. A change none of those reach selects nothing on a commit: a
+    library no test module imports, loads, is named for or declares, which tests drive only
+    through another script, or a file that is not `.py` or `.sh` (a hook, a doc, `pytest.ini`)
+    that no module declares as its census subject. This lane is what catches those.
+    Run as the commit hook runs a selection (`run_tests_plan`): across every core under
+    pytest-xdist, the `serial_only` tests after. A red run names each failing test and keeps the
+    whole output in `sdlc-studio/.local/boundary-suite-last.log`, since the gate prints one line.
+    """
+    import importlib.util  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415 - local: only this lane spawns the runner
+    modules = suite_modules(root)
+    if not modules:
+        return {"count": 0, "blocking": False, "detail": "N/A (no test suites under --root)"}
+    if importlib.util.find_spec("pytest") is None:
+        return {"count": 1, "blocking": True,
+                "detail": "pytest is not installed, so the full suite cannot run here"}
+    parallel = importlib.util.find_spec("xdist") is not None
+    outputs, failed, summaries = [], [], []
+    for argv in run_tests_plan(modules, parallel, root):
+        cp = subprocess.run(argv, cwd=root, capture_output=True, text=True, check=False)
+        text = cp.stdout + cp.stderr
+        outputs.append(text)
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        summaries.append(lines[-1].strip("= ") if lines else "no output")
+        if cp.returncode not in (0, 5):     # 5: a phase that collected nothing
+            named = [ln.split(" - ")[0].removeprefix("FAILED ").removeprefix("ERROR ")
+                     for ln in lines if ln.startswith(("FAILED ", "ERROR "))]
+            # A usage error ends on pytest's rootdir line, so name the last line that says why.
+            # Exit 1 is an ordinary red: its summary line is the honest reason, and an "error"
+            # line there may be nothing but a passing test's warning.
+            why = summaries[-1] if cp.returncode == 1 else next(
+                (ln.strip() for ln in reversed(lines) if "error" in ln.lower()), summaries[-1])
+            failed.extend(named or [f"exit {cp.returncode}: {why}"])
+    failed = list(dict.fromkeys(failed))    # xdist reports a collection error once per worker
+    how = f"{len(modules)} module(s){' in parallel' if parallel else ''}: {'; '.join(summaries)}"
+    log = Path(root) / "sdlc-studio" / ".local" / "boundary-suite-last.log"
+    if not failed:
+        log.unlink(missing_ok=True)         # an earlier red's log must not outlive a green
+        return {"count": 0, "blocking": True, "detail": how}
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("\n".join(outputs), encoding="utf-8")
+        kept = f"; output in {log.relative_to(root)}"
+    except OSError:
+        kept = ""
+    return {"count": len(failed), "blocking": True,
+            "detail": f"{len(failed)} red - {', '.join(failed)} - {how}{kept}"}
+
+
+def _module_alone(root: str) -> dict:
+    """BOUNDARY lane: every skill test module run ALONE, under the unittest runner, in a fresh
+    interpreter, from the repository root.
+
+    The suite runs green as one discovery pass and hides a module that only passes because a
+    sibling imported a name first: `test_critic` used `unittest.mock` without importing it, and
+    the name was there because an earlier module had imported it. pytest imports the missing
+    name itself and passes the broken module, so the runner here is `unittest`, the hook's own,
+    and each module is one fresh interpreter. The working directory is `--root`, the hook's,
+    because that alone decides which modules are red: two modules read config under the
+    working directory and are red only from the tests directory.
+
+    PARALLEL across the cores, so the wall-clock is the slowest module (`test_gate`, about four
+    minutes on this machine) rather than the serial sum (about seventeen minutes measured at
+    delivery); the `serial_only` partition is read the runner's way - the marker,
+    through `pytest --collect-only -m serial_only`, never a source scan - and those modules run
+    in a serial phase after the parallel one, as the suite's runner partitions them. Bound at the
+    release (tag) boundary only, on `release-rehearsal`'s precedent: minutes per run is a cost a
+    push should not carry beside the full suite it already pays.
+    """
+    import os  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415 - local: only this lane spawns interpreters
+    import time  # noqa: PLC0415
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+    root = Path(root)
+    tests_dir = root / ".claude" / "skills" / "sdlc-studio" / "scripts" / "tests"
+    if not tests_dir.is_dir():
+        return {"count": 0, "blocking": False, "detail": "N/A (no skill tests directory under --root)"}
+    modules = sorted(p.stem for p in tests_dir.glob("test*.py") if p.is_file())   # unittest discover's own pattern
+    if not modules:
+        return {"count": 0, "blocking": False, "detail": "N/A (no test modules under the skill tests directory)"}
+    # the serial partition, read the way the suite's own runner reads it: the marker, collected
+    collect = subprocess.run(
+        [sys.executable, "-B", "-m", "pytest", "--collect-only", "-q", "-m", "serial_only",
+         "-p", "no:cacheprovider", str(tests_dir)],
+        cwd=root, capture_output=True, text=True, check=False)
+    if collect.returncode not in (0, 5):     # 5: pytest collected nothing at all - a valid empty partition
+        why = _clip_reason(next((ln for ln in (collect.stdout + collect.stderr).splitlines() if ln.strip()), "no output"))
+        return {"count": 1, "blocking": True,
+                "detail": f"could not read the serial_only partition (pytest --collect-only -m serial_only "
+                          f"exited {collect.returncode}: {why}) - the modules were NOT run, "
+                          f"because a partition read as empty would run the marked modules beside the others"}
+    serial = {Path(ln.split("::", 1)[0]).stem for ln in collect.stdout.splitlines() if "::" in ln}
+    serial &= set(modules)
+    # EXACTLY the hook's environment: `tools/skill-tests.sh` exports the tests directory as a
+    # path RELATIVE to the root it runs from, and one module (`test_repo_hygiene`) is green under
+    # that form and red under an absolute one - the first cut of this lane refused every push
+    # from this clone on that difference alone.
+    env = dict(os.environ)
+    env["PYTHONPATH"] = (str(tests_dir.relative_to(root))
+                         + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""))
+    env.pop("PYTEST_CURRENT_TEST", None)
+
+    # A hung module must name itself, never hang the push: half an hour per module by default,
+    # an operator knob for a slower machine
+    try:
+        limit = float(os.environ.get("SDLC_MODULE_ALONE_TIMEOUT") or 1800)
+    except ValueError:
+        limit = 1800.0
+
+    def run(mod: str) -> tuple:
+        t0 = time.monotonic()
+        try:
+            cp = subprocess.run([sys.executable, "-B", "-m", "unittest", mod], cwd=root, env=env,
+                                capture_output=True, text=True, check=False, timeout=limit)
+        except subprocess.TimeoutExpired:
+            return mod, 124, f"timed out after {limit:g} s", time.monotonic() - t0
+        return mod, cp.returncode, cp.stdout + cp.stderr, time.monotonic() - t0
+
+    parallel = [m for m in modules if m not in serial]
+    phase = {m: "parallel" for m in parallel}
+    results: list = []
+    with ThreadPoolExecutor(max_workers=max(1, os.cpu_count() or 1)) as pool:
+        workers = pool._max_workers          # the figure the summary prints IS the pool's size
+        results.extend(pool.map(run, parallel))
+    for m in sorted(serial):                     # AFTER the parallel phase, never beside it
+        results.append(run(m)); phase[m] = "serial"
+    failed = []
+    for mod, rc, out, _secs in results:
+        if rc == 0:
+            continue
+        lines = out.splitlines()
+        idx = next((i for i, ln in enumerate(lines) if ln.startswith(("FAIL:", "ERROR:"))), None)
+        if idx is None:
+            first = next((ln for ln in reversed(lines) if ln.strip()), "exited non-zero with no output")
+        else:
+            # the header names the test; the exception line says WHY - `test_critic`'s own
+            # defect is an AttributeError the header never mentions
+            exc = next((ln for ln in lines[idx + 1:]
+                        if re.match(r"^[A-Za-z_][\w.]*(Error|Exception|Exit|Warning)\b", ln)), None)
+            first = lines[idx] + (f" - {exc.strip()}" if exc else "")
+        failed.append(f"{mod} [{phase[mod]}]: {first.strip()}")
+    summary = (f"{len(modules)} module(s) alone under unittest from {root}: {len(parallel)} in the "
+               f"parallel phase on {workers} workers, {len(serial)} in the serial phase after it"
+               f" ({', '.join(sorted(serial))})" if serial else
+               f"{len(modules)} module(s) alone under unittest from {root}: {len(parallel)} in the "
+               f"parallel phase on {workers} workers, none marked serial_only")
+    if failed:
+        return {"count": len(failed), "blocking": True,
+                "detail": f"{len(failed)} module(s) red when run alone - {'; '.join(failed)} - {summary}"}
+    return {"count": 0, "blocking": True, "detail": summary}
+
+
+#: The standard gate: the lanes a plain run, and so every commit, pays for.
+DEFAULT_CHECKS = {
+    "conformance": _conformance_scoped,
+    "reconcile": _reconcile,
+    "index-derived": _index_derived,
+    "validate": _validate_scoped,
+    "integrity": _integrity,
+    "duplicate-id": _duplicate_id,
+    "doc-coverage": _doc_coverage,
+    "engagement-floor": _engagement_floor,
+    "window": _window,
+    # Structure + hand-edit are COMMITTED faults, so the changelog lane runs in the standard
+    # gate too; --release swaps in the superset that also refuses a stray fragment at the cut.
+    "changelog-fragments": _changelog,
+}
+
+#: Advisory lanes a plain run leaves out. None refuses a commit, and together they cost about
+#: 70s of every one. Each runs when named with `--only`; doc-freshness also runs at the sprint
+#: close (`--require-retro`), where it reports once a sprint and never blocks. Constitution and
+#: provenance stay in a plain run for a project that set them to block (`_enforced_lanes`).
+ON_DEMAND_CHECKS = {
+    "constitution": _constitution,
+    "provenance": _provenance,
+    "doc-surface": _doc_surface,
+    "disclosure": _disclosure,
+    "doc-freshness": _doc_freshness,
+    "hook-enabled": _hook_enabled,
+    "batch-size": _batch_size,
+}
+
+#: The on-demand lanes the sprint close runs without being named.
+CLOSE_ADVISORY_CHECKS = ("doc-freshness",)
+
+
+def _enforced_lanes(root: str) -> set[str]:
+    """The on-demand lanes this project configured to block. A refusal a project opted into
+    stays in its plain gate; only a lane that can merely advise leaves it (D0263). Each asks
+    the lane's own module, so the gate and the lane cannot disagree about the setting."""
+    import constitution
+    import provenance
+    return ({"constitution"} if constitution.enforced(root) else set()) | (
+        {"provenance"} if provenance.enforced(root) else set())
+
+
+def _lessons_loop_blocking(root: str) -> bool:
+    """Whether the bound close lessons/retro lanes BLOCK, or merely report. The documented
+    opt-out `lessons.loop: judgement` makes the whole retro/lessons close set advisory (ADR-010);
+    any other value (default `enforce`) blocks. One derivation for all three lanes - retro,
+    lessons-summary and lessons-validity - so the key covers exactly what the docs say it covers,
+    never a subset an operator has to discover by trial."""
+    import config
+    mode = str(config.get(root, "lessons.loop", "enforce") or "enforce").strip().lower()
+    return mode != "judgement"
+
+
+def _retro_present(root: str, retro_id: str) -> dict:
+    """Blocking close-gate check: the batch's retro must exist AND say something before a
+    sprint/review close reports success. Fail-loud per LL0008 - 'unconditional' retro is
+    doctrine until it is a gate. The sprint-close orchestration passes the next retro id
+    via --require-retro.
+
+    This leg used to glob for a filename, so a 0-byte file named RETRO9999.md passed it:
+    the one gate that made the retrospective un-skippable was the one an agent could
+    satisfy with `touch`. Existence is not evidence - so the check is now
+    delegated to `retro.py validate`, which interrogates the CONTENT: the required
+    sections, at least one real lesson, and a disposition for every finding.
+    """
+    import retro
+    # The documented opt-out (`lessons.loop: judgement`), mirroring the engagement floor: the
+    # lane still REPORTS, it just does not block. An opt-out that is documented but unread
+    # would be the very disease this loop exists to cure.
+    blocking = _lessons_loop_blocking(root)
+    res = retro.validate(root, retro_id)
+    if res["ok"]:
+        n_l, n_f = len(res["lessons"]), len(res["findings"])
+        return {"count": 0, "blocking": blocking,
+                "detail": (f"batch retro {retro_id}: {n_l} lesson(s), {n_f} finding(s) all "
+                           f"dispositioned ({len(res['filed'])} filed, "
+                           f"{len(res.get('fixed', []))} fixed in-sprint, "
+                           f"{len(res['declined'])} declined)")}
+    # Every error names its own remedy; surface them all rather than only the first, so one
+    # close tells you everything it wants instead of a queue of one-at-a-time refusals.
+    suffix = "" if blocking else " (advisory: lessons.loop is judgement)"
+    return {"count": len(res["errors"]), "blocking": blocking,
+            "detail": f"batch retro {retro_id} incomplete{suffix} - " + "; ".join(res["errors"])}
+
+
+def _only_close_status_block_differs(root: Path, path: Path) -> bool:
+    """True when the ONLY uncommitted change to `path` is inside the close's machine-maintained
+    status block.
+
+    The close stamps that block as its last act, so it is uncommitted BY CONSTRUCTION for the
+    rest of that close and for the operator's follow-up `--apply-signoff` invocation. Treating it
+    as "uncommitted review paperwork" made the close block its own second invocation with a
+    remedy - commit the paperwork - that the close itself had just created the need for. The
+    substantive anchor (everything a human wrote) is still held to the committed rule; only the
+    block the tool owns is exempt.
+    """
+    try:
+        import subprocess
+        rel = path.relative_to(root)
+        head = subprocess.run(["git", "show", f"HEAD:{rel}"], cwd=root,
+                              capture_output=True, text=True, timeout=10)
+        if head.returncode != 0:
+            return False                      # not in history at all - genuinely uncommitted
+        def _strip(text: str) -> str:
+            begin, end = "<!-- close-status:begin -->", "<!-- close-status:end -->"
+            if begin in text and end in text:
+                return text[:text.index(begin)] + text[text.index(end) + len(end):]
+            return text
+        return _strip(head.stdout) == _strip(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - currency reporting must never break the gate
+        return False
+
+
+def _is_dirty(root: Path, path: Path) -> bool:
+    """True when `path` has uncommitted working-tree or staged changes.
+
+    Answers only what it is asked: a git failure, an untracked file, or no repo at all
+    returns False, so the caller falls back to the committed-time reading rather than
+    inventing a dirty state.
+    """
+    try:
+        import subprocess
+        rel = path.relative_to(root)
+        out = subprocess.run(["git", "status", "--porcelain", "--", str(rel)],
+                             cwd=root, capture_output=True, text=True, timeout=10)
+        return bool(out.stdout.strip())
+    except Exception:  # noqa: BLE001 - currency reporting must never break the gate
+        return False
+
+
+#: Metadata fields the CLOSE itself writes onto a unit: the status transition, the AC
+#: back-annotation and the verification tier it gates on. A change confined to these is the
+#: close's own bookkeeping, not content a review would have judged differently.
+_CLOSE_OWNED_FIELDS = ("Status:", "Verified:", "Verification depth:", "Signed-off", "Critiqued")
+
+#: The field whose carve-out is DIRECTIONAL. Every other close-owned field above is a stamp
+#: the close adds; `Status` is the one whose meaning depends entirely on which way it moved.
+_STATUS_FIELD = "Status:"
+
+def _status_value(body: str) -> str | None:
+    """The value of a `Status:` metadata line, or None when the line carries none.
+    Tolerates both the bold (`**Status:** Done`) and bare (`Status: Done`) spellings."""
+    import re as _re  # noqa: PLC0415 - as elsewhere in this module
+    m = _re.search(r"\*{0,2}Status:\*{0,2}\s*(.+?)\s*$", body)
+    return m.group(1).strip().strip("*").strip() if m else None
+
+
+def _story_status(path: Path) -> str | None:
+    """The story's own `Status` value, or None when it cannot be read.
+
+    Read from the file rather than from the verify report, because the report is about the
+    criteria and this question is about the story's claim.
+
+    Asked of `sdlc_md.extract_field`, the canonical field reader, NOT of this module's
+    `_status_value`. That helper takes a single metadata LINE - its `$` anchor has no `re.M` -
+    so over a whole document it answers None for every story. The first cut of this used it and
+    the existing release tests went red immediately, which is the only reason it is not still
+    here quietly classifying every story as claiming nothing.
+    """
+    try:
+        return sdlc_md.extract_field(path.read_text(encoding="utf-8", errors="replace"), "Status")
+    except OSError:
+        return None
+
+
+def _claims_completion(status: str | None) -> bool:
+    """Whether this status asserts the work is DONE - the only claim a red criterion can falsify.
+
+    ASKED OF THE LIBRARY, never re-decided here. `sdlc_md.canonical_status` folds the decorated
+    spellings this repository actually writes - `Done (v5.0.1) · **CR:** CR0088` is a real shape,
+    and that function exists because of it - and `sdlc_md.is_delivered_terminal` already means
+    exactly "claims completion", deriving the abandonments by wording rather than by a list.
+    THE VOCABULARY IS THE BASE ONE, DELIBERATELY. The first cut read `status_vocab(..., root)`,
+    which honours a project's `.config.yaml` extensions - and that was the hole. `terminal_statuses`
+    is built from module constants, so a declared status is RECOGNISED by the extended vocab
+    (skipping the fail-closed branch for an unknown one) and can never be terminal in the tables:
+    recognised, then excluded. A project moving finished stories to `Shipped` would have lost every
+    red criterion on its completed work from this metric, silently and permanently, reported as
+    "unbuilt or abandoned". Asking the BASE vocab asks the question that matters here - can the
+    terminal tables classify this? - so anything a project added falls to the same fail-closed
+    branch as anything misspelt. A review found this; the docstring it replaces claimed the
+    opposite, which is why the claim is now stated as the reason for the argument's absence.
+
+
+    The first cut of this carried its own `_ABANDONED_STATUSES` literal beside the terminal set,
+    with a comment claiming it was derived. It was already diverging - no `withdrawn`,
+    `cancelled` or `obsolete` - and it FAILED OPEN on every status the literal did not recognise:
+    a decorated `Done` was EXCLUDED from the metric, so a real regression on finished work
+    vanished from the number by having release context appended to its status line. Two lines
+    away, `_is_close_transition` had already reached for the canonical readers and written down
+    the rule this broke: an exemption granted on an unanswered question is the failure this lane
+    exists to prevent.
+
+    BG0592. The corpus baseline defines its metric, twice, as red criteria "across stories
+    already at Done", and the lane counted every story at any status. Measured across 670
+    stories: 87 red in total, 20 of them on stories at Done. The other 67 were unbuilt or
+    abandoned work, and the lane's own remedy text told the reader to hunt them as renamed tests.
+
+    That also explains the number's history. The baseline header records it moving 106, 53, 58,
+    50, 52 and notes a reading that "could NOT be reproduced a day later on a tree whose stories
+    are byte-identical - the DENOMINATOR differs". A population containing every un-started story
+    moves whenever anybody grooms, which is precisely what a metric about FINISHED work must be
+    immune to.
+
+    FAILS CLOSED, and that governs every uncertain case: an absent status, an unreadable one and
+    one the vocabulary does not recognise all count as claiming completion. "Cannot say, so it
+    claims nothing" sounds careful and is the permissive direction - it lets a story leave the
+    regression metric by dropping or misspelling a line, and it is the exclusion nobody notices
+    because the number only goes down.
+
+    The asymmetry is the argument. Wrongly counting a red criterion costs somebody an
+    investigation; wrongly excluding one loses a regression silently, in the one number this
+    repository's own baseline records having been wrong five times. Only a status the vocabulary
+    RECOGNISES and that is explicitly non-completing - unbuilt, or abandoned - earns the
+    exclusion.
+    """
+    if not status:
+        return True
+    canon = sdlc_md.canonical_status(status, sdlc_md.status_vocab("story"))
+    if not canon:
+        # Unknown OR project-declared - both are UNCLASSIFIABLE by the terminal tables, and
+        # unclassifiable is not the same as non-completing. Fails closed, like an absent one.
+        return True
+    return sdlc_md.is_delivered_terminal("story", canon)
+
+
+def _artifact_type_of(root: Path, path: Path) -> str | None:
+    """The artefact type `path` belongs to, from the declared type->directory map. Derived
+    from `ARTIFACT_TYPES`, never a list written here, so a new type is covered on the day
+    it is declared."""
+    try:
+        rel = path.resolve().relative_to(Path(root).resolve()).as_posix()
+    except (ValueError, OSError):
+        rel = path.as_posix()
+    for type_, (dirname, _prefix) in sdlc_md.ARTIFACT_TYPES.items():
+        if rel.startswith(dirname.rstrip("/") + "/"):
+            return type_
+    return None
+
+
+def _close_recorded_transition(type_: str | None, frm: str | None, to: str | None,
+                               root: Path | str | None = None) -> bool:
+    """True when a Status move is one the CLOSE tooling itself records.
+
+    The carve-out used to ask only whether a changed line contained the substring
+    `Status:`, so it was blind to both direction and value: a hand-flip from Draft or
+    Blocked straight to Done, and a reopen of a terminal status, were both waved through as
+    "the close recording a verdict already reached" - over a verdict no reviewer reached.
+
+    Three conditions, each read from a DECLARED vocabulary rather than a list kept here:
+
+    * the new value is an absorbing state for the type (`terminal_statuses`) - only a close
+      moves a unit into one;
+    * the old value is not (terminal to terminal is a re-labelling, and terminal to
+      anything else is a reopen: both are changes a reviewer would judge);
+    * the old value is one of the implementation states the delivery loop actually parks a
+      unit at before the close (`transition._IMPL_TARGETS`, the same set the tier gate
+      reads). A unit that was Draft, Ready or Blocked did not pass through delivery, so
+      nothing about its arrival at Done is bookkeeping.
+
+    Unknown type, unreadable value, or an unrecognised status: NOT a close transition. The
+    carve-out is an exemption, and an exemption granted on an unanswered question is the
+    failure mode this whole lane exists to prevent.
+    """
+    if not type_ or not frm or not to:
+        return False
+    vocab = sdlc_md.status_vocab(type_, root)   # honours a project's declared vocabulary
+    frm = sdlc_md.canonical_status(frm, vocab) or frm
+    to = sdlc_md.canonical_status(to, vocab) or to
+    terminal = sdlc_md.terminal_statuses(type_)
+    if to not in terminal or frm in terminal:
+        return False
+    try:
+        import transition  # noqa: PLC0415 - sibling; the one declaration of the delivery states
+        in_flight = set(transition._IMPL_TARGETS)
+    except Exception:  # noqa: BLE001 - a gate must not break on an import
+        return False
+    return frm in (in_flight & set(vocab)) - terminal
+
+
+def _anchor_last_commit(root: Path, path: Path) -> str:
+    """The sha of the last commit touching `path`, or "" when unknown.
+
+    "" is the honest-degrade value and its callers treat it as "cannot tell", falling back to
+    reporting every newer artefact as stale. A carve-out that opened up when git was unreadable
+    would be a carve-out that opens up exactly when nothing can be checked.
+    """
+    import subprocess  # noqa: PLC0415 - as elsewhere in this module
+    try:
+        out = subprocess.run(["git", "log", "-1", "--format=%H", "--", str(path)],
+                             cwd=str(root), capture_output=True, text=True,
+                             timeout=10)  # nosec B603 B607
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _close_owned_change_only(root: Path, path: Path, since: str) -> bool:
+    """True when everything that changed in `path` since commit `since` is close bookkeeping.
+
+    The review-currency lane refuses when any artefact is newer than the anchor. But the close
+    chain TRANSITIONS the batch in its own steps 5-7 and refreshes the anchor in step 7, while
+    the gate is step 4 - so re-running the documented close flow fails on changes its own
+    previous run made, and the printed remedy is to re-run an adversarial review over a tree
+    whose only change is a set of status stamps. The honest remedy would be to touch the anchor,
+    which is precisely what the lane exists to stop being done casually.
+
+    So the question asked is not "did anything change" but "did anything a REVIEWER would judge
+    change". A status moving Review to Done is the close recording a verdict already reached; a
+    changed acceptance criterion is not. Anything this cannot read falls back to STALE, because
+    an unreadable diff is not evidence of innocence.
+
+    The Status line is read for its DIRECTION and its VALUES, not for the substring. Asking
+    only whether the line contained `Status:` exempted a hand-flip from Draft or Blocked
+    straight to Done, and a reopen of a terminal status, as readily as it exempted the
+    close's own Review-to-Done stamp - so the gate printed PASS over a status change no
+    reviewer ever judged. `_close_recorded_transition` decides which moves the close
+    records; every other close-owned field is still a plain stamp and still exempt.
+    """
+    import subprocess  # noqa: PLC0415 - as elsewhere in this module
+    try:
+        proc = subprocess.run(["git", "diff", "--unified=0", since, "--", str(path)],
+                              cwd=str(root), capture_output=True, text=True,
+                              timeout=30)  # nosec B603 B607
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    if proc.returncode != 0:
+        return False
+    removed_status: list[str] = []
+    added_status: list[str] = []
+    for line in proc.stdout.splitlines():
+        if not line.startswith(("+", "-")) or line.startswith(("+++", "---")):
+            continue
+        body = line[1:].strip().lstrip("> ").strip()
+        if not body:
+            continue
+        if not any(f in body for f in _CLOSE_OWNED_FIELDS):
+            return False
+        if _STATUS_FIELD in body:
+            value = _status_value(body)
+            if value is None:
+                return False   # a Status line whose value cannot be read is not evidence
+            (added_status if line.startswith("+") else removed_status).append(value)
+    if added_status or removed_status:
+        # A Status line ADDED where none existed, or REMOVED and not replaced, is not a
+        # transition the close records either - it is somebody rewriting the field.
+        if len(added_status) != 1 or len(removed_status) != 1:
+            return False
+        if not _close_recorded_transition(_artifact_type_of(root, path),
+                                          removed_status[0], added_status[0], root):
+            return False
+    return True
+
+
+def _batch_is_independently_covered(root: Path) -> tuple[bool, str]:
+    """Whether EVERY unit of the open run carries independent review coverage.
+
+    The question the close is entitled to ask about itself. Fails CLOSED: no open run, an
+    unreadable state, or any uncovered unit all return False, so this can only ever turn a
+    blocking lane advisory when the evidence positively says the batch was reviewed.
+    """
+    try:
+        from lib import run_state  # noqa: PLC0415
+        import critic  # noqa: PLC0415
+        state = run_state.read(root) or {}
+        units = [u for u in (state.get("batch") or []) if u]
+        if not units:
+            return (False, "")
+        for unit in units:
+            verdict = critic.verdict_for(root, unit)
+            if not critic.sprint_covers_independently(root, unit, verdict):
+                return (False, "")
+        return (True, f"{len(units)}/{len(units)} units")
+    except Exception as exc:  # noqa: BLE001
+        sdlc_md.debug("gate._batch_is_independently_covered", exc)
+        return (False, "")
+
+
+def _review_current(root: str) -> dict:
+    """Blocking close-gate check: the unified-review anchor (reviews/LATEST.md) must be at least
+    as new as every artefact. If any artefact changed since the last review, LATEST.md is stale
+    and a fresh session orients on an out-of-date claim.
+
+    The sprint close is reconcile + review + retro. Reconcile blocks on drift and retro is a
+    hard gate; this is the review leg, which was only advisory before (doc_freshness) - so a
+    stale review reached a close, and did. Presence is not currency: the review-legs lane checks
+    the doc legs EXIST; this checks the review was actually re-RUN. The estimate machinery is
+    reused from review_prep (git commit time, mtime fallback).
+    """
+    import review_prep
+    rr = Path(root)
+    latest = rr / "sdlc-studio" / "reviews" / "LATEST.md"
+    if not latest.is_file():
+        return {"count": 1, "blocking": True,
+                "detail": "no reviews/LATEST.md - run `review` before closing the sprint"}
+    latest_dt = review_prep._parse_dt(review_prep._modified_iso(latest, rr)[0])
+    # The timestamp above is the last COMMIT time, so a review that has just been re-run but
+    # not yet committed still reads at its previous commit - stale, with a remedy telling the
+    # operator to do the thing they just did. Re-read the dirty anchor at its working-tree
+    # mtime so the two genuinely different states get two different remedies.
+    uncommitted = _is_dirty(rr, latest)
+    if uncommitted:
+        latest_dt = review_prep._parse_dt(
+            datetime.fromtimestamp(latest.stat().st_mtime, timezone.utc).isoformat())
+    stale = []
+    for key, rec in review_prep.staleness(rr).items():
+        m = review_prep._parse_dt(rec.get("last_modified"))
+        stale_by_anchor = bool(m and latest_dt and m > latest_dt)
+        # Currency is a property of the review RECORD, not only the anchor file's commit time. A
+        # re-run review that re-stamped LATEST.md byte-identically kept its old commit time (git saw
+        # no change) and read stale, though review-state.json records the review as freshly run - the
+        # remedy printed ("run `review`") was the thing just done, and only a substantive edit to an
+        # already-correct anchor cleared it. An artefact is stale only when the anchor commit-time AND
+        # the review record BOTH say so: the record can make an already-reviewed artefact current, but
+        # never a genuinely-changed one (a change past the last review sets needs_review). An absent or
+        # unparseable record leaves needs_review True, so this falls back to the commit-time behaviour
+        # unchanged.
+        stale_by_record = bool(rec.get("needs_review", True))
+        if stale_by_anchor and stale_by_record:
+            stale.append(key)
+    if stale:
+        anchor_rev = _anchor_last_commit(rr, latest)
+        recs = review_prep.staleness(rr)
+        judged = ([k for k in stale
+                   if not _close_owned_change_only(
+                       rr, rr / (recs.get(k, {}).get("path") or k), anchor_rev)]
+                  if anchor_rev else stale)
+        bookkeeping = len(stale) - len(judged)
+        if judged:
+            note = (f" ({bookkeeping} further artefact(s) changed only in close bookkeeping and "
+                    f"are not counted)" if bookkeeping else "")
+            # CADENCE, not correctness, when this run's own units are all independently
+            # reviewed. The repo-wide unified review runs on its own schedule and covers the
+            # whole tree; a sprint whose every unit carries independent coverage and a sign-off
+            # is not made less correct by that ceremony being overdue, and it did nothing to
+            # cause the staleness. Blocking there makes every sprint inherit the deferral
+            # history of a ceremony it does not own - and because a sprint is nearly always in
+            # flight, it also makes the unified review MORE likely to be deferred, not less.
+            covered, why = _batch_is_independently_covered(rr)
+            if covered:
+                return {"count": len(judged), "blocking": False,
+                        "detail": (f"CADENCE DEBT (reported, not blocking): reviews/LATEST.md is "
+                                   f"stale - {len(judged)} artefact(s) changed since the last "
+                                   f"unified review ({_elide(sorted(judged))}). This run's own "
+                                   f"units are all independently covered ({why}), so the close "
+                                   f"proceeds; the repo-wide review is still owed{note}")}
+            return {"count": len(judged), "blocking": True,
+                    "detail": (f"reviews/LATEST.md is stale - {len(judged)} artefact(s) changed "
+                               f"since the last review ({_elide(sorted(judged))}); run `review` "
+                               f"before closing{note}")}
+        if bookkeeping:
+            # The close's OWN transitions, and nothing a reviewer would judge. Reporting these
+            # as a stale review sends the operator to re-run an adversarial pass over a set of
+            # status stamps, and the only way out is to backdate the thing being measured.
+            return {"count": 0, "blocking": False,
+                    "detail": (f"reviews/LATEST.md is current - the {bookkeeping} artefact(s) "
+                               f"newer than it changed only in close bookkeeping (status, "
+                               f"verification), which is not review content")}
+    if uncommitted and _only_close_status_block_differs(rr, latest):
+        # The close's own stamp, and nothing else. Not uncommitted review work, so it does not
+        # block the close that wrote it (nor the operator's follow-up sign-off invocation).
+        return {"count": 0, "blocking": False,
+                "detail": "reviews/LATEST.md carries only the close's own status stamp "
+                          "uncommitted - commit it with the rest of the close paperwork"}
+    if uncommitted:
+        # Current in content, absent from history. Still blocking - an uncommitted close is
+        # not a close - but the honest remedy is to commit, not to re-run the review.
+        return {"count": 1, "blocking": True,
+                "detail": "reviews/LATEST.md is current with all artefacts but UNCOMMITTED - "
+                          "commit the close paperwork (re-running `review` will not change this)"}
+    return {"count": 0, "blocking": True, "detail": "reviews/LATEST.md is current with all artefacts"}
+
+
+def _lessons_summary(root: str) -> dict:
+    """Blocking close-gate lane: the committed LESSONS-SUMMARY.md must be the digest of the
+    CURRENT lessons log. Summarising the sprint's lessons was doctrine - prose four steps long,
+    of which only the retro was enforced - so an agent under effort pressure skipped it and the
+    next sprint read a summary that predated the last one's learning.
+
+    The verdict is recomputed, never trusted: `lessons.summary_status` regenerates the digest
+    from the log and compares it with what the file says, so a lesson CLOSED since the last
+    regeneration fails it exactly as an added one does. Nothing is stamped, so there is nothing
+    to forge; the only way to green is for the file to say what the log implies.
+    """
+    import lessons
+    blocking = _lessons_loop_blocking(root)
+    status = lessons.summary_status(root)
+    if not status["applicable"]:
+        return {"count": 0, "blocking": blocking, "detail": status["reason"]}
+    if not status["stale"]:
+        return {"count": 0, "blocking": blocking, "detail": status["reason"]}
+    n = len(status["added"]) + len(status["removed"]) or 1
+    suffix = "" if blocking else " (advisory: lessons.loop is judgement)"
+    return {"count": n, "blocking": blocking, "detail": status["reason"] + suffix}
+
+
+def _lessons_validity(root: str) -> dict:
+    """Blocking close-gate lane: no open lesson may sit past its validity horizon unclosed and
+    unextended, and none may carry no horizon at all. The re-validation step, made mechanical.
+
+    An unstamped lesson counts. A lane that reported only EXPIRED entries would pass every
+    legacy log vacuously - a check that catches only the total case is not a check.
+    """
+    import lessons
+    blocking = _lessons_loop_blocking(root)
+    status = lessons.validity_status(root)
+    if not status["applicable"]:
+        return {"count": 0, "blocking": blocking, "detail": status["reason"]}
+    n = len(status["expired"]) + len(status["unstamped"])
+    suffix = "" if blocking or not n else " (advisory: lessons.loop is judgement)"
+    return {"count": n, "blocking": blocking, "detail": status["reason"] + suffix}
+
+
+# The close-gate lanes, bound as one set: the sprint close is a single obligation (write the
+# retro, re-validate the lessons, regenerate the digest the next sprint reads), so the command
+# the doctrine already prescribes - `gate --require-retro RETROxxxx` - carries all of it. A
+# separate flag per step is a step an agent under effort pressure forgets.
+LESSONS_CLOSE_CHECKS = {
+    "lessons-summary": _lessons_summary,
+    "lessons-validity": _lessons_validity,
+}
+
+
+#: The per-verifier ceiling in seconds, CI's figure: the corpus-verify job runs every criterion
+#: under 300, and a release gate on a developer machine must not read red what CI reads green. At
+#: the old 120 (the `verify_ac run` default) a 177 s verifier failed the local release gate on the
+#: v6.0.0-rc.1 commit while CI passed it, and the cut runbook carried the override by hand.
+VERIFY_TIMEOUT = 300
+#: The operator's per-verifier ceiling for the executing verify lane, in whole seconds. A slower
+#: machine reads a criterion that outlives the default as red, and the lane cannot tell a
+#: timeout from a regression, so a runner that needs longer says so here rather than banking
+#: the difference into a baseline.
+VERIFY_TIMEOUT_ENV = "SDLC_VERIFY_TIMEOUT"
+#: The pytest batch's own ceiling in seconds, every phase of the release lane's one batch run
+#: together. Held apart from the per-verifier ceiling because the batch runs every verifier
+#: file: under the per-verifier 300 s the serial batch timed out and resolved nothing (measured
+#: 2026-11-02), and each criterion paid its own cold start. A criterion the batch timed at longer
+#: than the per-verifier ceiling still reads red, so raising this one does not raise that one.
+#: Set above each of three separate runs of the parallel batch, measured on one 8-core machine
+#: on 2026-11-03 while its phases still split with `-m`: two at load 2 to 26 took 2,261 s and
+#: 2,966 s, and one at load 2 to 14 took 1,788 s (the run the changelog gives). It sits below
+#: the 4,447 s the whole 6.2.0 lane took.
+VERIFY_BATCH_TIMEOUT = 3600
+VERIFY_BATCH_TIMEOUT_ENV = "SDLC_VERIFY_BATCH_TIMEOUT"
+#: How many stories the verify lane runs at once, after the batch: a positive integer, else
+#: min(cores, `_VERIFY_WORKERS_CAP`). The pytest batch answers only a bare `pytest <node>` line
+#: whose file it collected; the rest (631 lines that are not a bare node on 2026-11-03) ran one
+#: story at a time. `1` runs one at a time again, though a story naming a `serial_only` test
+#: module still runs after the rest.
+VERIFY_WORKERS_ENV = "SDLC_VERIFY_WORKERS"
+_VERIFY_WORKERS_CAP = 8
+_MAX_NAMED = 10       # failing ACs listed by name before the detail is elided
+
+
+def _positive(raw: str | None, default: int) -> int:
+    """`raw` when it is a positive integer, else `default`."""
+    try:
+        seconds = int(raw or default)
+    except ValueError:
+        return default
+    return seconds if seconds > 0 else default
+
+
+def _ceiling(env: str, default: int) -> int:
+    """The ceiling in force for THIS run: `env` when it is a positive integer, else `default`.
+    Read when the lane runs, never when it is registered."""
+    return _positive(os.environ.get(env), default)
+
+
+def _verify_timeout() -> int:
+    """The per-verifier ceiling in force for THIS run. It reads its variable itself, where
+    tools/tests/test_lint_workflow_coverage.py finds the name the CI corpus job must set."""
+    return _positive(os.environ.get(VERIFY_TIMEOUT_ENV), VERIFY_TIMEOUT)
+
+
+def _verify_workers() -> tuple[int, int]:
+    """`(workers in force for THIS run, the default)` for the verify lane's story pool."""
+    default = min(os.cpu_count() or 1, _VERIFY_WORKERS_CAP)
+    return _ceiling(VERIFY_WORKERS_ENV, default), default
+
+
+#: A unittest dotted name, `tests.test_gate.GateTests`, read as the module path it names.
+_DOTTED_NAME = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
+
+
+def _names_serial_only(verifiers: list[str], root: Path, memo: dict) -> bool:
+    """Does one of a story's Verify lines name a test module whose text carries `serial_only`?
+
+    `run_tests_plan`'s text test, applied to each test module (`test_*.py` or `*_test.py`) a line
+    names, once quotes are dropped and any `::node` is cut: as a path, or as a unittest dotted
+    name (`tests.test_gate.GateTests` names `tests/test_gate.py`). Each is read against the
+    workspace root and against every directory the line names, so `cd <dir> && python3 -m
+    unittest <dotted>` and `discover -s <dir> -p <file>` both count. A directory named as the
+    target itself is not searched, and a script that is not a test module is never read.
+    `memo` holds each file's answer, so a file is read once per run."""
+    for line in verifiers:
+        tokens = [t.split("::", 1)[0] for t in line.replace("'", " ").replace('"', " ").split()]
+        # `os.path.isdir`, never `Path.is_dir`: each word is statted, and on Python 3.10 and 3.12
+        # `Path.is_dir` raises, out of the whole lane, for a word whose stat fails with
+        # ENAMETOOLONG (a 300-character grep pattern) or EACCES (a path under an unreadable
+        # directory). `os.path.isdir` answers False.
+        bases = [root, *(root / t for t in tokens if t and os.path.isdir(root / t))]
+        for token in tokens:
+            if token.endswith(".py"):
+                names = [token]
+            elif _DOTTED_NAME.fullmatch(token):
+                parts = token.split(".")
+                names = ["/".join(parts[:i]) + ".py" for i in range(1, len(parts) + 1)]
+            else:
+                continue
+            for name in names:
+                module = name.rsplit("/", 1)[-1]
+                if not (module.startswith("test_") or module.endswith("_test.py")):
+                    continue
+                for path in (base / name for base in bases):
+                    if path not in memo:
+                        memo[path] = "serial_only" in (sdlc_md.read_text_safe(path) or "")
+                    if memo[path]:
+                        return True
+    return False
+
+
+def _pytest_batch_clause(cache, verifiers: int) -> str:
+    """The cost clause's batch half: how many pytest verifiers the batch answered, of the
+    `verifiers` it could, and why it answered none: its own reason when it failed, and when it
+    ran, that none of the tests it reported answered one. Never a bare `(batched)`, which read
+    the same whether the batch resolved every criterion or timed out and resolved nothing."""
+    rest = verifiers - cache.resolved
+    how = ("in one serial run" if "parallel" not in cache.phases else "on xdist workers"
+           + (", then its serial_only tests with no worker" if "serial_only" in cache.phases
+              else ""))
+    what = (f": {cache.reason}, so each ran on its own" if cache.reason else
+            f" in {cache.seconds:.0f}s {how}"
+            + ("" if not rest else f", the other {rest} on their own" if cache.resolved else
+               f", but its {len(cache)} reported test(s) answered none of them, so each ran on "
+               f"its own"))
+    return (f" (batch resolved {cache.resolved} of {verifiers} pytest verifier(s){what}; "
+            f"batch ceiling {cache.batch_ceiling:g}s ({VERIFY_BATCH_TIMEOUT_ENV}, default "
+            f"{VERIFY_BATCH_TIMEOUT}s))")
+
+
+def _elide(names: list[str]) -> str:
+    """`a, b, c (+2 more)` - name the failures, bound the line."""
+    more = f" (+{len(names) - _MAX_NAMED} more)" if len(names) > _MAX_NAMED else ""
+    return ", ".join(names[:_MAX_NAMED]) + more
+
+
+def _identities(ids: list[str]) -> str:
+    """`[ids: US0021::AC1 US0040::AC3]` - the machine-readable half of a clause.
+
+    Every identity, whitespace-separated, NEVER elided. `_elide` bounds the human list at ten
+    and appends a count of the rest, which is right for a line somebody reads and fatal for one
+    a lane parses: the eleventh identity is unrecoverable from `(+10 more)`, so a baseline that
+    records identities off that list records a truncation and calls it a record. Bracketed so a
+    reader stops at the clause boundary instead of running on into the next clause, and kept as
+    its own expression so the bounded job and the complete one cannot be collapsed back into one.
+    """
+    return f"[ids: {' '.join(ids)}]"
+
+
+#: The verify lane's DECLARED cost budget, in seconds. Not a timeout - the lane always
+#: finishes - but a number the run is measured against and reports exceeding, so "the release
+#: gate is slow again" is a verdict the gate states rather than something an operator discovers
+#: by killing it, after a run where the lane took over ten minutes and was therefore never run.
+#:
+#: Set to 600 against a MEASURED 453s after batching (160s for the one scoped pytest run plus
+#: ~294s of verifiers that cannot be batched). Not 300: a threshold the lane exceeds on every
+#: single run is a constant, and a warning that always fires is already switched off - which is
+#: the defect CR0419 recorded about the capacity ceiling and D0064 had to repair. Re-derive it
+#: from a measured run when the shape changes, never carry it forward silently.
+VERIFY_LANE_BUDGET_S = 600
+
+
+def _verify_acs(root: str, timeout: int | None = None, allow_external: bool = False,
+                batch: bool = False) -> dict:
+    """Blocking release-gate lane: EXECUTE every story's `Verify:` expression now, and fail
+    on any AC that is red OR unproven, naming each one.
+
+    Properties this lane must hold at once, and how it holds them:
+
+    * It EXECUTES rather than reading the stored verify-report. A merged report carries a
+      story's last green forward until something re-runs it, so a rotted verifier keeps
+      reading PASS - the stale green that reaches a tag. Silence is not assertion integrity.
+    * It does NOT write. `verify_ac run` in its normal mode rewrites each AC's
+      `- **Verified:**` back-annotation and overwrites `.local/verify-report.json`; the gate
+      is read-only (a pre-commit hook runs it), and a gate that edits tracked files while
+      judging them is not a gate. So the lane calls `verify_story(dry_run=True)` per story:
+      the verifiers run for real, nothing is written back, and the verdict is this run's.
+    * A verifier the trust boundary REFUSED TO RUN is reported as BLOCKED, never as red. On a
+      story stamped `Provenance: external`, a shell-backed verb is not executed (see
+      `verify_ac`), so its result is not evidence about the code: reporting it as a failing AC
+      sends the operator to debug a verifier that works. It still fails the lane - unproven is
+      not proof - and `allow_external` is the deliberate way to run it and reach a green.
+    * NOTHING TO PROVE IS NOT PROOF, and the guard is PER-STORY, not repo-wide. An empty story
+      set fails (a wrong --root, a moved directory). A story with an UNSPECIFIED AC - one
+      carrying no `Verify:` line at all - fails and is NAMED, because an omitted verifier is
+      not a passed one. This is per-story on purpose: a repo-wide "some executable verifier
+      exists" test let one green AC anywhere carry every verifier-less story along, so DELETING
+      a rotted `Verify:` line reached a green gate. A story whose ACs are ALL declared
+      `Verify: manual` is honestly declaring human verification and PASSES - the guard fires on
+      omission, never on a declared judgement call.
+    * It runs stories on a bounded pool and REPORTS in path order. At most `SDLC_VERIFY_WORKERS`
+      stories run at once; a story naming a test module that carries `serial_only` runs after
+      the pool has drained, one at a time; each clause lists its criteria in the order one story at
+      a time gives, so no clause depends on which verifier finished first.
+    """
+    import verify_ac
+    from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+    rr = Path(root).resolve()
+    stories = list(verify_ac.walk_stories(rr / "sdlc-studio" / "stories"))
+    if not stories:
+        return {"count": 1, "blocking": True,
+                "detail": "no stories under sdlc-studio/stories - the verify lane proved "
+                          "nothing about the AC layer (wrong --root?)"}
+    # THE SCOPE, STATED. This lane walks `sdlc-studio/stories` and nothing else, so no bug's
+    # acceptance criteria has entered the release gate in any version - 534 bug files, 55% of
+    # the delivery corpus, silently outside a pass this lane reports. Naming it is the whole of
+    # BG0530 AC5: a verification pass taken over a fraction of the corpus while reporting on
+    # "the AC layer" is the same false green one level up. Counted rather than asserted, so the
+    # number moves when the scope does.
+    try:
+        skipped = len(list((rr / "sdlc-studio" / "bugs").glob("BG*.md")))
+    except OSError:
+        skipped = 0
+    scope_note = (f" SCOPE: stories only - {skipped} bug file(s) carry acceptance criteria this "
+                  f"lane does not walk, so this pass says nothing about them."
+                  if skipped else "")
+    started = time.time()
+    # One ceiling for every verifier this run executes: a per-criterion spawn is killed at it,
+    # and a criterion the pytest batch timed at longer reads red as that timeout. The batch's
+    # JUnit time leaves out the start-up and collection a spawn also pays, so a criterion a few
+    # seconds under the ceiling there can still time out alone. The pytest batch itself, every
+    # verifier file at once, runs under its own ceiling; jest's batch still runs under this one.
+    if timeout is None:
+        timeout = _verify_timeout()
+    jest_cache = verify_ac.jest_batch_cache(rr, timeout) if batch else None
+    # Without batching this lane pays a cold pytest start PER CRITERION. 694 of this
+    # workspace's 1,223 Verify lines are pytest and a bare start costs ~1.26s, so the spawns
+    # alone were ~15 minutes and `--release` could not be completed inside any usable timeout.
+    # One scoped run replaces them. The cache is empty on any failure, and an absent node is
+    # never resolved from it, so a verifier always falls back to its own authoritative
+    # subprocess rather than being reported green by a batch that ran nothing.
+    pytest_targets = verify_ac.pytest_batch_targets(stories) if batch else []
+    pytest_cache = (verify_ac.pytest_batch_cache(
+        rr, timeout, pytest_targets,
+        batch_timeout=_ceiling(VERIFY_BATCH_TIMEOUT_ENV, VERIFY_BATCH_TIMEOUT))
+        if batch else None)
+    pytest_collected = (verify_ac.pytest_batch_collected(pytest_cache)
+                        if pytest_cache else None)
+    red: list[str] = []
+    # The same failures as `red`, stripped to the bare `<record>::<AC>` address. The human list
+    # carries each verifier expression beside the id, which is what a reader needs and what a
+    # baseline must not store: the expression changes whenever a test is renamed, so an identity
+    # recorded with it drifts for reasons that are not the criterion going red or green.
+    red_ids: list[str] = []
+    unbuilt: list[str] = []
+    blocked: list[str] = []
+    unspecified: list[str] = []
+    acs = manual = unspec = 0
+
+    def run(path: Path) -> tuple:
+        # Each story resolves against its own view of the batch. `resolve_pytest_from_cache`
+        # counts an answer with `+=` on the cache it is handed, which is not atomic across
+        # threads, so the shared cache is never handed to a worker; its count is the sum of the
+        # views', added in the main thread below.
+        view = (verify_ac.PytestBatch(pytest_cache, ceiling=pytest_cache.ceiling,
+                                      durations=pytest_cache.durations)
+                if isinstance(pytest_cache, verify_ac.PytestBatch) else pytest_cache)
+        report = verify_ac.verify_story(path, dry_run=True, timeout=timeout, repo_root=rr,
+                                        jest_cache=jest_cache, pytest_cache=view,
+                                        pytest_collected=pytest_collected,
+                                        allow_external=allow_external)
+        return report, getattr(view, "resolved", 0)
+
+    # THE POOL. The batch has already run; what is left is one subprocess per
+    # verifier it could not answer, so stories run `workers` at a time. A story naming a test
+    # module that carries `serial_only` waits until the pool has drained and then runs alone. Each
+    # report is kept against its path and read in path order, never in completion order.
+    workers, default_workers = _verify_workers()
+    memo: dict = {}
+    serial = [p for p in stories if _names_serial_only(
+        [line for block in verify_ac.criteria_blocks(sdlc_md.read_text_safe(p) or "")
+         for line in block.verifiers], rr, memo)]
+    alone = set(serial)
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {p: pool.submit(run, p) for p in stories if p not in alone}
+        pool.shutdown(wait=True)
+    except BaseException:
+        # An interrupt cancels the stories still queued; without it the interpreter's exit
+        # would wait for every one of them to run.
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    results = {p: f.result() for p, f in futures.items()}
+    for p in serial:
+        results[p] = run(p)
+    for path in stories:
+        report, resolved = results[path]
+        if isinstance(pytest_cache, verify_ac.PytestBatch):
+            pytest_cache.resolved += resolved
+        story_id = sdlc_md.extract_record_id(path.stem) or path.stem
+        acs += report.ac_count
+        manual += report.manual
+        unspec += report.unspecified
+        if report.unspecified:
+            unspecified.append(f"{story_id} ({report.unspecified} AC(s) with no Verify: line)")
+        status = _story_status(path)
+        claims_done = _claims_completion(status)
+        for f in report.failures:
+            name = f"{story_id}::{f['ac']} ({f['verifier']})"
+            # BLOCKED WINS, at every status. A blocked verifier was not run at all - the trust
+            # boundary refused it - so it is an UNPROVEN criterion rather than a judged one, and
+            # that is true whether or not the story claims completion. Ordered first deliberately:
+            # the alternative reading, `blocked and claims_done`, quietly un-blocks a
+            # `Provenance: external` story sitting at Ready, turning "nobody ran this" into
+            # "nothing to see" - and no test caught that until a review mutated it.
+            if f.get("kind") == "blocked":
+                blocked.append(name)
+            elif claims_done:
+                red.append(name)
+                red_ids.append(f"{story_id}::{f['ac']}")
+            else:
+                # COUNTED SEPARATELY, NOT DROPPED. A red criterion on a story nobody claims is
+                # finished is unbuilt behaviour, and on a `design` rung it is the RUNG'S OWN
+                # PRODUCT - that rung exists to author criteria that fail until the code exists.
+                # It is still executed, still listed, and still reported; what it is not is a
+                # regression, which is the only thing the corpus baseline measures.
+                unbuilt.append(f"{name} [{status or '?'}]")
+    executable = acs - manual - unspec
+    elapsed = int(time.time() - started)
+    # State the cost and the scope. A `--release` run that got fast by judging less
+    # is the exact defect `--release` exists to catch, so a reader must be able to tell the two
+    # apart without rerunning it.
+    how = (_pytest_batch_clause(pytest_cache, len(pytest_targets)) if batch
+           else " (per-AC subprocess)")
+    how += (f", stories on {workers} worker(s) ({VERIFY_WORKERS_ENV}, default {default_workers})"
+            + (f", then {len(serial)} naming a serial_only test module, one at a time"
+               if serial else ""))
+    cost = (f"{len(stories)} story/stories, {executable} executable AC(s) in {elapsed}s{how}"
+            f"{f' - OVER the {VERIFY_LANE_BUDGET_S}s declared budget' if elapsed > VERIFY_LANE_BUDGET_S else ''}")
+    parts = []
+    if unspecified:
+        parts.append(f"{len(unspecified)} story/stories with an unspecified AC (no Verify: line "
+                     f"- an omitted verifier is not a passed one; author one or mark it "
+                     f"`Verify: manual`): {_elide(unspecified)}")
+    if red:
+        # The bounded human list AND the complete machine-readable one, in that order. The corpus
+        # lane records WHICH criteria are red, not merely how many, so an equal-sized swap - one
+        # repaired and one introduced in the same window - stops being silent; it cannot do that
+        # from a list that ends at ten.
+        parts.append(f"{len(red)} red AC(s): {_elide(red)} {_identities(red_ids)}")
+    if unbuilt:
+        # REPORTED, and deliberately not folded into the red count. Every suppression is also a
+        # blindfold: a criterion excluded from the metric but printed nowhere is one nobody can
+        # audit the exclusion of. It carries each story's status so a reader can judge the call
+        # rather than take it.
+        # LISTED IN FULL, deliberately not elided. Every other clause here names a handful of
+        # failures a reader will go and fix, and eliding those costs nothing. This clause is the
+        # EXCLUSION LEDGER - the criteria being removed from the number the release baseline
+        # enforces - and "auditable rather than taken on trust" is false if 57 of 67 read
+        # `(+57 more)`. A review measured exactly that against the real corpus. The set is
+        # verbose by construction and appears only under `--release`.
+        parts.append(f"{len(unbuilt)} failing AC(s) on stories claiming NO completion - unbuilt "
+                     f"or abandoned, not a regression, so outside the corpus red count: "
+                     f"{', '.join(unbuilt)}")
+    if blocked:
+        parts.append(f"{len(blocked)} unproven AC(s) - verifier BLOCKED unrun by the "
+                     f"trust boundary (story stamped Provenance: external): {_elide(blocked)}; "
+                     f"pass --allow-external to run them once you trust the content")
+    # The criteria that actually PASSED. `executable` is everything that ran, failures
+    # included, so it is the green figure ONLY where nothing failed. The first repair of the
+    # exclusion-only PASS printed `executable` on a branch that is non-empty by construction
+    # and so reported `3/3 green` beside `2 failing` in one line - BG0530 AC5's own
+    # false-green-over-a-fraction, reintroduced by the sentence written to repair it. Subtract
+    # every failing class, never a subset: a partial subtraction is the same defect quieter.
+    passing = executable - len(red) - len(unbuilt) - len(blocked)
+    if parts:
+        count = len(unspecified) + len(red) + len(blocked)
+        # The scope disclosure belongs on every verdict this lane can render. When the
+        # exclusion ledger is the only clause the count is 0 and this branch renders PASS - so
+        # a pass could be printed with the un-walked corpus undisclosed. The green summary is
+        # restored on that path for the same reason: a PASS that states no denominator is a
+        # verdict a reader cannot size.
+        green = ("" if count else
+                 f" {passing}/{acs} executable AC(s) green across "
+                 f"{len(stories)} story/stories ({manual} manual).")
+        return {"count": count, "blocking": True,
+                "detail": "; ".join(parts) + f" [{cost}]" + green + scope_note}
+    if acs == 0:
+        return {"count": 1, "blocking": True,
+                "detail": f"no acceptance criteria across {len(stories)} story/stories - the "
+                          f"verify lane proved nothing about the AC layer (wrong --root?)"
+                          + scope_note}
+    return {"count": 0, "blocking": True,
+            "detail": f"{passing}/{acs} executable AC(s) green across "
+                      f"{len(stories)} story/stories ({manual} manual) [{cost}]"
+                      + scope_note}
+
+
+def _review_legs(root: str) -> dict:
+    """Blocking release-gate lane: every required DOCUMENT leg (PRD/TRD/TSD/Persona) must be
+    PRESENT or explicitly WAIVED against a recorded decision id. A required leg that is absent
+    and unwaived FAILS - the review cannot reclassify a missing leg as 'optional' in prose,
+    because a waiver is a decisions-log row (`decisions.py waive --leg <leg>`), not narrative.
+
+    The CODE leg is out of scope: it has no single artefact whose presence can be tested, so this
+    lane makes no claim about it (decision D0022) - it states that exclusion in every verdict, so a
+    green lane is never misread as certifying the code leg too.
+    """
+    import review_prep
+    legs = review_prep.required_legs(Path(root).resolve())
+    absent = sorted(k for k, v in legs.items() if not v["present"] and not v["waiver"])
+    waived = sorted(f"{k} ({v['waiver']})" for k, v in legs.items()
+                    if not v["present"] and v["waiver"])
+    if absent:
+        detail = (f"{len(absent)} required leg(s) absent and unwaived: {', '.join(absent)} - "
+                  f"add the artefact, or record a waiver (`decisions.py waive --leg <leg> "
+                  f"--rationale ...`); CODE leg out of scope (D0022)")
+    else:
+        present = sorted(k for k, v in legs.items() if v["present"])
+        detail = (f"{len(present)} required leg(s) present"
+                  + (f"; waived: {', '.join(waived)}" if waived else "")
+                  + " (CODE leg out of scope, D0022)")
+    return {"count": len(absent), "blocking": True, "detail": detail}
+
+
+# What each bound lane is FOR, named in the refusal so an operator who deselects one is
+# told what the verdict would have been printed over. A lane with no entry falls back to
+# the generic phrase.
+BOUND_LANE_SUBJECT = {
+    "verify": "the AC layer",
+    "review-legs": "the required document legs (present or waived)",
+    "retro": "the sprint close's learning loop",
+    "lessons-summary": "the sprint close's learning loop",
+    "lessons-validity": "the sprint close's learning loop",
+    "review-current": "the sprint close's review currency",
+}
+
+
+#: The gate's own declared cost budget, in seconds. Not a timeout - the gate always finishes -
+#: but a number every run is measured against and reports exceeding, so "the gate got slower"
+#: is a verdict it states rather than something an operator absorbs one commit at a time.
+#:
+#: Derived from `GATE_BUDGET_MEASURED` below and never set apart from it: first set against a
+#: measured 33s, it stays 45, 13% above the 39.8s run recorded there. Not the measurement
+#: itself: a threshold a normal run exceeds is a constant, and a warning that always fires is
+#: already switched off. Re-measure when the lane set changes and replace the record, never
+#: carry it forward silently. A project overrides it with `gate.budget_seconds` in `.config.yaml`.
+GATE_BUDGET_S = 45
+
+#: The run `GATE_BUDGET_S` is derived from, as data a test holds it to: `gate.py --root .` over
+#: this workspace on a tree with a staged change that touches no story, as the commit hook runs
+#: it, with the one-minute load average at its start. A clean tree is not this run: with nothing
+#: changed, conformance judges the whole workspace.
+GATE_BUDGET_MEASURED = {"seconds": 39.8, "date": "2026-11-01", "commit": "1ccb8795",
+                        "load_average_1m": 7.96, "cores": 8}
+
+#: Where the last run's cost is kept, so the next one can state a direction of travel.
+GATE_COST_REL = "sdlc-studio/.local/gate-cost.json"
+
+
+def gate_budget(root: str) -> float:
+    """The declared budget for this project, in seconds."""
+    try:
+        override = sdlc_md.project_override(root, "gate.budget_seconds", None)
+    except Exception:  # noqa: BLE001 - a cost report must never break the gate
+        override = None
+    try:
+        value = float(override) if override is not None else float(GATE_BUDGET_S)
+    except (TypeError, ValueError):
+        return float(GATE_BUDGET_S)
+    return value if value > 0 else float(GATE_BUDGET_S)
+
+
+def read_gate_cost_baseline(root: str) -> float | None:
+    """The last recorded run cost, or None when there is none to compare against."""
+    try:
+        data = json.loads((Path(root) / GATE_COST_REL).read_text(encoding="utf-8"))
+        value = float(data["seconds"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    return value if value > 0 else None
+
+
+def record_gate_cost(root: str, seconds: float) -> None:
+    """Record this run's cost as the next run's baseline. Best effort: a cost report that
+    could fail a gate would be worse than no cost report."""
+    try:
+        path = Path(root) / GATE_COST_REL
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "seconds": round(float(seconds), 3),
+            "recorded_at": datetime.now(timezone.utc).isoformat()}) + "\n",
+            encoding="utf-8")
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _cost_report(root: str, results: list[dict], elapsed: float,
+                 record: bool = False, scoped: bool = False,
+                 boundary: str | None = None, boundary_lanes: set | None = None) -> dict:
+    """This run's cost, its budget, the lane that dominated it and the direction of travel.
+
+    The DOMINANT lane is what makes this actionable: a total over budget with no lane named
+    sends a reader to bisect the gate by hand, which is the same as not reporting it. A lane
+    that RAISED is timed too - an error lane that dominated the run is exactly the one that
+    needs naming.
+
+    At a push or release boundary the budget judges the standard lanes alone. It was measured
+    on the standard lane set, and a push's full suite runs far past it, so every push read OVER
+    and the line carried no signal there. The boundary lanes are named with their seconds,
+    outside the budget and the choice of dominant lane. The run is neither compared with the
+    baseline nor recorded as it, as a scoped run is not, since it measures a different lane
+    set."""
+    budget = gate_budget(root)
+    at_boundary = boundary in ("push", "release")
+    outside = boundary_lanes or set()
+    timed = [r for r in results if isinstance(r.get("seconds"), (int, float))]
+    unjudged = [r for r in timed if r["check"] in outside]
+    judged_lanes = [r for r in timed if r["check"] not in outside]
+    dominant = max(judged_lanes, key=lambda r: r["seconds"]) if judged_lanes else None
+    baseline = read_gate_cost_baseline(root)
+    judged = max(0.0, elapsed - sum(r["seconds"] for r in unjudged))
+    over = judged > budget
+    lead = (f"{elapsed:.1f}s at the {boundary} boundary; its standard lanes {judged:.1f}s"
+            if at_boundary else f"{elapsed:.1f}s")
+    if over:
+        detail = f"{lead} - OVER the {budget:g}s budget by {judged - budget:.1f}s"
+    else:
+        detail = f"{lead} of a {budget:g}s budget"
+    if dominant is not None:
+        detail += f"; dominant lane: {dominant['check']} at {dominant['seconds']:.1f}s"
+    if unjudged:
+        detail += "; outside the budget: " + ", ".join(
+            f"{r['check']} at {r['seconds']:.1f}s" for r in unjudged)
+    if scoped:
+        # No comparison either. A fraction of the lanes measured against a full-run baseline
+        # reports a saving nobody made - the same defect as recording it, read from the other
+        # side, and the more misleading of the two because it looks like good news.
+        detail += ("; SCOPED run - not compared with the baseline and not recorded as it "
+                   "(it measures fewer lanes)")
+    elif at_boundary:
+        detail += ("; BOUNDARY run - not compared with the baseline and not recorded as it "
+                   "(it measures a different lane set)")
+    elif baseline is None:
+        detail += "; no baseline recorded yet, so this run becomes it"
+    else:
+        delta = elapsed - baseline
+        pct = abs(delta) / baseline * 100.0
+        if pct < 1.0:
+            detail += f"; level with the {baseline:.1f}s baseline"
+        else:
+            detail += (f"; {pct:.0f}% {'slower' if delta > 0 else 'faster'} than the "
+                       f"{baseline:.1f}s baseline")
+    # A SCOPED run never becomes the baseline. `--only`/`--skip` cover a fraction of the lanes,
+    # so recording one lowers the number the next FULL run is compared against, and that run
+    # then reads as a regression against a figure that never measured the same thing. Stated in
+    # the detail rather than silently skipped, or a reader cannot tell a scoped run from a
+    # cheap one.
+    recorded = bool(record and not scoped and not at_boundary)
+    if recorded:
+        record_gate_cost(root, elapsed)
+    return {"seconds": round(elapsed, 3), "budget": budget, "over": over,
+            "scoped": scoped, "recorded": recorded, "judged_seconds": round(judged, 3),
+            "outside_budget": {r["check"]: round(r["seconds"], 3) for r in unjudged},
+            "dominant": dominant["check"] if dominant is not None else None,
+            "dominant_seconds": (round(dominant["seconds"], 3)
+                                 if dominant is not None else None),
+            "baseline": baseline, "detail": detail}
+
+
+def run_gate(root: str = ".", only: list[str] | None = None,
+             skip: list[str] | None = None, checks: dict | None = None,
+             require_retro: str | None = None, release: bool = False,
+             allow_external: bool = False,
+             require_lessons: bool = False,
+             require_review: bool = False,
+             conformance_scope: "set[str] | None" = None,
+             record_cost: bool = False, boundary: str | None = None) -> dict:
+    """Run the selected checks and report. `ok` is False only when a BLOCKING check
+    fails; a non-blocking failure is reported but does not fail the gate. `require_retro`
+    is the SPRINT-CLOSE gate: it binds a blocking check that the named batch retro exists,
+    plus the lessons lanes (`require_lessons` binds those alone) - the close's learning loop
+    is one obligation, so one command carries it. `release` adds the blocking `verify` lane -
+    the pre-tag gate is then ONE command with ONE exit code, not a gate plus a separate verify
+    run whose exit code can be dropped. A BOUND lane cannot be deselected: a mode's verdict
+    printed over the lane that defines it is the false-assurance class this gate exists to
+    refuse."""
+    # Guard against a vacuous PASS on a wrong/missing root (a CI step pointed at the wrong
+    # dir, or a failed checkout). "No project found" must FAIL, not look all-green. Only
+    # applies to real runs; injected check registries (logic tests) skip it.
+    if checks is None:
+        rr = Path(root)
+        if not rr.exists() or not (rr / "sdlc-studio").is_dir():
+            return {"ok": False, "checks": [{
+                "check": "scope", "count": 0, "blocking": True, "status": "fail",
+                "detail": f"no SDLC project under {root} (no sdlc-studio/ dir) - wrong --root?"}]}
+    registry = dict(checks) if checks is not None else {**DEFAULT_CHECKS, **ON_DEMAND_CHECKS}
+    # Registered so `--only` can name them, and left out of a run that names nothing, unless
+    # the close runs one or the project set one to block.
+    on_demand = set() if checks is not None else (
+        set(ON_DEMAND_CHECKS) - set(CLOSE_ADVISORY_CHECKS if require_retro else ())
+        - _enforced_lanes(root))
+    bound: list[str] = []  # lanes a mode bound in: deselecting one is refused, not honoured
+    # The sprint- and release-level Definition of Done, when the project declares one,
+    # decides which close/release criteria the gate binds (the un-skippable close-down
+    # enforcement restated as the sprint-DoD close clause; shipped defaults = today's
+    # lanes, byte-compatible). A criterion whose tag the project removed is downgraded
+    # to human judgement - reported as a visible warn row, never silently unbound.
+    from lib import sdlc_md as _md  # local alias; gate already imports the lib package
+    sprint_dod = _md.dor_dod_level_checks(root, "done", "sprint")
+    release_dod = _md.dor_dod_level_checks(root, "done", "release")
+    def _dod_enforced(dod, check_id: str) -> bool:
+        return dod is None or check_id in dod
+    downgraded: list[str] = []
+    if require_retro:  # close-gate: bind the expected retro id into a blocking check
+        if _dod_enforced(sprint_dod, "close.retro"):
+            registry["retro"] = lambda r, _rid=require_retro: _retro_present(r, _rid)
+            bound.append("retro")
+        else:
+            downgraded.append("close.retro")
+    if require_retro or require_lessons:  # ...and the rest of the close's learning loop
+        if _dod_enforced(sprint_dod, "close.lessons"):
+            registry.update(LESSONS_CLOSE_CHECKS)
+            bound.extend(LESSONS_CLOSE_CHECKS)
+        else:
+            downgraded.append("close.lessons")
+    if require_review:  # close-gate review leg: LATEST.md must be current with the artefacts
+        if _dod_enforced(sprint_dod, "close.review"):
+            registry["review-current"] = _review_current
+            bound.append("review-current")
+        else:
+            downgraded.append("close.review")
+    if release:  # pre-tag: the diff-scoped lanes go back to the WHOLE workspace...
+        # A commit is judged on what it changed; a TAG is judged on everything, so the debt a
+        # pre-commit run reported as advisory blocks here. Swapped by identity against the
+        # shipped scoped lane, so a caller's own injected entry of that name is left alone.
+        for _name, _whole in WHOLE_WORKSPACE_LANES.items():
+            if registry.get(_name) is DEFAULT_CHECKS.get(_name):
+                registry[_name] = _whole
+        # ...and the executing AC-verify lane joins the standard gate...
+        # `--release` IMPLIES batching. It is the only run that executes every criterion in the
+        # workspace, so it is the one run where a cold start per criterion is unaffordable -
+        # a measured ~15 minutes of process spawns alone made the lane unrunnable
+        # and therefore unrun. A scoped run keeps the per-criterion path.
+        registry["verify"] = (lambda r, _x=allow_external:
+                              _verify_acs(r, allow_external=_x, batch=True))
+        bound.append("verify")
+        # ...and every required document leg must be present or explicitly waived: a tag over a
+        # silently-missing required artefact is the BG0110 hole this refuses to leave open.
+        registry["review-legs"] = _review_legs
+        bound.append("review-legs")
+        # ...and the version strings must agree across their authoritative homes, CHANGELOG
+        # included: a tag cut over a drifted version is a release nobody can identify later.
+        registry["versions"] = _versions_strict
+        bound.append("versions")
+        # ...and the changelog lane is UPGRADED from its standard structure/hand-edit form to
+        # the release superset that also refuses a stray uncomposed fragment at the cut. The
+        # structure/hand-edit half runs regardless (it is in DEFAULT_CHECKS); the DoD downgrade
+        # governs only the stray-fragment release criterion.
+        if _dod_enforced(release_dod, "release.changelog"):
+            registry["changelog-fragments"] = _changelog_fragments
+            bound.append("changelog-fragments")
+        else:
+            downgraded.append("release.changelog")
+    # The boundary lanes, REGISTERED rather than BOUND, so a `--boundary push --only <lane>` run
+    # stays a caller deliberately narrowing. Keyed on the BOUNDARY, not the `--release` mode flag,
+    # which is the pre-tag lane set: binding lanes to the mode refused every `--release --only`.
+    # A push pays the full suite ONCE; the lanes that cost minutes each stay at the tag.
+    pre_boundary = dict(registry)
+    if boundary in ("push", "release"):
+        registry["full-suite"] = _full_suite
+    if boundary == "release":
+        registry["release-rehearsal"] = _release_rehearsal
+        registry["module-alone"] = _module_alone
+    # The lanes the boundary added, which the cost report keeps outside the budget.
+    boundary_lanes = {n for n, f in registry.items() if pre_boundary.get(n) is not f}
+    # The sprint close scopes conformance to the BATCH it owns. On a clean tree the diff scope is
+    # empty, so the default lane judges the whole workspace and blocks an in-batch close on another
+    # author's out-of-batch debt. Applied AFTER the release swap - a TAG still judges
+    # everything - and bound only over the shipped scoped/whole lane, so a caller's injected entry
+    # of that name is left alone. Bound: the close cannot deselect the lane that proves its batch.
+    if conformance_scope is not None and not release:
+        _scope = {str(x) for x in conformance_scope}
+        if registry.get("conformance") in (DEFAULT_CHECKS.get("conformance"),
+                                            WHOLE_WORKSPACE_LANES.get("conformance")):
+            registry["conformance"] = lambda r, _s=_scope: _conformance(r, scope_ids=_s)
+            if "conformance" not in bound:
+                bound.append("conformance")
+    # The push boundary judges the pushed range. Swapped by identity against the shipped
+    # scoped lane, AFTER the release swap and the close's batch scope, so either of those wins.
+    if boundary == "push":
+        for _name, _pushed in PUSHED_RANGE_LANES.items():
+            if registry.get(_name) is DEFAULT_CHECKS.get(_name):
+                registry[_name] = _pushed
+    # A wrong/typo'd --only/--skip (or a renamed check) must FAIL, not silently select
+    # nothing and report a vacuous PASS - the false-assurance class LL0008 warns against.
+    unknown = sorted({n for n in (list(only or []) + list(skip or [])) if n not in registry})
+    if unknown:
+        return {"ok": False, "checks": [{
+            "check": "selection", "count": len(unknown), "blocking": True, "status": "fail",
+            "detail": f"unknown check name(s): {', '.join(unknown)} - "
+                      f"valid: {', '.join(sorted(registry))}"}]}
+    selected = [n for n in registry
+                if (n in only if only else n not in on_demand) and (not skip or n not in skip)]
+    if not selected:
+        return {"ok": False, "checks": [{
+            "check": "selection", "count": 0, "blocking": True, "status": "fail",
+            "detail": "no checks selected - the gate proved nothing (check --only/--skip)"}]}
+    # A bound lane is what MAKES the mode that bound it: `verify` a release gate, `retro` and
+    # the lessons lanes a sprint close. Honouring a --skip/--only that deselects one would
+    # print that mode's verdict over the very thing it claims to have examined - the
+    # passing-looking command these modes exist to abolish. Refuse instead: a caller who does
+    # not want the lane examined wants the standard gate, and should say so.
+    dropped = [n for n in bound if n not in selected]
+    if dropped:
+        subjects = sorted({BOUND_LANE_SUBJECT.get(n, "what it claims to gate")
+                           for n in dropped})
+        what = " and ".join(subjects)
+        return {"ok": False, "checks": [{
+            "check": "selection", "count": len(dropped), "blocking": True, "status": "fail",
+            "detail": f"deselecting the bound lane(s) {', '.join(dropped)} proves nothing "
+                      f"about {what} - that verdict will not be printed over them. Drop the "
+                      f"--skip/--only that excludes them, or drop the mode flag "
+                      f"(--release/--require-retro/--require-lessons) and "
+                      f"run the standard gate"}]}
+    results = []
+    run_started = time.monotonic()
+    with boundary_suite_env(boundary):
+        for name in selected:
+            lane_started = time.monotonic()
+            try:
+                r = registry[name](root)
+                results.append({"check": name, "count": r["count"], "blocking": r["blocking"],
+                                "status": "pass" if r["count"] == 0 else "fail",
+                                "detail": r.get("detail", ""),
+                                "seconds": round(time.monotonic() - lane_started, 3)})
+            except Exception as exc:  # noqa: BLE001 - one buggy check must not abort the gate
+                # A conventions shape error is the operator's config, not a buggy
+                # check: it silently disables whichever lane read it (reconcile's
+                # drift detection, most damagingly), so it must BLOCK - a green
+                # gate over a disabled lane is the false assurance class.
+                from lib.conventions import ConventionsError
+                blocking = isinstance(exc, ConventionsError) or name in BLOCKING_ON_ERROR
+                results.append({"check": name, "count": 1, "blocking": blocking,
+                                "status": "error",
+                                "detail": f"check raised{'' if blocking else ', skipped'}: {exc}",
+                                "seconds": round(time.monotonic() - lane_started, 3)})
+    if downgraded:  # the document's downgrades, visible in the verdict - never silent
+        results.append({"check": "dod-downgrades", "count": len(downgraded),
+                        "blocking": False, "status": "warn",
+                        "detail": f"downgraded to human-judged by definition-of-done.md "
+                                  f"(tag removed): {', '.join(sorted(downgraded))}"})
+    ok = all(r["status"] == "pass" for r in results if r["blocking"])
+    return {"ok": ok, "checks": results,
+            "cost": _cost_report(root, results, time.monotonic() - run_started,
+                                 record=record_cost, scoped=bool(only or skip),
+                                 boundary=boundary, boundary_lanes=boundary_lanes)}
+
+
+def _split(v: str | None) -> list[str] | None:
+    return [x.strip() for x in v.split(",") if x.strip()] if v else None
+
+
+# --- suite decision ----------------------------------------------------------------
+# Whether the unit suites need to run at all, and if so over what. A commit runs what its
+# change reaches (`select_tests` below), and nothing when that is nothing; a boundary runs
+# everything. Between them sits the reuse: a green verdict recorded over a byte-identical
+# tracked tree answers the question already, so a retry over the same tree pays nothing.
+#
+# Every unknown degrades to RUNNING. An unhashable surface, an absent or malformed record, a
+# record with no hash, a record whose verdict was red: each of those is a thing not known, and
+# a cache that answered "skip" on a thing not known would be a false green.
+
+#: Where the last suite verdict is recorded. Under `.local/`, so it is untracked and a gate
+#: run never dirties the tree it is judging.
+SUITE_VERDICT_REL = "sdlc-studio/.local/gate-suite-verdict.json"
+
+#: Directory names never hashed into the surface. Build caches and generated local state
+#: change on every run, so hashing them would make the surface differ from itself and the
+#: skip could never fire - a cache nothing can hit is a cache that was never built.
+_SURFACE_SKIP_DIRS = frozenset({
+    "__pycache__", ".git", ".local", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "node_modules", ".venv", "venv", ".tox",
+})
+
+
+def surface_files(root: str = ".") -> list[str]:
+    """Every TRACKED repo-relative file, sorted - not the measured read set.
+
+    The measured set is a proxy, and a proxy is the wrong instrument for "did anything change".
+    Measured on this repo it omitted 233 tracked files - SKILL.md, every help/ and reference-*.md
+    page, README, CHANGELOG, AGENTS.md, the workflows - and an edit to SKILL.md left the digest
+    BYTE-IDENTICAL while three tests in test_command_audit.py went red. A cache that can mask a
+    change is the false-green this module exists to refuse, so the digest now covers everything
+    git tracks: 2,517 files hash in 0.03s, which makes the precision worth nothing and the
+    completeness worth everything.
+
+    Falls back to the measured surface only when git cannot answer, and that fallback is reported
+    by `surface_hash` returning None rather than a narrower digest, so an unanswerable probe runs
+    the suites instead of reusing a verdict taken over less.
+    """
+    root = os.path.abspath(root)
+    import subprocess as _sp  # local: gate.py keeps heavy imports off the cold paths
+    try:
+        proc = _sp.run(["git", "-C", root, "ls-files", "-z"],
+                       capture_output=True, text=True, timeout=30)
+        if proc.returncode == 0:
+            return sorted(p for p in proc.stdout.split("\0") if p)
+    except (OSError, _sp.SubprocessError):
+        pass
+    return []
+
+
+def surface_hash(root: str = ".") -> str | None:
+    """A content digest of the test-relevant surface, or None when it cannot be taken.
+
+    None is UNKNOWN, never "unchanged": the caller runs the suites on it. Names are hashed
+    alongside contents, so a rename that preserves every byte still changes the digest."""
+    import hashlib
+    root_abs = os.path.abspath(root)
+    digest = hashlib.sha256()
+    files = surface_files(root_abs)
+    if not files:
+        # An empty surface is git declining to answer, not a tree with nothing in it. Hashing
+        # nothing yields a STABLE digest, which would make the skip fire for ever on any
+        # directory git cannot enumerate - the false-green this returns None to avoid.
+        return None
+    try:
+        for rel in files:
+            path = os.path.join(root_abs, rel)
+            digest.update(rel.encode("utf-8", "surrogateescape") + b"\0")
+            if os.path.isfile(path):
+                with open(path, "rb") as handle:
+                    digest.update(hashlib.sha256(handle.read()).hexdigest().encode("ascii"))
+            else:
+                digest.update(b"ABSENT")   # a named path that is gone is a CHANGE
+            digest.update(b"\n")
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def read_suite_verdict(root: str = ".") -> dict | None:
+    """The recorded suite verdict, or None when there is nothing trustworthy to read.
+
+    One reader for absent, unreadable and malformed, because the caller must treat all three
+    the same way: as an answer it does not have."""
+    path = Path(root) / SUITE_VERDICT_REL
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict) or not data.get("run"):
+        return None
+    return data
+
+
+def record_suite_verdict(root: str = ".", *, run: str, status: str = "green",
+                         mode: str = "full", digest: str | None = None) -> Path:
+    """Record `status` for the current surface, attributed to the run that earned it.
+
+    `mode` is how much of the suite earned it - `full` or `selected`. It is recorded because
+    a green from a SELECTED run is evidence about the tests that ran, not about the suite, so
+    a boundary must not reuse it (see `suite_decision`). A record with no mode is read as
+    UNKNOWN coverage, which a boundary also declines."""
+    path = Path(root) / SUITE_VERDICT_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run": str(run),
+        "status": str(status),
+        "mode": str(mode),
+        "surface_hash": digest if digest is not None else surface_hash(root),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+# --- test selection ---
+# What a commit runs: the test modules its change reaches, read from the test sources alone.
+# Four routes, each a fact a test module states about itself - the changed test module, the
+# `x.py` -> `test_x.py` naming convention the TSD states, the modules that import or load `x` by
+# name, and the modules whose `test-census-subject` header names the changed file. Script edges
+# are DIRECT: a hub such as `sdlc_md` is imported by nearly every script, so following a
+# script's dependents transitively selects most of the suite on every commit. Between test
+# modules, one that imports a fixture test module inherits what that module imports or loads,
+# one level deep; it does not inherit the fixture's name or census subject.
+# Whatever these routes miss selects NOTHING per commit and is caught by the full suite at the
+# push boundary: a library no test module imports, loads, is named for or declares, which tests
+# drive only through another script (`lib/tiers.py`), and a file that is not `.py` or `.sh` (a
+# hook, a docs page, pytest.ini) that no module declares as its census subject.
+# That is the price of a commit that stays fast, and the skip reason says so.
+
+#: Where the suites live, as repo-relative directories.
+TEST_SUITE_DIRS = (
+    ".claude/skills/sdlc-studio/scripts/tests",
+    "tools/tests",
+)
+
+#: The file kinds a test module can import, load or be named for. A doc, a template or an
+#: artefact is none of these, so a commit touching only those selects only the modules that
+#: declare one as their `test-census-subject`.
+_CODE_SUFFIXES = (".py", ".sh")
+
+
+def _normalise(paths) -> list[str]:
+    out: list[str] = []
+    for raw in paths:
+        candidate = str(raw).strip().replace(os.sep, "/")
+        while candidate.startswith("./"):
+            candidate = candidate[2:]
+        candidate = candidate.lstrip("/")
+        if candidate and candidate not in out:
+            out.append(candidate)
+    return out
+
+
+#: `from X import a, b` (one line or parenthesised) and `import a.b, c`.
+_FROM_IMPORT = re.compile(
+    r"^[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]+(?:\(([^)]*)\)|([^\n#]*))", re.M)
+_PLAIN_IMPORT = re.compile(r"^[ \t]*import[ \t]+([^\n#]*)", re.M)
+
+#: How a test module NAMES the script it loads dynamically. Many modules here build their
+#: subject with `spec_from_file_location` or the shared `loader.load_script` rather than an
+#: import, so there is no import statement to read.
+_LOADER_NAME = re.compile(
+    r"""spec_from_file_location\(\s*["']([a-z_][a-z0-9_]*)["']"""
+    r"""|_load\(\s*["']([a-z_][a-z0-9_]*)["']"""
+    r"""|load_script\(\s*["']([a-z_][a-z0-9_]*)["']"""
+    r"""|SCRIPTS\s*/\s*["']([a-z_][a-z0-9_]*)\.py["']""",
+    re.IGNORECASE)
+
+#: The header a test module names its subject with, `# test-census-subject: <path>`. The subject
+#: may be any file. For one that is not code (a document, a hook) the header is the only route
+#: that selects the module; for a code file it also selects a module that tests the file without
+#: importing, loading or being named for it. Read as this repository's `tools/test_census.py`
+#: reads it: the FIRST marker in the file's first `_CENSUS_HEAD_LINES` lines, wherever it sits
+#: among them, so neither a second marker nor a marker line inside a fixture's string further
+#: down claims a subject.
+_CENSUS_SUBJECT = re.compile(r"^#[ \t]*test-census-subject:[ \t]*(\S+)[ \t]*$", re.M)
+_CENSUS_HEAD_LINES = 40
+
+
+def _imported_names(text: str) -> set[str]:
+    """Every module-name component a source imports: `from lib import sdlc_md` yields both
+    `lib` and `sdlc_md`, since the imported name may itself be the module."""
+    items: list[str] = []
+    for m in _FROM_IMPORT.finditer(text):
+        items.append(m.group(1))
+        items.extend((m.group(2) or m.group(3) or "").split(","))
+    for m in _PLAIN_IMPORT.finditer(text):
+        items.extend(m.group(1).split(","))
+    names: set[str] = set()
+    for item in items:
+        words = item.split()
+        if words:
+            names.update(p.lower() for p in words[0].split(".") if p.isidentifier())
+    return names
+
+
+def _selection_indexes(root: str) -> tuple[dict, dict]:
+    """`(reach, census)` from ONE read of the test sources: `reach` is `{module stem: {test
+    modules that import or load it, or import a fixture test module that does}}`, `census` is
+    `{repo-relative path: {test modules whose test-census-subject names it}}`.
+
+    A test module that imports another test module inherits what that module imports or loads,
+    one level deep: a module whose tests subclass a fixture module's base class drives the
+    scripts that fixture loads, though its own source names none of them.
+    """
+    base = Path(root)
+    reach: dict[str, set[str]] = {}
+    by_stem: dict[str, str] = {}
+    census: dict = {}
+    for suite in TEST_SUITE_DIRS:
+        tests_dir = base / suite
+        if not tests_dir.is_dir():
+            continue
+        for module in sorted(tests_dir.glob("test_*.py")):
+            text = sdlc_md.read_text_safe(module)
+            if not text:
+                continue
+            rel = f"{suite}/{module.name}"
+            names = _imported_names(text)
+            names.update(next(g for g in m.groups() if g).lower()
+                         for m in _LOADER_NAME.finditer(text))
+            reach[rel] = names
+            by_stem.setdefault(module.stem.lower(), rel)
+            if "test-census-subject" in text:       # over a third of modules carry one
+                head = "\n".join(text.splitlines()[:_CENSUS_HEAD_LINES])
+                if m := _CENSUS_SUBJECT.search(head):
+                    census.setdefault(m.group(1), set()).add(rel)
+    out: dict = {}
+    for rel, names in reach.items():
+        inherited: set[str] = set()
+        for name in names:
+            fixture = by_stem.get(name)
+            if fixture and fixture != rel:
+                inherited |= reach[fixture]     # the fixture's own reach, not its inheritance
+        for name in names | inherited:
+            out.setdefault(name, set()).add(rel)
+    return out, census
+
+
+def reach_index(root: str) -> dict:
+    """`{module stem: {test modules that import or load it, or import a fixture test module
+    that does}}`, read from the test sources.
+
+    The import graph restricted to the edges selection needs, in one regex pass: building the
+    whole repository's graph took four seconds, and the commit hook asks this on every commit.
+    """
+    return _selection_indexes(root)[0]
+
+
+def suite_modules(root: str = ".") -> list[str]:
+    """Every test module of both suites, repo-relative: the whole of what a full run covers."""
+    base = Path(root)
+    return sorted(f"{suite}/{p.name}" for suite in TEST_SUITE_DIRS
+                  if (base / suite).is_dir() for p in (base / suite).glob("test_*.py"))
+
+
+def select_tests(root: str = ".", changed: "list[str] | None" = None) -> dict:
+    """The test modules `changed` reaches, or an unresolved verdict meaning "run all".
+
+    `{"resolved": bool, "selectors": [...], "total": int, "excluded": int, "reason": str}`.
+    `resolved` False means nothing is known about the change - no suites to select from, or a
+    changed-file probe that could not answer - and the caller runs everything. Resolved with no
+    selectors is an answer: no changed file is a test module, and no test module imports, loads,
+    is named for or declares as its census subject a changed file, so the commit runs no unit
+    suite and the push's full run is the check.
+    """
+    result: dict = {"resolved": False, "selectors": [], "total": 0, "excluded": 0,
+                    "reason": ""}
+    modules = suite_modules(root)
+    if not modules:
+        result["reason"] = "no test suites here to select from - running everything"
+        return result
+    result["total"] = len(modules)
+    if changed is None:
+        result["reason"] = ("the changed-file probe could not answer, so nothing is known "
+                            "about this diff - running everything")
+        return result
+    module_set = set(modules)
+    index, census = _selection_indexes(root)
+    selected: set[str] = set()
+    paths = _normalise(changed)
+    code = [p for p in paths if p.endswith(_CODE_SUFFIXES)]
+    for path in code:
+        if path in module_set:
+            selected.add(path)
+        stem = Path(path).stem.replace("-", "_").lower()
+        selected |= {m for m in modules if os.path.basename(m).lower() == f"test_{stem}.py"}
+        selected |= index.get(stem, set())
+    for path in paths:
+        selected |= census.get(path, set())
+    result["resolved"] = True
+    result["selectors"] = sorted(selected)
+    result["excluded"] = len(modules) - len(selected)
+    if selected:
+        result["reason"] = (f"{len(selected)} of {len(modules)} test module(s) selected for "
+                            f"the {len(paths)} changed file(s): each is one of them, or imports, "
+                            f"loads, is named for or declares as its census subject one of them "
+                            f"(an import or load counts through one fixture test module too); "
+                            f"{result['excluded']} excluded, and the full suite runs at push")
+    else:
+        result["reason"] = ("no test module imports, loads, is named for or declares as its "
+                            "census subject a changed file (an import or load counts through "
+                            "one fixture test module too), so no unit suite runs here. "
+                            "Selection does not follow a script into the code it imports: a "
+                            "library tests drive only through another script waits for the "
+                            "full suite at push, which runs every module")
+    return result
+
+
+#: The pytest-xdist release that added `--maxschedchunk`. An older one refuses the option with
+#: exit 4, which would fail every commit's tests and every push's full suite.
+MAXSCHEDCHUNK_SINCE = (3, 2, 0)
+
+
+def xdist_takes_maxschedchunk() -> bool:
+    """Whether the installed pytest-xdist knows `--maxschedchunk`. A missing or unparseable
+    version answers no: the flag is a speed-up, never a reason to refuse a run."""
+    import importlib.metadata  # noqa: PLC0415
+    try:
+        version = importlib.metadata.version("pytest-xdist")
+        return tuple(int(part) for part in version.split(".")[:3]) >= MAXSCHEDCHUNK_SINCE
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        return False
+
+
+def run_tests_plan(selectors: list[str], parallel: bool, root: str = ".", *,
+                   commit: bool = False) -> list[list[str]]:
+    """The pytest command lines that run `selectors`, in order.
+
+    With pytest-xdist, the selection runs across every core and the tests marked `serial_only`
+    (they assert on global tree state, so a concurrent worker makes them wrong, or bound a
+    wall-clock duration from above) follow on their own, over only the modules that carry the
+    marker. Without it, one serial run.
+
+    The parallel phase hands tests out one at a time (`--maxschedchunk=1`), though xdist still
+    keeps two queued per worker. Its default first hand-out is a block of consecutive tests per
+    worker - about 33 on a hub commit's selection - so a class of heavy tests queued on one
+    worker while the rest idled (21% busy, measured). An xdist older than 3.2.0 does not know
+    the option, so it gets the default hand-out rather than a refused run.
+
+    `commit` is a commit's selected run: every phase leaves out the tests marked
+    `boundary_only`, which run the real gate or a boundary lane for 10-37s each (measured), or
+    bound a wall-clock duration from above. The push's full-suite lane calls this without it, so
+    it runs them."""
+    base = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+    deferred = " and not boundary_only" if commit else ""
+    if not parallel:
+        return [base + (["-m", "not boundary_only"] if commit else []) + list(selectors)]
+    serial = [s for s in selectors
+              if "serial_only" in (sdlc_md.read_text_safe(Path(root) / s) or "")]
+    chunk = ["--maxschedchunk=1"] if xdist_takes_maxschedchunk() else []
+    plan = [base + ["-n", "auto", *chunk, "-m", "not serial_only" + deferred] + list(selectors)]
+    if serial:
+        plan.append(base + ["-m", "serial_only" + deferred] + serial)
+    return plan
+
+
+def missing_test_paths(selectors: list[str], root: str = ".") -> list[str]:
+    """The selectors, in order, whose path (the part before any `::`) names no file or
+    directory under `root`. `os.path.exists` answers a name too long to stat, or one carrying a
+    NUL byte, as absent rather than raising."""
+    return [s for s in selectors
+            if not os.path.exists(os.path.join(root, s.split("::", 1)[0]))]
+
+
+def unresolved_node_ids(selectors: list[str], root: str = ".") -> list[str]:
+    """The selectors, in order, carrying a `::` node id that pytest refuses to collect under
+    `root` (exit 4, a usage error such as "not found"): a file that exists, naming a test that
+    does not. Under pytest-xdist such a node id beside a failing module exits 5 having run
+    nothing, as a missing path did.
+
+    A selection with no `::` (the commit hook's whole modules) spawns nothing. Otherwise one
+    `pytest --collect-only` reads every node id at once, and only when that one is refused does
+    each node id get its own, so the refusal names the ones at fault. Any exit but 4 (5 for a
+    node id that collects nothing, say) is left to the run, whose own verdict reads it."""
+    import subprocess  # noqa: PLC0415
+    nodes = [s for s in selectors if "::" in s]
+
+    def refused(batch: list[str]) -> bool:
+        return subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q",
+                               "-p", "no:cacheprovider", *batch],
+                              cwd=root, capture_output=True, text=True,
+                              check=False).returncode == 4
+
+    if not nodes or not refused(nodes):
+        return []
+    return [n for n in nodes if refused([n])]
+
+
+def cmd_run_tests(args: argparse.Namespace) -> int:
+    """Run the selected test modules; exit non-zero when any test fails.
+
+    Without a boundary this is a commit's selection, which leaves the `boundary_only` tests to
+    the push. With one (`--boundary push`, as CI and `run-suite.sh` run tools/tests) it is the
+    push's own plan, so they run: CI and the push then give one verdict on the same tests.
+
+    pytest's exit 5 (nothing collected) is a pass here: a module whose every test is
+    `serial_only` leaves the parallel phase empty, and the serial phase then runs them. So a
+    selector whose path (the part before any `::`) names nothing under `--root` is refused by
+    name, exit 2, before pytest starts: under pytest-xdist a missing path beside a real one
+    exits 5 having run nothing, which read as a pass over a failing module. A node id whose
+    file exists but whose test pytest refuses to collect does the same, so it is refused by name
+    too, exit 2, after pytest's own `--collect-only` and before any test runs."""
+    import importlib.util
+    import subprocess
+    try:
+        boundary = resolve_boundary(args)
+    except BoundaryError as exc:
+        print(f"unit-tests: refused - {exc}", file=sys.stderr)
+        return 2
+    missing = missing_test_paths(args.run_tests, args.root)
+    if missing:
+        print(f"unit-tests: refused - {len(missing)} of {len(args.run_tests)} selected path(s) "
+              f"do not exist under {args.root}, so no test ran: {', '.join(missing)}",
+              file=sys.stderr)
+        return 2
+    if importlib.util.find_spec("pytest") is None:
+        print("unit-tests: pytest is not installed, so the selection cannot run here",
+              file=sys.stderr)
+        return 2
+    unresolved = unresolved_node_ids(args.run_tests, args.root)
+    if unresolved:
+        print(f"unit-tests: refused - {len(unresolved)} of {len(args.run_tests)} selector(s) "
+              f"name a test pytest cannot collect under {args.root} (pytest --collect-only "
+              f"exited 4), so no test ran: {', '.join(unresolved)}",
+              file=sys.stderr)
+        return 2
+    parallel = importlib.util.find_spec("xdist") is not None
+    selectors = list(args.run_tests)
+    hand = ", one test at a time, two queued per worker" if xdist_takes_maxschedchunk() else ""
+    how = (f"in parallel (pytest-xdist, -n auto{hand}), serial_only tests after" if parallel
+           else "serially (pytest-xdist is not installed)")
+    deferred = (f"boundary_only tests included ({boundary} boundary)" if boundary
+                else "boundary_only tests run at push")
+    print(f"unit-tests: {len(selectors)} selected module(s) {how}; {deferred}")
+    started = time.monotonic()
+    rc = 0
+    with boundary_suite_env(boundary):
+        for argv in run_tests_plan(selectors, parallel, args.root, commit=boundary is None):
+            code = subprocess.run(argv, cwd=args.root).returncode
+            if code not in (0, 5):
+                rc = code
+    print(f"unit-tests: finished in {time.monotonic() - started:.0f}s")
+    return rc
+
+
+#: The moments the FULL suite is worth its price: a wrong answer past one of these is
+#: expensive and hard to unwind - it is out of the working tree and somebody else's to
+#: reverse. Everywhere else the gate runs what the change can reach, because paying the
+#: whole price on every keystroke-sized commit is what trains people to batch commits or
+#: reach for --no-verify, and a bypassed gate enforces nothing at all.
+BOUNDARIES = ("push", "release", "close")
+
+#: The environment spelling of `--boundary`, for a push hook or a release step that runs the
+#: gate through a wrapper it does not control the arguments of.
+BOUNDARY_ENV = "SDLC_GATE_BOUNDARY"
+
+#: The switch a `@boundary_only` test reads (`scripts/tests/boundary.py`): it executes only when
+#: this is "1" in its runner's environment, and skips otherwise.
+BOUNDARY_SUITE_ENV = "SDLC_STUDIO_BOUNDARY_SUITE"
+
+
+@contextlib.contextmanager
+def boundary_suite_env(boundary: str | None):
+    """Export `BOUNDARY_SUITE_ENV=1` to every runner spawned inside, at a push or release boundary.
+
+    Whatever route resolved the boundary - `--boundary`, `SDLC_GATE_BOUNDARY`, an in-process
+    caller - the lanes it binds run the tests deferred to it. When only the pre-push hook set the
+    switch, a hand-run release gate read a red marked test as skipped and passed. A close
+    and a commit's selection leave it as the caller had it, and so does the exit: the caller's
+    environment is restored whichever way the block ends."""
+    if boundary not in ("push", "release"):
+        yield
+        return
+    before = os.environ.get(BOUNDARY_SUITE_ENV)
+    os.environ[BOUNDARY_SUITE_ENV] = "1"
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop(BOUNDARY_SUITE_ENV, None)
+        else:
+            os.environ[BOUNDARY_SUITE_ENV] = before
+
+
+class BoundaryError(ValueError):
+    """An unrecognised boundary. Refused rather than downgraded: a typo that quietly took
+    the selective path would leave the caller believing they had asked for everything, which
+    is the false-assurance class this gate exists to refuse."""
+
+
+def resolve_boundary(args=None) -> str | None:
+    """The boundary this run is at - the flag, else the environment, else none."""
+    value = getattr(args, "boundary", None) if args is not None else None
+    if not value:
+        value = os.environ.get(BOUNDARY_ENV, "")
+    value = str(value or "").strip().lower()
+    if not value:
+        return None
+    if value not in BOUNDARIES:
+        raise BoundaryError(
+            f"unrecognised boundary {value!r} - expected one of {', '.join(BOUNDARIES)}. "
+            f"Refusing rather than running the selective path: a caller who asked for a "
+            f"boundary and silently got a selection would be wrong about their coverage")
+    return value
+
+
+def suite_decision(root: str = ".", changed: "list[str] | None" = None,
+                   boundary: str | None = None, reuse: bool = True) -> dict:
+    """Whether the unit suites must run over this tree, over what, and why.
+
+    `{"run", "mode", "reason", "reused", "selectors", "excluded", "surface_hash"}`, where
+    `mode` is one of `none` (the change reaches no test module), `reuse` (a green verdict
+    covers this exact tree), `selected` (run `selectors`) or `full`.
+
+    Off a boundary the selection answers first: a change no test module reaches runs nothing,
+    whatever the verdict record says. A boundary runs everything and never reuses. `reuse`
+    False asks only what `changed` selects, whatever verdict this tree has recorded.
+    """
+    at_boundary = bool(boundary)
+    selection = None if at_boundary else select_tests(root, changed)
+    if selection is not None and selection["resolved"] and not selection["selectors"]:
+        return {"run": False, "mode": "none", "reused": None, "surface_hash": None,
+                "selectors": [], "excluded": selection["excluded"],
+                "reason": selection["reason"]}
+    digest = surface_hash(root)
+    verdict = read_suite_verdict(root)
+    why: str | None = None
+    if digest is None:
+        why = "the tracked surface could not be hashed, so nothing is known about it"
+    elif not reuse:
+        why = "asked for the selection alone, so no recorded verdict is consulted"
+    elif verdict is None:
+        why = "no readable suite verdict is recorded (absent, unreadable or malformed)"
+    else:
+        recorded = verdict.get("surface_hash")
+        run_id = str(verdict.get("run"))
+        recorded_mode = str(verdict.get("mode") or "unknown")
+        if str(verdict.get("status")) != "green":
+            why = (f"the last recorded verdict ({run_id}) is {verdict.get('status')!r}, "
+                   f"not green")
+        elif not isinstance(recorded, str) or not recorded:
+            # Two unknowns must never compare equal into a green.
+            why = (f"the recorded verdict ({run_id}) carries no surface hash, so it proves "
+                   f"nothing about this tree")
+        elif recorded != digest:
+            why = f"the tracked surface has changed since the green verdict of {run_id}"
+        elif at_boundary:
+            # A boundary NEVER reuses, whatever the digest says: it is the backstop the
+            # per-commit selection leans on, and reuse would inherit every gap in whatever
+            # produced the earlier verdict.
+            why = (f"boundary {boundary}: a boundary always runs in full - it is the backstop "
+                   f"the per-commit selection relies on, so it never reuses a verdict")
+        else:
+            return {"run": False, "mode": "reuse", "reused": run_id, "surface_hash": digest,
+                    "selectors": [], "excluded": 0,
+                    "reason": (f"the tracked surface is unchanged since the {recorded_mode} "
+                               f"green verdict of {run_id} - reusing it and running no tests")}
+    if at_boundary:
+        return {"run": True, "mode": "full", "reused": None, "surface_hash": digest,
+                "selectors": [], "excluded": 0,
+                "reason": f"{why}; {boundary} is a boundary, so the FULL suite runs"}
+    return {"run": True, "mode": "selected" if selection["resolved"] else "full",
+            "reused": None, "surface_hash": digest,
+            "selectors": selection["selectors"], "excluded": selection["excluded"],
+            "reason": f"{why}; {selection['reason']}"}
+
+
+def staged_paths(root: str) -> list[str] | None:
+    """The paths the pending commit stages, both sides of a rename, or None when git cannot
+    answer. What a commit hook selects from: the working tree may hold unrelated edits."""
+    import subprocess
+    try:
+        proc = subprocess.run(["git", "diff", "--cached", "--name-only", "--no-renames"],
+                              cwd=str(root), capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.splitlines() if proc.returncode == 0 else None
+
+
+def cmd_suite_decision(args: argparse.Namespace) -> int:
+    """Print the decision and exit 0 when a run is needed, 1 when it is not.
+
+    A SENTINEL line the hook keys on, so a stubbed or old gate.py (which prints nothing) is
+    told apart from a real answer, plus an exit code."""
+    try:
+        boundary = resolve_boundary(args)
+    except BoundaryError as exc:
+        print(f"suite-decision: refused - {exc}", file=sys.stderr)
+        return 2
+    reuse = getattr(args, "changed", None) is None
+    if not reuse:
+        changed = list(args.changed)
+    elif getattr(args, "staged", False):
+        changed = staged_paths(args.root)
+    else:
+        changed = changed_paths(args.root)
+    decision = suite_decision(args.root, changed=changed, boundary=boundary, reuse=reuse)
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps(decision, indent=2))
+    else:
+        print(f"suite-decision: {'run' if decision['run'] else 'skip'} - {decision['reason']}")
+        print(f"suite-mode: {decision['mode']}")
+        for selector in decision["selectors"]:
+            print(f"suite-selector: {selector}")
+    return 0 if decision["run"] else 1
+
+
+def cmd_record_suite_verdict(args: argparse.Namespace) -> int:
+    status = getattr(args, "status", "green")
+    mode = getattr(args, "verdict_mode", "full")
+    try:
+        path = record_suite_verdict(args.root, run=args.record_suite_verdict, status=status,
+                                    mode=mode)
+    except OSError as exc:
+        # Loud, not silent: an unrecordable verdict means every later run pays full price,
+        # which is a cost regression rather than a correctness one - but a caller that
+        # believed it recorded one would be wrong about why.
+        print(f"suite verdict NOT recorded ({exc}) - the next run will pay in full",
+              file=sys.stderr)
+        return 1
+    print(f"suite-verdict: {status} ({mode}) recorded for {args.record_suite_verdict} "
+          f"at {path}")
+    return 0
+# --- end suite decision ------------------------------------------------------------
+
+
+def lane_stamp(check: dict) -> str:
+    """One lane's seconds as it is printed beside its name, or "" when it was not timed.
+
+    A separate function so a test can assert what the gate PRINTS instead of re-implementing
+    the conditional and asserting it against itself - which is what the guard here used to do,
+    and why no change to this file could redden it.
+
+    Untimed is not instant: a lane stamped `0.0s` because nobody measured it sends a reader
+    looking for cost anywhere but the lane that has it."""
+    secs = check.get("seconds")
+    return f" [{secs:.1f}s]" if isinstance(secs, (int, float)) else ""
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    if getattr(args, "run_tests", None):
+        return cmd_run_tests(args)
+    if getattr(args, "record_suite_verdict", None):
+        return cmd_record_suite_verdict(args)
+    if getattr(args, "suite_decision", False):
+        return cmd_suite_decision(args)
+    release = getattr(args, "release", False)
+    # The boundary decides which lanes are BOUND, on the same terms `--release` already does.
+    # Resolved through the shared reader so `--boundary` and SDLC_GATE_BOUNDARY agree, and an
+    # unrecognised value is refused rather than quietly read as "no boundary".
+    try:
+        boundary = resolve_boundary(args)
+    except BoundaryError as exc:
+        print(f"gate: refused - {exc}", file=sys.stderr)
+        return 2
+    report = run_gate(args.root, only=_split(args.only), skip=_split(args.skip),
+                      boundary=boundary,
+                      require_retro=getattr(args, "require_retro", None), release=release,
+                      allow_external=getattr(args, "allow_external", False),
+                      require_lessons=getattr(args, "require_lessons", False),
+                      require_review=getattr(args, "require_review", False),
+                      record_cost=True)
+    if args.format == "json":
+        print(json.dumps(report, indent=2))
+    else:
+        for c in report["checks"]:
+            mark = "PASS" if c["status"] == "pass" else ("FAIL" if c["blocking"] else "warn")
+            # Each lane's OWN seconds, beside it. The total plus a dominant lane tells a reader
+            # where the worst of the cost went; it does not tell them what the second and third
+            # lanes cost, which is what a decision about where to spend effort needs. A lane
+            # that was not timed prints nothing rather than 0.0s - untimed is not instant.
+            print(f"  [{mark}] {c['check']}{lane_stamp(c)}: {c['detail']}")
+        # The gate's own cost, every run. A regression in gate time is absorbed silently
+        # otherwise - nobody notices thirty seconds becoming forty - and the dominant lane
+        # is what makes the number something a reader can act on rather than bisect.
+        cost = report.get("cost")
+        if cost:
+            print(f"  gate cost: {cost['detail']}")
+        # The release banner is printed only when the release gate actually RAN - i.e. the
+        # verify lane is in the results. Anything else prints the plain gate verdict, so a
+        # deselected AC layer can never wear a release PASS.
+        ran_release = release and any(c["check"] == "verify" for c in report["checks"])
+        print(f"gate{' --release' if ran_release else ''}: "
+              f"{'PASS' if report['ok'] else 'FAIL'}")
+        if ran_release and report["ok"]:
+            # A green mechanical gate is not the whole pre-tag ritual; say so, so a PASS here
+            # is never read as the checklist's judgement items being done.
+            print("  the checklist's judgement items remain: "
+                  "templates/workflows/release-gate.md")
+    return 0 if report["ok"] else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Portable CI quality gate.")
+    p.add_argument("--root", default=".", help="Repo root (default: .)")
+    p.add_argument("--only", help="Comma-separated checks to run (default: the standard lanes; "
+                                  "an on-demand advisory lane runs only when named here)")
+    p.add_argument("--skip", help="Comma-separated checks to skip")
+    p.add_argument("--require-retro", metavar="RETROxxxx",
+                   help="Sprint-close gate: fail unless this batch retro exists in "
+                        "sdlc-studio/retros/, the committed LESSONS-SUMMARY.md is the digest of "
+                        "the current lessons log, and every open lesson is inside its validity "
+                        "horizon (it implies --require-lessons - the close is one obligation)")
+    p.add_argument("--require-lessons", dest="require_lessons", action="store_true",
+                   help="The lessons half of the close gate on its own: fail on a stale "
+                        "LESSONS-SUMMARY.md (regenerate it with `lessons summary`) or on an open "
+                        "lesson past its validity horizon (`lessons revalidate`)")
+    p.add_argument("--require-review", dest="require_review", action="store_true",
+                   help="The review half of the sprint close: fail unless reviews/LATEST.md is at "
+                        "least as new as every artefact (run `review` to refresh it). Currency, "
+                        "not presence - a stale review anchor is a fresh session's first read")
+    sdlc_md.retire_flag(p, "--require-close",
+                        "`sprint sign` seals each run, and the tag asks only whether the gate "
+                        "was green on the tagged commit and CI passed on the forge; "
+                        "`status` still reports an owed close as an advisory")
+    p.add_argument("--release", action="store_true",
+                   help="Pre-tag gate: also EXECUTE every story's Verify: expression and fail "
+                        "on any red or unproven AC (read-only - no Verified: back-annotation, "
+                        "no report rewrite). One command, one exit code, before you tag. "
+                        "Deselecting the `verify` lane under --release is refused. The bare "
+                        "`pytest <node>` verifiers run as one batch, on every core when the "
+                        "`pytest` on PATH takes pytest-xdist's -n, under its own ceiling "
+                        f"({VERIFY_BATCH_TIMEOUT_ENV}, default {VERIFY_BATCH_TIMEOUT}s); each "
+                        "criterion is still held to "
+                        f"{VERIFY_TIMEOUT_ENV} (default {VERIFY_TIMEOUT}s). Then at most "
+                        f"{VERIFY_WORKERS_ENV} stories run at once (default the cores, at most "
+                        f"{_VERIFY_WORKERS_CAP}), and a story whose Verify line names a test "
+                        "module carrying `serial_only` runs alone after them")
+    p.add_argument("--allow-external", dest="allow_external", action="store_true",
+                   help="--release: run shell-backed verifiers on stories stamped "
+                        "`Provenance: external` too (off by default - the trust boundary; "
+                        "those verifiers are otherwise reported BLOCKED, never green)")
+    p.add_argument("--run-tests", dest="run_tests", nargs="+", metavar="PATH",
+                   help="Run these test modules under pytest, in parallel when pytest-xdist is "
+                        "installed (the `serial_only` tests after, the `boundary_only` tests "
+                        "left to the push unless --boundary is given), and exit non-zero on any "
+                        "failure. The commit hook runs its selection through this; CI runs "
+                        "tools/tests through it with --boundary push")
+    p.add_argument("--suite-decision", dest="suite_decision", action="store_true",
+                   help="Answer whether the unit suites must run, and over which modules: a "
+                        "changed test module itself, those named for a changed code file, those "
+                        "that import or load it (directly or through one fixture test module "
+                        "they import) and those whose `test-census-subject` header names a "
+                        "changed path. Skips when none is reached (an artefact or doc no test "
+                        "module declares as its census subject, say) or when the tracked "
+                        "tree hashes identically to the last GREEN verdict's. A boundary runs "
+                        "everything. Exits 0 when a run is needed")
+    p.add_argument("--changed", nargs="+", metavar="PATH",
+                   help="--suite-decision: what these repo-relative paths select, instead of "
+                        "the working tree's changes; no recorded verdict is reused")
+    p.add_argument("--staged", action="store_true",
+                   help="--suite-decision: decide for the staged paths only (the commit hook)")
+    p.add_argument("--boundary", choices=BOUNDARIES,
+                   help="Declare that this run is at a boundary, so the FULL suite runs "
+                        f"rather than a selection (or set {BOUNDARY_ENV}). A boundary also "
+                        "declines a green verdict earned by a partial run")
+    p.add_argument("--record-suite-verdict", dest="record_suite_verdict", metavar="RUN",
+                   help="Record the current surface's suite verdict against this run label, "
+                        "so an unchanged tree can reuse it instead of paying again "
+                        "(use --status red to record a failure - a red is never reused)")
+    p.add_argument("--status", choices=("green", "red"), default="green",
+                   help="--record-suite-verdict: the verdict being recorded (default: green)")
+    p.add_argument("--verdict-mode", dest="verdict_mode", choices=("full", "selected"),
+                   default="full",
+                   help="--record-suite-verdict: how much of the suite earned the verdict. "
+                        "A boundary declines a green earned by a `selected` run")
+    p.add_argument("--format", choices=("text", "json"), default="text")
+    p.set_defaults(func=cmd_gate)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    # Resolve the root ONCE and write it back, so every verb below anchors on the tree the
+    # run belongs to. The family default `.` means "work it out from here", not "the cwd
+    # is the project": otherwise a run from a subdirectory acts on a stray tree and exits 0.
+    args.root = str(sdlc_md.resolve_root(args))
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)

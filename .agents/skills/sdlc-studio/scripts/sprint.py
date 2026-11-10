@@ -1,0 +1,13461 @@
+#!/usr/bin/env python3
+"""SDLC Studio sprint - batch selection and ordering.
+
+`sprint plan` selects a batch of work by query (open bugs, proposed CRs, ready
+stories) and orders it, so the operator sees the triage plan before the run starts.
+Ordering is by priority/severity (Critical first); dependency-topological; and WSJF
+(`--order wsjf`): **Cost of Delay divided by Points**, both on the modified Fibonacci scale.
+CoD falls out of the declared Priority, so WSJF runs on any groomed backlog - it needs NO seat
+scores, which is why it can now actually run. When the review seats HAVE scored a unit, their
+value + time-criticality + risk-reduction replaces the derived CoD; the denominator is always
+the unit's `Points`, because there is only one size vocabulary.
+
+Under WSJF, priority is deliberately NOT the dominant axis: a job worth less but four times
+cheaper does go first, and that is the whole economic content of WSJF. `--order priority` is
+there for anyone who wants strict priority bands instead.
+
+THE GATE REFUSES A UNIT ABOVE 8 POINTS (`sprint.points_split_above` to move the ceiling). Above
+it the estimate is not worth having, and the answer is to DECOMPOSE - a triage decision, not an
+estimation one. See the forecast block below for the measurement that demands it.
+
+The forecast is sum(points) x a tokens-per-point rate MEASURED from this project's own evidence.
+It carries the BATCH HISTORY (what sprints actually cost) beside it, and it names the evidence
+the rate came from, so nobody has to take the number on trust.
+
+The plan then SIZES the batch against the sprint's CAPACITY (`capacity.*`: tokens, wall-clock
+minutes, units) and says whether it fits - at plan time, while the operator can still cut it,
+rather than mid-run when the breaker halts the sprint. The same capacity resolves the run
+APPETITE that `loop_guard budget` later breaks on, so the plan-time ceiling and the run-time
+ceiling are ONE number and cannot disagree. Over budget is a WARNING, never a refusal: a script
+measures the session total from the transcript, but only as a LOWER BOUND - delegated and
+sidechain spend is supplied rather than observed - and the token model is a hypothesis, not a
+measurement.
+
+The plan also EMITS the failure classes injected at plan (`lessons.phase_digest`), as rule
+plus behaviour: the lessons the last sprints paid for arrive inside the plan the agent reads at
+sprint start, rather than as a prose instruction to open a file that an agent under effort
+pressure skips. The lane and review briefs carry their own phase's classes the same way.
+Read-only; pure stdlib (lessons, telemetry and route are sibling helpers).
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fnmatch
+import io
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib import run_state, sdlc_md  # noqa: E402
+import config  # noqa: E402  (sibling - routing block for tier enrichment)
+import lessons  # noqa: E402  (sibling - the still-valid lessons digest carried in the plan)
+import reconcile  # noqa: E402  (sibling - reconcile before plan)
+import telemetry  # noqa: E402  (sibling - the forecast log the plan records its prediction in)
+import blocker_sweep  # noqa: E402  (sibling - blocker sweep before plan)
+
+
+PRIORITY_FIELD = {"bug": "Severity", "cr": "Priority", "story": "Priority"}
+# One weight scale across types (documented in reference-sprint.md): bug Severity and
+# CR/story Priority - including the P1-P4 form - map onto the same rank, so a merged
+# bugs + CRs tranche orders on a single documented axis instead of two vocabularies.
+PRIORITY_WEIGHT = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3,
+                   "P1": 0, "P2": 1, "P3": 2, "P4": 3}
+
+# ---------------------------------------------------------------------------
+# COST OF DELAY: the WSJF numerator, derived from Priority, on the Fibonacci scale
+# ---------------------------------------------------------------------------
+# WSJF = Cost of Delay / Job Size, and this project already records both halves. The size is
+# `Points` (the scale lives in lib/sdlc_md - one definition, read by everyone). The value half
+# is the declared Priority/Severity, which is exactly what a Cost of Delay is: how much it
+# costs to NOT do this yet.
+#
+# The old WSJF needed the review seats to have scored value, time-criticality and risk-reduction
+# into `.local/wsjf-inputs.json` first. They almost never had, so WSJF almost never ran - and a
+# signal that scores r = +0.03 against measured cost was quietly doing the ordering instead.
+# A ranking that only works after a ceremony nobody performs is a ranking that does not work.
+# This one runs on any groomed backlog.
+#
+# ONE RUNG PER BAND, on the same modified Fibonacci scale the points use. Each band is therefore
+# worth about 1.6x the one below - the golden ratio the scale is built on - so a unit has to be
+# more than ~1.6x bigger to lose a band of priority. That is the intended economics of WSJF and
+# not an accident of the mapping: a 3-point High DOES outrank an 8-point Critical, because you
+# can finish it and still start the Critical sooner than the Critical would have finished. An
+# operator who wants strict priority bands has `--order priority`, which is what it is for.
+COST_OF_DELAY = {"Critical": 13, "High": 8, "Medium": 5, "Low": 3,
+                 "P1": 13, "P2": 8, "P3": 5, "P4": 3}
+#: An unknown, blank or absent Priority ranks Medium - the same neutral rank `_weight` gives it.
+#: A half-filled template field must plan, never crash the planner, and never rank itself first.
+DEFAULT_COST_OF_DELAY = COST_OF_DELAY["Medium"]
+
+# ---------------------------------------------------------------------------
+# THE FORECAST: sum(points) x a MEASURED tokens-per-point rate. No base term.
+# ---------------------------------------------------------------------------
+# For the first time this number rests on a signal that predicts. A blind re-estimation
+# recovered 21 delivered units AS FILED, stripped the declared size, and had three independent
+# estimators size them in modified Fibonacci with no access to the outcomes:
+#
+#     Points (median of 3)    r = +0.68 pooled, +0.78 on units of 8 or below, and POSITIVE
+#                             within every one of the four sprints
+#     declared Effort (S/M/L) r = +0.35    retired: a second size vocabulary, and worse
+#     max_cognitive           r = +0.03    dead, and it was ordering the batch
+#
+# A POINT IS A STABLE UNIT OF COST FROM 2 TO 8, and it BREAKS ABOVE THAT. Measured tokens per
+# point, by band: 2-pt 22,370 | 3-pt 26,153 | 5-pt 27,396 | 8-pt 25,171 | 13-pt 14,144. The 13s
+# are systematically OVER-estimated - 1.9x cheaper per point than every band below - and all
+# three estimators returned them with LOW confidence and the words "should be split", unprompted.
+# That is why the gate refuses above 8 (`points_split_above`): the ceiling is not a ceremony, it
+# is the boundary of the region where the model is known to work.
+#
+# NO BASE TERM, DELIBERATELY. A least-squares fit adds one (8,043) and does WORSE: 11/19 units
+# inside the 0.75x-1.25x band, 9/19 leave-one-out, against 12/19 for the flat rate with NO
+# fitting at all. The simple model won on the evidence and it is not re-complicated here.
+#
+# THE RATE IS MEASURED, NOT FITTED, and it is re-measured from the project's own evidence every
+# time a plan is built (`tokens_per_point`): the points a plan RECORDED, against the tokens the
+# work actually cost. The seed below is the starting rate for a project with no evidence of its
+# own yet, and the plan always says which of the two it is quoting.
+POINTS_RATE_SEED = 25_000
+#: The condition the "no base term" finding was measured under. Stated, not asserted flatly:
+#: that a fitted base term did worse than none was TRUE OF PER-UNIT ACTUALS with no sprint
+#: ceremony, review rounds or close in the numerator - runner-era data about the BUILD. Applied
+#: to whole sprints the same claim is false by roughly 300 times. The forecast prices the build
+#: alone (D0258: one forecast, the plan snapshot's), so it travels with every forecast basis, seed
+#: or local, and the figure is never read as a whole sprint's cost.
+NO_BASE_TERM_CONDITION = (
+    "the no-base-term result was measured on PER-UNIT ACTUALS with no sprint ceremony, review "
+    "rounds or close in the numerator, so it holds for the BUILD, not for a whole sprint - a "
+    "fitted base term did worse than none ON THAT DATA. This forecast prices the build; a whole "
+    "sprint's ceremony is not in it")
+POINTS_RATE_SEED_BASIS = (
+    "the shipped default from a blind re-estimation of 21 delivered units, recovered as filed "
+    "and sized in modified Fibonacci by three independent estimators with no access to the "
+    "outcomes; 19 had measured actuals. A point measured 22,370-27,396 tokens across the 2-, "
+    "3-, 5- and 8-point bands (~25,000, flat). " + NO_BASE_TERM_CONDITION + ". Your project's "
+    "own evidence replaces this the moment it has enough")
+#: Units of the project's OWN evidence before its measured rate replaces the seed. A rate
+#: re-fitted to one or two units is fitting noise - a fit to one or two sprints has burned this
+#: estimator before, and a wild single unit would drag the rate for the whole next sprint.
+RATE_MIN_UNITS = 5
+#: The rate source a forecast carried when a fitted fixed-plus-marginal term priced it. No plan
+#: produces it since D0258; kept because forecasts recorded before then still name it.
+RATE_FIXED_FIT = "fixed-fit"
+
+# ---------------------------------------------------------------------------
+# What the rate was measured FROM - so a ratio can never be quoted as evidence for a model
+# against the very data that produced it.
+# ---------------------------------------------------------------------------
+# A model's fit against its own training data is TRAINING ERROR. It lands near 1.0x by
+# construction and it cannot be wrong, which is precisely why it reassures: an earlier estimator
+# was quoted at 1.09x in-sample while it was running at 0.55x on live work.
+#
+# The sprints whose actuals the rate was read from are NAMED here, and every accuracy figure the
+# planner quotes to an operator excludes them. Only a forecast made by the estimator in force, on
+# a sprint that was NOT in the measurement, is evidence.
+#
+# CHANGE THIS IN THE SAME COMMIT THAT CHANGES THE RATE. It is declared per SPRINT, not per unit:
+# the blind re-estimation read these four sprints' actuals, and naming a unit list this rate was
+# never fitted to unit-by-unit would be inventing a precision the measurement does not have.
+CALIBRATION_FIT_RETROS = ("RETRO0024", "RETRO0025", "RETRO0026", "RETRO0027")
+
+# How a recorded sprint stands in relation to the estimator IN FORCE.
+SAMPLE_IN = "in-sample"            # its actuals are the training data - training error, not evidence
+SAMPLE_OUT = "out-of-sample"       # forecast by the constants in force, on data they never saw
+SAMPLE_STALE = "stale-constants"   # forecast by a DIFFERENT estimator - judges that one, not this one
+SAMPLE_MIXED = "mixed-constants"   # the batch was forecast by more than one estimator
+SAMPLE_NONE = "unforecast"         # no plan-time forecast was recorded - it predicted nothing
+
+
+#: The rate came from the VELOCITY record - the source VELOCITY.md's own header MANDATES, and
+#: the only one an interactive sprint ever writes to. Sprint-level, and re-measured every plan.
+RATE_VELOCITY = "velocity-record"
+#: The rate came from the PER-UNIT evidence log. Finer-grained, and only a runner-driven project
+#: produces it, so it is the fallback rather than the mandated source.
+RATE_EVIDENCE = "measured"
+#: No rate of this project's own: the shipped seed, quoted as a seed and never as a calibration.
+RATE_SEED = "seed"
+#: A rung other than `done` (design/plan/triage) has no per-rung rate measured on
+#: this project, so its marginal term reads UNMEASURED rather than borrowing the build
+#: (`done`) rate - a design run that writes no code must not be priced as a build
+#: The build rung is unaffected.
+RATE_UNMEASURED_RUNG = "unmeasured-rung"
+#: The operator set the rate in `.config.yaml` (TOKENS_PER_POINT_KEY): it prices the plan, and
+#: the basis says so beside the measured rate it replaced.
+RATE_OVERRIDE = "operator-override"
+TOKENS_PER_POINT_KEY = "estimate.tokens_per_point"
+
+
+def tokens_per_point(repo_root: Path | str | None = None) -> dict:
+    """The tokens-per-point rate IN FORCE: the operator's `estimate.tokens_per_point` when set,
+    else `_measured_tokens_per_point`. An override is named as one and carries the measured
+    rate it replaced; a value that is not a finite number rounding to 1 or more (text, a
+    bool, NaN, infinity, 0.4) is not applied, and the basis of the measured rate says it was
+    ignored."""
+    got = _measured_tokens_per_point(repo_root)
+    raw = None if repo_root is None else sdlc_md.project_override(repo_root, TOKENS_PER_POINT_KEY)
+    if raw is None:
+        return got
+    rate = (round(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool)
+            and math.isfinite(raw) else 0)
+    if rate < 1:
+        return {**got, "basis": f"{got['basis']}. `{TOKENS_PER_POINT_KEY}` ({raw!r}) in "
+                                f".config.yaml is not a number of at least 1 token and was "
+                                f"ignored"}
+    return {**got, "rate": rate, "source": RATE_OVERRIDE,
+            "basis": (f"operator override: `{TOKENS_PER_POINT_KEY}` is {rate:,} in "
+                      f".config.yaml. The measured rate it replaces is {got['rate']:,} "
+                      f"({got['source']}: {got['basis']})")}
+
+
+def _measured_tokens_per_point(repo_root: Path | str | None = None) -> dict:
+    """The tokens-per-point rate MEASURED from this project's own evidence.
+
+    TWO SOURCES, ONE ANSWER, AND NEITHER IS EVER SILENTLY SUBSTITUTED FOR THE OTHER.
+
+    1. THE VELOCITY RECORD WINS. `retro.measured_rate` is the one definition: the rolling
+       median tokens per point of the latest rows for the model doing the work, falling back
+       to any single model's rows when that model has too few. A row naming no model, or
+       several, is skipped rather than refusing the whole record, so the rate advances.
+    2. THE PER-UNIT EVIDENCE LOG is the finer-grained fallback, for a runner-driven project
+       that has one. The join is the closed loop: the points a plan RECORDED at plan time (the
+       forecast log, first-record-wins, so hindsight cannot rewrite it) against the tokens the
+       work ACTUALLY cost. Total tokens over total points - not the mean of the per-unit
+       ratios, which would over-weight the small units. Below `RATE_MIN_UNITS` this source is
+       noise and the seed stands: a rate re-fitted to one unit is exactly the mistake that
+       produced two bad recalibrations. The count is REPORTED either way.
+    3. THE SEED, named as a seed, with the fact that this project has measured no rate of its
+       own carried beside it. A plan is never REFUSED over a token estimate.
+
+    `refused` stays in the shape and is always None: the record no longer refuses.
+
+    Fail-safe throughout: unreadable evidence yields the seed, never an exception - a project
+    must be able to plan before it has measured anything.
+    """
+    seed = {"rate": POINTS_RATE_SEED, "source": RATE_SEED, "units": 0, "points": 0, "tokens": 0,
+            "ids": [], "min_units": RATE_MIN_UNITS, "basis": POINTS_RATE_SEED_BASIS,
+            "refused": None}
+    if repo_root is None:
+        return seed
+    try:
+        import retro  # noqa: PLC0415 - deferred, as everywhere else in this module
+        vel = retro.measured_rate(repo_root)
+    except Exception as exc:  # noqa: BLE001 - no record must never break planning
+        sdlc_md.debug("sprint.tokens_per_point", exc)
+        vel = {}
+    if vel.get("tokens_per_point"):
+        # Every Source the rate pooled is named, a row's counting basis among them, so a median
+        # taken across two bases is never read as one figure.
+        sources = vel.get("sources") or []
+        pooled = ("" if not sources else
+                  f"Every row it pooled has the Source `{sources[0]}`. " if len(sources) == 1 else
+                  f"It pooled rows under {len(sources)} Sources ("
+                  + "; ".join(f"`{s}`" for s in sources)
+                  + "), so it is a rate across them, not one figure. ")
+        return {"rate": vel["tokens_per_point"], "source": RATE_VELOCITY, "units": 0,
+                "points": vel["points"], "tokens": vel["actual_tokens"], "ids": vel["sprints"],
+                "min_units": RATE_MIN_UNITS, "refused": None, "model": vel["model"],
+                "sources": sources,
+                "basis": (f"measured from this project's VELOCITY.md, {vel['source']}. "
+                          f"{pooled}Re-measured every plan")}
+    try:
+        forecasts = telemetry.forecasts(repo_root)
+        actuals = telemetry.actuals(repo_root)
+    except Exception as exc:  # noqa: BLE001 - no evidence must never break planning
+        sdlc_md.debug("sprint.tokens_per_point", exc)
+        return seed
+    points = tokens = 0
+    ids: list[str] = []
+    for uid, fc in sorted(forecasts.items()):
+        pts = fc.get("points")
+        actual = (actuals.get(uid) or {}).get("tokens")
+        if not isinstance(pts, int) or isinstance(pts, bool) or pts <= 0:
+            continue
+        if not isinstance(actual, (int, float)) or isinstance(actual, bool) or actual <= 0:
+            continue
+        points += pts
+        tokens += int(actual)
+        ids.append(uid)
+    seed["units"], seed["points"], seed["tokens"], seed["ids"] = len(ids), points, tokens, ids
+    if len(ids) < RATE_MIN_UNITS or not points:
+        return seed          # counted, named, and NOT yet trusted
+    return {"rate": int(round(tokens / points)), "source": RATE_EVIDENCE, "units": len(ids),
+            "points": points, "tokens": tokens, "ids": ids, "min_units": RATE_MIN_UNITS,
+            "refused": None,
+            "basis": (f"measured from this project's evidence: {len(ids)} delivered unit(s), "
+                      f"{points} point(s) forecast at plan time, {tokens:,} tokens actually "
+                      f"spent (sdlc-studio/retros/evidence/)")}
+
+
+def plan_rates(repo_root: Path | str) -> dict:
+    """The two per-point rates a plan forecasts with, each `{"value", "source"}`. A value of None
+    means not measured: minutes stay unmeasured until `retro.minutes_per_point` answers."""
+    tpp = tokens_per_point(repo_root)
+    minutes: dict = {"value": None, "source": "not measured"}
+    try:
+        import retro  # noqa: PLC0415 - deferred, as everywhere else in this module
+        fn = getattr(retro, "minutes_per_point", None)
+        got = fn(repo_root) if fn else None
+    except Exception as exc:  # noqa: BLE001 - no rate must never break planning
+        sdlc_md.debug("sprint.plan_rates", exc)
+        got = None
+    if isinstance(got, dict):
+        value = got.get("value", got.get("rate"))
+        source = got.get("source") or "retro.minutes_per_point"
+    else:
+        value, source = got, "retro.minutes_per_point"
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        minutes = {"value": value, "source": source}
+    elif isinstance(got, dict) and got.get("source"):
+        minutes["source"] = got["source"]
+    return {"tokens_per_point": {"value": tpp.get("rate"), "source": tpp.get("source")},
+            "minutes_per_point": minutes}
+
+
+def record_plan_snapshot(repo_root: Path | str, batch: list[dict]) -> dict:
+    """Record the plan snapshot for `batch` (each unit's planned points and its token and minute
+    forecast, kept as approved) and set run state `token_forecast` to the snapshot's total -
+    the ONE token forecast (D0258). A total no row set can price is left unrecorded, never 0."""
+    state = run_state.record_plan_snapshot(
+        repo_root, {u["id"]: _declared_size(sdlc_md.read_text_safe(u["path"]) or "")
+                    for u in batch}, plan_rates(repo_root))
+    tokens = run_state.plan_totals(state.get(run_state.PLAN_SNAPSHOT))["tokens"]
+    return run_state.update(repo_root, token_forecast=tokens) if tokens is not None else state
+
+
+def forecast_constants(repo_root: Path | str | None = None) -> dict:
+    """The estimator, as a record. Stamped on every forecast at plan time so a later reader can
+    tell WHICH model produced a number, instead of assuming it was this one.
+
+    A row forecast by the OLD estimator (a flat per-unit rate scaled by a dead complexity axis)
+    carries different keys entirely, so `sample_class` reads it as what it is: evidence about a
+    different model, and not about this one.
+    """
+    return {"TOKENS_PER_POINT": tokens_per_point(repo_root)["rate"]}
+
+
+# ---------------------------------------------------------------------------
+# WHO estimated a unit, and under WHAT COMPULSION.
+# ---------------------------------------------------------------------------
+# The loop recorded a forecast and an actual, and never who made the size call. So it could tell
+# an operator what estimation is like IN GENERAL - a population average from a study of other
+# people - and could not tell them whether THEIR judgement was any good. Those are different
+# questions, and only the second one is actionable. Low engagement and low capability produce an
+# identical correlation in a population study, and the study cannot separate them; a per-person
+# figure against measured actuals can.
+#
+# So the plan RECORDS the estimator, and the accuracy report is segmented by them. Feedback on
+# your own past calls is the one intervention known to improve human estimation, and here it
+# costs a field.
+#
+# It is NEVER INFERRED. With no `Estimated-by:` on the artefact and no project default, the
+# estimate belongs to nobody - which is a fact, not a gap to be filled by guessing from whoever
+# happened to file the ticket. Attributing a bad call to a person who did not make it is worse
+# than attributing it to no one.
+ESTIMATOR_UNATTRIBUTED = "unattributed"
+
+
+def estimator_of(repo_root: Path | str, text: str) -> str:
+    """WHO made the size call on this unit: the artefact's `Estimated-by:`, else the project's
+    declared default, else `unattributed`."""
+    raw = sdlc_md.extract_field(text, "Estimated-by")
+    if raw and raw.strip() and raw.strip() not in ("-", "--"):
+        name = (sdlc_md.parse_authorship_value(raw) or {}).get("name") or raw
+        name = str(name).strip().strip("*_`")
+        if name and not name.startswith("{{"):
+            return name
+    default = config.get(repo_root, "estimator.default", None)
+    default = str(default or "").strip()
+    return default or ESTIMATOR_UNATTRIBUTED
+
+
+# Was an Effort COMPULSORY when it was written, or freely given? The coercion hazard turns on
+# this, and it is only answerable if the answer is RECORDED: a compulsory estimate from someone
+# who does not want to estimate is a careless estimate, and a careless number is worse than none.
+EFFORT_GATE_COMPULSORY = "compulsory"  # the grooming gate refuses a unit with no size
+EFFORT_GATE_VOLUNTARY = "voluntary"    # `sprint.breakdown: judgement` - the size is freely given
+EFFORT_GATE_UNKNOWN = "unknown"        # recorded before the planner stamped the era
+
+
+def effort_gate(repo_root: Path | str) -> str:
+    """The compulsion in force RIGHT NOW, stamped on every forecast the plan records.
+
+    Read from the grooming gate itself (`breakdown_mode`), not from a second copy of the rule:
+    when the gate blocks an unsized unit, an Effort is compulsory, by definition."""
+    return (EFFORT_GATE_COMPULSORY if breakdown_mode(repo_root) == "enforce"
+            else EFFORT_GATE_VOLUNTARY)
+
+
+def effort_gate_era(repo_root: Path | str, unit_id: str, stamped: str | None) -> str:
+    """The era an Effort was recorded in. The STAMP on the forecast record wins - it was
+    observed at the moment the plan read the field.
+
+    For evidence recorded BEFORE the planner stamped the era, a project may DECLARE the
+    boundary, per id prefix, in its own config:
+
+        estimator:
+          compulsory_after:
+            BG: 136        # every bug filed after BG0136 had to carry an Effort
+
+    A declaration, in the project's config, that a human can be held to - not an inference from
+    a timestamp. A commit date is when the work was COMMITTED, not when the size was written,
+    and guessing the era from one would put units on the wrong side of the very split the
+    comparison exists to make. With neither a stamp nor a declaration the era is UNKNOWN, and an
+    unknown-era unit is reported as its own cohort rather than quietly filed on one side.
+    """
+    if stamped in (EFFORT_GATE_COMPULSORY, EFFORT_GATE_VOLUNTARY):
+        return stamped
+    cutoffs = config.get(repo_root, "estimator.compulsory_after", None)
+    if not isinstance(cutoffs, dict) or not cutoffs:
+        return EFFORT_GATE_UNKNOWN
+    uid = sdlc_md.norm_id(str(unit_id or ""))
+    m = re.match(r"([A-Za-z]+)", uid)
+    num = sdlc_md.id_number(uid)
+    if not m or num is None:
+        return EFFORT_GATE_UNKNOWN
+    cut = {str(k).upper(): v for k, v in cutoffs.items()}.get(m.group(1).upper())
+    try:
+        cut = sdlc_md.parse_cutoff(cut)
+    except Exception:  # noqa: BLE001 - a malformed cutoff declares nothing; it never guesses
+        return EFFORT_GATE_UNKNOWN
+    if cut is None:
+        return EFFORT_GATE_UNKNOWN
+    return EFFORT_GATE_COMPULSORY if num > cut else EFFORT_GATE_VOLUNTARY
+
+
+def sample_class(retro_id: str | None, constants: dict | None,
+                 repo_root: Path | str | None = None) -> str:
+    """Is this recorded sprint evidence about the estimator in force, or is it its own fit?
+
+    Derived at READ time from two facts the row carries - which sprint it is, and which
+    ESTIMATOR produced its forecast - never from a label frozen when the row was written. A
+    re-measurement that adds a sprint to the training set therefore reclassifies that sprint's
+    row immediately, instead of leaving it quoted as validation for a model it helped fit.
+
+    WHICH ESTIMATOR, NEVER WHICH CALIBRATION OF IT. `stale-constants` means "forecast by a
+    DIFFERENT estimator", and an estimator's identity is the PARAMETERS it takes, not the
+    values they were measured at: the retired one took `base`/`tpc`, this one takes
+    `TOKENS_PER_POINT`. The value moves by design - the rate is re-measured from VELOCITY.md
+    on every plan - so comparing values instead would let a LATER sprint reclassify an EARLIER
+    row. Measured on this repo's own record, stamping the delivering model on three rows moved
+    the rate from the 25,000 seed to a measured 77,013 and turned all 19 out-of-sample rows
+    stale in one read - 23 stale rows and no out-of-sample evidence left, counting the 4 already
+    stale - emptying the whole-sprint excess to UNMEASURED and reverting the forecast band to
+    its default, with no recorded fact having changed. A row's class is a fact about the
+    plan that WROTE it, and nothing measured afterwards may reach back and alter it.
+    """
+    rid = (retro_id or "").strip().upper()
+    if constants == SAMPLE_MIXED:
+        return SAMPLE_MIXED
+    if not isinstance(constants, dict) or not constants:
+        return SAMPLE_NONE
+    try:
+        same = set(constants) == set(forecast_constants(repo_root))
+    except (TypeError, ValueError):
+        return SAMPLE_NONE
+    # IN-SAMPLE (training error) requires BOTH that this sprint's actuals are in the current fit
+    # AND that the constants which MADE its forecast are the current ones. A row forecast by an
+    # OLDER estimator, whose actuals were LATER folded into the current fit, is a GENUINE
+    # out-of-sample falsification of the estimator that made it - not training error.
+    # Gating the fit-membership check on `same` is what stops a recalibration from relabelling the
+    # very falsifications that justified it: RETRO0025/0026 (forecast by the retired base/tpc
+    # estimator) judge THAT estimator, so they read stale-constants, never in-sample.
+    if same:
+        in_fit = bool(rid) and rid in {r.upper() for r in CALIBRATION_FIT_RETROS}
+        return SAMPLE_IN if in_fit else SAMPLE_OUT
+    return SAMPLE_STALE
+
+
+# ---------------------------------------------------------------------------
+# Sprint capacity: ONE operator-set budget, TWO consumers.
+# ---------------------------------------------------------------------------
+# The plan-time question ("does this batch fit?") and the run-time circuit breaker
+# ("stop, the appetite is spent") were two numbers that could disagree: an operator could plan a
+# 12-unit batch and then watch the breaker halt it at 8, mid-sprint. They are now one number.
+# `capacity.*` is the source; the appetite is RESOLVED ONCE, here, at plan time, and stamped on
+# the run state - which is exactly what `loop_guard budget` reads back at each unit boundary. So
+# the ceiling the plan checked the batch against IS the ceiling that stops the run.
+#
+# PROVISIONAL. These defaults are round numbers over one measured sprint (6 units, 384,278
+# tokens actual, RETRO0024), not a calibration. `retro.velocity_history` accumulates a row per
+# sprint; once it has CALIBRATION_MIN_SPRINTS rows a human re-reads the trend and decides
+# whether the numbers have earned a change. NOTHING here re-fits anything automatically - a fit
+# to one or two sprints would fit noise.
+DEFAULT_CAPACITY = {"tokens": 500_000, "minutes": 240, "units": 8}
+
+# The honest error band on the token forecast, and it is WIDE on purpose.
+#
+# Points predict cost well (r = +0.68), but "well" is not "tightly": the held-out batch ratios in
+# the blind re-estimation were 0.98x, 1.47x, 0.84x and 0.82x, and one sprint in four fell outside
+# 0.75x-1.25x. +/-50% is the floor that spread implies; observed out-of-sample ratios in the
+# velocity history WIDEN it and never narrow it, because one sprint agreeing with the model is not
+# evidence the model is tight.
+FORECAST_BAND = 0.50
+
+# Sprints of recorded velocity before the history is worth recalibrating the constants against.
+# Below this the plan says so, and changes nothing.
+CALIBRATION_MIN_SPRINTS = 5
+
+
+def capacity(repo_root: Path | str) -> dict:
+    """The configured per-sprint capacity: tokens, wall-clock minutes, unit count.
+
+    0 on an axis means that axis is unbounded (the pre-capacity behaviour). A malformed value
+    degrades to the shipped default rather than crashing the planner."""
+    out: dict = {}
+    for axis, default in DEFAULT_CAPACITY.items():
+        try:
+            out[axis] = max(0, int(config.get(repo_root, f"capacity.{axis}", default)))
+        except (TypeError, ValueError):
+            out[axis] = default
+    return out
+
+
+def resolve_appetite(repo_root: Path | str, cli_minutes: float | None = None,
+                     cli_units: int | None = None) -> dict:
+    """The run appetite in force, resolved ONCE - at plan time, from the capacity budget.
+
+    Per axis, most specific first: the CLI flag, then an explicitly configured `appetite.*`
+    (non-zero; the pre-capacity key, still honoured), then the sprint capacity. The resolved
+    pair is what the plan checks the batch against AND what `sprint plan --write` stamps on the
+    run state for `loop_guard budget` to break on. One number, two consumers.
+    """
+    cap = capacity(repo_root)
+
+    def pick(flag, axis: str) -> tuple:
+        if flag is not None:
+            return flag, f"--appetite-{axis}"
+        legacy = config.get(repo_root, f"appetite.{axis}", 0) or 0
+        if legacy:
+            return legacy, f"config appetite.{axis}"
+        return cap[axis], f"config capacity.{axis}"
+
+    minutes, m_src = pick(cli_minutes, "minutes")
+    units, u_src = pick(cli_units, "units")
+    return {"minutes": float(minutes or 0), "units": int(units or 0),
+            "minutes_source": m_src, "units_source": u_src}
+
+
+def calibration(repo_root: Path | str) -> dict:
+    """What the velocity history says about the forecast the plan is about to quote -
+    OUT-OF-SAMPLE, and nothing else.
+
+    A row whose actuals the constants in force were fitted to is training error. Quoting it as
+    the estimator's observed accuracy is how the planner came to reassure the operator with
+    1.09x while the estimator was actually running at 0.55x on live work. So an in-sample row
+    is counted, named, and EXCLUDED - from the reported ratio and from the band.
+
+    REPORTS, never re-fits. `low`/`high` are multipliers on the point forecast that bound the
+    plausible actual: FORECAST_BAND is the floor, and any observed OUT-OF-SAMPLE estimate/actual
+    ratio widens them (an actual of estimate/ratio). A history that agrees with the model does
+    not shrink the band - agreeing once is not evidence of precision.
+    """
+    rows: list[dict] = []
+    try:
+        import retro  # noqa: PLC0415 - deferred: the planner must not pay for the retro import graph
+        rows = retro.velocity_history(repo_root)
+    except Exception as exc:  # noqa: BLE001 - no history must never break planning
+        sdlc_md.debug("sprint.calibration", exc)
+    by_class: dict[str, list[dict]] = {}
+    for r in rows:
+        by_class.setdefault(sample_class(r.get("id"), r.get("constants"), repo_root),
+                            []).append(r)
+    evidence = [r for r in by_class.get(SAMPLE_OUT, [])
+                if isinstance(r.get("ratio"), (int, float)) and r["ratio"] > 0]
+    ratios = [float(r["ratio"]) for r in evidence]
+    low, high = 1.0 - FORECAST_BAND, 1.0 + FORECAST_BAND
+    if ratios:
+        low = min(low, 1.0 / max(ratios))
+        high = max(high, 1.0 / min(ratios))
+    excluded = {k: len(v) for k, v in by_class.items() if k != SAMPLE_OUT}
+    return {"sprints": len(evidence), "ratios": ratios,
+            # The rows themselves, named. A bare list of ratios cannot be quoted BESIDE the
+            # rate it tests, and a seed quoted with nothing beside it reads as calibrated.
+            "rows": [{"id": r.get("id"), "ratio": float(r["ratio"]),
+                      "estimate": r.get("estimate"), "actual_tokens": r.get("actual_tokens")}
+                     for r in evidence],
+            "low": round(low, 2), "high": round(high, 2),
+            "in_sample": len(by_class.get(SAMPLE_IN, [])),
+            "unforecast": len(by_class.get(SAMPLE_NONE, [])),
+            "stale_constants": len(by_class.get(SAMPLE_STALE, [])),
+            "excluded": excluded,
+            "recalibrate_after": CALIBRATION_MIN_SPRINTS,
+            "enough_history": len(evidence) >= CALIBRATION_MIN_SPRINTS,
+            "note": "out-of-sample rows only. A row whose actuals the constants were fitted to "
+                    "is training error and is excluded: it lands near 1.0x by construction. "
+                    "Nothing is re-fitted automatically"}
+
+
+def _unit_wall_minutes(cal_rows: list[dict]) -> float | None:
+    """Mean per-unit SUBAGENT wall time from the velocity history, in minutes, or None.
+
+    A lower bound on a run, never a forecast of it: the history records the time the workers
+    spent, not the elapsed clock of the run around them (orchestration, reviews, operator
+    STOPs). It is reported as a floor so nobody reads it as the answer. A close's whole-sprint
+    row (Measured 0) carries the run's active time, not any measured unit's, so it counts
+    neither side."""
+    total_s = sum(r["wall_time_s"] for r in cal_rows
+                  if isinstance(r.get("wall_time_s"), (int, float)) and r.get("measured"))
+    units = sum(r["measured"] for r in cal_rows if isinstance(r.get("measured"), (int, float)))
+    if not total_s or not units:
+        return None
+    return round(total_s / units / 60.0, 1)
+
+
+def capacity_report(repo_root: Path | str, batch: list[dict], forecast: dict | None,
+                    appetite: dict) -> dict:
+    """Does this batch fit the sprint's capacity? Answered AT PLAN TIME, as a WARNING.
+
+    Never a gate. The session total IS transcript-measured, but it is a LOWER BOUND -
+    delegated spend is supplied, not observed - so a token ceiling
+    would depend on the actor self-reporting the budget meant to constrain it; and the forecast
+    itself is mis-calibrated out-of-sample by ~30%. Refusing to plan on a number that soft would
+    be false authority. The real breaker is wall-clock/unit-count, and it fires on the SAME
+    appetite reported here.
+    """
+    root = Path(repo_root)
+    cap = capacity(root)
+    cal = calibration(root)
+    # UNMEASURED IS NOT ZERO. A non-build rung prices no marginal term, so its forecast carries
+    # no spendable token figure. Reading that as 0 let the budget line print
+    # "tokens ~0/100,000 - within budget" four lines under a header saying the batch is NOT
+    # priced - the forecast asserting the label while its CONSUMER spent the value, which is the
+    # exact shape of the previous sprint's MAJOR. An unmeasured marginal is carried as None and
+    # the token half of the budget is reported unjudged rather than passed.
+    fc = forecast or {}
+    tokens_unmeasured = bool(fc.get("marginal_unmeasured"))
+    tokens = None if tokens_unmeasured else int(fc.get("tokens") or 0)
+    units = len(batch)
+    token_budget = cap["tokens"]
+    unit_budget = appetite["units"]        # the number the run breaker will actually stop on
+    minute_budget = appetite["minutes"]    # ditto
+
+    over: list[str] = []
+    if token_budget and tokens is not None and tokens > token_budget:
+        over.append("tokens")
+    if unit_budget and units > unit_budget:
+        over.append("units")
+    low, high = ((None, None) if tokens is None
+                 else (int(tokens * cal["low"]), int(tokens * cal["high"])))
+    return {
+        "budget": {"tokens": token_budget, "minutes": minute_budget, "units": unit_budget},
+        "forecast": {"tokens": tokens, "low": low, "high": high},
+        "units": units,
+        "over": over,
+        "over_budget": bool(over),
+        # under budget on the point estimate, but the top of the honest band is not
+        # an unpriced forecast has no top of band: unjudged, never compared
+        "tokens_may_exceed": bool(token_budget and high is not None and "tokens" not in over
+                                  and high > token_budget),
+        "appetite": appetite,
+        "calibration": cal,
+        "unit_wall_minutes_floor": _unit_wall_minutes(_velocity_rows(root)),
+        "advisory": True,
+        "basis": "a WARNING, never a gate - the total is transcript-measured but a LOWER "
+                 "BOUND, since delegated spend is supplied rather than observed, and the "
+                 "forecast is a hypothesis. The run breaker is wall-clock/unit-count, on the "
+                 "same appetite reported here",
+    }
+
+
+# ---------------------------------------------------------------------------
+# WHAT THE FORECAST PRICES, AND WHAT IT LEAVES OUT.
+# ---------------------------------------------------------------------------
+# points x a tokens-per-point rate prices the BUILD. On a project whose budget is dominated by
+# proving the build correct, that under-forecasts by whatever the proving costs - and here that
+# is most of the total. Measured at RUN-01KY321Q's sign-off: the plan forecast 400,000 for 16
+# points; the four cluster agents spent 787,834 building all seven units, while the review,
+# repair and re-verification rounds spent 698,027 on top of a main thread that ran to 2,634,055.
+#
+# THE ANSWER IS NOT A BIGGER CONSTANT. Refitting the rate against that sprint would fit noise to
+# one observation and would keep pricing a single undifferentiated quantity, so the same
+# structural gap would reappear at whatever the new number was. What the forecast owes the
+# operator is the EXCLUSION, stated, and a proving term they can see - read off the record, not
+# invented.
+FORECAST_SCOPE = "build"
+FORECAST_EXCLUDES = (
+    "the mandatory closing review",
+    "repair rounds and the re-verification after them",
+    "orchestration and main-thread cost around the build",
+    "the spend of delegated agents the capture cannot yet see",
+)
+
+
+def _whole_sprint_actual(row: dict) -> bool:
+    """Does this velocity row's Actual measure the WHOLE SPRINT, or only its units' build?
+
+    The record's own coverage rule (`retro._tokens_cover_points`) admits two honest shapes, and
+    only ONE of them is a whole-sprint figure:
+
+    * Measured == 0 with an Actual present: a sprint-level total read off the harness, which by
+      definition covers the sprint - the ceremony around the units included. This one qualifies.
+    * Measured == Units: the sum of the units' PER-UNIT telemetry. That is the BUILD, and the
+      review, the repair rounds and the orchestration around it are exactly what it leaves out.
+      Divided by a build forecast it measures the build's own error, not a whole-sprint excess.
+
+    Both shapes carry a rate, which is why `measured_rate` accepts both; only the first can be
+    published under a heading that says whole-sprint. This repo published RETRO0028 (Units 3 /
+    Measured 3) at 2.26x inside that span.
+    """
+    try:
+        import retro  # noqa: PLC0415 - deferred, as everywhere else in this module
+        if not retro._tokens_cover_points(row):   # noqa: SLF001 - ONE coverage rule, shared
+            return False
+    except Exception as exc:  # noqa: BLE001 - no record must never break planning
+        sdlc_md.debug("sprint._whole_sprint_actual", exc)
+        return False
+    return row.get("measured") == 0
+
+
+def whole_sprint_excess(repo_root: Path | str) -> dict:
+    """How far a WHOLE sprint has run over the build forecast it was planned with - measured.
+
+    Read off the velocity record: every OUT-OF-SAMPLE row carrying both a plan-time forecast
+    and a whole-sprint actual gives one observation of actual/forecast. A row whose Actual is a
+    per-unit BUILD sum is not such a row and is excluded - see `_whole_sprint_actual`.
+    In-sample rows are excluded for the same reason `calibration` excludes them - a fit against
+    its own training data lands near 1.0x by construction.
+
+    WHAT THIS NUMBER IS NOT, and the distinction is the whole point of reporting it honestly:
+    it is NOT a measurement of proving cost. The excess over a build forecast is proving cost
+    PLUS whatever the build itself was under-estimated by, and the record carries no split
+    between them, so attributing all of it to proving would be a property this figure does not
+    have. It is reported as what it is - the observed whole-sprint multiple of the number the
+    plan quoted - and the reader is told the record cannot separate the two.
+
+    With no such row the answer is UNMEASURED, never a default multiplier: a constant nobody
+    measured is exactly what BG0254 exists to stop the forecast acquiring.
+    """
+    root = Path(repo_root)
+    obs: list[dict] = []
+    for r in _velocity_rows(root):
+        est, actual = r.get("estimate"), r.get("actual_tokens")
+        if not isinstance(est, (int, float)) or est <= 0:
+            continue
+        if not isinstance(actual, (int, float)) or actual <= 0:
+            continue
+        if not _whole_sprint_actual(r):
+            continue
+        if sample_class(r.get("id"), r.get("constants"), root) != SAMPLE_OUT:
+            continue
+        obs.append({"id": r.get("id"), "forecast": int(est), "actual": int(actual),
+                    "multiple": round(actual / est, 2)})
+    mults = [o["multiple"] for o in obs]
+    return {
+        "measured": bool(obs), "observations": obs,
+        "sprints": [o["id"] for o in obs],
+        "low": min(mults) if mults else None,
+        "high": max(mults) if mults else None,
+        "basis": "whole-sprint actual over the build forecast the plan quoted, on the "
+                 "out-of-sample rows of VELOCITY.md whose Actual covers the whole sprint "
+                 "rather than summing per-unit build telemetry. NOT a measurement of proving "
+                 "cost: the excess is proving plus any under-estimate of the build, and the "
+                 "record carries no split between them",
+    }
+
+
+def _velocity_rows(repo_root: Path | str) -> list[dict]:
+    """The raw velocity rows (fail-safe: [] when there is no history or retro cannot load)."""
+    try:
+        import retro  # noqa: PLC0415
+        return retro.velocity_history(repo_root)
+    except Exception as exc:  # noqa: BLE001
+        sdlc_md.debug("sprint._velocity_rows", exc)
+        return []
+
+
+def _weight(pri: str) -> int:
+    """Shared cross-type rank of a Severity/Priority value (case-tolerant; decorations
+    like `High (gate)` use the leading token). Unknown, blank, or absent values rank
+    Medium - a half-filled template field must plan, never crash the planner."""
+    toks = (pri or "").strip().split()
+    if not toks:
+        return 2
+    tok = toks[0].rstrip(":,;")
+    key = tok.upper() if re.fullmatch(r"[Pp]\d", tok) else tok.title()
+    return PRIORITY_WEIGHT.get(key, 2)
+
+
+def _affects_files(text: str) -> list[str]:
+    """File paths a unit declares it will touch (delegates to the shared parser in
+    lib/sdlc_md so the planner and the routing estimator count the same files)."""
+    return sdlc_md.affects_files(text)
+
+
+def _resolve(root: Path, p: str) -> Path | None:
+    """Resolve an Affects path (delegates to the shared resolver in lib/sdlc_md)."""
+    return sdlc_md.resolve_affects(root, p)
+
+
+#: Which argument of a built verifier command carries the paths, per DSL verb. `jest`,
+#: `vitest`, `http` and `shell` are absent on purpose: they name a test title, a URL or a
+#: shell line, and inventing a path out of one would be the guessing D0053 rules out.
+_VERIFY_VALUE_FLAGS = frozenset({"-k", "-m", "-p", "-n", "--deselect", "--ignore",
+                                 "--rootdir", "-run", "-t"})
+
+
+def _positional_paths(args: list[str]) -> list[str]:
+    """The positional path arguments of an argv list: flags dropped, and the value of a
+    flag that takes one dropped with it. A `::node` selector is trimmed to its file."""
+    out: list[str] = []
+    skip = False
+    for tok in args:
+        if skip:
+            skip = False
+            continue
+        if tok.startswith("-"):
+            skip = tok in _VERIFY_VALUE_FLAGS
+            continue
+        out.append(tok.split("::", 1)[0])
+    return [p for p in out if p]
+
+
+def verify_files(repo_root: Path | str, text: str) -> list[str]:
+    """The files this unit's `Verify:` lines target - the test files it will touch.
+
+    DERIVED FROM THE VERIFIER PARSER, NOT FROM A SECOND REGEX OF OUR OWN. Every path is the
+    one `verify_ac._build_command` resolves for that expression, so the planner's idea of what
+    a Verify line targets is identical to the one the verifier runs; a private pattern here
+    would be a second answer to the same question, and the pair would drift.
+
+    FROM VERIFY LINES ONLY (D0053). A path named in AC prose is NOT read: prose has no grammar
+    to parse, and a path-shaped token in a sentence is as often an example as a target, so
+    guessing would produce false collisions - and a collision report that cries wolf is
+    abandoned faster than one that misses.
+
+    Fail-safe per expression: an unparseable or unrecognised verifier contributes nothing and
+    never raises. A unit whose ACs are half-written must still plan.
+    """
+    root = Path(repo_root)
+    try:
+        import verify_ac  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+        blocks = verify_ac.parse_story(text)
+    except Exception as exc:  # noqa: BLE001 - a broken AC must never break planning
+        sdlc_md.debug("sprint.verify_files", exc)
+        return []
+    out: list[str] = []
+    for block in blocks:
+        expr = (block.verifier or "").strip()
+        if not expr:
+            continue
+        try:
+            kind, cmd = verify_ac._build_command(expr, cwd=root)
+        except (ValueError, OSError) as exc:
+            sdlc_md.debug("sprint.verify_files", exc)
+            continue
+        if not isinstance(cmd, list):
+            continue                       # `shell`/`http` - a command line, not a path
+        if kind == "pytest":
+            out += _positional_paths(cmd[2:])
+        elif kind == "go":
+            out += _positional_paths(cmd[2:])
+        elif kind == "file":
+            out += cmd[2:]                 # ["test", "-e", <path>]
+        elif kind == "grep" and "--" in cmd:
+            out += cmd[cmd.index("--") + 1:]   # everything after the terminator is a path
+    return sorted(dict.fromkeys(out))
+
+
+def affects_mismatch(repo_root: Path | str, text: str) -> dict:
+    """Where a unit's declared `Affects` disagrees with the unit's own content.
+
+    `{unresolvable, undeclared}`. UNRESOLVABLE is a declared path with nothing behind it on
+    disk; UNDECLARED is a file the unit's own `Verify:` lines target that the declaration omits.
+
+    THE ONE PREDICATE, shared by the planner and by `validate`, so the two cannot drift into
+    disagreeing about what a contradicted `Affects` is. Two implementations of "contradicted"
+    is how a unit comes to pass one check and fail the other on identical bytes.
+
+    ADVISORY BY CONSTRUCTION: it returns findings and decides nothing. A path to a file the unit
+    will CREATE cannot resolve yet and is perfectly legitimate, so refusing on it would refuse
+    the normal case; and a derived path must never satisfy the `Affects` requirement, or a unit
+    declaring nothing would pass by having its verifiers read (D0053).
+    """
+    root = Path(repo_root)
+    declared = _affects_files(text)
+    unresolvable = [p for p in declared if _resolve(root, p) is None]
+    declared_keys = {_affect_key(root, p) for p in declared}
+    undeclared = sorted({_affect_key(root, p) for p in verify_files(root, text)} - declared_keys)
+    return {"unresolvable": unresolvable, "undeclared": undeclared}
+
+
+def _dep_ids(value: str) -> set:
+    """The leading artifact-ID tokens of a `Depends on` field, normalised.
+
+    Stops at the first non-ID word, so prose like "see US0001 for background" or
+    "supersedes US0001" does not become a hard ordering dependency. Handles
+    comma/space-separated lists and a trailing parenthetical (`US0003 (note)`).
+    """
+    ids: set = set()
+    for tok in re.split(r"[,\s]+", value.strip()):
+        if not tok:
+            continue
+        m = sdlc_md.ID_RE.match(tok)  # anchored at the start of the token
+        if not m:
+            break  # first non-ID token ends the dependency list
+        ids.add(sdlc_md.norm_id(m.group(0)))
+    return ids
+
+
+def _rank_key(it: dict):
+    """Tiebreak order among ready units: highest WSJF first, else priority, then id.
+
+    THE COMPLEXITY TIE-BREAK IS GONE. It used to sit here, between priority and id, so
+    the running order within a priority band was decided by `max_cognitive` - a number measured
+    at r = +0.03 against actual cost, under a docstring vouching that "the smaller blast-radius
+    job goes first". It measured how complicated the FILE was, never how big the JOB was.
+    Shortest-job-first is a sound heuristic; it just needs a size signal that is real, and it now
+    has one - so it does the work up in the WSJF denominator, where a size signal belongs.
+
+    With no WSJF (priority order, or a unit the grooming opt-out let through unsized) the order
+    falls to id: arbitrary, and honestly so. Arbitrary beats meaningful-looking and arbitrary.
+    Shared by topo order + waves.
+    """
+    w = _weight(it["priority"])
+    if "wsjf" in it:
+        return (-it["wsjf"], w, it["id"])
+    return (w, it["id"])
+
+
+def _build_dag(items: list[dict], deps: dict[str, set]) -> tuple[dict, dict, dict]:
+    """(by_id, adjacency dep->dependents, indegree) over the in-batch dependency graph."""
+    by_id = {sdlc_md.norm_id(it["id"]): it for it in items}
+    adj: dict[str, set] = {k: set() for k in by_id}
+    indeg: dict[str, int] = {k: 0 for k in by_id}
+    for k in by_id:
+        for dep in deps.get(k, ()):
+            if dep in by_id and dep != k and k not in adj[dep]:
+                adj[dep].add(k)        # dep must come before k
+                indeg[k] += 1
+    return by_id, adj, indeg
+
+
+def _topo_waves(items: list[dict], deps: dict[str, set]) -> list[list[dict]]:
+    """Dependency LEVELS: wave 0 = units with no in-batch deps; wave n+1 = units all of
+    whose in-batch deps sit in waves <= n. Units in one wave are independent (parallelisable),
+    ordered within the wave by `_rank_key`. Raises ValueError naming a dependency cycle."""
+    by_id, adj, indeg = _build_dag(items, deps)
+    waves: list[list[dict]] = []
+    placed = 0
+    current = sorted([k for k in by_id if indeg[k] == 0], key=lambda k: _rank_key(by_id[k]))
+    while current:
+        waves.append([by_id[k] for k in current])
+        placed += len(current)
+        nxt: list[str] = []
+        for k in current:
+            for m in adj[k]:
+                indeg[m] -= 1
+                if indeg[m] == 0:
+                    nxt.append(m)
+        current = sorted(nxt, key=lambda k: _rank_key(by_id[k]))
+    if placed != len(by_id):
+        raise ValueError("dependency cycle among: "
+                         + ", ".join(sorted(k for k in by_id if indeg[k] > 0)))
+    return waves
+
+
+def _topo_order(items: list[dict], deps: dict[str, set]) -> list[dict]:
+    """Dependency-topological order - a unit follows its in-batch deps - with
+    priority/severity (then id) as the tiebreak among ready units. A dependency on
+    a unit outside the batch is ignored here (the tranche audit reports it as
+    unmet-deps). Raises ValueError naming the units in a dependency cycle.
+    """
+    by_id, adj, indeg = _build_dag(items, deps)
+
+    def rank(k: str):
+        return _rank_key(by_id[k])
+
+    ready = sorted([k for k in by_id if indeg[k] == 0], key=rank)
+    order: list[dict] = []
+    while ready:
+        k = ready.pop(0)
+        order.append(by_id[k])
+        for m in adj[k]:
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                ready.append(m)
+        ready.sort(key=rank)
+    if len(order) != len(by_id):
+        raise ValueError("dependency cycle among: " + ", ".join(sorted(k for k in by_id if indeg[k] > 0)))
+    return order
+
+
+def cost_of_delay(priority: str) -> int:
+    """The WSJF numerator for a declared Priority/Severity, on the Fibonacci scale.
+
+    Case-tolerant, and tolerant of a decorated value (`High (gate)`) exactly as `_weight` is -
+    the two read the same field and must never disagree about what it says. An unknown, blank or
+    absent value is Medium: a half-filled template field must plan, and it must not rank itself
+    first by accident.
+    """
+    toks = (priority or "").strip().split()
+    if not toks:
+        return DEFAULT_COST_OF_DELAY
+    tok = toks[0].rstrip(":,;")
+    key = tok.upper() if re.fullmatch(r"[Pp]\d", tok) else tok.title()
+    return COST_OF_DELAY.get(key, DEFAULT_COST_OF_DELAY)
+
+
+def wsjf_score(cod: float, points: float) -> float:
+    """WSJF = Cost of Delay / Points. Points >= 1 (the scale has no zero, and a zero
+    denominator would make the cheapest possible job out of a unit nobody sized)."""
+    return round(cod / max(points, 1), 3)
+
+
+def _seat_cost_of_delay(inp: dict) -> float:
+    """The seats' Cost of Delay: value + time-criticality + risk-reduction, the classic
+    three-part CoD. Missing parts score 0 - a component the seats did not discuss adds
+    nothing, and must not be imputed."""
+    return sum(float(inp.get(k, 0) or 0)
+               for k in ("value", "time_criticality", "risk_reduction"))
+
+
+def _wsjf_inputs(root: Path) -> dict:
+    """Per-unit value/time-criticality/risk-reduction the review seats scored, written
+    to `sdlc-studio/.local/wsjf-inputs.json` by the model after the PO/Eng/QA consult. Keyed by
+    normalised id.
+
+    An OPTIONAL override of the CoD the planner derives from Priority, and nothing more: absent
+    (the normal case) the WSJF still runs, because Priority is always there. The seats do NOT
+    supply a size - `Points` is the one size vocabulary, and a second one is what this change
+    removed."""
+    raw = sdlc_md.read_json(root / "sdlc-studio" / ".local" / "wsjf-inputs.json", {})
+    return {sdlc_md.norm_id(k): v for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+
+def _collect(root: Path, kind: str, status: str,
+             epic_filter: set | None) -> tuple[list[dict], dict[str, set]]:
+    """One kind+status query: (items, in-batch dependency map)."""
+    vocab = sdlc_md.status_vocab(kind, root)
+    # canonicalise the user-supplied status arg so a lowercase '--crs proposed' (the
+    # documented form) matches the title-case vocab token, instead of silently selecting nothing.
+    target = sdlc_md.canonical_status(status, vocab) or status
+    if vocab and target not in vocab:
+        raise ValueError(
+            f"status '{status}' is not a {kind} status; valid: {', '.join(vocab)}")
+    out: list[dict] = []
+    deps: dict[str, set] = {}
+    for path in sdlc_md.artifact_files(kind, root):
+        text = path.read_text(encoding="utf-8")
+        st = sdlc_md.canonical_status(sdlc_md.extract_field(text, "Status"), vocab) or "Unknown"
+        if st != target:
+            continue
+        if epic_filter is not None:  # scope to the named epic(s)
+            ef = sdlc_md.extract_field(text, "Epic") or ""
+            m = sdlc_md.ID_SEARCH_RE.search(ef)
+            if not (m and sdlc_md.norm_id(m.group(0)) in epic_filter):
+                continue
+        out.append(_unit(kind, path, text, st, deps))
+    return out, deps
+
+
+def _unit(kind: str, path: Path, text: str, st: str, deps: dict[str, set]) -> dict:
+    pri = sdlc_md.extract_field(text, PRIORITY_FIELD.get(kind, "Priority")) or "Medium"
+    rid = sdlc_md.extract_record_id(path.stem) or path.stem
+    dval = sdlc_md.extract_field(text, "Depends on") or sdlc_md.extract_field(text, "Depends On") or ""
+    deps[sdlc_md.norm_id(rid)] = _dep_ids(dval)
+    return {"id": rid, "type": kind, "status": st, "priority": pri, "path": str(path)}
+
+
+def _worklist_units(root: Path, worklist: str) -> tuple[list[dict], dict[str, set]]:
+    """The documented tranche-file batch source: one unit id per line (markdown
+    bullets and `#` comment/heading lines are tolerated). Every id must resolve to
+    an artifact on disk - a silent skip would ship a smaller tranche than approved."""
+    if REPORT_ID_RE.fullmatch(str(worklist).strip().upper()) and not Path(worklist).is_file():
+        lines = report_worklist_ids(root, str(worklist))
+    else:
+        lines = Path(worklist).read_text(encoding="utf-8").splitlines()
+    wanted: list[str] = []
+    for ln in lines:
+        ln = ln.strip().lstrip("-*").strip()
+        if not ln or ln.startswith("#"):
+            continue
+        m = sdlc_md.ID_SEARCH_RE.search(ln)
+        if m:
+            wanted.append(sdlc_md.norm_id(m.group(0)))
+    wanted = list(dict.fromkeys(wanted))  # a repeated id is one unit, in every order mode
+    by_id: dict[str, tuple[Path, str]] = {}
+    for kind in sdlc_md.ARTIFACT_TYPES:
+        for path in sdlc_md.artifact_files(kind, root):
+            rec = sdlc_md.extract_record_id(path.stem)
+            if rec and sdlc_md.norm_id(rec) in set(wanted):
+                by_id[sdlc_md.norm_id(rec)] = (path, kind)
+    missing = [w for w in wanted if w not in by_id]
+    if missing:
+        raise ValueError(f"worklist ids not found on disk: {', '.join(missing)}")
+    out: list[dict] = []
+    deps: dict[str, set] = {}
+    for w in wanted:
+        path, kind = by_id[w]
+        text = path.read_text(encoding="utf-8")
+        st = sdlc_md.canonical_status(
+            sdlc_md.extract_field(text, "Status"),
+            sdlc_md.status_vocab(kind, root)) or "Unknown"
+        out.append(_unit(kind, path, text, st, deps))
+    return out, deps
+
+
+def _enrich_routing(root: Path, out: list[dict]) -> None:
+    """Per-unit routing enrichment, for EVERY order mode: `difficulty` is
+    always stamped (advisory info); `tier` + `model` only when `routing.enabled` in
+    the project config. Fail-safe per unit: an estimator exception degrades that unit
+    to no routing fields - routing must never break planning."""
+    try:
+        import route  # sibling - deferred so a broken estimator can't break import
+        routing = config.get(root, "routing", None) or {}
+    except Exception:  # noqa: BLE001
+        return
+    enabled = bool(routing.get("enabled"))
+    for it in out:
+        try:
+            est = route.estimate(root, Path(it["path"]))
+            it["difficulty"] = {"score": est["difficulty_score"],
+                                 "band": est["difficulty_band"],
+                                 "confidence": est["confidence"]}
+            if enabled:
+                picked = route.pick(root, Path(it["path"]), role="author",
+                                    routing=routing)
+                it["tier"] = picked["tier"]
+                it["model"] = picked["model"]
+        except Exception:  # noqa: BLE001 - degrade this unit, keep planning
+            continue
+
+
+def _order_batch(root: Path, out: list[dict], deps: dict[str, set], order: str,
+                 skip_personas: bool) -> list[dict]:
+    """WSJF enrichment + dependency-topological ordering over one (possibly mixed) batch.
+
+    WSJF = Cost of Delay / Points, and it needs NOTHING but the artefact: the CoD falls out of
+    the declared Priority, and the Points are on the unit (the grooming gate refuses a batch
+    where they are not). Seat scores, when they exist, replace the derived CoD - they never
+    replace the size, because there is one size vocabulary and the seats do not speak a second.
+
+    A unit with NO points scores no WSJF and falls to priority order. That is only reachable
+    through the recorded `sprint.breakdown: judgement` opt-out - and it is the honest outcome:
+    a unit nobody sized cannot be ranked by size.
+    """
+    _enrich_routing(root, out)  # difficulty always; tier/model when routing.enabled
+    if order == "wsjf":
+        seat_inputs = {} if skip_personas else _wsjf_inputs(root)
+        for it in out:
+            text = Path(it["path"]).read_text(encoding="utf-8")
+            points = sdlc_md.read_points(text)
+            if points is None:
+                continue                       # unsized: no WSJF, and nothing is invented
+            it["points"] = points
+            inp = seat_inputs.get(sdlc_md.norm_id(it["id"]))
+            if inp:
+                it["value"] = inp.get("value", 0)
+                it["time_criticality"] = inp.get("time_criticality", 0)
+                it["risk_reduction"] = inp.get("risk_reduction", 0)
+                it["cod"] = _seat_cost_of_delay(inp)
+                it["cod_source"] = "seats"
+            else:
+                it["cod"] = cost_of_delay(it["priority"])
+                it["cod_source"] = "priority"
+            it["wsjf"] = wsjf_score(it["cod"], points)
+    if order in ("priority", "wsjf"):
+        out = _topo_order(out, deps)
+    return out
+
+
+
+# --------------------------------------------------------------------------- the charter queue
+#
+# A charter is queued INTENT. Its batch is resolved when the run starts, never when the charter
+# is written, because a queue of frozen batches decays: units land, units are delivered, and a
+# plan authored three runs ago selects a set that no longer exists. `sprint next` therefore
+# materialises the head charter against the backlog AS IT IS at that moment.
+_SCOPE_QUERY_FIELD = "Scope query"
+#: The selector vocabulary a charter's `Scope query` speaks is `sprint plan`'s OWN - the same
+#: `--stories Ready --bugs Open` pairs, parsed here into the same (kind, status) tuples
+#: `select_batches` already takes. One vocabulary, not two that drift (D0127).
+_SCOPE_FLAG_KIND = {"--stories": "story", "--bugs": "bug", "--crs": "cr"}
+
+
+def parse_scope_query(query: str) -> tuple[list, set]:
+    """A charter's `Scope query` as (kind, status) pairs plus an epic filter.
+
+    Raises ValueError naming the offending token, because a scope nobody can parse is a charter
+    that will stop the queue at the moment it reaches the head - and the head is the worst place
+    to discover it.
+    """
+    toks = (query or "").split()
+    queries: list[tuple[str, str]] = []
+    epics: set = set()
+    i = 0
+    while i < len(toks):
+        flag = toks[i]
+        value = toks[i + 1] if i + 1 < len(toks) else None
+        if value is None or value.startswith("--"):
+            raise ValueError(f"`{flag}` in the scope query has no value")
+        if flag in _SCOPE_FLAG_KIND:
+            queries.append((_SCOPE_FLAG_KIND[flag], value))
+        elif flag == "--epic":
+            epics.add(sdlc_md.norm_id(value))
+        else:
+            raise ValueError(
+                f"`{flag}` is not a selector this scope query understands - it speaks "
+                f"`sprint plan`'s vocabulary: {', '.join(sorted(_SCOPE_FLAG_KIND))}, --epic")
+        i += 2
+    if not queries:
+        raise ValueError("the scope query selects no unit type "
+                         f"({', '.join(sorted(_SCOPE_FLAG_KIND))})")
+    return queries, epics
+
+
+def queued_charters(repo_root: Path | str) -> list[dict]:
+    """The Queued charters in queue order - id order, which is authoring order.
+
+    Order is the file's, not a stored rank: a rank is a second thing to keep true, and the queue
+    is short enough that re-ordering is a rename away.
+    """
+    out = []
+    for path in sorted(sdlc_md.artifact_files("charter", Path(repo_root))):
+        text = sdlc_md.read_text_safe(path) or ""
+        if (sdlc_md.extract_field(text, "Status") or "").strip() != "Queued":
+            continue
+        raw_rank = (sdlc_md.extract_field(text, _RANK_FIELD) or "").strip()
+        try:
+            rank = int(raw_rank) if raw_rank else None
+        except ValueError:
+            rank = None                    # an unreadable rank is no rank, not rank zero
+        out.append({"id": sdlc_md.extract_record_id(path.stem), "path": str(path),
+                    "title": sdlc_md.extract_h1_title(text) or path.stem,
+                    "goal": _section_text(text, "Sprint Goal"),
+                    "scope": _section_text(text, "Scope rule"),
+                    "rank": rank,
+                    "appetite": (sdlc_md.extract_field(text, "Appetite") or "").strip(),
+                    "query": (sdlc_md.extract_field(text, _SCOPE_QUERY_FIELD) or "").strip()})
+    # (rank, id). An UNRANKED charter sorts after every ranked one rather than silently jumping
+    # the queue - absence is not rank zero, and a queue nobody reordered still reads in
+    # authoring order because the id carries it.
+    out.sort(key=lambda c: (0, c["rank"]) if c["rank"] is not None else (1, 0))
+    return out
+
+
+def _section_text(text: str, heading: str) -> str:
+    """The prose under `## <heading>`, or ''. Read rather than parsed: a charter's goal is a
+    sentence, and anything that tried to structure it would be a schema nobody asked for."""
+    body = text.split(f"## {heading}", 1)
+    if len(body) < 2:
+        return ""
+    return body[1].split("\n## ", 1)[0].strip()
+
+
+#: A charter's queue rank. Absent means "authoring order", which is what the id already gives -
+#: so a queue nobody has reordered needs no rank at all, and a rank exists only where somebody
+#: made a decision. `queued_charters` sorts on (rank, id), so an unranked charter falls after a
+#: ranked one rather than silently jumping the queue.
+_RANK_FIELD = "Queue rank"
+
+
+def call_it_here(repo_root: Path | str, reason: str) -> dict:
+    """Call the sprint at this point: descope the unstarted remainder and close HONESTLY.
+
+    The distinction from `stop` is the whole unit. `stop` ABANDONS a run - it did not reach its
+    goal and says so. `call` finishes one: what was delivered is judged against the Sprint Goal
+    and the close paperwork runs, while the units nobody started leave the batch.
+
+    The remainder goes back to the BACKLOG, not forward to the next charter. Attaching it to the
+    following charter would couple two sprints - the next run would inherit a batch it never
+    approved, which is the thing the single-slot rule and the approved-batch record exist to
+    prevent. Back in the backlog, the next charter's scope query picks the units up if they
+    still match, and does not if they no longer do. That is the same late-materialising rule the
+    queue is built on, applied to the tail of a run.
+
+    Each descoped unit keeps its own status untouched: `drop_from_batch` judges THIS BATCH, not
+    the work. A unit that was Ready is still Ready, and nothing marks it as having failed.
+    """
+    root = Path(repo_root)
+    if not str(reason or "").strip():
+        raise ValueError(
+            "calling the sprint needs a reason - the same reason `batch drop` already "
+            "requires, because a descope nobody explained is indistinguishable from work "
+            "that was forgotten")
+    state = run_state.read(root) or {}
+    if (state.get("outcome") or "").strip().lower() != "running":
+        raise ValueError("no run is open to call")
+    batch = [sdlc_md.norm_id(u) for u in (state.get("batch") or [])]
+    unstarted, delivered = [], []
+    for uid in batch:
+        found = sdlc_md.find_by_id(root, uid)
+        if not found:
+            unstarted.append({"id": uid, "status": "unresolved"})
+            continue
+        path, type_ = found[0], found[1]
+        text = sdlc_md.read_text_safe(path) or ""
+        status = sdlc_md.canonical_status(sdlc_md.extract_field(text, "Status"),
+                                          sdlc_md.status_vocab(type_, root)) or ""
+        # The DELIVERED test is the handoff's own: terminal by the type's vocabulary. A unit
+        # that is terminal-but-not-delivered (Won't Fix) is not descoped by a call - it was
+        # already decided, and re-dropping it would rewrite a decision somebody made.
+        if status and status in sdlc_md.terminal_statuses(type_):
+            delivered.append(uid)
+        else:
+            unstarted.append({"id": uid, "status": status or "unknown"})
+    for u in unstarted:
+        run_state.drop_from_batch(root, u["id"], f"called at this point: {reason.strip()}")
+    return {"called": True, "reason": reason.strip(), "delivered": delivered,
+            "descoped": unstarted, "run_id": state.get("run_id"),
+            "detail": (f"called at {len(delivered)} delivered, {len(unstarted)} descoped. The "
+                       f"remainder returns to the BACKLOG at its own status - not to the next "
+                       f"charter, which would couple two sprints.")}
+
+
+def charter_review(text: str) -> list:
+    """The seat verdicts recorded ON a charter, as [{seat, verdict, note}].
+
+    Read from the charter's own `## Seat review` section rather than from
+    `.local/goal-review.json`, because local state does not travel: a charter committed to the
+    repository and pulled into another working copy must carry the review that justified it, or
+    the next operator sees a plan nobody can tell was examined.
+    """
+    body = _section_text(text, "Seat review")
+    out = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line.startswith("- "):
+            continue
+        row = line[2:]
+        if "|" not in row:
+            continue
+        parts = [p.strip() for p in row.split("|")]
+        out.append({"seat": parts[0].strip("* "), "verdict": parts[1] if len(parts) > 1 else "",
+                    "note": " | ".join(parts[2:]) if len(parts) > 2 else ""})
+    return out
+
+
+def record_charter_review(repo_root: Path | str, charter: str, seats: list,
+                          reviewer: str) -> dict:
+    """Write the seat verdicts into the charter itself, replacing its `## Seat review` body."""
+    root, cid = Path(repo_root), sdlc_md.norm_id(charter)
+    found = sdlc_md.find_by_id(root, cid)
+    if not found:
+        raise ValueError(f"{cid} is not a charter this workspace holds")
+    path = found[0]
+    text = sdlc_md.read_text_safe(path) or ""
+    if not seats:
+        raise ValueError(f"recording a review of {cid} with no seat verdict records nothing")
+    rows = "".join(f"- {s['seat']} | {s['verdict']}"
+                   + (f" | {s['note']}" if s.get("note") else "") + "\n" for s in seats)
+    block = (f"\n> **Reviewed-by:** {reviewer}\n\n{rows}")
+    head, sep, tail = text.partition("## Seat review")
+    if not sep:
+        raise ValueError(f"{cid} carries no `## Seat review` section to record into")
+    rest = tail.split("\n## ", 1)
+    remainder = ("\n## " + rest[1]) if len(rest) > 1 else ""
+    path.write_text(head + "## Seat review\n" + block + remainder, encoding="utf-8")
+    return {"charter": cid, "seats": len(seats), "reviewer": reviewer}
+
+
+def charter_review_state(text: str, runner: str | None = None) -> dict:
+    """Whether a charter's goal was reviewed, by whom, and whether the runner is the reviewer.
+
+    SEPARATION IS RECORDED, NEVER ENFORCED. A queue is often planned and run by the same person,
+    and refusing that would make the queue unusable for the operator it was built for. What
+    would be dishonest is leaving it unsaid, so the match is stated plainly and travels with the
+    run.
+    """
+    seats = charter_review(text)
+    reviewer = (sdlc_md.extract_field(text, "Reviewed-by") or "").strip() or None
+    if not seats:
+        return {"reviewed": False, "reviewer": None, "runner": runner, "same": None,
+                "detail": "this charter's goal was never reviewed by a seat - the plan is "
+                          "unexamined, which is different from a review that found nothing"}
+    same = bool(reviewer and runner and reviewer.strip().lower() == runner.strip().lower())
+    return {"reviewed": True, "reviewer": reviewer, "runner": runner, "same": same,
+            "seats": seats,
+            "detail": (f"goal reviewed by {reviewer} ({len(seats)} seat verdict(s))"
+                       + (" - and run by the same identity; separation is recorded here, "
+                          "not enforced" if same else ""))}
+
+
+def queue_reorder(repo_root: Path | str, charter: str, rank: int) -> dict:
+    """Give a charter an explicit queue rank. Refuses an id the queue does not hold."""
+    root, cid = Path(repo_root), sdlc_md.norm_id(charter)
+    held = {c["id"]: c for c in queued_charters(root)}
+    if cid not in held:
+        raise ValueError(
+            f"{cid} is not a Queued charter - the queue holds "
+            f"{', '.join(held) or 'nothing'}. Refused rather than succeeding over nothing.")
+    import transition as _tr  # noqa: PLC0415 - lazy sibling import, as elsewhere here
+    _tr.annotate(root, cid, _RANK_FIELD, str(int(rank)))
+    return {"charter": cid, "rank": int(rank)}
+
+
+def queue_cancel(repo_root: Path | str, charter: str, reason: str) -> dict:
+    """Withdraw a charter. It leaves the queue and KEEPS its record - a cancelled plan is a
+    decision somebody made, and deleting it loses the only trace of why the queue looks as it
+    does."""
+    root, cid = Path(repo_root), sdlc_md.norm_id(charter)
+    held = {c["id"] for c in queued_charters(root)}
+    if cid not in held:
+        raise ValueError(
+            f"{cid} is not a Queued charter - the queue holds "
+            f"{', '.join(sorted(held)) or 'nothing'}. Refused rather than succeeding over nothing.")
+    if not str(reason or "").strip():
+        raise ValueError(f"cancelling {cid} needs a reason - a queue whose shape nobody can "
+                         f"explain is a queue nobody trusts")
+    import transition as _tr  # noqa: PLC0415
+    _tr.transition(root, cid, "Withdrawn")
+    _tr.annotate(root, cid, "Withdrawn-because", str(reason).strip())
+    return {"charter": cid, "status": "Withdrawn", "reason": str(reason).strip()}
+
+
+def queue_clear(repo_root: Path | str, reason: str) -> list:
+    """Withdraw every Queued charter, each keeping its own record and reason."""
+    out = []
+    for c in queued_charters(repo_root):
+        out.append(queue_cancel(repo_root, c["id"], reason))
+    return out
+
+
+def queue_show(repo_root: Path | str, skip_personas: bool = False) -> dict:
+    """The queue, head first, with what the HEAD would resolve to against the backlog NOW.
+
+    Only the head is resolved. Resolving every charter would be arithmetic on a backlog that
+    the earlier runs will have changed before the later charters are reached - a number that
+    looks precise and is not.
+    """
+    root = Path(repo_root)
+    queue = queued_charters(root)
+    # The RESOLUTION, not the materialiser. Showing what a charter would select cannot open
+    # anything, so it must not inherit the materialiser's single-run-slot refusal - see
+    # `resolve_head_charter`.
+    head = resolve_head_charter(root, skip_personas=skip_personas) if queue else None
+    return {"queue": queue, "head": head}
+
+
+def resolve_head_charter(repo_root: Path | str, order: str = "priority",
+                         skip_personas: bool = False, runner: str | None = None) -> dict:
+    """Resolve the head charter's scope against the CURRENT backlog. Writes nothing, and asks
+    nothing about whether a run is open.
+
+    Split out of `materialise_next` because the single-run-slot rule is a WRITE precondition and
+    this is a read. Sharing one function meant `queue show` refused first on that guard, so
+    during a run - the one moment the queue exists to be inspected - it reported that nothing was
+    runnable instead of what the head would select, and suppressed the charter's goal review with
+    it, both sitting inside the same success branch.
+
+    Four refusals, each leaving the queue exactly as it was, because a charter that cannot be
+    run is not a charter that should be silently dropped:
+      - the head charter carries no parseable scope query
+      - the query does not parse
+      - the scope resolves to no units against the backlog as it stands
+      - under `two_backlog.enforce`, the scope resolves to DISCOVERY items only
+
+    The last is `sprint plan`'s discovery gate, read here so the head never materialises a batch
+    the plan that follows refuses. A mixed scope is not refused whole: its stories and bugs are
+    the resolution, and its discovery items travel beside them under `discovery` so the caller
+    names what was left out rather than dropping it silently.
+    """
+    root = Path(repo_root)
+    queue = queued_charters(root)
+    if not queue:
+        return {"ok": False, "reason": "empty-queue", "detail": "no Queued charter to run"}
+    head = queue[0]
+    if not head["query"]:
+        return {"ok": False, "reason": "no-query", "charter": head["id"],
+                "detail": f"{head['id']} carries a prose scope rule and no `{_SCOPE_QUERY_FIELD}`, "
+                          f"so nothing can resolve its batch. Add one in `sprint plan`'s own "
+                          f"selector vocabulary."}
+    try:
+        queries, epics = parse_scope_query(head["query"])
+    except ValueError as exc:
+        return {"ok": False, "reason": "bad-query", "charter": head["id"], "detail": str(exc)}
+    units = select_batches(root, queries, order=order, skip_personas=skip_personas,
+                           epics=epics or None)
+    if not units:
+        return {"ok": False, "reason": "empty-scope", "charter": head["id"],
+                "detail": f"{head['id']}'s scope selects no unit against the backlog as it "
+                          f"stands - the work it was written for is delivered, or was never "
+                          f"created. The charter is left Queued, not dropped."}
+    # THE DISCOVERY GATE, on the same condition `sprint plan` reads, so the two cannot disagree
+    # about what a charter may select. Partitioned per unit, never gated on the whole selection.
+    held: list[dict] = []
+    if sdlc_md.two_backlog_enforced(root):
+        kept = []
+        for u in units:
+            (held if sdlc_md.is_discovery(u["type"]) else kept).append(u)
+        if not kept:
+            return {"ok": False, "reason": "discovery-only", "charter": head["id"],
+                    "discovery": held,
+                    "detail": f"{head['id']}'s scope selects only DISCOVERY items "
+                              f"({', '.join(u['id'] for u in held)}), which `sprint plan` refuses: "
+                              f"an RFC, a CR or an Issue has no executable criteria to close on. "
+                              f"{_DISCOVERY_REMEDY} The charter is left Queued, not dropped."}
+        units = kept
+    review = charter_review_state(sdlc_md.read_text_safe(Path(head["path"])) or "", runner)
+    return {"ok": True, "charter": head["id"], "title": head["title"], "goal": head["goal"],
+            "query": head["query"], "units": units, "review": review,
+            "ids": [u["id"] for u in units], "discovery": held, "queued": len(queue)}
+
+
+# The decompose path both `next` and `queue show` name for a discovery item the head's scope
+# selects - the same two commands `sprint plan`'s refusal names.
+_DISCOVERY_REMEDY = ("Decompose each into the delivery units it produces and point the charter's "
+                     "scope query at those: a request (RFC/CR) with `refine.py apply --request <id> "
+                     "--epic-title ... --story ...`, an Issue with `triage.py apply --issue <id> "
+                     "--bug 'title|points|severity'`.")
+
+
+def _discovery_left_out(held: list[dict]) -> str:
+    """The line naming the discovery items a mixed scope selected and the batch left out."""
+    named = ", ".join(f"{u['id']} ({u['type']})" for u in held)
+    return (f"  not materialised: {len(held)} DISCOVERY item(s) the scope also selects, which "
+            f"`sprint plan` refuses - {named}. "
+            f"Decompose each (`refine.py apply --request <id>`, or `triage.py apply --issue <id>`) "
+            f"and plan what it produces.")
+
+
+def materialise_next(repo_root: Path | str, order: str = "priority",
+                     skip_personas: bool = False, runner: str | None = None) -> dict:
+    """The head charter resolved, for a caller that is about to OPEN a run from it.
+
+    The single-run-slot rule lives here rather than in `resolve_head_charter` because it guards
+    a WRITE: merging a charter's batch into an open run would make that run's approved batch a
+    set nobody approved. A read of the same charter carries no such risk, so the guard must not
+    travel with the resolution.
+    """
+    root = Path(repo_root)
+    state = run_state.read(root) or {}
+    if (state.get("outcome") or "").strip().lower() == "running":
+        return {"ok": False, "reason": "run-open", "run_id": state.get("run_id"),
+                "detail": f"run {state.get('run_id')} is still open - close or stop it first. "
+                          f"Merging a charter's batch into an open run would make that run's "
+                          f"approved batch a set nobody approved."}
+    return resolve_head_charter(root, order=order, skip_personas=skip_personas, runner=runner)
+
+
+def select_batches(repo_root: Path | str, queries: list[tuple[str, str]],
+                   order: str = "priority", skip_personas: bool = False,
+                   epics: set[str] | None = None) -> list[dict]:
+    """The union of one or more kind+status queries as ONE merged, ordered batch -
+    a mixed bugs + CRs tranche is first-class, and a cross-type `Depends on` edge
+    (CR depends on BG) orders and waves like any other."""
+    root = Path(repo_root)
+    epic_filter = {sdlc_md.norm_id(e) for e in epics} if epics else None
+    out: list[dict] = []
+    deps: dict[str, set] = {}
+    for kind, status in queries:
+        items, d = _collect(root, kind, status, epic_filter if kind == "story" else None)
+        out.extend(items)
+        deps.update(d)
+    return _order_batch(root, out, deps, order, skip_personas)
+
+
+def select_batch(repo_root: Path | str, kind: str, status: str, order: str = "priority",
+                 skip_personas: bool = False, epics: set[str] | None = None) -> list[dict]:
+    """Files of `kind` whose Status matches, with priority, ordered. Single-query
+    wrapper over `select_batches` - see there for ordering semantics."""
+    return select_batches(repo_root, [(kind, status)], order,
+                          skip_personas=skip_personas, epics=epics)
+
+
+#: Statuses at which a unit is CLOSED, so it cannot be "built but not closed". Mirrors
+#: integrity.TERMINAL, inlined so the forecast carries no heavy import.
+_CLOSED_STATUSES = {
+    "Done", "Complete", "Superseded", "Won't Implement", "Won't Fix",
+    "Deferred", "Rejected", "Withdrawn", "Closed", "Fixed", "Verified",
+}
+
+
+def _verifiers_all_green(root: Path, uid: str) -> bool:
+    """True if the unit's executable ACs all pass in the verify-report: verified > 0, no failures,
+    no stale. The deterministic 'already built' signal. Mirrors the audit close-candidate
+    predicate, kept local so the forecast has no audit import. A manual-only / AC-less unit
+    records verified == 0 and never matches."""
+    report = sdlc_md.read_json(root / "sdlc-studio" / ".local" / "verify-report.json", {})
+    stories = report.get("stories", {})
+    items = stories.items() if isinstance(stories, dict) else []
+    for stem, entry in items:
+        # `extract_record_id`, not a hyphen split. A v3 key is `CR-0001-add-auth`, so
+        # `split("-")[0]` yields `CR` and the comparison never matches - the reader was blind to
+        # every id the product now ships by default, and silently returned "not verified" for
+        # all of them. One idiom for reading an artefact key, shared with every other reader
+        # (the divergent-reader-of-a-shared-field class).
+        if sdlc_md.norm_id(sdlc_md.extract_record_id(stem) or "") == sdlc_md.norm_id(uid):
+            return entry.get("verified", 0) > 0 and not entry.get("failed", 0) and not entry.get("stale", 0)
+    return False
+
+
+def _rejected_unanswered(root: Path, uid: str) -> bool:
+    """Is this unit's latest review round a REJECT, in EITHER ledger?
+
+    Two ledgers, and the question spans them: `critic record` appends to `critic-verdicts.md`
+    while the frozen `sprint-review-record.md` still holds historical batch rows. Reading only
+    the first was a real defect twice over - `review_rounds_across_ledgers` exists because two
+    batch REJECT rounds on one unit once escalated nothing - so this asks that function rather
+    than reaching for `verdict_for`, which reads one file.
+
+    FAILS CLOSED. An unreadable ledger is not an approval: a directory at the ledger's path, or
+    any other read fault, must leave the unit priced as unbuilt rather than waved through on the
+    strength of its own green verifiers.
+    """
+    try:
+        import critic  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+        rounds = critic.review_rounds_across_ledgers(root, uid)
+    except Exception as exc:  # noqa: BLE001 - an unreadable bar is not a passed one
+        # FAILS CLOSED, and this handler is the whole guard. An explicit `is_file()` probe was
+        # written here first and measured redundant: `review_rounds_across_ledgers` raises
+        # IsADirectoryError on a directory at the ledger's path rather than swallowing it, so
+        # the probe never fired and a mutant deleting it SURVIVED. Removed rather than kept -
+        # a guard that guards nothing still has to be read and maintained, and it invites the
+        # belief that the handler below is the fallback rather than the mechanism.
+        sdlc_md.debug("sprint._rejected_unanswered", exc)
+        return True
+    if not rounds:
+        return False
+    # A later round's APPROVE is the only answer, and it would be the last round.
+    return str(rounds[-1].get("verdict") or "").upper() == critic.REJECT
+
+
+def _built_not_closed(root: Path, uid: str, text: str) -> bool:
+    """A non-terminal unit whose executable ACs ALL pass is BUILT but not CLOSED: it should be
+    pointed at the close path, not priced as new work in the build forecast. An unverified,
+    failing or stale unit is ordinary unbuilt work and is priced normally."""
+    status = (sdlc_md.extract_field(text, "Status") or "").strip()
+    if status in _CLOSED_STATUSES:
+        return False
+    if _rejected_unanswered(root, uid):
+        # A unit no reviewer has approved is not built work awaiting a close. The exclusion
+        # sentence tells the reader to `close them`, and it was saying that about BG0592 - four
+        # REJECTs, unanswered - while removing its points from the forecast, so the unit with the
+        # worst convergence record in the batch was the one priced at nothing. Its own
+        # verifiers read green throughout, which is why this is asked before them.
+        return False
+    return _verifiers_all_green(root, uid)
+
+
+def _token_forecast(root: Path, batch: list[dict], goal: str = "done") -> dict:
+    """The batch's token cost: SUM OF THE POINTS x the calibrated tokens-per-point rate.
+
+    ONE FORECAST (D0258): the figure the plan snapshot records, points times the rate
+    `tokens_per_point` resolves, and nothing else. Points predict measured cost at r = +0.68
+    (+0.78 at 8 points and below) where every computed signal this project tried failed. A fitted
+    fixed per-sprint term once sat beside it and disagreed with the snapshot by nearly 2x on this
+    repository; two figures answer the operator's question twice and differently, so it left.
+
+    An ESTIMATE and never a gate: a script cannot observe real token spend (see telemetry.py), so
+    a token ceiling would depend on the actor self-reporting the budget meant to constrain it.
+    The wall-clock / unit-count appetite is the breaker; this only informs the operator.
+
+    Each unit's record carries the POINTS it was priced from - which is what lets the NEXT plan
+    measure the rate from this one's outcome - plus the ATTRIBUTION of the size call: WHO made it
+    (`estimator`) and under what compulsion (`effort_gate`: the size gate's compulsion, whose key
+    name predates Points). A unit with no points is NOT priced at some stand-in - it is named in
+    `unpriced` and left out of the total.
+    """
+    rate_info = tokens_per_point(root)
+    rate, rate_source, rate_basis = rate_info["rate"], rate_info["source"], rate_info["basis"]
+    # A rung other than `done` has no measured per-point rate on this project, so the marginal
+    # term reads UNMEASURED rather than borrowing the build rate. The build
+    # rung keeps whatever rate the evidence or the seed above resolved.
+    rung = (goal or "done")
+    rung_unmeasured = rung != "done"
+    # The marginal PER-POINT rate a non-`done` rung is priced at: NONE, because it has no measured
+    # rate on this project. It must not merely be RELABELLED - it must not be SPENT. So the marginal
+    # term drops out of the total, the per-unit costs and each unit's rate. A design run that
+    # writes no code is not priced as a build.
+    marginal_rate = None if rung_unmeasured else rate
+    if rung_unmeasured:
+        rate_source = RATE_UNMEASURED_RUNG
+        rate_basis = (f"the `{rung}` rung has no measured per-point rate on this project; the "
+                      f"marginal term reads UNMEASURED rather than borrowing the build (`done`) "
+                      f"rate, so a run that is not a build is not priced as one")
+    per_unit: dict[str, int | None] = {}
+    units: dict[str, dict] = {}
+    unpriced: list[str] = []
+    built_not_closed: list[str] = []
+    rejected_unanswered: list[str] = []
+    built_points = 0
+    total_points = 0
+    gate = effort_gate(root)   # the compulsion in force for this whole plan
+    for it in batch:
+        text = Path(it["path"]).read_text(encoding="utf-8")
+        uid = sdlc_md.norm_id(it["id"])
+        if _rejected_unanswered(root, uid) and _verifiers_all_green(root, uid) \
+                and (sdlc_md.extract_field(text, "Status") or "").strip() not in _CLOSED_STATUSES:
+            # A THIRD CLASS, priced IN. Green verifiers and an unanswered REJECT is neither
+            # built nor ordinary unbuilt work: its remaining cost is a repair round. Named
+            # separately so the exclusion sentence - which says `close them` - can never be read
+            # as an instruction about a unit no reviewer has approved.
+            rejected_unanswered.append(uid)
+        if _built_not_closed(root, uid, text):
+            # Green verifiers, not yet closed: a close-candidate, not work to build. Kept out of
+            # the total so a delivered-but-open unit does not inflate the build forecast. The
+            # points it removes are carried too: a forecast below the batch total has to explain
+            # the difference where it is printed, not leave a reader to work it out.
+            built_not_closed.append(uid)
+            built_points += sdlc_md.read_points(text) or 0
+            continue
+        points = it.get("points")
+        if points is None:  # priority/manual order never stamped one - read it here
+            points = sdlc_md.read_points(text)
+        if points is None:
+            unpriced.append(uid)
+            continue
+        total_points += points
+        # UNMEASURED on a non-build rung (tokens=None), a real number on `done`.
+        cost = None if marginal_rate is None else points * marginal_rate
+        per_unit[uid] = cost
+        units[uid] = {"tokens": cost, "points": points, "rate": marginal_rate,
+                      "rate_source": rate_source,
+                      "estimator": estimator_of(root, text), "size_gate": gate}
+    marginal_total = 0 if marginal_rate is None else total_points * marginal_rate
+    return {"tokens": marginal_total, "points": total_points,
+            "marginal_unmeasured": rung_unmeasured,
+            "per_unit": per_unit,
+            "units": units, "rate": marginal_rate, "rate_source": rate_source,
+            "rate_units": rate_info["units"], "rate_basis": rate_basis,
+            "rate_refused": rate_info.get("refused"),
+            "rate_out_of_sample": calibration(root)["rows"],
+            "rung": rung, "rung_unmeasured": rung_unmeasured,
+            # Units already built (green verifiers) but not yet closed: a close, not a build.
+            "built_not_closed": built_not_closed, "built_points": built_points,
+            "rejected_unanswered": rejected_unanswered,
+            "all_built": bool(built_not_closed and not per_unit and not unpriced),
+        "scope": FORECAST_SCOPE, "excludes": list(FORECAST_EXCLUDES),
+            "whole_sprint_excess": whole_sprint_excess(root),
+            "unpriced": unpriced, "history": batch_history(root),
+            "constants": forecast_constants(root),
+            "basis": "sum(points) x the calibrated tokens-per-point rate (points predict "
+                     "measured cost at r = +0.68, +0.78 at 8 points and below, the range the gate "
+                     "allows). " + NO_BASE_TERM_CONDITION + ". An ESTIMATE, never a gate"}
+
+
+#: How a row's per-unit cost was arrived at. `measured` counts the units carrying PER-UNIT
+#: telemetry, which only a runner produces; an interactive sprint records a sprint-level total
+#: and 0 there. Both are real cost, and they are not the same measurement, so each row says
+#: which it is rather than being averaged into one undifferentiated number.
+HISTORY_PER_UNIT = "per-unit"        # telemetry per unit - the variance between units is visible
+HISTORY_SPRINT_LEVEL = "sprint-level"  # sprint total / units - per-unit variance is HIDDEN
+
+#: The velocity row's provenance mark for a TYPED total. `basis` answers what the number was
+#: divided by; this answers where it came from, and only one of the two can tell a measurement
+#: from a claim. A row recorded before the column existed carries no mark and gets none here.
+HISTORY_TYPED_SOURCE = "supplied"
+
+
+def batch_history(repo_root: Path | str) -> list[dict]:
+    """What sprints have ACTUALLY cost, per sprint, oldest first - the plan's real cost input.
+
+    This is what the operator should plan against, and the forecast above is what they should
+    treat with suspicion. "The last two five-unit sprints cost 642k and 902k" is a defensible
+    basis for sizing a third. A per-unit number derived from a signal that correlates with cost
+    at r = +0.03 is not, and quoting one lent the plan an authority the measurement never had.
+
+    EVERY sprint with a recorded total is here, including the interactive ones. Requiring
+    per-unit telemetry excluded every sprint run without a runner - which is now the norm - and
+    left the oldest runner-era rows standing as the current cost picture, with nothing saying
+    two newer measured sprints had been dropped. A sprint that cost 2,390,624 over 9 units did
+    cost 265,625 per unit whether or not anything recorded each unit separately.
+
+    What that inclusion COSTS, recorded here because the row alone cannot say it: a sprint-level
+    figure is the total divided by the units, so a sprint where one unit ate half the budget
+    looks identical to one where the spend was even. Each row therefore carries its `basis`, and
+    the renderer prints it - the label is what keeps the two kinds of evidence apart.
+
+    It also carries its `source`, because `basis` answers the wrong question for the second
+    cost of that inclusion. A sprint-level total is either read off the harness meter or TYPED
+    by an operator, and the divisor is identical either way, so a keyed-in number reached this
+    block reading exactly like a captured one. `supplied` is a claim about what a sprint cost;
+    `harness` and `per-unit` are measurements of it. A row written before the velocity history
+    recorded provenance carries None, which is unrecorded and is never read as either.
+
+    The divisor is the measured-unit count where there is one, because a runner-era sprint that
+    delivered 7 units and recorded telemetry for 5 is evidence about those 5; otherwise it is
+    the delivered-unit count. With neither, no per-unit cost can be derived and no row is made.
+
+    Read-only, from the recorded velocity history. Fail-safe: no history is an empty list, never
+    an exception - a project with no measured sprints yet must still be able to plan.
+    """
+    out: list[dict] = []
+    for r in _velocity_rows(repo_root):
+        actual = r.get("actual_tokens")
+        if not isinstance(actual, (int, float)) or not actual:
+            continue
+        measured, delivered = r.get("measured"), r.get("units")
+        if isinstance(measured, (int, float)) and measured:
+            units, basis = int(measured), HISTORY_PER_UNIT
+        elif isinstance(delivered, (int, float)) and delivered:
+            units, basis = int(delivered), HISTORY_SPRINT_LEVEL
+        else:
+            continue          # no divisor of either kind - a per-unit cost cannot be derived
+        out.append({"id": r.get("id"), "units": units, "tokens": int(actual),
+                    "per_unit": int(actual / units), "basis": basis,
+                    # Carried, never derived from `basis`: a sprint-level total is a harness
+                    # capture or an operator's typed figure, and the divisor cannot tell them
+                    # apart. None is unrecorded, and unrecorded is not a third measurement.
+                    "source": r.get("source") or None})
+    return out
+
+
+def record_forecast(repo_root: Path | str, data: dict) -> dict:
+    """RECORD what this plan predicted, per unit, WHEN it predicted it.
+
+    Called by the plan that opens the run (`--write`) and by each rolling cycle, never by a
+    preview: a unit's FIRST record wins on read, so a preview's row would be the one the retro
+    judges, at whatever size the unit had before it was regroomed. What is recorded is never
+    re-derived later from whatever the constants say by then: that is not a prediction, and a
+    loop built on it cannot falsify its own estimator.
+
+    Each record carries the number, the POINTS it was priced from, and the CONSTANTS that
+    produced it, so a later reader can tell which estimator to credit or blame. It also carries
+    WHO made the size call and under what compulsion, which is what makes per-estimator accuracy
+    - and the coercion comparison - answerable from the evidence instead of from opinion. First
+    record for a unit wins on read (telemetry.forecasts), so a re-plan cannot rewrite it with
+    hindsight.
+
+    The `points` on the record are what CLOSE the loop: the next plan measures its rate by
+    dividing the tokens these units actually cost by the points recorded here, before the work
+    started. A points value re-read off the artefact afterwards would be an estimate revised with
+    hindsight, and it would quietly drive the ratio towards 1.0x.
+    """
+    fc = data.get("token_forecast") or {}
+    units = fc.get("units") or {}
+    if not units:
+        return {"recorded": [], "already": [], "path": None}
+    # A RUNG THAT PRICES NOTHING RECORDS NOTHING. On a non-build rung every unit's cost is None,
+    # and the recorder drops None fields - so a tokens-less row would be written, and
+    # `telemetry.forecasts` is FIRST-RECORD-WINS. That row would then win permanently over the
+    # real build forecast made later, and the retro would class the unit `unforecast` for ever,
+    # dropping it out of every estimate-versus-actual ratio. Recording nothing is honest: this
+    # rung made no prediction to judge.
+    if fc.get("marginal_unmeasured"):
+        return {"recorded": [], "already": [], "path": None,
+                "skipped": sorted(units),
+                "reason": f"the `{fc.get('rung')}` rung prices no marginal term, so it made no "
+                          f"per-unit prediction to record; a tokens-less row would win "
+                          f"first-record-wins over the real build forecast made later"}
+    constants = fc.get("constants") or forecast_constants(repo_root)
+    when = data.get("generated_at") or sdlc_md.now_iso8601()
+    recs = [{"id": uid, "tokens": u["tokens"], "points": u["points"],
+             "estimator": u.get("estimator"), "size_gate": u.get("size_gate"),
+             "constants": constants, "planned_at": when}
+            for uid, u in units.items()]
+    return telemetry.record_forecasts(repo_root, recs)
+
+
+# ---------------------------------------------------------------------------
+# The breakdown gate: a plan over an UNGROOMED or UNSPLITTABLE batch is REFUSED.
+# ---------------------------------------------------------------------------
+# A plan that looks authoritative over units nobody was required to groom is the false
+# authority this gate exists to abolish. A unit with no `Points` cannot be forecast at all,
+# and a unit that names no files cannot be checked against its neighbours - the planner
+# cannot see that two of them touch the SAME FILE, so it reports them as safely parallel
+# when they will collide. Both gaps were closed by hand before every plan.
+#
+# The gate also refuses a unit sized ABOVE the split ceiling. That one is not about grooming
+# but about triage: the unit IS sized, honestly, and the honest size says nobody could size
+# it. See `points_split_above`.
+#
+# Enforcement lives HERE, in the command people actually invoke. A separate grooming step
+# that nobody runs is doctrine, and doctrine is what gets skipped under effort pressure: the
+# grooming rung that already exists, and is specified to produce a reviewable estimated
+# backlog, has never once been run. So `plan` refuses instead of warning: an advisory lane is
+# the one that gets scrolled past.
+#
+# The escape is a RECORDED DECISION, never an omission: `sprint.breakdown: judgement` in the
+# project config makes the lane report instead of block. Absence of config means BLOCK, and an
+# unreadable or unknown mode is not an escape either - it falls back to enforce.
+BREAKDOWN_MODES = ("enforce", "judgement")
+
+# A CR at or above this many declared files, or sized at the split ceiling, is doing enough work
+# to warrant stories: only a story carries executable `Verify:` lines, so an un-decomposed CR's
+# Done is gated on prose. Advisory - "where the work warrants" is a judgement the report can only
+# name.
+DECOMPOSE_FILE_THRESHOLD = 5
+
+
+def breakdown_mode(repo_root: Path | str) -> str:
+    """`enforce` (the default) or the recorded opt-out `judgement`. Never fails open."""
+    mode = str(config.get(repo_root, "sprint.breakdown", "enforce") or "enforce").strip().lower()
+    return mode if mode in BREAKDOWN_MODES else "enforce"
+
+
+def points_split_above(repo_root: Path | str) -> int:
+    """The point ceiling a unit must be SPLIT above. `sdlc_md.POINTS_SPLIT_ABOVE` (8) unless the
+    project has recorded a different one in `sprint.points_split_above`.
+
+    Configurable because 8 is where the evidence broke for THIS project's units, and another
+    team's 8 is not this one's. A project that finds 8-point units too chunky to deliver in one
+    go tightens to 5, and the gate refuses more. Raising it is a recorded decision too - and it
+    is a decision to forecast in a range where the estimate is known to fall apart (the 13s came
+    in 1.9x cheaper per point than every band below).
+
+    A malformed or non-positive value degrades to the shipped ceiling rather than disabling the
+    gate: a gate that a typo can switch off is not a gate.
+    """
+    try:
+        value = int(config.get(repo_root, "sprint.points_split_above",
+                               sdlc_md.POINTS_SPLIT_ABOVE))
+    except (TypeError, ValueError):
+        return sdlc_md.POINTS_SPLIT_ABOVE
+    return value if value > 0 else sdlc_md.POINTS_SPLIT_ABOVE
+
+
+def _affect_key(root: Path, p: str) -> str:
+    """One file, one key - however the path was written.
+
+    A declared path is resolved where it exists, so `scripts/x.py` and the same file spelled
+    from the repo root are ONE file for clustering. An unresolvable (not-yet-existing) path
+    keeps its declared spelling rather than being dropped: a new file two units both create is
+    still a collision."""
+    r = _resolve(root, p)
+    if r is not None:
+        try:
+            return str(r.relative_to(root))
+        except ValueError:
+            return str(r)
+    return re.sub(r"^\./", "", p.strip())
+
+
+def _declared_size(text: str) -> int | None:
+    """The size a PERSON recorded for this unit: its `Points`, on the modified Fibonacci scale.
+    None when the field is absent, or carries a value the scale does not have.
+
+    ONE source, because there is one size vocabulary (lib/sdlc_md owns the scale and the parser).
+    A seat estimate is no longer accepted here: the seats price VALUE, and a second size
+    vocabulary living beside the first is exactly what this change deleted. Nor is an `unknown`
+    an answer any more - the scale IS the estimate, and it is relative ("is this bigger than that
+    one"), so a person who has delivered anything at all can place a unit on it."""
+    return sdlc_md.read_points(text)
+
+
+# SIZE BY WHAT A THING IS. A delivery unit (story, bug) is MEASURED, so it carries story points.
+# A container/request (CR, RFC, epic) is DECOMPOSED before it is delivered, so it carries a coarse
+# T-shirt Size instead - a request is not a unit of work until it is broken down, and pointing it
+# is guessing at a shape that does not exist yet. The grooming gate therefore demands the RIGHT
+# size per type: `Points` for a story or bug, a T-shirt `Size` for a CR or RFC.
+TSHIRT_SIZED_TYPES = frozenset({"cr", "rfc", "epic"})
+
+
+def _declared_tshirt(text: str) -> str | None:
+    """The T-shirt Size (S/M/L/XL) a container/request declares, or None. `lib/sdlc_md` owns the
+    scale and the parser, exactly as it does for points - one vocabulary, one reader."""
+    return sdlc_md.read_size(text)
+
+
+def _file_source(declared: bool, derived: bool) -> str:
+    """How the planner came to know about a file: somebody DECLARED it in `Affects`, the
+    planner DERIVED it from a Verify line, or both said so."""
+    if declared and derived:
+        return "declared+derived"
+    return "declared" if declared else "derived"
+
+
+def _shared_file_clusters(files_by_unit: dict[str, list[str]],
+                          sources_by_unit: dict[str, dict] | None = None) -> list[dict]:
+    """Units that touch the SAME FILE are ONE cluster, not independent parallel work.
+
+    TWO SOURCES OF FILES, AND THE CLUSTER SAYS WHICH IS WHICH. `Affects` is a DECLARATION and
+    the grooming gate judges it; a path a unit's `Verify:` line names is a FACT the planner
+    worked out. Both belong in the cluster - two agents collide over a test file neither
+    declared exactly as they collide over a declared one - but they must stay distinguishable,
+    because only the declaration is a promise anybody made. Each cluster therefore carries a
+    `sources` map alongside its `files`.
+
+    The dependency graph knows only what someone declared in `Depends on:`; a shared file
+    collides whether or not anyone declared it. Union-find over the shared files; a unit that
+    shares nothing is not a cluster."""
+    parent = {uid: uid for uid in files_by_unit}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    by_file: dict[str, list[str]] = {}
+    for uid, files in files_by_unit.items():
+        for f in files:
+            by_file.setdefault(f, []).append(uid)
+    for uids in by_file.values():
+        for other in uids[1:]:
+            union(uids[0], other)
+    groups: dict[str, list[str]] = {}
+    for uid in files_by_unit:
+        groups.setdefault(find(uid), []).append(uid)
+    src = sources_by_unit or {}
+    out: list[dict] = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        members = sorted(members)
+        shared = sorted(f for f, uids in by_file.items() if len(set(uids) & set(members)) > 1)
+        sources = {
+            f: _file_source(
+                any(f in (src.get(u) or {}).get("declared", ()) for u in members),
+                any(f in (src.get(u) or {}).get("derived", ()) for u in members))
+            for f in shared}
+        out.append({"units": members, "files": shared, "sources": sources})
+    return sorted(out, key=lambda c: c["units"])
+
+
+def _ids_cited_by_stories(root: Path) -> set:
+    """Every artifact id any story mentions - so a CR a story already actions is not flagged
+    for decomposition a second time."""
+    cited: set = set()
+    for path in sdlc_md.artifact_files("story", root):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:  # noqa: PERF203 - an unreadable story must not break planning
+            sdlc_md.debug("sprint._ids_cited_by_stories", exc)
+            continue
+        for m in sdlc_md.ID_SEARCH_RE.finditer(text):
+            cited.add(sdlc_md.norm_id(m.group(0)))
+    return cited
+
+
+def breakdown(repo_root: Path | str, batch: list[dict], skip_personas: bool = False) -> dict:
+    """Is this batch GROOMED enough to plan? The census the gate refuses on.
+
+    A unit is plannable when it declares the files it will touch (`Affects`) and carries the
+    size its TYPE is sized by - `Points` for a story or bug (the delivery units), a T-shirt
+    `Size` for a CR or RFC (the requests/containers). A pointed unit is additionally refused when
+    its points are ABOVE the split ceiling: a triage rule, not an estimation one - above the
+    ceiling the estimate is not worth having (the 13s in the blind re-estimation were
+    over-estimated by 1.9x per point, and all three estimators said so unprompted), and the
+    answer is to DECOMPOSE the unit rather than estimate it harder. A T-shirt Size has no number
+    and no ceiling; a container's answer to "too big" is always decomposition.
+
+    `ungroomed` and `oversized` are counted separately because they are different failures with
+    different fixes: one unit was never sized, the other was sized honestly and is too big.
+    Everything else the lane surfaces - shared-file clusters, CRs big enough to warrant stories -
+    falls out of the same fields at no extra cost to the operator. Read-only: it reports, and
+    `cmd_plan` decides what to do about it."""
+    root = Path(repo_root)
+    cited = _ids_cited_by_stories(root)
+    ceiling = points_split_above(root)
+    # The story-level Definition of Ready, when the project declares one, decides WHICH of
+    # the grooming checks enforce (absent document = shipped defaults, byte-compatible).
+    # A criterion whose tag the project removed is downgraded to human-judged - reported
+    # visibly below, never skipped silently.
+    dor = sdlc_md.dor_dod_level_checks(root, "ready", "story")
+    def _enforced(check_id: str) -> bool:
+        return dor is None or check_id in dor
+    downgraded = [] if dor is None else sorted(
+        c for c in ("grooming.affects", "grooming.points", "grooming.split",
+                    "grooming.acs")
+        if c not in dor)
+    ungroomed: list[dict] = []
+    oversized: list[dict] = []
+    groomed: list[str] = []
+    files_by_unit: dict[str, list[str]] = {}
+    sources_by_unit: dict[str, dict] = {}
+    affects_advisories: list[dict] = []
+    decompose: list[dict] = []
+    for it in batch:
+        try:
+            text = Path(it["path"]).read_text(encoding="utf-8")
+        except OSError as exc:  # noqa: PERF203
+            sdlc_md.debug("sprint.breakdown", exc)
+            continue
+        declared = _affects_files(text)
+        # BG0144: a declared `Affects` must name at least one file that RESOLVES on disk. A unit
+        # whose declared paths ALL fail to resolve is sized against a fictional list - a typo, or a
+        # stale rename - and every downstream consumer then treats a guess wearing a path as a
+        # sized unit. A path to a file the unit will CREATE cannot resolve yet, so SOME unresolved
+        # paths are legitimate; ALL of them is the error. Unresolvable paths are named either way.
+        import file_finding  # noqa: PLC0415 - local: the ONE resolvable-Affects seam, shared with every writer
+        unresolvable = file_finding.unresolvable_affects(root, declared)
+        points = _declared_size(text)
+        # THE COLLISION ANALYSIS SEES BOTH; THE GROOMING GATE BELOW SEES ONLY `declared`.
+        # Test files are almost never declared, so the file parallel work most often shares
+        # was the one file this analysis could not see. Deriving it from the unit's own Verify
+        # lines closes that hole without letting derivation satisfy the `Affects` requirement -
+        # a unit declaring nothing would otherwise pass by having its verifiers read.
+        declared_keys = sorted({_affect_key(root, p) for p in declared})
+        derived_keys = sorted({_affect_key(root, p) for p in verify_files(root, text)})
+        files_by_unit[it["id"]] = sorted(set(declared_keys) | set(derived_keys))
+        sources_by_unit[it["id"]] = {"declared": declared_keys, "derived": derived_keys}
+        # A declaration the unit's OWN content contradicts, reported per unit rather than only
+        # when every path fails. Four of the twenty-two stories minted for this batch carried a
+        # wrong or incomplete Affects, one of them written minutes after the author ruled on
+        # this very defect - so "a careful author will get it right" is not a control. Advisory:
+        # it never changes the grooming verdict below.
+        mism = affects_mismatch(root, text)
+        if mism["unresolvable"] or mism["undeclared"]:
+            affects_advisories.append({"id": it["id"], **mism})
+        # The size demanded depends on WHAT the unit is. A story/bug is groomed by `Points`; a
+        # CR/RFC by a T-shirt `Size`. LEGACY TOLERANCE: a CR filed before this rule carries
+        # `Points` and no `Size` (the earlier gate forced it) - it still counts as sized, so the
+        # transition never invalidates the backlog. A T-shirt `Size` is never read as a number.
+        if it["type"] in TSHIRT_SIZED_TYPES:
+            sized = _declared_tshirt(text) is not None or points is not None
+            size_field = "Size"
+        else:
+            sized = points is not None
+            size_field = "Points"
+        # ACCEPTANCE CRITERIA. The gate asked only for Affects and Points, so a story whose
+        # criteria are still the grooming placeholder - the literal banner the template writes,
+        # or the bare `{{role}}/{{capability}}` scaffold - was certified GROOMED as long as it
+        # declared files and a size. Four such stories and 15 points were planned into a sprint
+        # on that green, in enforcing blocking mode, whose entire purpose is to refuse them.
+        # `conformance.unit_is_ungroomed` already reads every shape and already had this right;
+        # nothing asked it. EVERY TYPE, not stories: the predecessor restricted this to stories
+        # because "a bug carries no user-story scaffold", which is true of the scaffold and false
+        # of the other two shapes - so five bugs with no criteria at all, and four more carrying
+        # only tool-derived text, were certified GROOMED by the very census whose job is to say
+        # whether a batch is worth planning. `transition` refused those same five outright.
+        import conformance  # noqa: PLC0415 - deferred; one definition of "ungroomed", never a second
+        # ...and ONE definition of "can this type be graded at all", which is `_rung_grades`.
+        # Asking `unit_is_ungroomed` of every type made `breakdown` a THIRD answer to a question
+        # the close's two surfaces already share: a batch could be refused for holding an
+        # ungroomed epic and then closed reporting that same epic was never gradeable.
+        ungroomed_ac, ac_why = (conformance.unit_is_ungroomed(
+            it["type"], sdlc_md.read_text_safe(it["path"]))
+            if _enforced("grooming.acs") and _rung_grades(it["type"]) else (False, ""))
+        _AC_MISS = {
+            **_AC_MISS_RENDERINGS,
+        }
+        missing = (([] if declared or not _enforced("grooming.affects") else ["Affects"])
+                   + ([] if sized or not _enforced("grooming.points") else [size_field])
+                   + ([_AC_MISS[ac_why]] if ungroomed_ac else []))
+        # All declared paths unresolvable AND at least one of them a TYPO = a fictional Affects.
+        # Named so the author can fix the typo. Not applied when Affects is absent (that is the
+        # plainer "Affects" miss), and not applied when the basenames exist NOWHERE - a unit whose
+        # every declared path is a file it will create is the normal greenfield case, and refusing
+        # it refuses the first sprint plan of every new project. `fictional_affects` is the same
+        # predicate the writers refuse on, which is what keeps the two from disagreeing.
+        typos = (file_finding.fictional_affects(root, declared)
+                 if declared and _enforced("grooming.affects") else [])
+        if declared and len(unresolvable) == len(declared) and typos:
+            # Name the MATCH, not just the path. "src/authh/signup.py does not exist" leaves the
+            # author to work out why that is a typo rather than a file they have not written yet;
+            # naming `src/auth/signup.py` beside it IS the reason, and it comes from the same
+            # lookup that decided the verdict rather than from a second walk of the tree.
+            matches = {p: file_finding.basename_matches(root, p) for p in typos}
+            missing = missing + [
+                "Affects names a path that does not exist while its filename does: "
+                + "; ".join(f"{p} (found at {', '.join(m)})" for p, m in matches.items())]
+        if missing:
+            # `ac_why` is carried as a CODE beside the prose so a caller with a different
+            # contract can filter on it without string-matching the message. `file_finding`
+            # is that caller: it legitimately writes `derived-only` criteria, so refusing them
+            # at CREATION would make filing a finding impossible, while refusing them at
+            # PLANNING is the whole point. Two contracts, one definition, no second predicate.
+            # The VERB is derived here rather than hardcoded in the renderer, because a unit that
+            # declared an `Affects` and mistyped it does not LACK one, and telling its author it
+            # does sends them to add a field that is already present.
+            absences = [m for m in missing if not m.startswith("Affects names a path")]
+            ungroomed.append({"id": it["id"], "type": it["type"], "path": it["path"],
+                              "missing": missing, "unresolvable": unresolvable,
+                              "typos": typos,
+                              "verb": "lacks" if absences else "typo:",
+                              "ac_why": ac_why})
+        elif points is not None and points > ceiling and _enforced("grooming.split"):
+            # Only a POINTED unit can be over the split ceiling; a T-shirt Size has no number to
+            # be above it. A legacy CR carrying points is judged by the same ceiling it always was.
+            oversized.append({"id": it["id"], "type": it["type"], "path": it["path"],
+                              "points": points, "ceiling": ceiling})
+        else:
+            groomed.append(it["id"])
+        if it["type"] == "cr" and sdlc_md.norm_id(it["id"]) not in cited:
+            big = points is not None and points >= ceiling
+            wide = len(declared) >= DECOMPOSE_FILE_THRESHOLD
+            if big or wide:
+                why = (f"{points} points" if big else f"touches {len(declared)} files")
+                decompose.append({"id": it["id"], "why": why})
+    mode = breakdown_mode(root)
+    return {"mode": mode, "blocking": mode != "judgement",
+            "ungroomed": ungroomed, "oversized": oversized, "groomed": groomed,
+            "ceiling": ceiling, "downgraded": downgraded,
+            "clusters": _shared_file_clusters(files_by_unit, sources_by_unit),
+            "affects_advisories": affects_advisories,
+            "decompose": decompose,
+            "triage": _batch_triage(root, [it["id"] for it in batch]),
+            "probable_duplicates": probable_duplicates(root, batch),
+            "ok": not ungroomed and not oversized}
+
+
+PARALLEL = "parallel"
+SEQUENTIAL = "sequential"
+
+
+#: How much of two titles must be shared before a pair with identical `Affects` is reported as a
+#: probable duplicate. Tuned to be quiet: a shared file set alone is a CLUSTER and already
+#: reported, so this only speaks when the two units also describe the same thing.
+_DUPLICATE_TITLE_OVERLAP = 0.6
+
+#: Words that carry no subject and would make any two bug titles look alike.
+_TITLE_STOPWORDS = frozenset(
+    "a an and are as at be but by for from has have in is it its no not of on or so that the "
+    "then there this to was were when which while with without".split())
+
+
+def _title_tokens(title: str) -> set:
+    words = re.findall(r"[a-z0-9_]+", (title or "").lower())
+    return {w for w in words if w not in _TITLE_STOPWORDS and len(w) > 2}
+
+
+def probable_duplicates(root: Path | str, batch: list) -> list:
+    """Pairs in `batch` with IDENTICAL declared `Affects` and heavily overlapping titles.
+
+    Reported, never acted on. BG0577 found that 12% of a forty-one bug backlog was not work at
+    all - two already repaired, two with expired premises, one a straight duplicate - and none of
+    it was detectable: `status.py points` counts open artefacts and `conformance` judges terminal
+    ones, so nothing asks whether an OPEN bug is still true. A plan sized against that number
+    inherits the error silently, which is what happened on 2026-08-13.
+
+    This is the cheapest of the three checks that bug asks for, and the only one that needs no
+    judgement: an identical file set plus the same words is a stronger signal than the shared-file
+    cluster already printed beside it, and a duplicate costs most at PLAN time, which is here.
+
+    Deliberately NOT auto-closed. A backlog that silently closed its own items would be the same
+    failure with the sign reversed - the point is to put the pair in front of somebody.
+    """
+    root = Path(root)
+    rows = []
+    for it in batch:
+        found = sdlc_md.find_by_id(root, it["id"])
+        if not found:
+            continue
+        text = sdlc_md.read_text_safe(found[0])
+        affects = tuple(sorted(sdlc_md.affects_files(text)))
+        if not affects:
+            continue          # no declared surface is a different finding, reported elsewhere
+        rows.append((it["id"], affects, _title_tokens(sdlc_md.extract_h1_title(text) or "")))
+    out = []
+    for i, (aid, a_files, a_words) in enumerate(rows):
+        for bid, b_files, b_words in rows[i + 1:]:
+            if a_files != b_files or not (a_words and b_words):
+                continue
+            overlap = len(a_words & b_words) / min(len(a_words), len(b_words))
+            if overlap >= _DUPLICATE_TITLE_OVERLAP:
+                out.append({"pair": [aid, bid], "overlap": round(overlap, 2),
+                            "affects": list(a_files),
+                            "shared": sorted(a_words & b_words)})
+    return sorted(out, key=lambda r: (-r["overlap"], r["pair"]))
+
+
+def _unit_files(root: Path, text: str) -> list[str]:
+    """The normalised files a unit touches: its declared `Affects` AND the files its `Verify:`
+    lines name. Test files are almost never declared but are exactly where parallel worktree
+    builds collide, so the derived set is folded in - a shared test module couples two units as
+    surely as a shared source module does."""
+    declared = {_affect_key(root, p) for p in _affects_files(text)}
+    derived = {_affect_key(root, p) for p in verify_files(root, text)}
+    return sorted(declared | derived)
+
+
+#: Build tooling and shared config: paths the whole batch's gate and build depend on, so a
+#: unit touching one is coupled to every other unit however file-disjoint its own edits look.
+#: Two worktrees editing DIFFERENT tools files still share the one gate that runs across both,
+#: and a shared-config change (the project config, the hooks) reshapes every worktree's build
+#: at once - a merge-clean split that is still not parallel-safe. The set is DECLARED here as
+#: explicit paths and directory prefixes, never inferred from a filename shape: a guess like
+#: "anything ending .yaml" or "anything with test in the name" is exactly the fragile naming
+#: rule this avoids. A trailing "/" declares a directory (its whole subtree); anything else is
+#: one exact repo-relative file.
+BUILD_TOOLING_PATHS: tuple[str, ...] = (
+    ".githooks/",                 # the commit gate every worktree runs
+    "tools/",                     # the CI guards the gate invokes
+    ".github/workflows/",         # the CI definition
+    "package.json",               # dependency and script manifest
+    "package-lock.json",
+    "install.sh",                 # the installer the payload ships through
+    "sdlc-studio/.config.yaml",   # the shared project config the gate reads
+    ".claude/skills/sdlc-studio/scripts/gate.py",   # the gate itself
+)
+
+
+def _build_tooling_hits(files: list[str]) -> list[str]:
+    """Which of `files` (repo-relative keys) fall in the declared build-tooling set."""
+    hits: list[str] = []
+    for f in files:
+        norm = re.sub(r"^\./", "", f.replace("\\", "/")).lstrip("/")
+        for decl in BUILD_TOOLING_PATHS:
+            if decl.endswith("/"):
+                if norm == decl.rstrip("/") or norm.startswith(decl):
+                    hits.append(f)
+                    break
+            elif norm == decl:
+                hits.append(f)
+                break
+    return sorted(set(hits))
+
+
+def _full_partition(units: list[tuple[str, list[str]]]) -> list[list[str]]:
+    """Every unit assigned to a file-disjoint group, SINGLETONS INCLUDED (unlike the cluster
+    view, which drops units that share nothing). Union-find over the shared files; the result is
+    sorted so a given batch always partitions the same way."""
+    parent = {uid: uid for uid, _ in units}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    by_file: dict[str, list[str]] = {}
+    for uid, files in units:
+        for f in files:
+            by_file.setdefault(f, []).append(uid)
+    for uids in by_file.values():
+        for other in uids[1:]:
+            ra, rb = find(uids[0]), find(other)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+    groups: dict[str, list[str]] = {}
+    for uid, _ in units:
+        groups.setdefault(find(uid), []).append(uid)
+    return sorted((sorted(g) for g in groups.values()), key=lambda g: g[0])
+
+
+def delivery_mode_offer(repo_root: Path | str, batch: list[dict]) -> dict:
+    """Whether a batch may be built in PARALLEL isolated worktrees, or must go SEQUENTIALLY.
+
+    Parallel is offered ONLY when the batch genuinely decomposes into two or more file-disjoint
+    groups: two agents editing the same file in separate worktrees produce a merge conflict, and a
+    SHARED TEST FILE couples them exactly as a shared source file does (a real parallel build
+    learned this by colliding over a test module neither unit declared - so `_unit_files` counts
+    the Verify-derived files). A one-unit batch, a batch where every unit couples to another, or
+    any unit with no declared `Affects` (unknown blast radius) is delivered sequentially, and the
+    plan STATES the mode and why the alternative was or was not available. Deterministic: the same
+    batch and repo state always yield the same offer, so the choice is never a coin toss."""
+    root = Path(repo_root)
+    units: list[tuple[str, list[str]]] = []
+    undeclared: list[str] = []
+    unrecognised: dict[str, list[str]] = {}
+    for it in batch:
+        text = Path(it["path"]).read_text(encoding="utf-8")
+        uid = sdlc_md.display_id(root, it["id"])    # printed in the offer, so its file's spelling
+        if not _affects_files(text):
+            dropped = sdlc_md.unrecognised_affects(text)
+            if dropped:
+                unrecognised[uid] = dropped
+            else:
+                undeclared.append(uid)
+        units.append((uid, _unit_files(root, text)))
+    all_ids = [u for u, _ in units]
+    tooling = {uid: _build_tooling_hits(files) for uid, files in units}
+    coupled = sorted(uid for uid, hits in tooling.items() if hits)
+    modes = [SEQUENTIAL]
+    if len(units) <= 1:
+        groups = [[u] for u in all_ids]
+        reason = "a one-unit batch has nothing to parallelise; delivered sequentially"
+    elif undeclared or unrecognised:
+        groups = [sorted(all_ids)]
+        said = []
+        if undeclared:
+            said.append(f"unit(s) {', '.join(sorted(undeclared))} declare no Affects")
+        if unrecognised:
+            said.append("the Affects of " + "; ".join(
+                f"{uid} ({', '.join(f'`{t}`' for t in toks)})"
+                for uid, toks in sorted(unrecognised.items()))
+                + " are not recognised as file paths")
+        reason = (f"{' and '.join(said)}, so their blast radius is unknown; delivered "
+                  f"sequentially rather than risk an undeclared overlap")
+    elif coupled:
+        named = "; ".join(f"{uid} touches {', '.join(tooling[uid])}" for uid in coupled)
+        groups = [sorted(all_ids)]
+        reason = (f"unit(s) {', '.join(coupled)} touch build tooling or shared config that the "
+                  f"whole batch's gate and build depend on ({named}); a parallel worktree build "
+                  f"cannot isolate that coupling, so the batch is delivered SEQUENTIALLY")
+    else:
+        groups = _full_partition(units)
+        if len(groups) >= 2:
+            modes.append(PARALLEL)
+            reason = (f"the batch decomposes into {len(groups)} file-disjoint groups (test files "
+                      f"counted as coupling), so a PARALLEL worktree build is available alongside "
+                      f"the SEQUENTIAL one - either is safe")
+        else:
+            reason = ("every unit shares an affected file (source or test) with another, so the "
+                      "batch does not decompose; PARALLEL was withheld and it is delivered "
+                      "SEQUENTIALLY")
+    return {"modes": modes, "parallel_available": PARALLEL in modes,
+            "groups": groups, "reason": reason, "default_mode": SEQUENTIAL,
+            "undeclared_affects": sorted(undeclared),
+            "build_tooling_coupled": coupled}
+
+
+def record_delivery_mode(offer: dict, mode: str) -> dict:
+    """Record the chosen delivery mode against an offer. REFUSES a mode the offer did not make
+    available (you cannot pick PARALLEL for a coupled batch), so a recorded choice is always one
+    the disjointness analysis actually permitted."""
+    if mode not in offer.get("modes", ()):
+        raise ValueError(
+            f"delivery mode {mode!r} is not available for this batch - offered: "
+            f"{', '.join(offer.get('modes') or [])}. {offer.get('reason', '')}")
+    out = {"mode": mode, "reason": offer.get("reason", "")}
+    if mode == PARALLEL:
+        out["groups"] = offer.get("groups") or []
+    return out
+
+
+def lane_partition(repo_root: Path | str, batch: list[dict]) -> dict:
+    """A REPORT-ONLY file-disjoint partition of the batch into lanes, from the same
+    `_unit_files` / `_full_partition` machinery `delivery_mode_offer` uses - no second
+    implementation of disjointness. Unlike the delivery-mode offer, this reports the lanes for
+    EVERY batch (a coupled one still partitions - the coupling is why lanes merge), so an operator
+    can see how the work would split across teams or worktrees whatever mode is chosen.
+
+    A unit that declares no `Affects` is UNPLACEABLE and named, never placed: an undeclared file
+    is invisible to a collision check, so a lane holding it cannot be called disjoint. `_full_partition`
+    guarantees no file appears in two lanes. This changes no plan decision - it is a view over the
+    batch, not an input to selecting or ordering it."""
+    root = Path(repo_root)
+    placeable: list[tuple[str, list[str]]] = []
+    unplaceable: list[str] = []
+    files_by_unit: dict[str, list[str]] = {}
+    for it in batch:
+        text = Path(it["path"]).read_text(encoding="utf-8")
+        uid = sdlc_md.display_id(root, it["id"])    # printed and exported: the file's spelling
+        if not _affects_files(text):
+            unplaceable.append(uid)
+            continue
+        files = _unit_files(root, text)
+        placeable.append((uid, files))
+        files_by_unit[uid] = files
+    lanes = _full_partition(placeable)
+    return {"lanes": lanes, "unplaceable": sorted(unplaceable),
+            "files_by_unit": files_by_unit}
+
+
+def _write_lane_worklists(lanes: list[list[str]], out_dir: Path | str,
+                          repo_root: Path | str | None = None) -> list[str]:
+    """Write each lane as a worklist file the planner reads back (`sprint plan --worklist`). The
+    undeclared-file caveat is stated in EVERY export, because the guarantee travels with the
+    artefact handed to a team: disjointness is only as good as the declared `Affects`, and a unit
+    touching a file it did not declare (an undeclared file) can still collide with another lane.
+
+    With `repo_root`, the lessons injected at build travel in the same header - the file handed
+    to a team is the last thing between the lessons and the work, so they arrive with the units
+    rather than in a terminal the person picking this up never saw."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    carried = [f"# {line}" for line in
+               lessons.render_phase(lessons.phase_digest(repo_root, "build"))] if repo_root else []
+    lane_files: list[str] = []
+    for i, lane in enumerate(lanes, start=1):
+        p = out / f"lane-{i:02d}.worklist.txt"
+        header = [
+            f"# Lane {i} of {len(lanes)} - file-disjoint against the other lanes by declared"
+            " Affects.",
+            "# CAVEAT: disjointness is only as good as the declared Affects. A unit touching a"
+            " file it did not declare (an undeclared file) can still collide with another lane -"
+            " the guarantee does not cover what was never declared.",
+            *carried,
+        ]
+        p.write_text("\n".join(header + list(lane)) + "\n", encoding="utf-8")
+        lane_files.append(str(p))
+    return lane_files
+
+
+def export_lanes(repo_root: Path | str, batch: list[dict], out_dir: Path | str) -> dict:
+    """Write each lane of `lane_partition` as a worklist file the planner reads back
+    (`sprint plan --worklist`), so a lane can be handed to a separate team, agent or worktree.
+    Returns `{lane_files, unplaceable}`; the caller writes nothing else."""
+    part = lane_partition(repo_root, batch)
+    return {"lane_files": _write_lane_worklists(part["lanes"], out_dir, repo_root),
+            "unplaceable": part["unplaceable"]}
+
+
+# ---------------------------------------------------------------------------
+# The lessons a phase carries: `lessons.phase_digest(root, "plan"|"build"|"review")`
+# ---------------------------------------------------------------------------
+# The plan output, every lane brief and the review brief each carry the active failure classes
+# injected at their phase, as rule plus behaviour, at most five (`lessons.render_phase`). They
+# replaced a curated set of five titles that every brief carried unchanged for eight weeks.
+
+
+#: The step-ordered toolchain. Printed at plan time rather than left to be found, because the
+#: hand-rolling this project keeps catching is recall failure AT A STEP BOUNDARY - the agent
+#: knew the tool existed, just not at the moment the step arose. A catalogue ordered by script
+#: cannot fix a failure of step-to-command lookup. It ships with the skill, so it is read from
+#: the skill's own directory: a consuming project installs the skill outside its tree.
+RUNBOOK_REL = "reference-sprint-toolchain.md"
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+
+
+def render_runbook_pointer() -> list[str]:
+    """The runbook's step headings and where to read it, or the reported absence."""
+    text = sdlc_md.read_text_safe(SKILL_ROOT / RUNBOOK_REL)
+    where = f"{RUNBOOK_REL} in the skill directory"
+    if not text:
+        return [f"TOOLCHAIN RUNBOOK MISSING ({where}) - reported rather than omitted: a "
+                f"plan that silently drops it cannot be told from one that never had it."]
+    steps = [ln[3:].strip() for ln in text.splitlines() if ln.startswith("## ")]
+    return [f"Toolchain, by step - read it before hand-doing anything mechanical "
+            f"({where}):",
+            *(f"  {s}" for s in steps if not s.startswith("When a"))]
+
+
+# ---------------------------------------------------------------------------
+# The lane contract: what a lane may be dispatched onto, and what it must return
+# ---------------------------------------------------------------------------
+# A lane is the unit of delegated delivery - a subagent, a worktree, a teammate. Everything it
+# is held to used to live in whatever prompt the operator typed that night, so the checks were
+# only as good as one person's memory at 3am. Six units reached Fixed in RUN-01KYJZGZ carrying
+# no acceptance criterion at all: each lane inferred a contract from the unit's summary,
+# delivered against the inference, and nothing downstream could tell that from the real thing.
+#
+# So the obligations live here, beside the dispatch, and the dispatch enforces the first of them
+# itself: a unit whose contract cannot be READ is refused before a lane starts on it.
+
+#: What every lane is held to, stated once. Carried in the brief so it travels with the work
+#: rather than depending on who wrote that sprint's prompt.
+LANE_OBLIGATIONS = (
+    "Refuse a unit that carries no authored acceptance criteria - never infer a contract from "
+    "its summary.",
+    "Run this unit's OWN acceptance criteria before returning, and return BLOCKED on a red or "
+    "unresolvable one, carrying the verifier's own output rather than a claim about it.",
+    "Return the proof the plan's test strategy assigned this unit, or name the obligation you "
+    "could not discharge and why.",
+    "A repair answering a REJECT carries only the blocking findings and the pins that kill "
+    "them, and files the rest.",
+    "Land the unit on `main`: open no PR and push no branch, fast-forwarding a local worktree "
+    "onto `main` within the lane, unless `release_strategy` is `pr-required`.",
+)
+
+#: Opens the brief's file-history section. The lane meets the prior work and the defects its
+#: reviews found before writing a line rather than in a REJECT, and reads the history the brief
+#: already selected rather than the whole artefact corpus.
+LANE_PRIOR_ART = (
+    "Prior art: run `git log -S <symbol>` before changing a symbol you did not write; where an "
+    "artefact and the history disagree, the history wins; do not read the artefact corpus in "
+    "bulk - the units below are the ones that changed your files."
+)
+
+
+def _lane_ac_blocks(text: str) -> list[dict]:
+    """The unit's acceptance criteria as `{ac, title, verifier, verifiers}`, parsed by the SAME
+    parser the verifier executes (`verify_ac.parse_story`). A second parser here would let a lane
+    be dispatched against criteria the runner cannot see, which is the divergence that makes an
+    executable contract stop being executable. `verifiers` is every Verify line, in order."""
+    import verify_ac  # noqa: PLC0415 - sibling; imported lazily so a plan never pays for it
+    return [{"ac": b.ac_id, "title": b.title, "verifier": b.verifier, "verifiers": b.verifiers}
+            for b in verify_ac.parse_story(text)]
+
+
+def lane_contract(repo_root: Path | str, unit_id: str) -> dict:
+    """What a lane is contracted to deliver for one unit, or why it must not start.
+
+    Returns `{id, path, ok, refusal, criteria}`. `ok` is False - and `refusal` names the unit
+    and what is missing - when the unit cannot be read, carries no acceptance-criteria section,
+    or carries a grooming placeholder instead of authored criteria. A placeholder is refused for
+    the same reason as an absence: it is an absent contract wearing the shape of one, and a lane
+    that reads it as a specification delivers against nothing.
+
+    The two absence tests are NOT a second copy of the rules. "Is this authored?" comes from
+    `conformance._ac_signals` and "is this a placeholder?" from `conformance.story_is_ungroomed`,
+    the same definitions the grooming gate and the close report use, so a shape added there is
+    refused here without an edit.
+    """
+    root = Path(repo_root)
+    uid = sdlc_md.norm_id(unit_id)
+    hit = sdlc_md.find_by_id(root, uid)
+    if not hit:
+        return {"id": uid, "path": None, "ok": False, "criteria": [], "text": "",
+                "refusal": f"{uid}: no artefact on disk resolves to this id - a lane cannot be "
+                           f"dispatched onto a unit whose contract it cannot read"}
+    path = Path(hit[0])
+    text = sdlc_md.read_text_safe(path)
+    import conformance  # noqa: PLC0415 - one definition of authored/ungroomed, never a second
+    if conformance.story_is_ungroomed(text):
+        return {"id": uid, "path": str(path), "ok": False, "criteria": [],
+                "refusal": f"{uid} ({path.name}): its acceptance criteria are an ungroomed "
+                           f"placeholder, not authored content - a placeholder is an absent "
+                           f"contract in the shape of one. Groom it before dispatching a lane."}
+    has_ac, _has_verify, _states = conformance._ac_signals(text)
+    if not has_ac:
+        return {"id": uid, "path": str(path), "ok": False, "criteria": [], "text": text,
+                "refusal": f"{uid} ({path.name}): carries no authored acceptance criteria - "
+                           f"there is nothing to deliver against, and a contract inferred from "
+                           f"the summary is the lane's guess, not the unit's specification."}
+    blocks = _lane_ac_blocks(text)
+    if not blocks:
+        # One definition decides, not two. `_ac_signals` accepts checkbox and prose criteria
+        # the runner cannot parse, so a unit passed the gate with an EMPTY contract and was
+        # dispatched under the very obligation to refuse that - and could then never be
+        # reported fixed, because no criterion could be run. Measured live: 475 units.
+        return {"id": uid, "path": str(path), "ok": False, "criteria": [], "text": text,
+                "refusal": f"{uid} ({path.name}): carries an Acceptance Criteria section the "
+                           f"runner cannot read - no `### ACn` block. Rewrite the criteria in "
+                           f"the executable shape before dispatching a lane; a contract the "
+                           f"runner cannot parse is not a contract."}
+    return {"id": uid, "path": str(path), "ok": True, "refusal": "",
+            "criteria": blocks, "text": text}
+
+
+def lane_dispatch(repo_root: Path | str, unit_ids: list[str]) -> dict:
+    """Dispatch lanes onto `unit_ids`, refusing any unit whose contract cannot be read.
+
+    Returns `{briefs, refused}`. A refused unit never reaches a brief: the refusal is the
+    answer, and it names the unit and what is missing so the operator can groom it rather than
+    discover at review that the lane invented a specification.
+    """
+    root = Path(repo_root)
+    # Read ONCE per dispatch and put the same object in every brief: a set read per lane could
+    # differ between lanes of one sprint, and "every brief carries the lessons" would stop being
+    # one fact about the sprint.
+    injected = lessons.phase_digest(root, "build")
+    # The batch's seam map, computed ONCE for the dispatch. A seam is a fact about a PAIR, and
+    # a lane reads one unit - so the neighbouring property a lane must not regress is the one
+    # thing it can never learn by reading its own brief's unit. Thirteen of seventeen round-one
+    # majors in RUN-01KYKVZM were seam defects for exactly this reason.
+    # Against the OPEN RUN's approved batch, not this invocation's ids. The shipped docs
+    # dispatch one unit at a time (`lane brief --units <id>`), so a seam map scoped to the call
+    # never found a pair - the feature worked only when the whole batch was briefed at once,
+    # which is the case where a lane is not the one-unit reader the design is premised on. The
+    # brief below still filters to the unit it is for.
+    # `run_state.read` RAISES on an unparseable file, by design - unreadable is not the same
+    # fact as absent. But the seam computation below is guarded precisely because a seam read
+    # must never block a dispatch, and this read sat ABOVE that guard, so a corrupt run state
+    # produced an unhandled traceback where a brief used to be issued. The scope degrades to
+    # the units asked for, and the degradation is reported rather than silent.
+    scope_note = None
+    try:
+        approved = run_state.read(root).get("batch") or []
+    except Exception as exc:  # noqa: BLE001 - a brief must be issued even so
+        sdlc_md.debug("sprint.lane_dispatch.scope", exc)
+        approved, scope_note = [], ("the run state could not be read, so the seam scope is the "
+                                    "units named here rather than the approved batch - UNKNOWN, "
+                                    "not empty")
+    scope = list(dict.fromkeys([*approved, *(unit_ids or [])]))
+    seams = _batch_seams(root, scope)
+    # The builder's own section, from the tools that own it: the self-check is the section
+    # `critic.py brief` prints on stderr (`critic.author_self_check`), never a copy that could
+    # drift from it, and the seat is the card `persona_resolve` resolves, so a project's own
+    # engineering seat outranks the shipped default. The seat is one fact about the project,
+    # read once per dispatch.
+    import critic  # noqa: PLC0415 - sibling; the author's self-check is critic's own text
+    import persona_resolve  # noqa: PLC0415 - sibling; one resolver for every seat reader
+    seat = persona_resolve.resolve_card(root, "engineering", render="build")
+    briefs: list[dict] = []
+    refused: list[dict] = []
+    for uid in unit_ids or []:
+        contract = lane_contract(root, uid)
+        if not contract["ok"]:
+            refused.append({"id": contract["id"], "refusal": contract["refusal"]})
+            continue
+        briefs.append({"id": contract["id"], "path": contract["path"],
+                       "criteria": contract["criteria"],
+                       "trd_constraints": trd_constraints(root, contract["text"]),
+                       "obligations": list(LANE_OBLIGATIONS),
+                       "proof": lane_proof(root, contract["id"]),
+                       "seams": [s for s in seams if contract["id"] in s["units"]],
+                       "lessons": injected,
+                       "affects": sdlc_md.affects_files(contract["text"]),
+                       "self_check": _hand_in_self_check(
+                           critic.author_self_check(root, contract["id"]), contract["id"]),
+                       "points": sdlc_md.read_points(contract["text"]),
+                       "seat_card": str(seat) if seat else None})
+    # THE FILES' HISTORY, the section the unit's reviewer will read (`critic.py brief`), from the
+    # same renderer under the same bounds. One corpus cache around every unit, so the Done-unit
+    # corpus is walked once per dispatch rather than once per lane; opened here and nowhere
+    # wider, because nothing else in the dispatch was written to read a memoised tree.
+    import reconcile  # noqa: PLC0415 - sibling; the corpus walk is the already-delivered lane's
+    with sdlc_md.corpus_cache():
+        for b in briefs:
+            b["history"] = reconcile.file_history_section(root, b["id"], list(b["affects"]))
+    return {"briefs": briefs, "refused": refused, "seams": seams, "lessons": injected,
+            "scope_note": scope_note}
+
+
+def _batch_seams(root: Path, unit_ids: list[str]) -> list[dict]:
+    """The batch's seam map, or [] when it cannot be computed - a brief must still be issued."""
+    try:
+        import refine  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+        return refine.seam_map(root, unit_ids)
+    except Exception as exc:  # noqa: BLE001 - a seam read must never block a dispatch
+        sdlc_md.debug("sprint._batch_seams", exc)
+        return []
+
+
+# The TRD constraints a lane's files fall under. The TRD's Component Overview table carries a
+# Constraints column; a lane building a unit is handed the rows whose component names one of the
+# unit's files, so the TRD is read where it can prevent a defect rather than only kept.
+
+#: The brief's line when the TRD records nothing for the unit's files - no TRD, no Constraints
+#: column, or no matching row all read the same, and none of them refuses the dispatch.
+TRD_NO_CONSTRAINTS = "TRD constraints: the TRD records no constraints for these files."
+
+
+def trd_component_rows(text: str) -> list[dict]:
+    """The `{component, constraint}` rows of the first table headed by both a Component and a
+    Constraints column, skipping a row whose constraint is empty or `-`."""
+    for table in sdlc_md.iter_tables(text):
+        head = [c.lower() for c in table["header"] or ()]
+        if "component" in head and "constraints" in head:
+            ci, ki = head.index("component"), head.index("constraints")
+            return [{"component": cells[ci], "constraint": cells[ki]}
+                    for _n, cells in table["rows"]
+                    if len(cells) > max(ci, ki) and cells[ki] not in ("", "-")]
+    return []
+
+
+def _component_names(pattern: str, path: str) -> bool:
+    """Whether a component's path (`scripts/`, `SKILL.md`, `help/*.md`) names `path`, judged by
+    whole segments: a directory by its segments running anywhere above the file, a file by the
+    path's trailing segments. `scripts/` never names `tools/scripts_helper.py`."""
+    pat = [s for s in pattern.split("/") if s]
+    parts = [s for s in path.split("/") if s not in ("", ".")]
+    if not pat or len(pat) > len(parts):
+        return False
+
+    def at(i: int) -> bool:
+        return all(fnmatch.fnmatchcase(parts[i + k], seg) for k, seg in enumerate(pat))
+    if pattern.endswith("/"):
+        return any(at(i) for i in range(len(parts) - len(pat)))
+    return at(len(parts) - len(pat))
+
+
+def trd_constraints(root: Path, unit_text: str) -> list[dict]:
+    """The Component Overview rows whose backticked component path names a file in the unit's
+    `Affects`, or [] when there is no TRD, no Constraints column or no match."""
+    files = sdlc_md.affects_files(unit_text)
+    trd = Path(root) / "sdlc-studio" / "trd.md"  # absent is ordinary, not a degraded read
+    rows = trd_component_rows(sdlc_md.read_text_safe(trd)) if trd.is_file() else []
+    return [r for r in rows
+            if any(_component_names(p, f) for p in re.findall(r"`([^`]+)`", r["component"])
+                   for f in files)]
+
+
+def lane_brief_text(brief: dict) -> str:
+    """One lane's brief as the text handed to whoever (or whatever) picks the unit up: the
+    criteria it is held to, its Affects, the seat card to adopt, the history of the files it
+    touches, the proof its unit owes, the standing obligations, the lessons injected at build,
+    the author self-check, and the commands that run its criteria, hand its work in and stage it,
+    within its call budget. Composed purely from the brief record, so the same dispatch renders
+    identically."""
+    lines = [f"Unit: {brief['id']} ({brief.get('path') or 'path unknown'})",
+             f"Acceptance criteria ({len(brief['criteria'])}) - these are the contract:"]
+    for crit in brief["criteria"]:
+        # Built outside the f-string, not inside its braces: a replacement field spanning two
+        # lines is a 3.12+ grammar (PEP 701) and a SyntaxError on the 3.10 floor this skill
+        # supports - it would not fail here, it would fail on somebody else's machine.
+        declared = crit["verifier"] or ("NONE DECLARED - this criterion proves nothing until "
+                                        "one is authored")
+        lines.append(f"  {crit['ac']}: {crit['title']}")
+        lines.append(f"    Verify: {declared}")
+    affects = brief.get("affects") or []
+    if affects:
+        lines.append(f"Affects ({len(affects)}) - the files this unit changes, and the only "
+                     f"ones its commit stages:")
+        lines.extend(f"  {path}" for path in affects)
+    else:
+        lines.append("Affects: NONE DECLARED - declare the files this unit changes before "
+                     "building it.")
+    card = brief.get("seat_card")
+    lines.append(f"Seat: adopt the work render of the engineering seat card {card} - it frames "
+                 f"how you build and never overrides the criteria above." if card else
+                 "Seat: no engineering seat card resolves (neither the project nor the skill "
+                 "carries one) - build from the criteria alone.")
+    rules = brief.get("trd_constraints") or []
+    lines.append("TRD constraints on the components this unit touches:" if rules
+                 else TRD_NO_CONSTRAINTS)
+    lines.extend(f"  {r['component']}: {r['constraint']}" for r in rules)
+    for seam in brief.get("seams") or []:
+        other = [u for u in seam["units"] if u != brief["id"]]
+        owned = (f"owned by {', '.join(seam['owners'])}" if seam.get("owners")
+                 else "NOBODY states what the other must not regress - you are the first "
+                      "actor who can")
+        lines.append(f"Seam with {', '.join(other)}: you both touch "
+                     f"{', '.join(seam['shared'])}. {owned}.")
+    if brief.get("history"):
+        lines += ["", LANE_PRIOR_ART, *brief["history"].splitlines(), ""]
+    proof = brief.get("proof") or {}
+    if not proof.get("available"):
+        lines.append(f"Proof obligations: UNDERIVABLE - {proof.get('why') or 'unknown'}")
+    elif proof.get("obligations"):
+        lines.append(f"Proof this unit owes (from the plan's test strategy): "
+                     f"{', '.join(proof['obligations'])}")
+    else:
+        lines.append("Proof this unit owes: none beyond its own acceptance criteria")
+    lines.append("Obligations on this lane:")
+    lines.extend(f"  - {ob}" for ob in brief.get("obligations", ()))
+    lines.extend(lessons.render_phase(brief.get("lessons") or {"phase": "build"}))
+    if brief.get("self_check"):
+        lines += ["", brief["self_check"]]
+    lines += ["", *_lane_builder_commands(brief["id"], affects, brief.get("points"))]
+    return "\n".join(lines)
+
+
+#: Where a lane hands its work in, relative to the project root: the commit message and the
+#: unit's self-check passes, beside its staged change, for `sprint lane land` to commit.
+LANE_HAND_IN = "sdlc-studio/.local/lane"
+#: The note a builder writes at its budget, so a fresh builder continues from it.
+LANE_HAND_OFF = "HANDOFF.md"
+#: A lane's tool-call budget is LANE_CALLS_FIXED + points x LANE_CALLS_PER_POINT: the fixed share
+#: reads the brief and hands in, the per-point share builds. Run six's builder brief held about
+#: 45 calls for 1 or 2 points, 65 for 3 and 90 for 5; this gives 38, 51, 64 and 90. Every call
+#: re-reads the builder's whole context, so a context carried past its budget is paid again on
+#: each call that follows.
+LANE_CALLS_FIXED = 25
+LANE_CALLS_PER_POINT = 13
+
+
+def lane_call_budget(points: int | None) -> int | None:
+    """The tool calls a lane of `points` is budgeted, or None for a unit that declares no size."""
+    if points is None:
+        return None
+    return LANE_CALLS_FIXED + points * LANE_CALLS_PER_POINT
+
+
+def _lane_hand_in_files(uid: str) -> tuple[str, str]:
+    """The claims and mutants files `uid` hands in, under LANE_HAND_IN."""
+    return f"{LANE_HAND_IN}/{uid}-claims.json", f"{LANE_HAND_IN}/{uid}-mutants.json"
+
+
+def _hand_in_self_check(text: str | None, uid: str) -> str | None:
+    """`critic.author_self_check`'s section with every line naming `self-check record` replaced
+    by the hand-in files, its "Record both" step read as handing both in, and its CLAIMS.json and
+    MUTANTS.json placeholders named as the hand-in files: the builder writes its two passes there
+    and does not record them, so the brief never tells it to. Every other line is critic's own."""
+    if not text:
+        return text
+    claims, mutants = _lane_hand_in_files(uid)
+    note = f"   Write them to {claims} and {mutants}; do not record them yourself."
+    names = {"CLAIMS.json": claims.rsplit("/", 1)[-1], "MUTANTS.json": mutants.rsplit("/", 1)[-1]}
+    out = []
+    for ln in text.splitlines():
+        if "self-check record" in ln:
+            out.append(note)
+            continue
+        ln = ln.replace("Record both", "Hand both in", 1)
+        for placeholder, name in names.items():
+            ln = ln.replace(placeholder, name)
+        out.append(ln)
+    return "\n".join(out)
+
+
+def _lane_budget_line(uid: str, points: int | None) -> str:
+    """The lane's call budget and the hand-off rule that holds at it."""
+    rule = (f"at the budget, stop: write {LANE_HAND_IN}/{LANE_HAND_OFF} with what is done, the "
+            f"criteria left, the next step and the files touched, stage what you have, and "
+            f"return")
+    budget = lane_call_budget(points)
+    if budget is None:
+        return (f"  Budget: NONE DERIVED - {uid} declares no Points, so no call budget follows; "
+                f"size it before building it.")
+    unit = "point" if points == 1 else "points"
+    return (f"  Budget: {budget} tool calls ({LANE_CALLS_FIXED} + {points} {unit} x "
+            f"{LANE_CALLS_PER_POINT} per point); {rule}.")
+
+
+def _lane_builder_commands(uid: str, affects: list[str], points: int | None = None) -> list[str]:
+    """The builder's closing commands for `uid`: run its criteria, write the hand-in files,
+    stage exactly its Affects and stop, within the call budget its points give. The builder
+    neither commits nor records its self-check; `sprint lane land` commits from the hand-in
+    path. The commit message's shape is the project's own, so only the unit id is asked of the
+    subject."""
+    claims, mutants = _lane_hand_in_files(uid)
+    lines = [f"Then, for {uid} (the scripts are in {SKILL_ROOT / 'scripts'}):",
+             f"  Run its criteria: verify_ac.py run --id {uid}",
+             f"  Hand in, under {LANE_HAND_IN}/ at the project root:",
+             f"    {claims} - the claim inventory above, each as {{surface, claim, ruling}}",
+             f"    {mutants} - the mutation pass above, each as "
+             f"{{mutant, test, result, answer}}",
+             f"    {LANE_HAND_IN}/commit-msg.txt - the commit message, naming {uid} in its "
+             f"subject, written last"]
+    if not affects:
+        lines.append(f"  Stage: {uid} declares no Affects, so there is no path to stage - "
+                     f"declare them first.")
+    else:
+        lines += [f"  Stage exactly the Affects above, and stop - `sprint lane land` commits "
+                  f"them, with {uid} in the commit subject:",
+                  f"    git add -- {' '.join(shlex.quote(p) for p in affects)}"]
+    return [*lines, f"  Do not commit and do not record the self-check: `sprint lane land` "
+                    f"commits from {LANE_HAND_IN}/.",
+            _lane_budget_line(uid, points)]
+
+
+#: Criterion states that stop a lane returning `fixed`. Derived by SUBTRACTION from the states
+#: the verifier can produce, never by listing the bad ones: a state added later is blocking until
+#: somebody deliberately decides it is not, which is the safe direction for an unknown.
+LANE_CRITERION_STATES = ("passed", "failed", "unresolved", "unspecified", "manual")
+#: The only two states that do not block. `manual` is a DECLARED human check, not a silent pass -
+#: it is reported in the counts so a reader can see how much of the contract a machine proved.
+LANE_NON_BLOCKING_STATES = ("passed", "manual")
+
+
+def _lane_criterion_state(verifier: str | None, result) -> str:
+    """One criterion's state from the runner's own verdict.
+
+    `vacuous` is reported as UNRESOLVED rather than as a pass or a plain failure. The runner
+    sets it when a pytest target no longer collects, or when a run exited clean having executed
+    nothing: in both cases the check did not answer. An unanswerable check counted as passing is
+    exactly the false green the executable-criteria machinery exists to prevent.
+    """
+    import verify_ac  # noqa: PLC0415 - sibling
+    if verifier is None:
+        return "unspecified"
+    if verify_ac._is_manual(verifier):
+        return "manual"
+    if result is None or result.vacuous:
+        return "unresolved"
+    return "passed" if result.ok else "failed"
+
+
+def lane_verify(repo_root: Path | str, unit_id: str, timeout: int = 300,
+                allow_shell: bool = True, allow_external: bool = False) -> dict:
+    """Run a unit's OWN acceptance criteria and report each with the verifier's own output.
+
+    Returns `{unit, ok, criteria, counts, blocking}`. Each criterion carries `state`, the
+    runner's `exit_code` and its `output` - the text the runner printed, not a summary of it.
+    A claim can then be checked instead of trusted, which is the difference between a lane
+    reporting evidence and a lane reporting confidence.
+
+    Nothing is written back to the artefact: this runs at the LANE, before review, and a
+    verification that stamps the story it is judging would be scoring its own paper.
+    """
+    import verify_ac  # noqa: PLC0415 - sibling
+    # The trust boundary is verify_ac's to define, never ours to re-derive: a lane runner
+    # more permissive than the authoritative one passed a criterion that runner failed, and
+    # executed shell from an external-provenance artefact while doing it.
+    root = Path(repo_root)
+    contract = lane_contract(root, unit_id)
+    if not contract["ok"]:
+        return {"unit": contract["id"], "ok": False, "criteria": [],
+                "counts": dict.fromkeys(LANE_CRITERION_STATES, 0),
+                "blocking": [], "refusal": contract["refusal"]}
+    _lane_allow_shell = verify_ac.shell_allowed_for(
+        contract["text"], allow_shell=allow_shell, allow_external=allow_external)
+    rows: list[dict] = []
+    for crit in contract["criteria"]:
+        verifier = crit["verifier"]
+        result = None
+        if verifier is not None and not verify_ac._is_manual(verifier):
+            # Every line, through the loop `verify_ac run` uses: the first red line is the
+            # verdict and the line reported (a later `manual` line is not run here; `run` reads it).
+            verifier, result = verify_ac.first_red(verify_ac.run_lines(
+                crit["verifiers"],
+                lambda v: verify_ac.run_verifier(v, timeout, root, allow_shell=_lane_allow_shell)))
+        state = _lane_criterion_state(verifier, result)
+        output = ""
+        if result is not None:
+            output = "\n".join(p for p in (result.stdout, result.stderr) if p).strip()
+        rows.append({"ac": crit["ac"], "title": crit["title"], "verifier": verifier,
+                     "state": state,
+                     "exit_code": result.exit_code if result is not None else None,
+                     "output": output[-4000:]})
+    counts = {s: sum(1 for r in rows if r["state"] == s) for s in LANE_CRITERION_STATES}
+    blocking = [r["ac"] for r in rows if r["state"] not in LANE_NON_BLOCKING_STATES]
+    return {"unit": contract["id"], "ok": not blocking and bool(rows), "criteria": rows,
+            "counts": counts, "blocking": blocking, "refusal": ""}
+
+
+def _lane_why(verification: dict) -> str:
+    """The one sentence that says why a lane could not return what it claimed - naming the
+    criteria, because "some criteria failed" sends the reader back to the terminal."""
+    if verification.get("refusal"):
+        return verification["refusal"]
+    blocking = verification.get("blocking") or []
+    if not blocking:
+        if not verification.get("criteria"):
+            return (f"{verification['unit']}: no acceptance criterion was run, so nothing was "
+                    f"proved - an empty verification is not a green one")
+        return ""
+    named = ", ".join(f"{r['ac']} ({r['state']})"
+                      for r in verification["criteria"] if r["ac"] in blocking)
+    return (f"{verification['unit']}: {len(blocking)} acceptance criterion/criteria did not "
+            f"pass - {named}. The verifier output for each is carried in this result.")
+
+
+def lane_return(repo_root: Path | str, unit_id: str, claimed: str = "fixed",
+                proof: dict | None = None, proof_gaps: dict | None = None,
+                timeout: int = 300, allow_shell: bool = True) -> dict:
+    """What a lane returns for one unit: its own verification, and an outcome it cannot inflate.
+
+    `claimed` is what the lane believes it achieved. The returned `outcome` is that claim only
+    when every executable criterion passed; otherwise it is `blocked`, whatever the lane
+    claimed. This is the whole point: a lane may be wrong about its work, and the criteria are
+    the thing that is allowed to say so.
+    """
+    verification = lane_verify(repo_root, unit_id, timeout=timeout, allow_shell=allow_shell)
+    why = _lane_why(verification)
+    outcome = claimed if verification["ok"] else "blocked"
+    return {"unit": verification["unit"], "claimed": claimed, "outcome": outcome,
+            "verification": verification, "why": why,
+            "proof": lane_proof(repo_root, verification["unit"], proof, proof_gaps)}
+
+
+def lane_proof(repo_root: Path | str, unit_id: str, proof: dict | None = None,
+               proof_gaps: dict | None = None) -> dict:
+    """The proof the plan's test strategy assigned this unit, matched against what the lane
+    returned.
+
+    Returns `{available, why, obligations, discharged, undischarged}`. The obligations are the
+    unit's own risk bands from `test_strategy` - derived from the TSD, so a level added to that
+    document is owed by the next lane with no edit here.
+
+    Every obligation lands in exactly one of the two lists. An obligation for which the lane
+    supplied neither evidence nor a reason is UNDISCHARGED with that stated as its reason, so
+    the silence is what shows up in the result rather than the obligation disappearing from it -
+    an obligation nobody mentions reads exactly like an obligation that was met.
+
+    `available` is False when the strategy could not be derived at all. That is reported as an
+    unanswered question, never as "this unit owes no proof": a missing TSD tells you nothing
+    about the risk of the change.
+    """
+    root = Path(repo_root)
+    uid = sdlc_md.norm_id(unit_id)
+    strat = test_strategy(root, [uid])
+    if not strat.get("available"):
+        return {"available": False, "why": strat.get("why", ""), "obligations": [],
+                "discharged": [], "undischarged": []}
+    obligations = sorted(set(strat["units"].get(uid) or []))
+    supplied = {str(k): str(v) for k, v in (proof or {}).items()}
+    gaps = {str(k): str(v) for k, v in (proof_gaps or {}).items()}
+    discharged: list[dict] = []
+    undischarged: list[dict] = []
+    for band in obligations:
+        if band in supplied and supplied[band].strip():
+            discharged.append({"obligation": band, "evidence": supplied[band]})
+        elif band in gaps and gaps[band].strip():
+            undischarged.append({"obligation": band, "why": gaps[band]})
+        else:
+            undischarged.append({"obligation": band,
+                                 "why": "the lane returned neither evidence nor a reason - "
+                                        "stated here rather than omitted, because an obligation "
+                                        "nobody mentions reads like one that was met"})
+    return {"available": True, "why": "", "obligations": obligations,
+            "discharged": discharged, "undischarged": undischarged}
+
+
+def _batch_triage(root: Path, batch_ids: list[str]) -> dict:
+    """The JUDGEMENT triage lenses (duplicate/subsumed, stale, orphaned-dependency) that touch a
+    unit in this batch - surfaced in the plan the operator already reads. Reporting-only: a
+    duplicate is a judgement call the human makes, unlike an ungroomed unit. OVERSIZED is excluded
+    here because the breakdown gate above already owns it (and blocks on it). Best-effort - a
+    triage error must never break planning.
+
+    Returns `{findings, skipped}`: `skipped` is the count of backlog artefacts the scan could
+    not read, propagated from `backlog_triage.triage` so an unreadable file is logged in the plan
+    ceremony rather than silently truncating the batch into a clean-looking plan (the module's
+    own contract, which status already honours)."""
+    try:
+        import backlog_triage
+        report = backlog_triage.triage(root)
+    except Exception as exc:  # noqa: BLE001 - the plan must survive a triage hiccup
+        sdlc_md.debug("sprint._batch_triage", exc)
+        return {"findings": [], "skipped": 0}
+    want = {sdlc_md.norm_id(b) for b in batch_ids}
+    findings = [f for f in report["findings"] if f["lens"] != "oversized"
+                and want & {sdlc_md.norm_id(u) for u in f["units"]}]
+    return {"findings": findings, "skipped": report.get("skipped", 0)}
+
+
+DEFAULT_SEAT_STALE_DAYS = 7  # advisory window; seat judgement does not rot on a clock
+
+
+def _seat_provenance(root: Path, batch: list[dict]) -> dict:
+    """Which units the review seats scored, and how fresh wsjf-inputs.json is.
+
+    The inputs file is a cross-sprint side-channel: a later plan silently
+    re-reads what an earlier consult wrote, so the plan must say whose
+    judgement it consumed and from when, at the STOP where the operator
+    signs off. Staleness is advisory only, never a refusal.
+
+    COVERAGE IS THE PRIMARY FACT, AND AGE IS SECONDARY TO IT. A file whose entries score no
+    unit in this batch is not a slightly stale file: those scores are IRRELEVANT here, and
+    reporting their age says the ordering is running on ageing judgement when it is running
+    on none. Observed: seven entries, every one a CR from a closed era, reported as "11.3
+    day(s) old" for weeks. So `stale` is now true only of scores that ACTUALLY APPLY - a
+    thing with no bearing on this batch cannot go off - and `irrelevant` carries the other
+    case under its own name."""
+    path = root / "sdlc-studio" / ".local" / "wsjf-inputs.json"
+    inputs = _wsjf_inputs(root)
+    scored = [it["id"] for it in batch if sdlc_md.norm_id(it["id"]) in inputs]
+    unscored = [it["id"] for it in batch if sdlc_md.norm_id(it["id"]) not in inputs]
+    written_at = None
+    age_days = None
+    if path.exists():
+        import datetime as _dt
+        mtime = path.stat().st_mtime
+        written_at = _dt.datetime.fromtimestamp(mtime).astimezone().isoformat(timespec="seconds")
+        # clamp at 0: a future-dated file (clock skew on a shared checkout)
+        # must not report a negative age
+        age_days = max(0.0, round((_dt.datetime.now().timestamp() - mtime) / 86400.0, 1))
+    try:
+        window = int(sdlc_md.project_override(
+            root, "sprint.wsjf_inputs_stale_days", DEFAULT_SEAT_STALE_DAYS))
+    except (TypeError, ValueError):
+        window = DEFAULT_SEAT_STALE_DAYS
+    return {"file": str(path), "written_at": written_at, "age_days": age_days,
+            "stale_after_days": window,
+            "stale": bool(age_days is not None and age_days > window and scored),
+            "irrelevant": bool(inputs and not scored),
+            "entries": len(inputs), "covered": len(scored), "batch": len(batch),
+            "scored": scored, "unscored": unscored}
+
+
+# ---------------------------------------------------------------------------
+# THE GOAL CONSULT: the seats review what the run is FOR, not only how to order it.
+# ---------------------------------------------------------------------------
+# Personas contributed exactly one thing at plan time - seat-scored WSJF - and that is an
+# ORDERING input, not a review. Nothing asked whether the Sprint Goal was the right goal,
+# whether this batch could achieve it, or what done meant for it, and the goal is the thing the
+# closing review judges the increment against. In RUN-01KXVYGR that cost a whole session: the
+# goal was unreachable by construction, nobody examined it, and the verdict landed as partial.
+#
+# BLOCKING, not advisory (D0045). The same run is the natural experiment for what advisory
+# buys: the WSJF consult IS advisory, and it produced zero seat inputs across 32 units with only
+# a warning. An advisory goal review would have been skipped exactly as that one was.
+#
+# DEMANDED OF SEATS THAT EXIST. The gate asks a project's OWN review seats
+# (`sdlc-studio/personas/seats/`) for a verdict. A project that has adopted no seats has nobody
+# to ask, and refusing its every plan would block on a ceremony nobody there can perform - so
+# it is told plainly that the goal went unreviewed and the plan proceeds. That is the scope of
+# the gate, stated rather than left to be discovered.
+GOAL_REVIEW_REL = Path("sdlc-studio") / ".local" / "goal-review.json"
+#: What each consulted seat must answer. Fewer than these and the verdict is not a review of
+#: the goal: achievability without a definition of done is an opinion about an unstated target.
+GOAL_REVIEW_FIELDS = ("achievable", "done_means", "one_increment")
+
+
+def project_seats(repo_root: Path | str) -> list[str]:
+    """The declared roles of THIS project's own review seats, sorted. Empty when the project
+    has adopted none - the skill's default cards are not the project's seats, and a default
+    card cannot review a goal it was never shown."""
+    try:
+        import persona_resolve  # noqa: PLC0415 - deferred sibling
+        roles = {persona_resolve.card_role(p)
+                 for p in (Path(repo_root) / "sdlc-studio" / "personas" / "seats").glob("*.md")}
+    except Exception as exc:  # noqa: BLE001 - a persona read must never break planning
+        sdlc_md.debug("sprint.project_seats", exc)
+        return []
+    return sorted(r for r in roles if r)
+
+
+def review_seats(repo_root: Path | str) -> tuple[list[str], bool]:
+    """`(roles, shipped)`: the seats that review a goal on this project. Its own seats when it
+    declares any; otherwise the skill's shipped seats, which `persona_resolve` and `critic.py
+    brief` already fall back to, with `shipped` True so a reader can say which."""
+    own = project_seats(repo_root)
+    if own:
+        return own, False
+    import persona_resolve  # noqa: PLC0415 - deferred sibling, as in project_seats
+    return sorted(persona_resolve.SEATS), True
+
+
+def _norm_goal(goal: str | None) -> str:
+    """A goal compared as text: whitespace collapsed, case folded. Two spellings of one
+    sentence are one goal; two different sentences are never the same review."""
+    return " ".join(str(goal or "").split()).casefold()
+
+
+# A seat's `achievable` / `one_increment` answer, parsed against a small vocabulary rather than
+# accepted as free text. A PRESENCE test cannot tell "yes" from "no", so a seat that judged the
+# goal NOT achievable used to discharge the plan gate exactly as one that said it was: the verdict
+# was recorded and its CONTENT never read. The leading token decides, so a reasoned
+# "no - not at the stated appetite" reads as `no` and keeps its note.
+_VERDICT_YES = frozenset({"yes", "y", "true", "achievable", "ok", "agreed", "affirmative"})
+_VERDICT_NO = frozenset({"no", "n", "never", "false", "unachievable", "not", "negative"})
+
+
+def verdict_polarity(value: str | None) -> str:
+    """`yes`, `no` or `unclear` for a seat's achievable / one-increment answer."""
+    first = re.split(r"[\s,.;:|/-]+", str(value or "").strip().lower(), maxsplit=1)[0]
+    if first in _VERDICT_YES:
+        return "yes"
+    if first in _VERDICT_NO:
+        return "no"
+    return "unclear"
+
+
+def goal_review(repo_root: Path | str) -> dict:
+    """The recorded seat review of the Sprint Goal, or `{}`. Read-only, fail-safe."""
+    data = sdlc_md.read_json(Path(repo_root) / GOAL_REVIEW_REL, {})
+    return data if isinstance(data, dict) else {}
+
+
+def goal_review_rounds(rec: dict) -> list[dict]:
+    """Every recorded goal-review ROUND, oldest first. The record is a list of rounds so a goal
+    rewritten in answer to a REJECT does not erase the fact that it was rejected - the sprint
+    review keeps `review_rounds` for exactly this, and the goal review is the same activity one
+    rung earlier. Reads the legacy single-object shape too (a record written before rounds
+    accumulated), so an existing file is not lost."""
+    if not isinstance(rec, dict):
+        return []
+    rounds = rec.get("rounds")
+    if isinstance(rounds, list):
+        return [r for r in rounds if isinstance(r, dict)]
+    if rec.get("seats") is not None or rec.get("goal") is not None:
+        return [rec]                # the legacy single-round shape
+    return []
+
+
+def goal_review_status(repo_root: Path | str, sprint_goal: str | None,
+                       skip_personas: bool = False) -> dict:
+    """Has a seat reviewed THIS goal, what did it say, and how many rounds did it take?
+
+    A review of a DIFFERENT goal does not count, and the LATEST round is the one that must match
+    the goal being planned - so a stale file cannot discharge the gate (the `wsjf-inputs.json`
+    failure), and a goal rewritten in answer to a REJECT is judged on its final wording while the
+    earlier rounds stay on the record.
+
+    The read ADVISES: a seat that judged the goal NOT achievable is reported in `objections`
+    and printed with the plan, and the plan proceeds. `status` is `read` or `not read`, so a
+    goal no seat looked at is never recorded as approved.
+    """
+    root = Path(repo_root)
+    available, shipped = review_seats(root)
+    base = {"reviewed": False, "status": "not read", "skipped": None, "seats": [],
+            "goal": sprint_goal, "shipped_seats": shipped,
+            "available_seats": available, "rounds": 0,
+            "objected": False, "objections": []}
+    if skip_personas:
+        return {**base, "skipped": "--skip-personas",
+                "reason": "the goal went UNREVIEWED: --skip-personas is the recorded escape, "
+                          "and no seat was consulted on this plan"}
+    rec = goal_review(root)
+    rounds = goal_review_rounds(rec)
+    base["rounds"] = len(rounds)
+    latest = rounds[-1] if rounds else {}
+    # The rounds on the latest wording are read TOGETHER, newest verdict per seat, back to the
+    # amendment that introduced the wording (it already carried what carries): read alone, the
+    # latest round re-opened every seat it left out, so a seat owing a verdict cost a round of
+    # every seat. Each verdict keeps the round it came from, whose requester it answers to.
+    seats: list[dict] = []
+    source: dict[str, dict] = {}
+    for rnd in reversed(rounds):
+        if _norm_goal(rnd.get("goal")) != _norm_goal(latest.get("goal")):
+            break
+        for s in rnd.get("seats") or []:
+            role = str(s.get("seat") or "").strip() if isinstance(s, dict) else ""
+            if role and role not in source and all(str(s.get(f) or "").strip()
+                                                   for f in GOAL_REVIEW_FIELDS):
+                source[role] = rnd
+                seats.append(s)
+        if rnd.get("amended_from"):
+            break
+    if seats and _norm_goal(latest.get("goal")) == _norm_goal(sprint_goal):
+        # TWO DIFFERENT ANSWERS, never one predicate. `achievable = no` is an OBJECTION: advice
+        # the operator reads before approving the plan. `one_increment = no` is
+        # a CLASSIFICATION: it says the batch is not one atomic increment, which a themed batch
+        # (a tooling sweep, a bug-fix clearance, an audit remediation) legitimately is not. Folding
+        # them into one blocking test refused every themed sprint and, worse, REPORTED those seats
+        # as having judged the goal unachievable when they had judged the opposite.
+        # A verdict carried forward from the requesting seat was given on the wording it asked
+        # to change, so the amendment it requested answers its objection: it is DISCHARGED, not
+        # read as advice against the new wording.
+        def discharged(s: dict) -> bool:
+            role = str(s.get("seat") or "").strip()
+            requester = str(source[role].get("requesting_seat") or "").strip()
+            return bool(requester and s.get("carried_from") and role == requester)
+
+        objections = [{"seat": s.get("seat"), "achievable": s.get("achievable"),
+                       "one_increment": s.get("one_increment"), "note": s.get("note", "")}
+                      for s in seats
+                      if verdict_polarity(s.get("achievable")) == "no" and not discharged(s)]
+        answered = [s.get("seat") for s in seats
+                    if verdict_polarity(s.get("achievable")) == "no" and discharged(s)]
+        themed = [{"seat": s.get("seat"), "one_increment": s.get("one_increment"),
+                   "note": s.get("note", "")}
+                  for s in seats
+                  if verdict_polarity(s.get("one_increment")) == "no"]
+        reviewed_roles = {str(s.get("seat") or "").strip() for s in seats}
+        needs_reconsult = sorted(r for r in base["available_seats"]
+                                 if r not in reviewed_roles)
+        return {**base, "reviewed": True, "status": "read", "seats": seats,
+                "reviewed_at": latest.get("reviewed_at"),
+                "change_type": latest.get("change_type"),
+                "amended_from": latest.get("amended_from"),
+                "requesting_seat": latest.get("requesting_seat"),
+                "requested_by": latest.get("requested_by"),
+                "needs_reconsult": needs_reconsult,
+                # `themed` is ADVICE the operator reads, never a gate: it is surfaced so that
+                # separating the two answers loses no information.
+                "themed": themed, "discharged": answered,
+                "objected": bool(objections), "objections": objections, "reason": None}
+    if (not seats and latest.get("change_type") == "material"
+            and _norm_goal(latest.get("goal")) == _norm_goal(sprint_goal)):
+        # A material change recorded before any seat has read the new wording: nothing carried,
+        # so every seat owes a verdict on it.
+        return {**base, "needs_reconsult": list(available),
+                "reason": f"a material change from {latest.get('amended_from')!r} carries no "
+                          f"verdict forward, and no seat has reviewed the new wording yet"}
+    if not seats:
+        who = (f"the shipped {', '.join(available)} seats review it, as this project declares "
+               f"no review seats of its own (sdlc-studio/personas/seats/)" if shipped
+               else f"its seats are {', '.join(available)}")
+        return {**base, "reason": f"no seat verdict is recorded for any goal - {who} "
+                                  f"(`sprint.py goal-review record`)"}
+    return {**base, "reviewed_goal": latest.get("goal"),
+            "reason": f"the recorded review is of a different goal ({latest.get('goal')!r}), "
+                      f"so it says nothing about this one"}
+
+
+# ---------------------------------------------------------------------------
+# THE REACHABLE END STATE: the terminal this batch's rung is trying to reach.
+# ---------------------------------------------------------------------------
+#: The terminal each rung is trying to reach. A `design` rung is finished when its units are
+#: GROOMED, not when they are built, so reporting `Done` for it describes work it never set out
+#: to do.
+RUNG_TERMINALS = {"triage": "Triaged", "plan": "Ready", "design": "Ready", "done": "Done"}
+
+#: The rungs whose terminal is a COMPLETING state. Every other rung stops at a pre-terminal one
+#: - `Ready`, `Triaged` - and a type without that state in its vocabulary is simply not moved by
+#: the rung. This is a fact about the RUNGS, not something derivable from a status name.
+COMPLETING_RUNGS = frozenset({"done"})
+
+#: The rungs whose product is a TRIAGE decision. Under schema v3 a finding lands in an `inbox`
+#: lane and a different seat triages it out, so this rung genuinely does move a bug or a CR - and
+#: `sdlc_md.triage_target` is the shipped answer for where to. Under v2 there is no inbox and the
+#: rung moves nothing, which is why the schema is asked rather than assumed.
+TRIAGE_RUNGS = frozenset({"triage"})
+
+#: What a rung reaches for a type it does not transition. Reported instead of a state borrowed
+#: from another type's vocabulary, which is the defect this whole function exists to refuse. A
+#: NOUN PHRASE, because it is interpolated into prose as well as printed on its own.
+STATE_UNCHANGED = "no status change"
+
+
+def _terminal_in_type_vocab(root, rung: str, type_: str, terminal: str) -> str:
+    """`terminal` said in `type_`'s own vocabulary.
+
+    The rung terminals above are written in the STORY vocabulary, and `triage`'s in the issue
+    one, because that is the type each rung usually operates on. A bug has neither `Ready` nor
+    `Done`, so naming either for a bug batch names a state that does not exist for it - the same
+    defect as the story-only cap below, one axis over. A completing rung resolves to the type's
+    own completed outcome (`Fixed` for a bug, `Complete` for a CR); a pre-terminal rung resolves
+    to nothing at all, because it does not move that type."""
+    vocab = sdlc_md.status_vocab(type_, Path(root)) or []
+    if sdlc_md.canonical_status(terminal, vocab):
+        return terminal
+    if rung in COMPLETING_RUNGS:
+        return sdlc_md.default_terminal_status(type_) or STATE_UNCHANGED
+    if rung in TRIAGE_RUNGS and sdlc_md.is_schema_v3(root):
+        target = sdlc_md.triage_target(type_)
+        if target and sdlc_md.canonical_status(target, vocab):
+            return target
+    return STATE_UNCHANGED
+
+
+def _state_for_batch(root, rung: str, types: list[str], terminal: str) -> str:
+    """The reported end state: `terminal` in every type present, joined when they disagree."""
+    per = {t: _terminal_in_type_vocab(root, rung, t, terminal) for t in (types or ["story"])}
+    distinct = set(per.values())
+    if len(distinct) == 1:
+        return distinct.pop()
+    return ", ".join(f"{per[t]} ({t})" for t in sorted(per))
+
+
+def reachable_end_state(repo_root: Path | str, batch: list[dict],
+                        rung: str | None = None) -> dict:
+    """The state this batch's rung takes each unit to, said in each type's own vocabulary.
+
+    No per-unit gate caps a batch short of it: the per-unit reviewer-of-record sign-off that
+    once held stories at Review was retired, and one independent APPROVE now decides a unit.
+    """
+    root = Path(repo_root)
+    rung_key = (rung or "done").lower()
+    if rung_key not in RUNG_TERMINALS:
+        # Resolve the fallback ONCE. Falling back for the terminal but still testing the
+        # unrecognised key for membership split the answer in half: an unknown rung reported the
+        # build terminal for a story and `no status change` for a bug.
+        rung_key = "done"
+    terminal = RUNG_TERMINALS[rung_key]
+    types = sorted({(it.get("type") or it.get("kind") or "story").lower() for it in batch})
+    state = _state_for_batch(root, rung_key, types, terminal)
+    return {"state": state, "types": types,
+            "basis": f"the `{rung_key}` rung's own terminal for each type present is: {state}"}
+
+
+def build_plan(repo_root: Path | str, kind: str | None = None, status: str | None = None,
+               order: str = "priority", skip_personas: bool = False,
+               epics: set[str] | None = None, queries: list[tuple[str, str]] | None = None,
+               worklist: str | None = None, appetite_minutes: float | None = None,
+               appetite_units: int | None = None, goal: str = "done") -> dict:
+    """The triage plan: the ordered batch, a count, and (for ordered modes) the dependency
+    WAVES - the parallelisable levels operators otherwise hand-derive. The batch source is
+    a single kind+status, composed `queries`, or a `worklist` file (ids one per line).
+
+    The plan also sizes the batch against the sprint CAPACITY and resolves the run appetite
+    from it, so the ceiling the operator is shown at plan time is the ceiling the run breaker
+    later stops on."""
+    root = Path(repo_root)
+    if worklist is not None:
+        batch, deps = _worklist_units(root, worklist)
+        batch = _order_batch(root, batch, deps, order, skip_personas)
+        queries = [("worklist", worklist)]
+    else:
+        if queries is None:
+            queries = [(kind, status)]
+        batch = select_batches(root, queries, order, skip_personas=skip_personas, epics=epics)
+    waves = None
+    deps_declared: bool | None = None  # None for manual order (no wave computation)
+    if order in ("priority", "wsjf") and batch:
+        deps = {}
+        for it in batch:
+            text = Path(it["path"]).read_text(encoding="utf-8")
+            dval = (sdlc_md.extract_field(text, "Depends on")
+                    or sdlc_md.extract_field(text, "Depends On") or "")
+            deps[sdlc_md.norm_id(it["id"])] = _dep_ids(dval)
+        # batch already passed _topo_order above, so the graph is acyclic here.
+        waves = [[it["id"] for it in w] for w in _topo_waves(batch, deps)]
+        # whether ANY in-batch dependency edge was declared - a flat single wave with no
+        # edges is parallel because no one declared a `Depends on:`, not because none exist.
+        deps_declared = any(deps[k] & set(deps) for k in deps)
+    forecast = _token_forecast(root, batch, goal=goal) if batch else None
+    appetite = resolve_appetite(root, appetite_minutes, appetite_units)
+    return {
+        "generated_at": sdlc_md.now_iso8601(),
+        "kind": "+".join(k for k, _ in queries),
+        "status": ", ".join(str(s) for _, s in queries),
+        "queries": [{"kind": k, "status": s} for k, s in queries],
+        "order": order,
+        "batch": batch,
+        "count": len(batch),
+        "waves": waves,
+        "deps_declared": deps_declared,
+        # Is the batch GROOMED enough to plan at all? `cmd_plan` REFUSES on this (unless the
+        # project has recorded the `judgement` opt-out) - and it also carries the shared-file
+        # clusters the declared dependency graph cannot see.
+        "breakdown": breakdown(root, batch, skip_personas) if batch else None,
+        # SEQUENTIAL or PARALLEL: whether the batch decomposes into file-disjoint groups a
+        # parallel worktree build could take. Offered only when it genuinely does; the plan
+        # states the mode and why the alternative was or was not available.
+        "delivery_mode": delivery_mode_offer(root, batch) if batch else None,
+        # A report-only file-disjoint partition of the batch into lanes. Additive: it
+        # informs how the work would split across teams/worktrees, and feeds NO selection or
+        # ordering decision - delivery_mode above owns the parallel/sequential choice.
+        "lane_partition": lane_partition(root, batch) if batch else None,
+        "seat_provenance": (_seat_provenance(root, batch)
+                            if order == "wsjf" and not skip_personas else None),
+        # How far this batch can actually get under its own gates. Recorded on every plan, so
+        # a goal nothing could satisfy is visible before the work rather than at the close.
+        # THE RUNG IS PASSED, not assumed. A `design` rung is finished when its units are
+        # GROOMED, so reporting `Done` for it describes work it never set out to do - and the
+        # brief that carried this figure named `Review` for a batch of bugs, a state that is
+        # not in a bug's vocabulary at all.
+        "reachable_end_state": reachable_end_state(root, batch, rung=goal),
+        # A token cost FORECAST for the batch (estimate, never a gate - see _token_forecast).
+        "token_forecast": forecast,
+        # The batch's cost budget beside it: its points x the regression limit x the baseline.
+        "cost_budget": plan_cost_budget(root, forecast),
+        # Does the batch FIT? Sized against the sprint capacity at PLAN time - and carrying the
+        # run appetite resolved from that same capacity, so the two cannot disagree.
+        "capacity": capacity_report(root, batch, forecast, appetite),
+        # The lessons the last sprints paid for, IN the plan the agent reads at sprint start.
+        # A plan that merely pointed at LESSONS-SUMMARY.md relied on the agent opening it.
+        "lessons": lessons.plan_digest(root),
+        # The cross-project tier, ranked. It had NO automatic reader: recall was a prose
+        # instruction, and prose instructions are the ones that get skipped.
+        "cross_lessons": lessons.cross_digest(root),
+        # The failure classes injected at plan, as rule plus behaviour, at most five. The lane
+        # and review briefs read their own phase's classes from the store at brief time.
+        "phase_lessons": lessons.phase_digest(root, "plan"),
+        # Carried so the runbook renderer can resolve it; the plan payload travels to lanes
+        # that do not share this process's cwd.
+        "root": str(root),
+        # What each unit must satisfy to close, and the checks every commit meets - so the
+        # requirements arrive as a briefing rather than as refusals one gate run at a time.
+        "gate_briefing": build_gate_briefing(root, batch),
+    }
+
+
+GOALS = ("triage", "plan", "design", "done")  # the goal ladder a run is driven along
+
+
+#: A report id as `--worklist` accepts it in place of a file: `RPT` and its number.
+REPORT_ID_RE = re.compile(r"RPT\d+")
+
+
+def last_signed_report(repo_root: Path | str) -> dict | None:
+    """The newest SIGNED report's id, run and the artefact ids its `Known issues handed over`
+    section lists, or None when no report is signed. Read from the report's JSON of record, the
+    page the operator signed: the open findings raised in the run and the carried units. A close
+    gap's row (named for its source, not an artefact) is not work to plan and is left out."""
+    import sprint_report  # noqa: PLC0415 - deferred sibling, as everywhere else in this module
+    for path in sorted(sprint_report.report_dir(repo_root).glob("RPT*.json"), reverse=True):
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8"))  # bare-read-ok: own record
+        except (OSError, ValueError):
+            continue
+        if not (stored.get("signature") or {}).get("principal"):
+            continue
+        ids: list[str] = []
+        for section in stored.get("sections") or []:
+            if section.get("key") != "known_issues":
+                continue
+            for row in section.get("rows") or []:
+                value = str(((row.get("issue_id") or {}).get("value")) or "").strip()
+                if sdlc_md.ID_SEARCH_RE.fullmatch(value):
+                    ids.append(sdlc_md.norm_id(value))
+        return {"id": path.stem, "run_id": stored.get("run_id"),
+                "ids": list(dict.fromkeys(ids))}
+    return None
+
+
+def _still_open(root: Path, ids: list[str]) -> list[str]:
+    """The ids that resolve to an artefact on disk whose status is not terminal for its type."""
+    out = []
+    for uid in ids:
+        hit = sdlc_md.find_by_id(root, uid)
+        if not hit:
+            continue
+        path, kind = Path(hit[0]), hit[1]
+        status = (sdlc_md.extract_field(sdlc_md.read_text_safe(path) or "", "Status") or "").strip()
+        if not sdlc_md.is_terminal_status(kind, status):
+            out.append(uid)
+    return out
+
+
+def report_worklist_ids(repo_root: Path | str, report_id: str) -> list[str]:
+    """`--worklist RPT<n>`: the still-open ids that signed report handed over. Refused when the
+    report is not the last signed one, or hands over nothing still open - a batch quietly
+    smaller than the page it was planned from is the failure `--worklist` refuses elsewhere."""
+    last = last_signed_report(repo_root)
+    rid = report_id.strip().upper()
+    if not last or last["id"] != rid:
+        raise ValueError(f"--worklist {rid}: not the last signed report"
+                         + (f" ({last['id']} is)" if last else " (no report is signed)"))
+    ids = _still_open(Path(repo_root), last["ids"])
+    if not ids:
+        raise ValueError(f"--worklist {rid}: it hands over nothing still open")
+    return ids
+
+
+def last_run_notice(repo_root: Path | str) -> list[str]:
+    """The plan's notice of what the last run left: the units a forced stop waived, read from the
+    run record because a stopped run files no report, and the open work the last signed report
+    handed over. `[]` when there is neither. The signed report is the run's one account of what
+    is carried, so the plan reads it rather than a second document that could disagree."""
+    root = Path(repo_root)
+    state = run_state.read(root)
+    report = last_signed_report(root)
+    lines = []
+    waived = [str(u.get("unit")) for u in (state.get("unanswered") or [])
+              if isinstance(u, dict) and u.get("unit")]
+    if (waived and state.get("outcome") in run_state.CLOSED
+            and not (report and report["run_id"] == state.get("run_id"))):
+        how = ("waived by the forced stop"
+               if (state.get("stop") or {}).get("cause") == STOP_OPERATOR
+               else f"left unanswered when it ended {state.get('outcome')}")
+        lines.append(f"last run: {state.get('run_id')} ended over {len(waived)} unit(s) {how}: "
+                     f"{', '.join(waived)} - no report was filed, so they are named here")
+    if report:
+        still = _still_open(root, report["ids"])
+        closed = len(report["ids"]) - len(still)
+        since = f" ({closed} since closed or not on disk)" if closed else ""
+        lines.append(f"last run: {report['id']} (signed, {report['run_id']}) handed over "
+                     + (f"{len(still)} open item(s): {', '.join(still)}{since} - plan them with "
+                        f"--worklist {report['id']}" if still else
+                        f"nothing still open{since}"))
+    return lines
+
+
+def batch_selection_message() -> str:
+    """The no-batch-selected error on the plan's hottest path. Shows a USABLE example status per
+    status-taking selector (a valid value present in the text), so the first retry is a working
+    invocation rather than two more failed round-trips to the help file."""
+    return ("specify a batch: --bugs Open, --crs Proposed, --stories Ready (combinable, and a "
+            "status is optional), --worklist <file>, or --prd <file>")
+
+
+def spend_charter(repo_root: Path | str, charter_id: str, run_id: str) -> dict:
+    """Mark the charter this run was materialised from as `Spent`. The queue's only exit.
+
+    Refuses rather than guesses: a charter that does not resolve, or is not Queued, leaves the
+    queue untouched and says so. A refusal is REPORTED, never silently ignored - and the run is
+    already open by the time this runs, so `plan --write` carries the refusal out in its exit
+    code rather than exiting 0 over an unadvanced queue. That combination is what reproduced the
+    defect this exists to close: a green plan, a run running, and a charter still Queued that the
+    next `next` re-offers at the head of the queue.
+
+    THREE things the first version got wrong, each of them a way for the refusal to vanish:
+
+    * `transition.main` RAISES `SystemExit` on some paths, and `except Exception` does not catch
+      it - so a refusal became a process exit through the middle of a plan.
+    * transition prints its own refusal to stdout, which leaked unindented into the plan's page
+      and read as the plan's own words. It is CAPTURED and re-emitted under this function's
+      indent, attributed.
+    * `Spent` is a charter TERMINAL, so transition applies the terminal Open-Questions gate to it
+      and refuses a charter carrying one. Consuming a charter is not answering its questions -
+      the run is opened to answer them - so the gate is stood down for THIS write with `--force`,
+      and only for it. Every other gate transition runs still runs.
+    """
+    root = Path(repo_root)
+    cid = sdlc_md.norm_id(charter_id)
+    hit = sdlc_md.find_by_id(root, cid)
+    if not hit:
+        return {"ok": False, "attempted": False, "output": "",
+                "detail": f"{cid}: no charter on disk resolves to this id - the run "
+                          f"is open and the queue is untouched"}
+    path = Path(hit[0])
+    text = sdlc_md.read_text_safe(path) or ""
+    status = (sdlc_md.extract_field(text, "Status") or "").strip()
+    if status != "Queued":
+        return {"ok": False, "attempted": False, "output": "",
+                "detail": f"{cid} is {status or 'unreadable'}, not Queued - left "
+                          f"as it is rather than re-spent by this run"}
+    said = io.StringIO()
+    try:
+        import transition  # noqa: PLC0415 - deferred sibling; the one status writer
+        # Through transition's own entry point, not around it: it is what syncs the index and
+        # runs the status gates, and a second writer that skipped those would leave the charter
+        # index disagreeing with the charter.
+        with contextlib.redirect_stdout(said), contextlib.redirect_stderr(said):
+            rc = transition.main(["set", cid, "Spent", "--force", "--root", str(root)])
+        if rc != 0:
+            return {"ok": False, "attempted": True, "output": said.getvalue(),
+                    "detail": f"{cid} was NOT marked Spent - transition refused it (rc {rc}). "
+                              f"The run is open; resolve this or the queue will re-offer it"}
+    # SystemExit is not an Exception. `transition.main` raises it on some paths, and the first
+    # version's `except Exception` let it out of a half-finished plan.
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - a charter write must not lose a run
+        sdlc_md.debug("sprint.spend_charter", exc)
+        return {"ok": False, "attempted": True, "output": said.getvalue(),
+                "detail": f"{cid} could not be marked Spent ({type(exc).__name__}: {exc}) - the "
+                          f"run is open; mark it by hand or the queue will re-offer it"}
+    return {"ok": True, "attempted": True, "output": said.getvalue(),
+            "detail": f"{cid} is Spent - consumed by {run_id}, so the queue advances"}
+
+
+def run_opened_line(state: dict, appetite: dict) -> str:
+    """The run-opened confirmation. Names the Sprint Goal and the `--goal` LADDER RUNG with
+    DISTINCT labels, so a reader never reads `rung=done` as their Sprint Goal failing to take and
+    re-plan against an already-open run. The Sprint Goal is shown as set (quoted) or stated unset;
+    the rung is labelled `rung`, never the bare `goal=` that read as either."""
+    sprint_goal = (state.get("sprint_goal") or "").strip()
+    goal_field = f'sprint-goal="{sprint_goal}"' if sprint_goal else "sprint-goal=unset"
+    return (f"opened run {state['run_id']} (rung={state.get('goal') or 'unset'}, {goal_field}, "
+            f"appetite {appetite['minutes']:g}min/{appetite['units']}units)")
+
+
+def build_authoring_plan(repo_root: Path | str, prd_path: str) -> dict:
+    """The greenfield authoring plan: the batch source is a PRD, not existing units.
+    The planner validates the PRD and signals **authoring mode**; the decomposition itself
+    (PRD -> epics -> stories) is the model-instructed phase the loop runs next. It
+    cannot enumerate epics/stories here - they do not exist yet."""
+    prd = Path(prd_path)
+    if not prd.exists():
+        raise FileNotFoundError(f"PRD not found: {prd_path}")
+    return {
+        "generated_at": sdlc_md.now_iso8601(),
+        "mode": "authoring",
+        "prd": str(prd),
+        "next": "decompose the PRD into epics, then Ready stories (the authoring phase); "
+                "stop at the epic-cut STOP for approval before authoring stories",
+        "count": 0,
+        "lessons": lessons.plan_digest(repo_root),  # a greenfield start is a sprint start too
+        # A greenfield project has no lessons of its own - so the inherited registry is the
+        # ONLY tier that can help it, and the one it most needs.
+        "cross_lessons": lessons.cross_digest(repo_root),
+        # The plan-phase classes, or the reported absence: the authoring path is not the one
+        # plan shape that omits them silently.
+        "phase_lessons": lessons.phase_digest(repo_root, "plan"),
+    }
+
+
+def pre_plan_blocker_sweep(repo_root: Path | str) -> dict:
+    """Pre-plan step: surface units whose blockers have cleared so newly-unblocked work is
+    eligible for the batch, mirroring the reconcile-before-plan gate. Advisory and fail-safe -
+    it proposes Blocked -> Ready candidates and never transitions or blocks planning."""
+    try:
+        return blocker_sweep.sweep(repo_root)
+    except Exception:  # noqa: BLE001 - the sweep is advisory; never break planning on its failure
+        return {"now_unblocked": [], "still_blocked": [], "errors": []}
+
+
+def _git(root, *args, timeout: int = 30):
+    import subprocess
+    try:
+        return subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                              text=True, timeout=timeout)
+    except Exception:  # noqa: BLE001 - git absent/hung must never break planning
+        return None
+
+
+def _has_origin(root) -> bool:
+    r = _git(root, "remote")
+    return bool(r) and r.returncode == 0 and "origin" in r.stdout.split()
+
+
+def _default_branch(root) -> str:
+    """The origin default branch, or `main`. Thin alias for the shared
+    `next_id.origin_default_branch` so the resolution logic lives in one place."""
+    import next_id
+    return next_id.origin_default_branch(Path(root))
+
+
+def _git_failure(result, what: str) -> str:
+    """Why a git step could not answer, in the words git itself used. Derived from the result,
+    never restated beside it, so the reason cannot drift from the failure."""
+    if result is None:
+        return f"{what} could not run (git absent, hung, or refused to start)"
+    detail = (result.stderr or result.stdout or "").strip().splitlines()
+    tail = detail[-1].strip() if detail else f"exit {result.returncode}"
+    return f"{what} failed: {tail}"
+
+
+def origin_drift(root, do_fetch: bool = True) -> dict:
+    """Compare local HEAD to origin's default branch so a sprint is not planned against a stale
+    checkout. Fetches first unless `do_fetch=False`. Returns
+    {remote, behind, paths, branch, unverified}.
+
+    `unverified` names why the comparison could not be trusted - the fetch failed, or the
+    commit count could not be taken - and is None when the answer is real. A stale
+    remote-tracking ref answers 'level' whether or not the remote was reached, so a failed
+    fetch reported as behind=0 is not 'up to date', it is 'could not ask'. `do_fetch=False`
+    is a deliberate offline compare, not a failure, and never sets it.
+
+    Fail-safe: no origin, or no git at all -> remote False, behind 0, no warning."""
+    out = {"remote": False, "behind": 0, "paths": [], "branch": None, "unverified": None}
+    if not _has_origin(root):
+        return out
+    out["remote"] = True
+    if do_fetch:
+        fetched = _git(root, "fetch", "origin", "--quiet")
+        if fetched is None or fetched.returncode != 0:
+            out["unverified"] = _git_failure(fetched, "fetch from origin")
+    br = _default_branch(root)
+    out["branch"] = br
+    cnt = _git(root, "rev-list", "--count", f"HEAD..origin/{br}")
+    if cnt and cnt.returncode == 0:
+        try:
+            out["behind"] = int(cnt.stdout.strip() or 0)
+        except ValueError:
+            out["unverified"] = out["unverified"] or (
+                f"the commit count against origin/{br} was not a number: "
+                f"{cnt.stdout.strip()!r}")
+    else:
+        out["unverified"] = out["unverified"] or _git_failure(
+            cnt, f"counting commits against origin/{br}")
+    if out["behind"]:
+        names = _git(root, "diff", "--name-only", f"HEAD..origin/{br}")
+        if names and names.returncode == 0:
+            out["paths"] = [p for p in names.stdout.splitlines() if p.strip()]
+    return out
+
+
+def _batch_paths(root, batch_ids) -> set:
+    """Repo-relative file paths of the batch's units, for overlap against incoming remote
+    changes (does the drift touch a file this batch also allocates/edits)."""
+    root = Path(root)
+    want = {sdlc_md.norm_id(i) for i in batch_ids}
+    paths = set()
+    for t in sdlc_md.ARTIFACT_TYPES:
+        for p in sdlc_md.artifact_files(t, root):
+            rid = sdlc_md.extract_record_id(p.stem)
+            if rid and sdlc_md.norm_id(rid) in want:
+                try:
+                    paths.add(str(p.relative_to(root)))
+                except ValueError:
+                    paths.add(str(p))
+    return paths
+
+
+def _drift_warning(drift: dict, batch_paths: set) -> str | None:
+    """A warning line when local is behind origin, naming the commit-count and any overlap
+    between the incoming remote changes and the batch's own artifact files (the collision the
+    incident hit) - and a line when the comparison could not be made at all. None only when
+    the checkout was really compared and is really level."""
+    lines = []
+    if drift.get("unverified"):
+        # `unverified` has two causes and they need different remedies. A failed FETCH can be
+        # worked around with --no-fetch (compare against the last fetched state deliberately); a
+        # failed COMPARE cannot - --no-fetch would skip the fetch and still fail the same way.
+        # Naming only the fetch remedy sent an operator to a flag that does not clear their case.
+        _cause = str(drift["unverified"])
+        _fetch_failed = "fetch from origin" in _cause
+        _remedy = ("restore the remote and re-run, or pass --no-fetch to compare against the last "
+                   "fetched state deliberately" if _fetch_failed else
+                   "the comparison itself failed, so --no-fetch will not clear it - repair the "
+                   "checkout or the ref and re-run")
+        lines.append(f"origin drift UNVERIFIED: {_cause} - this is not evidence of no drift; "
+                     f"this checkout may already be stale ({_remedy})")
+    if drift.get("behind"):
+        overlap = sorted(p for p in drift["paths"] if p in batch_paths)
+        msg = (f"origin drift: local is {drift['behind']} commit(s) behind "
+               f"origin/{drift['branch']} - fetch and rebase before planning (a stale checkout "
+               f"can mint an id the remote already used)")
+        if overlap:
+            msg += f"; incoming changes touch batch artifacts: {', '.join(overlap)}"
+        lines.append(msg)
+    return "\n".join(lines) or None
+
+
+def _preplan_reconcile(args: argparse.Namespace, kinds: list[str],
+                       record: dict | None = None) -> int | None:
+    """Reconcile-before-plan: a plan must read a drift-free census (file Status vs its index
+    row). Mechanical drift only; semantic staleness still needs the audit. Prints a warning and,
+    under --strict, returns 2 to abort; otherwise None.
+
+    `record`, when given, receives the VERDICT under `preplan_reconcile`. The check ran on every
+    plan and left no trace, so the close could not show that the batch had been selected against
+    a drift-free census - which is the first row of the sprint checklist, and a stage whose
+    evidence does not exist cannot be certified however reliably it happens.
+    """
+    drift = []
+    for k in kinds:
+        try:
+            drift += [(k, d) for d in reconcile.detect_type(k, Path(args.root)).get("drift", [])]
+        except Exception:  # noqa: BLE001 - reconcile is advisory here, never block planning on its failure
+            pass
+    if record is not None:
+        record["preplan_reconcile"] = {"drift": len(drift),
+                                       "kinds": sorted({k for k, _ in drift}),
+                                       "at": sdlc_md.now_iso8601()}
+    if drift:
+        names = ", ".join(sorted({k for k, _ in drift}))
+        print(f"reconcile: {len(drift)} drift item(s) in the {names} index(es) - reconcile before "
+              f"planning (the plan reads file Status; a stale index misleads selection)",
+              file=sys.stderr)
+        if getattr(args, "strict", False):
+            return 2
+    return None
+
+
+def _origin_drift_preflight(args: argparse.Namespace, data: dict) -> int | None:
+    """Planning against a stale checkout can mint an id the remote already used, or plan over an
+    artifact a teammate has changed. Fetch + compare; warn (refuse under --strict). Fail-safe: git
+    absent/slow/odd never breaks planning. Returns 2 to abort under --strict, else None."""
+    try:
+        drift = origin_drift(args.root, do_fetch=not getattr(args, "no_fetch", False))
+        # `waves` is None for manual order and empty batches (the key is always present) - `or []`
+        # keeps the preflight alive on exactly those paths (a swallowed TypeError here silently
+        # disabled the --strict refusal).
+        batch_ids = [u for wave in (data.get("waves") or []) for u in wave]
+        warn = _drift_warning(drift, _batch_paths(args.root, batch_ids))
+        if warn:
+            print(warn, file=sys.stderr)
+            if getattr(args, "strict", False):
+                return 2
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        # Advisory: only the EXPECTED failure modes are contained; a programming error surfaces.
+        pass
+    return None
+
+
+def _render_goal_review(data: dict) -> None:
+    """What the seats said about the Sprint Goal - or, plainly, that nobody said anything."""
+    review = data.get("goal_review")
+    if not review or not data.get("sprint_goal"):
+        return
+    if review["reviewed"]:
+        print(f"  goal review ({review.get('reviewed_at') or 'undated'}): "
+              f"{len(review['seats'])} seat(s) examined \"{data['sprint_goal']}\"")
+        for s in review["seats"]:
+            print(f"    {s.get('seat', '?')}: achievable={s.get('achievable')}, "
+                  f"one increment={s.get('one_increment')}, done means "
+                  f"\"{s.get('done_means')}\"")
+        for o in review.get("objections") or []:
+            print(f"    advice from {o.get('seat')}: judged the goal NOT achievable"
+                  + (f" - {o['note']}" if o.get("note") else "")
+                  + " (advice for the operator approving this plan; the plan is not refused)")
+        for seat in review.get("discharged") or []:
+            print(f"    {seat}: its objection to the prior wording is answered by the amendment "
+                  f"it requested")
+        _render_owing(review)
+        themed = review.get("themed") or []
+        if themed and not review.get("objected"):
+            # Surfaced as ADVICE so separating it from achievability loses no information: the
+            # operator still learns the seats called this a themed batch.
+            print(f"    THEMED BATCH: {len(themed)} seat(s) judged this not one atomic increment "
+                  f"({', '.join(str(t.get('seat')) for t in themed)}) while finding the goal "
+                  f"achievable - a classification, not an objection; the plan is not refused")
+        return
+    print(f"  goal review: the Sprint Goal went UNREVIEWED - {review['reason']}")
+    _render_owing(review)
+
+
+def _render_owing(review: dict) -> None:
+    """The seats with no verdict on this wording, named so nobody runs a second round of every
+    seat to find them. Advice, like the rest of the read. The rounds on one wording are read
+    together, so each owing seat records its own verdict alone."""
+    owing = review.get("needs_reconsult") or []
+    if owing:
+        print(f"    owing a verdict on this wording: {', '.join(owing)} - each records its own "
+              f"alone (`sprint.py goal-review record --goal` with this wording); the verdicts "
+              f"already given on it stand (advice; the plan is not refused)")
+
+
+def _render_seat_provenance(data: dict) -> None:
+    """The WSJF seat-provenance lines: HOW MUCH of this batch the seats scored first, whose
+    judgement it was, and only then how fresh it is.
+
+    Two corrections live here, both of the same class - a message that describes a situation
+    other than the one on screen. The age advisory used to fire over scores covering none of
+    the batch, and the fallback line used to call the ORDER a priority fallback when only the
+    Cost of Delay falls back: WSJF still runs, on a CoD derived from the declared Priority."""
+    prov = data.get("seat_provenance")
+    if not prov:
+        return
+    when = f", inputs written {prov['written_at']}" if prov["written_at"] else ""
+    print(f"  seats: {prov['covered']}/{data['count']} unit(s) in this batch carry a seat "
+          f"score ({prov['entries']} entr{'y' if prov['entries'] == 1 else 'ies'} in "
+          f"wsjf-inputs.json){when}")
+    if prov["unscored"]:
+        print(f"  Cost of Delay derived from Priority for: {', '.join(prov['unscored'])} - "
+              f"the order is still WSJF (CoD/Points), only the CoD is derived. Seat-score "
+              f"them via an amigo consult writing sdlc-studio/.local/wsjf-inputs.json "
+              f"(reference-sprint.md, Seat-scored WSJF)")
+    if prov["irrelevant"]:
+        # NOT an age advisory. These scores are not old, they are about other work.
+        print(f"  wsjf-inputs.json scores NO unit in this batch: its {prov['entries']} "
+              f"entr{'y' if prov['entries'] == 1 else 'ies'} are about other work, so they "
+              f"are not stale - they do not apply here. Re-run the amigo consult over THIS "
+              f"batch to score it")
+    elif prov["stale"]:
+        print(f"  advisory: wsjf-inputs.json is {prov['age_days']} day(s) old "
+              f"(window {prov['stale_after_days']}) - re-run the amigo consult "
+              f"if these scores no longer reflect current judgement")
+
+
+def _render_waves(data: dict) -> None:
+    """The parallelisable dependency levels, or the flat priority list when there are no waves."""
+    if data.get("waves"):
+        for i, wave in enumerate(data["waves"], 1):
+            par = " (parallel)" if len(wave) > 1 else ""
+            print(f"  wave {i}{par}: {', '.join(wave)}")
+        # a flat single wave of >1 unit with no declared deps is not 'no dependencies exist' - it
+        # is undeclared. Flag it so the operator grooms `Depends on:` (the --goal design rung).
+        if data.get("deps_declared") is False and data["count"] > 1:
+            print("  hint: all units are parallel because no `Depends on:` is declared "
+                  "- groom inter-story dependencies (the --goal design rung) for real waves")
+    else:
+        for b in data["batch"]:
+            print(f"  {b['id']} [{b['priority']}]")
+
+
+def _render_delivery_mode(data: dict) -> None:
+    """SEQUENTIAL or PARALLEL, and why the alternative was or was not available. When parallel is
+    on the table the operator picks; the plan names the file-disjoint groups a parallel build
+    would fan out to, so the choice is informed rather than a preference."""
+    dm = data.get("delivery_mode")
+    if not dm:
+        return
+    if dm.get("parallel_available"):
+        groups = dm.get("groups") or []
+        print(f"  delivery mode: SEQUENTIAL or PARALLEL (operator picks). {dm['reason']}")
+        print(f"    parallel would fan out to {len(groups)} worktree group(s): "
+              + "; ".join("[" + ", ".join(g) + "]" for g in groups))
+    else:
+        print(f"  delivery mode: SEQUENTIAL (parallel withheld). {dm['reason']}")
+
+
+def _render_lane_partition(data: dict) -> None:
+    """The report-only file-disjoint lanes, for every batch. Additive - it drives no
+    plan decision; it shows how the batch would split across teams or worktrees, and names any
+    unit that could not be placed because it declared no Affects."""
+    lp = data.get("lane_partition")
+    if not lp:
+        return
+    lanes = lp.get("lanes") or []
+    print(f"  lane partition (report-only): {len(lanes)} file-disjoint lane(s) - "
+          "no file appears in two:")
+    for i, lane in enumerate(lanes, start=1):
+        print(f"    lane {i}: " + ", ".join(lane))
+    unplaceable = lp.get("unplaceable") or []
+    if unplaceable:
+        print("    unplaceable (declared no Affects, so cannot be proven disjoint - not placed): "
+              + ", ".join(unplaceable))
+
+
+def _render_duplicates(bd: dict) -> None:
+    """Probable duplicates, printed where the cost of carrying both is about to be paid."""
+    dupes = bd.get("probable_duplicates") or []
+    if not dupes:
+        return
+    print(f"  probable duplicate(s) - {len(dupes)} pair(s) declare the SAME files and describe "
+          f"the same thing. Not closed for you: whether two bugs are one is a judgement, and a "
+          f"backlog that closed its own items would be the failure this reports, reversed:")
+    for d in dupes:
+        print(f"    {d['pair'][0]} / {d['pair'][1]} - {d['overlap']:.0%} title overlap "
+              f"({', '.join(d['shared'][:6])}) over {', '.join(d['affects'][:3])}")
+
+
+def _render_clusters(data: dict) -> None:
+    """Shared-file clusters, and the waves they falsify.
+
+    A `Depends on:` edge is a DECLARATION; a shared file is a FACT. The wave computation only
+    knows the declarations, so it has called two units parallel while both rewrote one module.
+    The cluster is printed with the plan, and a wave holding more than one member of the same
+    cluster is called out as NOT safely parallel."""
+    bd = data.get("breakdown") or {}
+    clusters = bd.get("clusters") or []
+    if not clusters:
+        return
+    print("  shared-file clusters (one cluster = one file in common, so NOT parallel; "
+          "`derived` = worked out from a Verify line, not declared by anyone):")
+    for c in clusters:
+        src = c.get("sources") or {}
+        shown = ", ".join(f"{f} [{src.get(f, 'declared')}]" for f in c["files"][:3])
+        more = f" (+{len(c['files']) - 3} more)" if len(c["files"]) > 3 else ""
+        print(f"    {', '.join(c['units'])} -> {shown}{more}")
+    for i, wave in enumerate(data.get("waves") or [], 1):
+        for c in clusters:
+            both = [u for u in wave if u in set(c["units"])]
+            if len(both) > 1:
+                print(f"  warning: wave {i} is NOT safely parallel - {', '.join(both)} touch "
+                      f"{', '.join(c['files'][:2])}. Run them in sequence, or declare "
+                      f"`Depends on:` so the waves say so.", file=sys.stderr)
+
+
+#: Whether an `Affects` a unit's own content contradicts REPORTS or REFUSES. Default `warn`,
+#: because a declaration naming a file the unit will CREATE is legitimate and refusing it would
+#: refuse ordinary work. `block` is for a project that has paid its tail down and wants it kept
+#: at zero. Read here and stated in `help/sprint.md`; the two are pinned to agree.
+AFFECTS_CHECK_DEFAULT = "warn"
+
+
+def affects_check_mode(repo_root: Path | str) -> str:
+    mode = str(config.get(repo_root, "sprint.affects_check", AFFECTS_CHECK_DEFAULT)
+               or AFFECTS_CHECK_DEFAULT).strip().lower()
+    return mode if mode in ("warn", "block") else AFFECTS_CHECK_DEFAULT
+
+
+def affects_findings(repo_root: Path | str, unit_ids) -> list[dict]:
+    """`[{id, unresolvable, undeclared}]` for the units named, and for NOBODY else.
+
+    Scoped to the batch on purpose. The corpus carries a standing tail this unit is not for -
+    a defect in work nobody is planning cannot block a plan, and a check that refused on it
+    would be switched off within a day. `validate.py check` reports the undeclared half on
+    open work as advice, and nothing refuses on the tail.
+    """
+    root = Path(repo_root)
+    out: list[dict] = []
+    for uid in unit_ids:
+        hit = sdlc_md.find_by_id(root, sdlc_md.norm_id(uid))
+        if not hit:
+            continue
+        mism = affects_mismatch(root, sdlc_md.read_text_safe(hit[0]) or "")
+        if mism["unresolvable"] or mism["undeclared"]:
+            out.append({"id": sdlc_md.norm_id(uid), **mism})
+    return out
+
+
+def _affects_blocking(repo_root) -> bool:
+    """Is an Affects finding a refusal for this project? ONE reader, asked by every path.
+
+    `plan` announced "nothing is refused" whatever the mode while `batch add` consulted the mode
+    itself, so the same setting meant two things depending on which verb you ran."""
+    try:
+        return affects_check_mode(repo_root) == "block"
+    except Exception as exc:  # noqa: BLE001 - a mode read must not crash the verb it advises
+        sdlc_md.debug("sprint._affects_blocking", exc)
+        return False
+
+
+def _render_affects_advisories(data: dict, repo_root=None) -> None:
+    """A declaration the unit's own content contradicts. ADVISORY - it names what looks wrong
+    and refuses nothing, because a path to a file the unit will create is legitimate.
+
+    Reported per unit rather than only when EVERY declared path fails, which was the hole: a
+    declaration of four real files plus one typo read as fully groomed, and the typo travelled
+    into the collision analysis and the engagement floor, both of which read `Affects`."""
+    items = (data.get("breakdown") or {}).get("affects_advisories") or []
+    if not items:
+        return
+    # THE MODE DECIDES, and it is read here rather than announced. `block` and `warn` printed a
+    # byte-identical "nothing is refused" line, so the config key decided nothing on this path
+    # while `help/sprint.md` said it "decides what a finding does".
+    blocking = _affects_blocking(repo_root or data.get("root") or ".")
+    print("  Affects contradicted by the unit's own content"
+          + (" - REFUSED under sprint.affects_check: block:" if blocking
+             else " (advisory - nothing is refused):"))
+    for it in items:
+        if it.get("unresolvable"):
+            print(f"    {it['id']}: declared but not on disk - "
+                  f"{', '.join(it['unresolvable'])} (a file the unit CREATES is fine)")
+        if it.get("undeclared"):
+            print(f"    {it['id']}: targeted by its own Verify lines but undeclared - "
+                  f"{', '.join(it['undeclared'])}")
+
+
+def _render_decompose(data: dict) -> None:
+    """CRs doing enough work to warrant stories. Only a story carries executable `Verify:`
+    lines, so an un-decomposed CR of this size reaches Done on prose alone."""
+    items = (data.get("breakdown") or {}).get("decompose") or []
+    if not items:
+        return
+    print("  decompose into stories (only a story's Done is gated on executable ACs):")
+    for it in items:
+        print(f"    {it['id']} ({it['why']}) -> `cr action {it['id']}`")
+
+
+def _render_downgrades(data: dict) -> None:
+    """Grooming checks the project's Definition of Ready downgraded to human judgement.
+    The downgrade is the document's right; doing it INVISIBLY is not - a bar lowered
+    without a trace is the silent-weakening class the documents exist to prevent."""
+    downgraded = (data.get("breakdown") or {}).get("downgraded") or []
+    if downgraded:
+        print(f"  grooming downgraded to human-judged by definition-of-ready.md "
+              f"(tag removed): {', '.join(downgraded)}")
+
+
+def _breakdown_detail(bd: dict) -> list[str]:
+    """The ungroomed units, one line each: which unit, what it lacks, where it lives."""
+    return [f"    {u['id']:<8} {u.get('verb', 'lacks')} "
+            f"{', '.join(u['missing']):<15} {u['path']}"
+            for u in bd["ungroomed"]]
+
+
+BREAKDOWN_FIX = """  fix each one on the artefact, then re-plan:
+    Affects   > **Affects:** path/to/file.py, path/to/other.py
+              the files the unit will touch. Without it nothing can size the unit, and
+              nothing can see that two units touch the same file.
+    Points    > **Points:** 3
+              the job size on the modified Fibonacci scale ({scale}) - not its urgency,
+              and not a guess at hours. It is RELATIVE: is this bigger than the last 3 you
+              delivered? Nothing else is accepted: a 7 is the false precision the scale
+              exists to prevent, and above {ceiling} the unit must be SPLIT, not estimated.
+  see the whole grooming list, read-only:  sprint.py breakdown {sel}
+  opt out ONLY as a recorded decision: set `sprint.breakdown: judgement` in
+  sdlc-studio/.config.yaml and this lane reports instead of blocking. Omission is not an
+  escape - an absent config BLOCKS."""
+
+SPLIT_FIX = """  split each one into units of {ceiling} points or fewer, then re-plan:
+    `cr action <id>` decomposes a CR into stories; a story that big is two stories.
+    Each piece gets its OWN Points, and they do NOT have to sum to the original - the
+    whole reason the estimate was refused is that nobody could size the thing in one go.
+  tighten or move the ceiling as a RECORDED decision, in sdlc-studio/.config.yaml:
+    sprint:
+      points_split_above: 5    # this team finds 8-point units too chunky
+  raising it is a decision to forecast where the model is known to break - the 13s came in
+  1.9x cheaper per point than every band below, and all three blind estimators returned
+  them with low confidence and the words "should be split"."""
+
+
+def _refuse_affects_blocked(items: list, root) -> None:
+    """The refusal `sprint.affects_check: block` names and, until now, did not perform.
+
+    BG0521 was filed because `plan` under `block` was byte-identical to `warn`. Its repair made
+    the message say REFUSED. It did not make the command refuse: the renderer printed the word,
+    the plan was written and the run opened, and the exit status was 0. That is worse than the
+    honest advisory it replaced - a gate announcing a refusal it does not perform teaches an
+    operator to read every other refusal as decoration.
+    """
+    print(f"sprint plan REFUSED under `sprint.affects_check: block`: {len(items)} unit(s) whose "
+          f"declared Affects is contradicted by their own content. NO PLAN WAS PRINTED and no "
+          f"run was opened.\n", file=sys.stderr)
+    for it in items:
+        if it.get("unresolvable"):
+            print(f"    {it['id']}: declared but not on disk - "
+                  f"{', '.join(it['unresolvable'])}", file=sys.stderr)
+        if it.get("undeclared"):
+            print(f"    {it['id']}: targeted by its own Verify lines but undeclared - "
+                  f"{', '.join(it['undeclared'])}", file=sys.stderr)
+    print("\n  Fix the declaration on the artefact, or set `sprint.affects_check: warn` in\n"
+          "  sdlc-studio/.config.yaml as a recorded decision - the mode is the ONE reader, so\n"
+          "  changing it changes every path at once.", file=sys.stderr)
+
+
+def _refuse_ungroomed(bd: dict, count: int, sel: str) -> None:
+    """The refusal. It is the only message the operator gets, so it teaches: what is wrong,
+    why a plan over it would be worse than no plan, exactly how to fix each unit, and how to
+    opt out on purpose."""
+    n = len(bd["ungroomed"])
+    print(f"sprint plan REFUSED: {n} of {count} unit(s) are ungroomed. NO PLAN WAS PRINTED.\n",
+          file=sys.stderr)
+    print("  A plan over unsized units is false authority. A unit with no Points cannot be\n"
+          "  forecast at all, a unit that names no files cannot be checked for collisions,\n"
+          "  and the planner then reports two units as safely parallel when they will\n"
+          "  collide. A plan you cannot trust is worse than no plan.\n",
+          file=sys.stderr)
+    print("  ungroomed:", file=sys.stderr)
+    print("\n".join(_breakdown_detail(bd)), file=sys.stderr)
+    print(_breakdown_fix(bd, sel), file=sys.stderr)
+
+
+def _breakdown_fix(bd: dict, sel: str) -> str:
+    return BREAKDOWN_FIX.format(
+        sel=sel, ceiling=bd.get("ceiling", sdlc_md.POINTS_SPLIT_ABOVE),
+        scale=", ".join(str(p) for p in sdlc_md.POINTS_SCALE))
+
+
+def _oversized_detail(bd: dict) -> list[str]:
+    """The units over the ceiling, one line each: which unit, how big, where it lives."""
+    return [f"    {u['id']:<8} {u['points']:>3} points  (ceiling {u['ceiling']})  {u['path']}"
+            for u in bd["oversized"]]
+
+
+def _refuse_oversized(bd: dict, count: int) -> None:
+    """The split refusal. A unit above the ceiling is REFUSED - not warned about - because the
+    warning was already tried: the estimators who sized these units said "should be split",
+    unprompted, and the sprint that shipped one is the sprint whose forecast missed."""
+    n = len(bd["oversized"])
+    ceiling = bd["ceiling"]
+    print(f"sprint plan REFUSED: {n} of {count} unit(s) are above {ceiling} points. "
+          f"NO PLAN WAS PRINTED.\n", file=sys.stderr)
+    print(f"  Above {ceiling} points the estimate is not worth having, and the answer is to\n"
+          f"  DECOMPOSE the unit - not to estimate it harder. That is a TRIAGE decision, not\n"
+          f"  an estimation one. A point is a stable unit of cost up to {ceiling} (22k-27k\n"
+          f"  tokens per point, measured) and stops being one above it: the 13-point units in\n"
+          f"  the blind re-estimation came in at 14,144 per point, 1.9x cheaper, and all three\n"
+          f"  estimators returned them with LOW confidence saying they should be split. The one\n"
+          f"  sprint whose forecast missed its band is the one that contained a 13.\n",
+          file=sys.stderr)
+    print("  too big:", file=sys.stderr)
+    print("\n".join(_oversized_detail(bd)), file=sys.stderr)
+    print(SPLIT_FIX.format(ceiling=ceiling), file=sys.stderr)
+
+
+def _refuse_requests(requests: list[dict]) -> None:
+    """The G1 refusal. A sprint plans the DELIVERY backlog; an RFC/CR/Issue is a DISCOVERY-backlog
+    item with no executable ACs to close on. Naming the decompose path is the point - the refusal
+    is only useful if it says how to turn the discovery item into plannable work (a request is
+    refined, an Issue triaged)."""
+    n = len(requests)
+    print(f"sprint plan REFUSED: {n} unit(s) are DISCOVERY items, not deliverable work. "
+          f"NO PLAN WAS PRINTED.\n", file=sys.stderr)
+    print("  An RFC, a CR or an Issue is a DISCOVERY-backlog item, not a unit of work. It has\n"
+          "  no executable acceptance criteria to close on, so it can be neither sprinted nor\n"
+          "  verified Done. A sprint plans the DELIVERY backlog: stories and bugs.\n",
+          file=sys.stderr)
+    print("  discovery items:", file=sys.stderr)
+    for it in requests:
+        print(f"    {it['id']:8} {it['type']:5} {it['path']}", file=sys.stderr)
+    print("\n  decompose each into the delivery units it produces, then plan THOSE:\n"
+          "    a request (RFC/CR):  refine.py apply --request <id> --epic-title ... --story ...\n"
+          "    an Issue:            triage.py apply --issue <ISxxxx> --bug 'title|points|severity'\n"
+          "  the discovery item's own status then becomes terminal by DERIVATION when its children\n"
+          "  are resolved (transition refuses to assert it). See `status backlog` for both backlogs.",
+          file=sys.stderr)
+
+
+def _report_oversized(bd: dict, count: int) -> None:
+    """The recorded opt-out still REPORTS an oversized unit; it just does not block."""
+    print(f"breakdown: {len(bd['oversized'])} of {count} unit(s) are above "
+          f"{bd['ceiling']} points and should be SPLIT - planning anyway "
+          f"(sprint.breakdown: judgement). Their forecast is outside the range the rate was "
+          f"measured in:", file=sys.stderr)
+    print("\n".join(_oversized_detail(bd)), file=sys.stderr)
+
+
+def _report_ungroomed(bd: dict, count: int) -> None:
+    """The recorded opt-out (`sprint.breakdown: judgement`): the lane still REPORTS, it just
+    does not block. An opt-out that also went quiet would be the disease, not the cure."""
+    n = len(bd["ungroomed"])
+    print(f"breakdown: {n} of {count} unit(s) are ungroomed - planning anyway "
+          f"(sprint.breakdown: judgement). They carry NO forecast at all - an unsized unit is "
+          f"left out of the batch total rather than priced at a stand-in:", file=sys.stderr)
+    print("\n".join(_breakdown_detail(bd)), file=sys.stderr)
+
+
+def _render_triage(data: dict) -> None:
+    """The judgement triage lenses, printed with the plan so a dirty backlog is seen BEFORE it is
+    planned FROM. Reporting-only - the human decides whether a suspected duplicate is really one -
+    so it prints its findings and does not refuse. Silence here means the batch is coherent, EXCEPT
+    when a backlog file could not be read: a drop is logged rather than passed off as clean."""
+    bd = data.get("breakdown") or {}
+    triage = bd.get("triage") or {}
+    findings = triage.get("findings") or []
+    skipped = triage.get("skipped") or 0
+    if not findings and not skipped:
+        return
+    if findings:
+        print(f"  backlog triage: {len(findings)} item(s) to resolve before planning FROM this "
+              f"batch (judgement calls - not a refusal):")
+        for f in findings:
+            print(f"    [{f['lens']}] {f['detail']}")
+    if skipped:
+        print(f"  backlog triage: {skipped} artefact(s) unreadable - not triaged "
+              f"(fix the header, then re-plan)")
+
+
+def _render_phase_lessons(data: dict) -> None:
+    """The lessons injected at plan, printed in the plan - and their ABSENCE printed too,
+    because a plan that silently omits them reads exactly like a plan with none to carry."""
+    injected = data.get("phase_lessons")
+    if injected is None:
+        return
+    print("")
+    for line in lessons.render_phase(injected):
+        print(f"  {line}")
+    # The toolchain, beside the lessons and for the same reason: both are things an agent is
+    # supposed to have read, and both get skipped unless the command that runs anyway prints
+    # them.
+    print("")
+    for line in render_runbook_pointer():
+        print(f"  {line}")
+
+
+#: What stood in place of the refused velocity record, one sentence per rate source.
+#: EXHAUSTIVE BY TEST, never by argument. An earlier version was a two-key lookup whose docstring
+#: PROVED the domain closed; two later features each added a source to it - the fitted fixed term,
+#: and the rung-aware marginal - and each break surfaced as a KeyError at an operator's plan
+#: rather than in CI. Three of the five sources crashed before this was made total.
+#: `test_every_rate_source_is_handled` iterates the module's RATE_* constants, so the next source
+#: added fails a test instead of a sprint.
+_RATE_STOOD_INSTEAD = {
+    RATE_EVIDENCE: "the per-unit evidence log stands instead",
+    RATE_SEED: "the seed stands instead",
+    RATE_FIXED_FIT: "the fitted fixed-term marginal stands instead",
+    RATE_VELOCITY: "the velocity record's own surviving rate stands",
+    RATE_OVERRIDE: "the operator's override stands",
+    RATE_UNMEASURED_RUNG: "nothing stands: this rung prices no marginal at all",
+}
+
+
+def _render_rate_provenance(tf: dict) -> None:
+    """Why THIS rate and not another one - printed with the rate, never three blocks away.
+
+    A seed carries the one live test of itself; a refused record says which models refused it.
+    Both used to be silent, and a silent seed reads as a calibration.
+
+    The refusal prints whatever stood in place of the record, and NAMES what stood: on the
+    evidence-log path the seed did not stand at all, and saying it did would be a second false
+    statement stacked on the first.
+
+    Those two are the whole domain here, so the lookup is exhaustive rather than defaulting: the
+    velocity record is the source that refused, and `tokens_per_point` returns `refused: None` on
+    every answer the record itself supplies, so the record can never also be what stands. A
+    generic fallback sentence under that pair could not be reached, and unreachable prose is one
+    more claim nothing checks."""
+    if tf.get("rate_refused"):
+        instead = _RATE_STOOD_INSTEAD.get(
+            tf["rate_source"],
+            f"an unmapped rate source ({tf['rate_source']}) stands - its provenance sentence "
+            f"is missing, which is a defect in this renderer, not in the forecast")
+        print(f"    the velocity record yields no usable rate - {tf['rate_refused']} "
+              f"Nothing is averaged across that boundary, so {instead}")
+    if tf["rate_source"] != RATE_SEED:
+        return
+    print(f"    this project has measured no rate of its own yet: no VELOCITY.md row records "
+          f"both points delivered and a token total for one model"
+          + (f", and its per-unit evidence log holds {tf['rate_units']} unit(s) of the "
+             f"{RATE_MIN_UNITS} the finer-grained fallback needs" if tf["rate_units"]
+             else " and its per-unit evidence log is empty"))
+    rows = tf.get("rate_out_of_sample") or []
+    if rows:
+        shown = ", ".join(
+            f"{r['id']} forecast {int(r['estimate']):,} vs actual {int(r['actual_tokens']):,} "
+            f"({r['ratio']}x)" if r.get("estimate") and r.get("actual_tokens")
+            else f"{r['id']} ({r['ratio']}x)" for r in rows[-3:])
+        print(f"    out-of-sample test of this seed: {shown} - the live evidence about this "
+              f"number, next to the number")
+    else:
+        print("    out-of-sample test of this seed: NONE recorded - nothing has yet tested it "
+              "on a sprint it was not fitted to")
+
+
+def _render_forecast_scope(tf: dict) -> None:
+    """What the forecast prices, what it excludes, and the measured excess over it.
+
+    The point term prices the BUILD. Saying so is half the fix; the other half is a proving
+    term the operator can SEE, and it is read off the record rather than fitted to one sprint.
+"""
+    if not tf.get("scope"):
+        return
+    print(f"    this prices the {tf['scope'].upper()} only. It excludes: "
+          f"{'; '.join(tf['excludes'])}")
+    ex = tf.get("whole_sprint_excess") or {}
+    if ex.get("measured"):
+        shown = ", ".join(f"{o['id']} {o['multiple']}x" for o in ex["observations"][-4:])
+        span = (f"{ex['low']}x" if ex["low"] == ex["high"]
+                else f"{ex['low']}x-{ex['high']}x")
+        print(f"    whole-sprint cost against the forecast that priced it, measured on "
+              f"{len(ex['observations'])} out-of-sample sprint(s): {span} ({shown}). So a "
+              f"~{int(tf['tokens'] * (ex['high'] or 1)):,} whole-sprint figure is the one to "
+              f"plan capacity against")
+        print("    that excess is NOT attributed to proving alone: it is proving plus any "
+              "under-estimate of the build, and the record carries no split between them")
+    else:
+        print("    whole-sprint cost against the forecast: UNMEASURED - no out-of-sample row "
+              "records both a plan-time forecast and a sprint actual, and no multiplier is "
+              "assumed in place of one")
+
+
+def exclusion_line(tf: dict) -> str:
+    """The BUILT-NOT-CLOSED exclusion sentence, including the points it removes.
+
+    A forecast below the batch total has to explain the difference where it is printed. The
+    first version claimed "of the batch's N" using `priced + removed`, which is FALSE whenever
+    any unit carries no points: `points` is the PRICED subtotal - `_token_forecast` skips an
+    unpriced unit before accumulating it - so the two do not add to the batch. The unpriced
+    units are named rather than folded into a total that does not add up."""
+    built = tf.get("built_not_closed") or []
+    removed = tf.get("built_points") or 0
+    priced = tf.get("points", 0)
+    unpriced_n = len(tf.get("unpriced") or [])
+    tail = ""
+    if removed:
+        tail = (f" - this removes {removed} point(s), so the forecast prices {priced} "
+                f"point(s) of a batch carrying {priced + removed} priced point(s)")
+        if unpriced_n:
+            tail += f" plus {unpriced_n} unit(s) with no points at all"
+    return (f"excluded from the build forecast (BUILT-NOT-CLOSED, close them): "
+            f"{', '.join(built)}{tail}")
+
+
+def rejected_line(tf: dict) -> str | None:
+    """The REVIEWED-AND-REJECTED sentence, or None when the batch holds none.
+
+    Its own class, and priced IN. These units read green on their own verifiers and would have
+    been swept into BUILT-NOT-CLOSED, whose sentence ends `close them` - so the batch's least
+    trusted work was being both mispriced at zero and described as ready to close.
+    """
+    rejected = tf.get("rejected_unanswered") or []
+    if not rejected:
+        return None
+    return (f"REVIEWED AND REJECTED, priced IN (their verifiers are green, but no reviewer has "
+            f"approved them and the remaining cost is a repair round, not a close): "
+            f"{', '.join(rejected)}")
+
+
+def plan_cost_budget(root, forecast: dict | None) -> dict | None:
+    """The batch's cost budget: its points x `retro.COST_REGRESSION_RATIO` x the baseline the
+    close will judge the run against (`retro.cost_baseline`), in priced tokens, never the token
+    forecast's rate. `budget` None when the baseline or the points are not there."""
+    if not forecast:
+        return None
+    import retro  # noqa: PLC0415 - deferred, like the planner's retro import
+    base = retro.cost_baseline(root)
+    points = (forecast.get("points") or 0) + (forecast.get("built_points") or 0)
+    budget = (round(points * retro.COST_REGRESSION_RATIO * base["per_point"])
+              if base["per_point"] and points else None)
+    return {**base, "points": points, "budget": budget, "ratio": retro.COST_REGRESSION_RATIO}
+
+
+def _render_cost_budget(data: dict) -> None:
+    """The budget the close holds the run to, with the baseline and the runs it came from."""
+    b = data.get("cost_budget")
+    if not b:
+        return
+    if b["budget"] is None:
+        why = b["basis"] if b["per_point"] is None else "the batch carries no Points"
+        print(f"  cost budget: UNMEASURED - {why}")
+        return
+    print(f"  cost budget: {b['budget']:,} {run_state.PRICED_LABEL} = {b['points']} point(s) x "
+          f"{b['ratio']} x {round(b['per_point']):,} per point")
+    print(f"    baseline: {b['basis']}; the close records a run over it as a known issue")
+
+
+def _render_token_forecast(data: dict) -> None:
+    """LEAD WITH WHAT SPRINTS HAVE ACTUALLY COST. The forecast follows, as a range, and it STATES
+    ITS RATE AND WHERE THAT RATE CAME FROM - a bare number would read as a fact, when it is a
+    measurement multiplied by an estimate."""
+    tf = data.get("token_forecast")
+    if not tf:
+        return
+    built = tf.get("built_not_closed") or []
+    if tf.get("all_built"):
+        # AC3: every unit is a close-candidate. Say so plainly and point at the close path
+        # instead of pricing a build that has already happened.
+        print(f"  every unit in this batch is BUILT-NOT-CLOSED ({', '.join(built)}): its "
+              f"executable ACs already pass. This is a CLOSE, not a build - run `sprint close` "
+              f"(or transition each unit to Done), not a build plan.")
+        return
+    if built:
+        # AC1: some units are already built; they are flagged and excluded from the build
+        # forecast so a delivered-but-open unit is not priced as new work. Printed BEFORE the
+        # tokens guard so a batch whose only unbuilt units are unpriced (tokens == 0) still shows
+        # its close-candidates rather than rendering nothing.
+        print(f"  {exclusion_line(tf)}")
+    # Printed on its own, and OUTSIDE the built-not-closed guard: a batch may hold a rejected
+    # unit and no close-candidate at all, and that is exactly the batch whose forecast used to
+    # be quietly short.
+    rejected = rejected_line(tf)
+    if rejected:
+        print(f"  {rejected}")
+    marginal_unmeasured = tf.get("marginal_unmeasured")
+    # Nothing to render only when there is genuinely nothing to say: no cost, no unmeasured
+    # marginal to name, and no unpriced units to surface.
+    if not tf.get("tokens") and not marginal_unmeasured and not tf.get("unpriced"):
+        return
+    hist = tf.get("history") or []
+    if hist:
+        shown = hist[-4:]
+        print("  batch history (what sprints ACTUALLY cost - the real planning input):")
+        for h in shown:
+            src = h.get("source")
+            print(f"    {h['id']}: {h['units']} unit(s), {h['tokens']:,} tokens "
+                  f"({h['per_unit']:,}/unit, {h.get('basis', HISTORY_SPRINT_LEVEL)}"
+                  f"{', ' + src if src else ''})")
+        # Only when one is on screen: a caveat printed over a block it is not about is noise,
+        # and noise on a line that is usually fine is how a real caveat stops being read.
+        if any(h.get("basis") == HISTORY_SPRINT_LEVEL for h in shown):
+            print(f"    a {HISTORY_SPRINT_LEVEL} row divides the sprint total by its units - "
+                  f"real cost, but the variance between units is hidden, so one unit may have "
+                  f"taken far more than the figure shown")
+        if any(h.get("source") == HISTORY_TYPED_SOURCE for h in shown):
+            print(f"    a `{HISTORY_TYPED_SOURCE}` total was TYPED by an operator, not read off "
+                  f"a meter - a claim about what the sprint cost, and the only row kind here "
+                  f"that nothing measured")
+    cap = data.get("capacity") or {}
+    fc = cap.get("forecast") or {}
+    band = (f" (plausible {fc['low']:,}-{fc['high']:,})"
+            if fc.get("low") and fc.get("high") else "")
+    if marginal_unmeasured:
+        # The marginal term is UNMEASURED on this rung, so there is no `points x rate` to print -
+        # naming a rate here would be the very borrowing the rung change exists to stop.
+        print(f"  token forecast: marginal term UNMEASURED on the `{tf.get('rung')}` rung - "
+              f"{tf['points']} point(s) are NOT priced as a build")
+    else:
+        print(f"  token forecast: ~{tf['tokens']:,} tokens = {tf['points']} point(s) x "
+              f"{tf['rate']:,} tokens per point{band}")
+    print(f"    rate ({tf['rate_source']}): {tf['rate_basis']}")
+    _render_rate_provenance(tf)
+    _render_forecast_scope(tf)
+    if tf.get("unpriced"):
+        print(f"    NOT forecast (no Points, and nothing is invented for them): "
+              f"{', '.join(tf['unpriced'])}")
+    rec = data.get("forecast_record")
+    if rec and rec.get("preview"):
+        print("  forecast: a preview records nothing - the plan written with --write records "
+              "the forecast the retro judges")
+    elif rec and not rec.get("error"):
+        n = len(rec.get("recorded", [])) + len(rec.get("already", []))
+        print(f"  forecast recorded: {n} unit(s) at plan time, with the points and the rate that "
+              f"produced them. The retro judges THIS number - it never re-derives one, and the "
+              f"points recorded here are what the NEXT rate is measured from")
+
+
+#: The status a unit of each type is heading for. A briefing about "the gates you will meet"
+#: has to know which transition it is briefing.
+_TERMINAL_TARGET = {"story": "Done", "bug": "Fixed", "epic": "Done"}
+
+
+def build_gate_briefing(root, units: list) -> dict:
+    """What this batch's units must satisfy to close, and the checks every commit meets.
+
+    GENERATED, never restated. The per-unit half runs the real transition gates through
+    `transition.requirements`, so a requirement that changes in the gate changes here; the
+    commit half reads `gate.DEFAULT_CHECKS`, so a check added or removed there appears or
+    disappears here. A hand-written list would be a second copy that goes stale silently,
+    which is the failure this briefing exists to remove rather than relocate.
+
+    SCOPED to the batch: only the types actually present, and only requirements actually
+    unmet. The plan is already long, and an irrelevant checklist is how a relevant one stops
+    being read.
+
+    Repo-local guards - a house style rule, a commit-message trailer - are deliberately NOT
+    enumerated. The skill cannot know a consuming project's own hook, and inventing a list
+    would be the restatement this avoids.
+    """
+    import transition  # noqa: PLC0415 - lazy sibling import, as elsewhere in this module
+    import gate        # noqa: PLC0415
+
+    per_unit, types = [], set()
+    for unit in units:
+        uid = unit.get("id") if isinstance(unit, dict) else unit
+        utype = unit.get("type") if isinstance(unit, dict) else None
+        if not utype:
+            hit = sdlc_md.find_by_id(root, uid)
+            utype = hit[1] if hit else None
+        target = _TERMINAL_TARGET.get(utype)
+        if not target:
+            continue
+        types.add(utype)
+        try:
+            # The gates chatter - config advisories, DoD stand-down notes - and this is a
+            # REPORTER, not the gate itself. Leaking their diagnostics into the plan would
+            # print them once per unit for a briefing, which is noise in the output the agent
+            # is meant to read, and it tripped the suite's own printed-line budget.
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                unmet = transition.requirements(root, uid, target)
+        except (FileNotFoundError, ValueError):
+            continue     # a unit the briefing cannot resolve is not a reason to fail the plan
+        if unmet:
+            per_unit.append({"id": uid, "type": utype, "target": target, "unmet": unmet})
+    return {"units": per_unit, "types": sorted(types),
+            "commit_checks": sorted(gate.DEFAULT_CHECKS)}
+
+
+def _render_gate_briefing(data: dict) -> None:
+    brief = data.get("gate_briefing")
+    if not brief or not brief["types"]:
+        return
+    # ONLY what is actionable. The first cut also printed all 15 commit-check names and a
+    # caveat about repo-local guards on EVERY plan - two constant lines that say nothing about
+    # this batch. That is the bloat AC4 forbids, and the suite's printed-line budget caught it:
+    # a briefing nobody reads is worth less than no briefing, because it displaces the lines
+    # that do matter. The check count stays as one short line; the names are a `gate` run away.
+    n_checks = len(brief["commit_checks"])
+    if not brief["units"]:
+        return      # nothing owed: say nothing. A line that appears on every clean plan to
+                    # report the default state is the noise this briefing must not become.
+    print(f"  gates: {n_checks} commit check(s). {len(brief['units'])} unit(s) carry an unmet "
+          f"close requirement - meet it as part of the work, not as a refusal after it:")
+    for item in brief["units"]:
+        for req in item["unmet"]:
+            print(f"    {item['id']} -> {item['target']}: {req}")
+
+
+def _render_capacity(data: dict) -> None:
+    """Does the batch fit? The plan-time capacity check - and the appetite the run will break
+    on, which is the same number. Loud when over budget, and honest about its own error bar."""
+    cap = data.get("capacity")
+    if not cap:
+        return
+    b, fc, app, cal = cap["budget"], cap["forecast"], cap["appetite"], cap["calibration"]
+    units = f"{cap['units']}/{b['units']}" if b["units"] else f"{cap['units']}/unbounded"
+    spend = "unjudged" if fc["tokens"] is None else f"~{fc['tokens']:,}"
+    tokens = f"{spend}/{b['tokens']:,}" if b["tokens"] else f"{spend}/unbounded"
+    verdict = ("OVER BUDGET (" + ", ".join(cap["over"]) + ")") if cap["over"] else "within budget"
+    if fc["tokens"] is None:
+        verdict += " on units; this rung prices no tokens"
+    print(f"  capacity: units {units}, tokens {tokens} - {verdict}")
+    if cap["over"]:
+        print(f"  capacity: this batch does not fit. Cut it, or raise the appetite deliberately "
+              f"(--appetite-units / --appetite-minutes). This is a WARNING, not a gate - "
+              f"planning is never refused on a token estimate.", file=sys.stderr)
+    elif cap["tokens_may_exceed"]:
+        print(f"  capacity: within budget on the point estimate, but the top of the plausible "
+              f"range ({fc['high']:,}) is over {b['tokens']:,} - the forecast is not that "
+              f"precise.", file=sys.stderr)
+    # The Calibration line reports the OUT-OF-SAMPLE figure, or says plainly that it has none.
+    # It once quoted the in-sample 1.09x back as the estimator's observed accuracy while the
+    # live figure was 0.55x: a fit against its own training data cannot be wrong, which is
+    # exactly why it must never be shown as validation.
+    sprints = cal["sprints"]
+    ratios = ", ".join(f"{r}x" for r in cal["ratios"])
+    dropped = ", ".join(f"{n} {k}" for k, n in sorted(cal["excluded"].items()) if n)
+    excluded = (f" ({dropped} row(s) excluded - a fit against its own training data is not "
+                f"evidence)" if dropped else "")
+    history = (f"{sprints} out-of-sample sprint(s), est/actual {ratios}{excluded}" if sprints
+               else f"no out-of-sample evidence yet{excluded}")
+    enough = ("enough history to recalibrate - a human should re-read the trend"
+              if cal["enough_history"]
+              else f"not enough history to recalibrate (need {cal['recalibrate_after']})")
+    print(f"  capacity: the token half is a FORECAST, not a measurement - a script cannot "
+          f"observe token spend, and the model is points x a measured tokens-per-point rate, "
+          f"honest to about +/-50%. Calibration: {history}; {enough}. Nothing is re-fitted "
+          f"automatically.")
+    floor = cap.get("unit_wall_minutes_floor")
+    wall = (f", ~{floor} min/unit of worker time measured (a FLOOR on a "
+            f"{cap['units']}-unit run, not a forecast of it)" if floor else "")
+    print(f"  capacity: the run BREAKER is wall-clock/unit-count - appetite "
+          f"{app['minutes']:g} min ({app['minutes_source']}) / {app['units']} unit(s) "
+          f"({app['units_source']}){wall}")
+
+
+def _render_plan(args: argparse.Namespace, data: dict, queries: list, worklist, epics) -> None:
+    """Render a built plan to stdout: JSON, or the human batch header + provenance + waves."""
+    if args.format == "json":
+        print(json.dumps(data, indent=2))
+        return
+    scope = f", epics {', '.join(sorted(epics))}" if epics else ""
+    src = f"worklist {worklist}" if worklist else " + ".join(f"{k}s {s}" for k, s in queries)
+    print(f"batch: {data['count']} unit(s) ({src}){scope}, order={args.order}")
+    _render_goal_review(data)
+    _render_goal_trace(data)
+    _render_seat_provenance(data)
+    _render_waves(data)
+    _render_delivery_mode(data)
+    _render_lane_partition(data)
+    _render_clusters(data)
+    _render_affects_advisories(data, args.root)
+    _render_triage(data)
+    _render_decompose(data)
+    _render_downgrades(data)
+    _render_token_forecast(data)
+    _render_cost_budget(data)
+    _render_capacity(data)
+    _render_gate_briefing(data)
+    _render_phase_lessons(data)
+
+
+def _plan_authoring(args: argparse.Namespace) -> int:
+    """The greenfield PRD path: the batch IS a PRD (PRD -> epics -> stories)."""
+    try:
+        data = build_authoring_plan(args.root, args.prd)
+    except FileNotFoundError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(json.dumps(data, indent=2))
+        return 0
+    print(f"authoring plan: bootstrap from {data['prd']} (PRD -> epics -> stories)")
+    _render_phase_lessons(data)
+    return 0
+
+
+def _plan_batch_source(args: argparse.Namespace) -> tuple[list, object, int | None]:
+    """(queries, worklist, error_code). queries from --bugs/--crs/--stories (combinable),
+    worklist from --worklist; the two are mutually exclusive and at least one is required.
+    error_code is 2 on a bad combination (the message is already printed), else None."""
+    # each selector is repeatable (action="append"): --crs A --crs B is BOTH statuses,
+    # not the last one silently. None when unused; a list of one or more when given. A
+    # lone string (a hand-built Namespace) is coerced to one status, never iterated per
+    # character - the char-iteration is itself a silent-wrong-batch trap.
+    def _statuses(value) -> list[str]:
+        if value is None:
+            return []
+        return [value] if isinstance(value, str) else list(value)
+
+    queries: list[tuple[str, str]] = []
+    for status in _statuses(args.bugs):
+        queries.append(("bug", status))
+    for status in _statuses(args.crs):
+        queries.append(("cr", status))
+    for status in _statuses(args.stories):
+        queries.append(("story", status))
+    worklist = getattr(args, "worklist", None)
+    if worklist and queries:
+        print("--worklist is a complete batch source; do not combine it with "
+              "--bugs/--crs/--stories", file=sys.stderr)
+        return queries, worklist, 2
+    if not worklist and not queries:
+        print(batch_selection_message(), file=sys.stderr)
+        return queries, worklist, 2
+    return queries, worklist, None
+
+
+def _validate_epic_scope(args: argparse.Namespace, worklist, kinds: list) -> tuple[object, int | None]:
+    """(epics, error_code). --epic scopes a STORY batch and cannot filter a --worklist (whose
+    units are named). error_code is 2 on misuse (message printed), else None."""
+    epics = set(getattr(args, "epic", None) or []) or None
+    if epics and worklist:
+        print("--epic does not filter a --worklist batch; list the story ids you want",
+              file=sys.stderr)
+        return epics, 2
+    if epics and "story" not in kinds:
+        print("--epic scopes a story batch; use it with --stories", file=sys.stderr)
+        return epics, 2
+    return epics, None
+
+
+def _selector_hint(args: argparse.Namespace, queries: list, worklist) -> str:
+    """The batch selectors, re-spelled as flags, so a refusal can name the exact command that
+    reports the same census - rather than a generic one the operator has to reconstruct."""
+    if worklist:
+        return f"--worklist {worklist}"
+    flag = {"bug": "--bugs", "cr": "--crs", "story": "--stories"}
+    sel = " ".join(f"{flag.get(k, '--' + k)} {s}" for k, s in queries)
+    root = getattr(args, "root", ".")
+    return f"{sel} --root {root}" if root not in (".", None) else sel
+
+
+def cmd_breakdown(args: argparse.Namespace) -> int:
+    """The read-only grooming census: what this batch lacks before a plan can be trusted.
+
+    Reports; never blocks and never writes (the enforcement is `plan`, the command people
+    actually invoke - a separate step nobody runs is doctrine). Exists so the refusal has a
+    command to name, and so a backlog can be groomed against the same census the gate reads."""
+    queries, worklist, rc = _plan_batch_source(args)
+    if rc is not None:
+        return rc
+    root = Path(args.root)
+    skip = getattr(args, "skip_personas", False)
+    try:
+        batch = (_worklist_units(root, worklist)[0] if worklist
+                 else select_batches(root, queries, order="priority", skip_personas=skip))
+    except ValueError as exc:
+        print(f"cannot read the batch: {exc}", file=sys.stderr)
+        return 2
+    bd = breakdown(root, batch, skip_personas=skip)
+    if args.format == "json":
+        print(json.dumps(bd, indent=2))
+        return 0
+    print(f"breakdown: {len(batch)} unit(s), {len(bd['ungroomed'])} ungroomed, "
+          f"{len(bd['oversized'])} above {bd['ceiling']} points, "
+          f"{len(bd['clusters'])} shared-file cluster(s) (mode={bd['mode']})")
+    if bd["ungroomed"]:
+        print("  ungroomed - `sprint plan` refuses a batch holding any of these:")
+        print("\n".join(_breakdown_detail(bd)))
+        print(_breakdown_fix(bd, _selector_hint(args, queries, worklist)))
+    if bd["oversized"]:
+        print(f"  too big to estimate - `sprint plan` refuses these; SPLIT them into units of "
+              f"{bd['ceiling']} points or fewer:")
+        print("\n".join(_oversized_detail(bd)))
+        print(SPLIT_FIX.format(ceiling=bd["ceiling"]))
+    _render_duplicates(bd)
+    _render_clusters({"breakdown": bd})
+    _render_affects_advisories({"breakdown": bd}, args.root)
+    _render_decompose({"breakdown": bd})
+    _render_downgrades({"breakdown": bd})
+    return 0
+
+
+def cmd_goal_verdict(args: argparse.Namespace) -> int:
+    """The closing review's Sprint Goal judgement, recorded beside the goal it judges.
+
+    Refused when no goal was recorded: a verdict on an absent goal is invented
+    alignment - the review's honest statement there is that no goal was set."""
+    try:
+        state = run_state.read(args.root)
+    except run_state.RunStateError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not (state or {}).get("sprint_goal"):
+        print("goal-verdict refused: no sprint goal recorded on this run - the plan set none, "
+              "so there is nothing to judge (set one at plan time with --sprint-goal)",
+              file=sys.stderr)
+        return 2
+    import file_finding  # noqa: PLC0415 - the shared prose-fields loader, as elsewhere
+    try:
+        fields = file_finding.resolve_prose_fields(
+            getattr(args, "fields_file", None),
+            {"verdict": args.verdict, "note": args.note}, allowed=("verdict", "note"))
+    except ValueError as exc:
+        print(f"goal-verdict refused: {exc}", file=sys.stderr)
+        return 2
+    verdict, note = fields.get("verdict"), str(fields.get("note", "")).strip()
+    if verdict not in ("achieved", "partial", "missed"):
+        print("goal-verdict refused: --verdict (achieved|partial|missed) is required, via the "
+              "flag or the --fields-file", file=sys.stderr)
+        return 2
+    if not note:                      # a whitespace-only note is no note - strip before testing
+        print("goal-verdict refused: a note is required - a bare verdict is an assertion, not a "
+              "review", file=sys.stderr)
+        return 2
+    run_state.record_goal_verdict(args.root, verdict, note)
+    print(f"sprint goal verdict recorded: {verdict} - {note}")
+    return 0
+
+
+# --- sprint close: the close ceremony as one deterministic chain --------------------
+# The close was the last big hand-carried ceremony (~12 sequenced steps, each a skippable
+# seam under a less careful run). This orchestrates the deterministic chain - goal-verdict,
+# retro validate + extract, lessons summary, the close gate, reconcile - stopping
+# LOUDLY at the first failing gate with the remedy named, and ends by PRINTING the sign-off
+# decision brief composed from the committed records. Judgement stays outside: the retro's
+# content, the goal-verdict's note, and the signature itself remain human/agent work - the
+# chain sequences and refuses, never invents.
+
+
+def _run_cli(module_main, argv: list[str]) -> tuple[int, str]:
+    """Run a sibling script's main() in-process, capturing its combined output.
+
+    Not every sibling main() takes argv (retro.py's parses sys.argv directly), so the
+    argv is passed when the signature accepts it and patched into sys.argv otherwise -
+    a signature mismatch must not crash the chain."""
+    import contextlib as _ctx
+    import inspect as _inspect
+    import io as _io
+    buf = _io.StringIO()
+    takes_argv = bool(_inspect.signature(module_main).parameters)
+    with _ctx.redirect_stdout(buf), _ctx.redirect_stderr(buf):
+        try:
+            if takes_argv:
+                rc = module_main(argv)
+            else:
+                old = sys.argv
+                sys.argv = [old[0], *argv]
+                try:
+                    rc = module_main()
+                finally:
+                    sys.argv = old
+        except SystemExit as exc:  # argparse errors surface as SystemExit
+            rc = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+    return rc, buf.getvalue().strip()
+
+
+#: How many of the shipped template's demonstration lines a retro may still carry before the
+#: close treats it as unopened rather than merely unfinished. Carrying EVERY one of them is not
+#: a judgement about how much content is enough; it is the difference between a document
+#: somebody wrote and a scaffold nobody touched.
+def _template_demo_count() -> int:
+    import retro  # noqa: PLC0415
+    tpl = Path(__file__).resolve().parent.parent / "templates" / "reviews" / "retro.md"
+    try:
+        return sum(1 for line in tpl.read_text(encoding="utf-8").splitlines()
+                   if retro.DEMO_MARKER in line)
+    except OSError:
+        return 0
+
+
+#: The header `retro.py validate` prints above its failures (`retro RETRO0001: FAIL`).
+_RETRO_FAIL_HEADER_RE = re.compile(r"^retro \S+: FAIL$")
+
+
+def _close_retro_validate(root, retro_id, state):
+    """The retro's CONTENT gate.
+
+    The validator has always reported the template's unreplaced worked examples, and always
+    exited 0 for them, because a scaffold-shaped retro is structurally valid. This step kept
+    only the exit code, so a close printed `RETRO0086 valid` over a document in which nothing
+    had been replaced - the operator told the opposite of the truth by a check that had
+    correctly noticed it.
+
+    The rule, stated rather than inferred: any leftover is REPORTED on the close's own output;
+    a retro still carrying EVERY demonstration line the template ships is REFUSED. Reporting
+    without refusing is what let the scaffold through, and refusing on any leftover at all
+    would block a legitimate close over one unreplaced bullet.
+    """
+    import retro  # noqa: PLC0415 - deferred, like the planner's retro import
+    rc, out = _run_cli(retro.main, ["--root", str(root), "validate", "--id", retro_id])
+    remedy = (f"fix the retro's content ({retro_id}) - `retro.py validate "
+              f"--id {retro_id}` names each gap; absent, create it with "
+              "`artifact.py new --type retro --title ...` and write it")
+    if rc != 0:
+        # The validator's `retro <id>: FAIL` header is printed for the operator and kept out of
+        # the detail, whose every line the close hands over as a known issue: only what it found
+        # is a gap.
+        lines = out.splitlines()
+        for ln in lines:
+            if _RETRO_FAIL_HEADER_RE.match(ln):
+                print(ln, file=sys.stderr)
+        return False, "\n".join(ln for ln in lines if not _RETRO_FAIL_HEADER_RE.match(ln)), \
+            remedy
+    res = retro.validate(root, retro_id)
+    leftovers = res.get("demonstration") or []
+    if not leftovers:
+        return True, f"{retro_id} valid", ""
+    shipped = _template_demo_count()
+    detail = (f"{retro_id} is structurally valid, but {len(leftovers)} line(s) are still the "
+              f"template's worked EXAMPLES rather than this sprint's content:\n"
+              + "\n".join(f"      {line}" for line in leftovers[:6]))
+    if shipped and len(leftovers) >= shipped:
+        return False, (detail + f"\n  Every one of the {shipped} demonstration line(s) the "
+                       f"template ships is still present, so this retro has not been written."), \
+            (f"write {retro_id} - replace the template's demonstration lines with this "
+             f"sprint's own content, then re-run the close")
+    return True, detail, ""
+
+
+def _close_retro_extract(root, retro_id, state):
+    """Lift the retro's Try items into the lessons stores, then act on the class store: a REJECT
+    citing a class is a hit, a class that keeps recurring files a CR asking for its failing
+    path to be fixed or the class retired, and a quiet one retires (`lessons.close_pass`). The pass runs whether or not the extract did, so
+    a malformed retro does not also lose the review's evidence."""
+    import retro  # noqa: PLC0415
+    run = (state or {}).get("run_id") or retro_id
+    rc, out = _run_cli(retro.main, ["--root", str(root), "extract", "--id", retro_id,
+                                    "--run", run])
+    try:
+        res = lessons.close_pass(root, run, state)
+        passed, errors = lessons.close_pass_line(res), res["errors"]
+    except (OSError, ValueError) as exc:
+        passed, errors = "", [f"the lesson store could not be acted on: {exc}"]
+    if (rc != 0 or errors) and passed:
+        # The pass's summary is a status line, not a failure: printed for the operator, and kept
+        # out of the failed step's detail, whose every line the close hands over as a known
+        # issue - RPT0014 listed `lessons: 0 hit(s) from cited REJECTs` as a close gap.
+        print(f"close: {passed}")
+    if rc != 0:
+        return False, "\n".join([out, *errors]).strip(), \
+            f"`retro.py extract --id {retro_id}` must succeed - see its output"
+    if errors:
+        return False, "\n".join(errors).strip(), \
+            f"fix what `{lessons.STORE_FILE}` names above, then re-run the close"
+    return True, f"lessons lifted into the lessons stores (idempotent by content)\n{passed}", ""
+
+
+def _close_retro_accuracy(root, retro_id, state):
+    """Write the retro's estimate-versus-actual block, so the question is asked every sprint.
+
+    The template reserves a block for this and its prose asserts the comparison is always
+    taken; nothing ran it, so the largest sprint on record contributed no row to the
+    calibration the next plan's forecast is drawn from - and an empty block reads as "no
+    comparison to make", which is indistinguishable from "the comparison was never run".
+
+    NEVER BLOCKING on a nil result: a batch with no recorded forecast has nothing to compare and
+    says so. It blocks only when the write itself fails, which means the retro or the ledger is
+    malformed and the operator needs to know before the close records anything else.
+    """
+    import retro  # noqa: PLC0415
+    rc, out = _run_cli(retro.main, ["--root", str(root), "accuracy", "--id", retro_id, "--write"])
+    if rc == 0:
+        return True, "estimate-versus-actual written to the retro and to VELOCITY.md", ""
+    # A NIL RESULT IS NOT A FAILURE, and the docstring above promised exactly that while the
+    # first version blocked on it: a retro naming no units in its `Batch:` field has nothing to
+    # compare, and `cmd_close` returns 1 at the first `not ok`, so every such close hard-stopped
+    # at this step. That is a refusal for lacking a measurement nobody could have taken.
+    if _is_nil_accuracy(out):
+        return True, f"estimate-versus-actual: NOTHING TO MEASURE - {out.strip().splitlines()[-1] if out.strip() else 'no units named'}", ""
+    return False, out, (f"`retro.py accuracy --id {retro_id} --write` failed for a reason other "
+                        f"than an empty batch - the estimate-versus-actual block is the sprint's "
+                        f"row in the calibration every later forecast is drawn from")
+
+
+#: Output that means "there was nothing to compare", as distinct from "the write failed".
+_NIL_ACCURACY = ("no units named", "nothing to measure", "no forecast", "parses to 0 unit")
+
+
+def _is_nil_accuracy(out: str) -> bool:
+    low = (out or "").lower()
+    return any(marker in low for marker in _NIL_ACCURACY)
+
+
+def _close_lessons_summary(root, retro_id, state):
+    rc, out = _run_cli(lessons.main, ["--root", str(root), "summary"])
+    if rc != 0:
+        return False, out, "`lessons.py summary` must regenerate the committed digest"
+    return True, "lessons summary regenerated", ""
+
+
+# ---------------------------------------------------------------------------
+# The close must stop invalidating itself
+# ---------------------------------------------------------------------------
+# `sprint close` writes the review anchor, which makes it newer than the
+# anchor's last review, which fails the review-currency lane on the next attempt. Committing
+# that paperwork is another change, so the close chases a target it is moving itself:
+# RUN-01KYHVWK took four attempts and about sixteen minutes of test execution to record a
+# decision that had already been made. Filing a finding DURING the close did the same, which
+# punishes exactly the honest behaviour the doctrine asks for.
+#
+# The fix is attribution, not amnesty. An artefact the close WROTE is not unreviewed work
+# against that same close; anything else still refuses, and the refusal says which is which.
+
+#: Where the paths a close wrote are recorded on the run state.
+CLOSE_OUTPUT_KEY = "close_output"
+
+#: Where findings filed DURING a close are recorded, to be carried into the next run.
+CLOSE_FINDINGS_KEY = "close_findings"
+
+#: The review anchor: stamped by the close as its last act, so it is uncommitted and newer
+#: than its own last review BY CONSTRUCTION for the rest of that close.
+ANCHOR_REL = "sdlc-studio/reviews/LATEST.md"
+
+#: The only gate lanes a close can break by writing its own paperwork. Everything else is
+#: the work's, including a lane this cannot attribute - a refusal wrongly labelled
+#: self-inflicted is a refusal that gets walked past.
+_CLOSE_SELF_LANES = ("review-current",)
+
+#: A failing gate lane, as `gate.py` ACTUALLY prints it: `[FAIL] {check}{lane_stamp}: {detail}`,
+#: where `lane_stamp` inserts ` [0.4s]` BEFORE the colon when the lane was timed. The pattern
+#: used to require the colon immediately after the lane name, so it matched an untimed lane and
+#: dropped EVERY timed one - which is all of them in a real run. The close then reported "the
+#: refusal could not be attributed" one line after the gate had named the failing lane plainly,
+#: and burned its rounds retrying.
+#:
+#: `\[FAIL\]` stays anchored rather than widening to any bracketed word: a pattern loosened
+#: until it matches anything reports an advisory `[warn]` lane as a failure and refuses a close
+#: that should pass.
+_GATE_FAIL_RE = re.compile(r"^\s*\[FAIL\]\s+([A-Za-z0-9_.-]+)(?:\s+\[[^\]]*\])?:\s*(.*)$")
+
+
+def unparsed_fail_lines(out: str) -> list:
+    """`[FAIL]`-shaped lines the lane parser could NOT place, quoted for the reader.
+
+    A function rather than a comprehension inside the close, so a test can reach it. The first
+    version of this lived inline and its test recomputed the same expression - which passes
+    whatever production does, and the mutant that emptied it survived.
+    """
+    return [ln.strip() for ln in (out or "").splitlines()
+            if "[FAIL]" in ln and not gate_failed_lanes(ln)]
+
+
+def _repo_rel(root, path) -> str:
+    """`path` as a repo-relative posix string, or "" when it is not under the root.
+
+    "" rather than a guess: an unresolvable path registered as close output would exempt
+    nothing, which is the safe direction, and it is never silently turned into a match.
+    """
+    if not path:
+        return ""
+    try:
+        return Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
+    except (ValueError, OSError) as exc:  # noqa: BLE001 - a close never dies on a path
+        sdlc_md.debug("sprint._repo_rel", exc)
+        return ""
+
+
+def record_close_output(root, *paths: str) -> list[str]:
+    """Register paths THIS close wrote, so they are not counted as unreviewed work against it.
+
+    Recorded at the moment of writing rather than reconstructed afterwards: a list of likely
+    close artefacts written here would silently omit whatever a later step adds, and the
+    failure direction of that omission is a close refusing itself again.
+    """
+    try:
+        state = run_state.read(root) or {}
+    except run_state.RunStateError as exc:
+        sdlc_md.debug("sprint.record_close_output", exc)
+        return []
+    known = [p for p in (state.get(CLOSE_OUTPUT_KEY) or []) if isinstance(p, str)]
+    for p in paths:
+        rel = str(p or "").strip().replace("\\", "/")
+        if rel and rel not in known:
+            known.append(rel)
+    try:
+        run_state.update(root, **{CLOSE_OUTPUT_KEY: known})
+    except (run_state.RunStateError, OSError) as exc:
+        # Loud: an unrecorded write means the next attempt counts it as unreviewed work, which
+        # is the very loop this exists to break, and it would look like a real review failure.
+        sdlc_md.debug("sprint.record_close_output", exc)
+        print(f"warning: the close could not record its own output ({exc}) - a retry may "
+              f"count these artefacts as unreviewed changes against itself", file=sys.stderr)
+    return known
+
+
+def record_close_finding(root, artefact_id: str, path: str) -> dict:
+    """Record a finding filed DURING the close: carried into the next run, not held against
+    this one. Registers its path as close output too, so it cannot make the review stale."""
+    row = {"id": str(artefact_id), "path": str(path or "").replace("\\", "/"),
+           "at": sdlc_md.now_iso8601()}
+    try:
+        state = run_state.read(root) or {}
+        rows = [r for r in (state.get(CLOSE_FINDINGS_KEY) or []) if isinstance(r, dict)]
+        if not any(r.get("id") == row["id"] for r in rows):
+            rows.append(row)
+            run_state.update(root, **{CLOSE_FINDINGS_KEY: rows})
+    except (run_state.RunStateError, OSError) as exc:
+        sdlc_md.debug("sprint.record_close_finding", exc)
+        print(f"warning: {artefact_id} was filed during the close but could NOT be recorded as "
+              f"carried ({exc}) - name it in the retro's known issues by hand", file=sys.stderr)
+    record_close_output(root, row["path"])
+    return row
+
+
+def carried_close_findings(root, state) -> list[dict]:  # noqa: ARG001 - root kept for symmetry
+    """The findings filed during this close, to be carried into the next run."""
+    return [r for r in ((state or {}).get(CLOSE_FINDINGS_KEY) or []) if isinstance(r, dict)]
+
+
+def carried_findings_line(carried: list[dict]) -> str:
+    """One line naming what this close filed and where it goes, or "" for none."""
+    if not carried:
+        return ""
+    ids = ", ".join(str(r.get("id") or "?") for r in carried[:8])
+    return (f"close: {len(carried)} finding(s) filed during this close ({ids}) are CARRIED "
+            f"into the next run - they are this close's own output, not unreviewed work "
+            f"against it")
+
+
+def close_own_output(root, state) -> set[str]:
+    """Repo-relative paths this close created or rewrote.
+
+    Almost all of it is RECORDED rather than inferred, because the failure direction of a
+    hand-written list here is over-exemption, and an over-wide review carve-out is a hole.
+    One entry is structural rather than recorded - the anchor the close stamps - because it is
+    the close's contract, not an optional step. A handoff a run recorded before US0967 retired
+    the close's handoff step is still read here, so an older run's own output stays exempt.
+    """
+    out = {ANCHOR_REL}
+    for p in ((state or {}).get(CLOSE_OUTPUT_KEY) or []):
+        if isinstance(p, str) and p.strip():
+            out.add(p.strip().replace("\\", "/"))
+    handoff_id = (state or {}).get("handoff")
+    if handoff_id:
+        try:
+            hit = sdlc_md.find_by_id(Path(root), str(handoff_id))
+            if hit:
+                out.add(Path(hit[0]).resolve().relative_to(
+                    Path(root).resolve()).as_posix())
+        except (ValueError, OSError) as exc:  # noqa: BLE001 - a close never dies on a lookup
+            sdlc_md.debug("sprint.close_own_output", exc)
+    return out
+
+
+def close_review_currency(root, state) -> dict:
+    """Which artefacts are newer than the review anchor once the close's OWN output is set
+    aside, and whether a review-currency refusal is therefore self-inflicted.
+
+    The gate owns the VERDICT; this owns the ATTRIBUTION. It can only ever turn a refusal
+    into a pass when at least one stale artefact is the close's own AND nothing else is
+    stale. It fails safe in the other direction on purpose: if it cannot see the staleness
+    the gate saw, it reports nothing as self-caused, because agreeing to a pass on a
+    disagreement is how a carve-out becomes a hole.
+
+    The anchor's timestamp is the EARLIER of its last commit time and its working-tree mtime,
+    so the stale set computed here is a superset of the gate's rather than a subset. A
+    narrower view than the gate's would exempt artefacts the gate is still refusing over.
+    """
+    import review_prep  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+    from datetime import datetime, timezone  # noqa: PLC0415 - local, as elsewhere here
+    rr = Path(root)
+    own = close_own_output(root, state)
+    anchor = rr / ANCHOR_REL
+    if not anchor.is_file():
+        # A project's FIRST close: the anchor is this close's own output, written by its
+        # review-anchor step, so its absence is too. Refusing on it handed every fresh project
+        # a known issue that the same command then cleared.
+        return {"stale": [], "own_stale": [], "own": sorted(own), "self_caused": True,
+                "why": "there is no reviews/LATEST.md yet, and writing it is this close's own "
+                       "last step"}
+    stamps = [review_prep._parse_dt(review_prep._modified_iso(anchor, rr)[0]),
+              review_prep._parse_dt(
+                  datetime.fromtimestamp(anchor.stat().st_mtime, timezone.utc).isoformat())]
+    known = [s for s in stamps if s]
+    anchor_dt = min(known) if known else None
+    stale, own_stale = [], []
+    for key, rec in review_prep.staleness(rr).items():
+        modified = review_prep._parse_dt(rec.get("last_modified"))
+        if not (modified and anchor_dt and modified > anchor_dt):
+            continue
+        if not rec.get("needs_review", True):
+            continue
+        (own_stale if rec.get("path") in own else stale).append(key)
+    self_caused = bool(own_stale) and not stale
+    return {"stale": sorted(stale), "own_stale": sorted(own_stale), "own": sorted(own),
+            "self_caused": self_caused,
+            "why": (f"{len(own_stale)} artefact(s) newer than the review anchor were written "
+                    f"by this close ({', '.join(sorted(own_stale)[:6])}) and nothing else is "
+                    f"newer" if self_caused else
+                    f"{len(stale)} artefact(s) newer than the anchor were NOT written by this "
+                    f"close ({', '.join(sorted(stale)[:6]) or 'none seen from here'})")}
+
+
+def gate_failed_lanes(out: str) -> list[tuple[str, str]]:
+    """The blocking lanes a gate run refused on, read from its own printed verdict."""
+    found = []
+    for line in (out or "").splitlines():
+        m = _GATE_FAIL_RE.match(line)
+        if m:
+            found.append((m.group(1), m.group(2).strip()))
+    return found
+
+
+def close_blocker_split(root, state, out: str) -> dict:
+    """Split a failed close gate into blockers in the WORK and blockers the close created.
+
+    A lane counts as the close's own only when it is one the close can break by writing its
+    own paperwork AND the attribution shows every stale artefact under it is close output.
+    An unparseable verdict yields neither, and the caller must refuse on that: not knowing
+    whose fault a refusal is has never been evidence that it is nobody's.
+    """
+    lanes = gate_failed_lanes(out)
+    work, selfish, currency = [], [], None
+    for name, detail in lanes:
+        if name not in _CLOSE_SELF_LANES:
+            work.append((name, detail))
+            continue
+        if currency is None:
+            currency = close_review_currency(root, state)
+        (selfish if currency["self_caused"] else work).append((name, detail))
+    return {"work": work, "self": selfish, "attributed": bool(lanes), "currency": currency}
+
+
+def close_surface_hash(root, exclude) -> str | None:
+    """A content digest of the test-relevant surface MINUS the artefacts this close wrote.
+
+    The SET is the gate's own measurement (`gate.surface_files`), so there is one definition
+    of what a test reads and this cannot drift from it. The subtraction is what makes a close
+    retry answerable at all: the surface includes the workspace, so stamping the anchor
+    would otherwise change the surface the close is asking about, and
+    the answer would be "changed" on every attempt for reasons the close created itself.
+
+    None is UNKNOWN, never "unchanged": the caller runs the gate on it. An unhashable
+    surface, a missing gate, an unreadable file - each is a thing not known, and a reuse
+    granted on a thing not known is the false-green class the gate exists to refuse.
+    """
+    import hashlib  # noqa: PLC0415 - local, only this path needs it
+    skip = {str(p) for p in (exclude or ())}
+    try:
+        import gate  # noqa: PLC0415
+        files = [f for f in gate.surface_files(str(root)) if f not in skip]
+    except Exception as exc:  # noqa: BLE001 - an unanswerable surface runs, it does not fail
+        sdlc_md.debug("sprint.close_surface_hash", exc)
+        return None
+    digest = hashlib.sha256()
+    rr = Path(root)
+    try:
+        for rel in sorted(files):
+            digest.update(rel.encode("utf-8", "surrogateescape") + b"\0")
+            path = rr / rel
+            if path.is_file():
+                digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
+            else:
+                digest.update(b"ABSENT")   # a named path that is gone is a CHANGE
+            digest.update(b"\n")
+    except OSError as exc:
+        sdlc_md.debug("sprint.close_surface_hash", exc)
+        return None
+    return digest.hexdigest()
+
+
+def reusable_close_verdict(root, surface: str | None) -> dict | None:
+    """The recorded close-gate verdict this tree may reuse, or None.
+
+    Only the MOST RECENT close verdict is consulted, and only when it is a pass over this
+    exact surface. Reaching past a red one to an older green over the same bytes would be a
+    retry loop conflating "it failed" with "it did not run" - the class that never converges.
+    """
+    if not surface:
+        return None
+    for row in reversed(read_execution_ledger(root)):
+        if row.get("moment") != "close":
+            continue
+        # ONLY a `full` run is reusable. A `reuse` row carries no verdict of its own, and a
+        # `preflight` row was earned by a DIFFERENT gate: the pre-flight scopes conformance to
+        # the run's batch, the chain's gate does not. Reusing the narrower verdict for the wider
+        # gate would be a fail-open, and an allow-list is the only spelling of this rule that
+        # stays right when a third mode is added.
+        if row.get("verdict") != "pass" or row.get("mode") != "full":
+            return None
+        return row if row.get("surface") and row["surface"] == surface else None
+    return None
+
+
+def _close_gate(root, retro_id, state):
+    import gate  # noqa: PLC0415 - deferred so `plan` never pays for the gate import graph
+    import time  # noqa: PLC0415 - local, only this path measures
+    # WHAT THIS CLOSE ITSELF WROTE is subtracted before the surface is hashed, so a retry
+    # asks about the work rather than about the paperwork the previous attempt produced.
+    surface = close_surface_hash(root, close_own_output(root, state))
+    prior = reusable_close_verdict(root, surface)
+    if prior:
+        record_execution_run(root, moment="close", mode="reuse", seconds=0.0, verdict="pass",
+                             surface=surface, run_id=(state or {}).get("run_id"),
+                             reused_from=prior.get("at"))
+        return True, (f"gate verdict REUSED from the run at {prior.get('at')} - the "
+                      f"test-relevant surface is unchanged since it passed (the close's own "
+                      f"output is not part of that surface), so nothing was re-run"), ""
+    started = time.monotonic()
+    rc, out = _run_cli(gate.main, ["--root", str(root), "--require-retro", retro_id,
+                                   "--require-review"])
+    record_execution_run(root, moment="close", mode="full",
+                         seconds=time.monotonic() - started,
+                         verdict="pass" if rc == 0 else "fail", surface=surface,
+                         run_id=(state or {}).get("run_id"))
+    if rc == 0:
+        # US0553 STOOD HERE AND IS REVERTED. It recorded `status=green, mode=full` into the
+        # record `gate.suite_decision` reads, on the premise that "the close has just run the
+        # FULL suites". It has not: `gate.main` runs seventeen lanes - conformance, reconcile,
+        # validate, integrity and the rest - and NOT ONE of them runs a test suite. The suites
+        # are run by `.githooks/commit-msg`, which is the only honest writer of that record.
+        #
+        # So the close stamped a full-suite green over whatever sat in the working tree, and the
+        # next commit read it and skipped the suites. A false green, written by the mechanism
+        # built to refuse false greens. The premise was never checked before the code was built
+        # on it.
+        #
+        # Nothing replaces it. The close's own gate verdict is already reused through
+        # `reusable_close_verdict`, which is close-scoped and correct; the SUITE verdict has one
+        # writer, and it is the hook that runs the suites.
+        return True, f"gate --require-retro {retro_id} --require-review: PASS", ""
+    split = close_blocker_split(root, state, out)
+    if not split["attributed"]:
+        # NAME what was seen. "I could not attribute this" and "nothing was found" are different
+        # facts, and reporting the second when the first is true sends the reader to the wrong
+        # place - which is what happened while the gate had printed `[FAIL] review-current` one
+        # line above. Any `[FAIL]`-shaped line the parser could not place is quoted, so
+        # a lane whose format changed is visible rather than silently unattributable.
+        unread = unparsed_fail_lines(out)
+        saw = ("" if not unread else
+               "\n  failing line(s) this close could not parse - the lane format may have moved:"
+               + "".join(f"\n    {ln}" for ln in unread[:5]))
+        prose = (f"close gate: the refusal could not be attributed to a lane this close "
+                 f"recognises, so it is treated as a blocker in the WORK. That is not the same "
+                 f"as nothing having been found.")
+        # The gate's output and the prose are printed for the operator; the detail, whose every
+        # line the close hands over as a known issue, carries only the failing lines, or the
+        # prose's one line when the gate printed none.
+        print(f"{out}\n{prose}{saw}", file=sys.stderr)
+        return False, "\n".join(unread) or prose, \
+               "read the gate output above and clear what it names, then re-run sprint close"
+    if split["self"] and not split["work"]:
+        names = ", ".join(n for n, _ in split["self"])
+        return True, (f"{out}\nclose gate: the only refusal ({names}) names artefacts created "
+                      f"by this close - {split['currency']['why']}. Recording the close does "
+                      f"not invalidate it, so the ceremony continues"), ""
+    work = ", ".join(n for n, _ in split["work"])
+    mine = (f"; {len(split['self'])} further lane(s) name only this close's own output and are "
+            f"not counted: {', '.join(n for n, _ in split['self'])}" if split["self"] else "")
+    return False, (f"{out}\nclose gate: {len(split['work'])} blocker(s) are in the WORK "
+                   f"({work}) and must be cleared{mine}"), \
+        ("address each failing lane the gate names (reconcile drift -> `reconcile.py apply`; "
+         "stale review -> run `review`; lesson horizons -> `lessons.py revalidate`), then "
+         "re-run sprint close")
+
+
+def _close_reconcile(root, retro_id, state):
+    # The close SETTLES what it owns before it reads drift: a parent of this run's units whose
+    # every child is now terminal is derived here, not only in the tail, or the report hands over
+    # as known issues the epic status the same close then sets.
+    _derive_close_parents(root, (state or {}).get("batch") or [], "close")
+    _per_type, drift = reconcile.detect_all(root)
+    if not drift:
+        return True, "no index drift", ""
+    # A `request-derivable` item that another gate refuses is real drift, but `reconcile apply`
+    # provably CANNOT clear it - so the printed remedy is a loop with no exit, and every close in
+    # the project deadlocks behind one pending decision. It is reported, never suppressed, and it
+    # does not stop the ceremony. Anything else still blocks: the point of this step is that
+    # mechanical drift gets fixed before the run is sealed, not that drift gets waved through.
+    blocked = [d for d in reconcile.derivable_request_drift(root) if d.get("blocked_by")]
+    if blocked and _only_blocked_derivable_drift(root, blocked):
+        ids = ", ".join(d["id"] for d in blocked)
+        return True, (f"no mechanical drift; {len(blocked)} request(s) awaiting another gate "
+                      f"({ids}) - reported, not clearable by apply"), ""
+    # ONE LINE PER DRIFT ITEM, from the structured sweep: the step's detail becomes one known
+    # issue per line, and `detect`'s printed summary and guidance are not drift.
+    return False, "\n".join(f"{d['kind']} {d['id'] or d['type']}: {d['fix']}" for d in drift), \
+        "`reconcile.py detect` explains each kind; `reconcile.py apply` clears mechanical drift"
+
+
+def _only_blocked_derivable_drift(root, blocked) -> bool:
+    """True when the ONLY thing making detect non-zero is gate-blocked derivable requests.
+
+    Counted from the same census detect uses, so this cannot pass over a real drift item that
+    happens to share the sweep with a blocked one.
+    """
+    total = sum(len(reconcile.detect_type(t, Path(root)).get("drift", []))
+                for t in reconcile.DEFAULT_TYPES)
+    derivable = reconcile.derivable_request_drift(root)
+    return total == 0 and len(derivable) == len(blocked)
+
+
+def _close_lesson_repeats(root) -> bool:
+    """Report, at the close, every CARRIED lesson this run violated anyway, naming the unit.
+
+    Not a chain step and never blocking: a repeat is evidence for the operator's next decision
+    (does this lesson need a guard?), not a reason to refuse the ceremony that produced the
+    evidence. Silent when nothing repeated, so it is a signal rather than a fixture of every
+    close. Returns True iff it printed."""
+    import lessons  # noqa: PLC0415 - deferred, like the chain's other sibling imports
+    try:
+        # ONE read, passed to both consumers. The report and the proposal path each took their
+        # own, so a violation recorded between them answered one question two ways.
+        found = lessons.repeats(root)
+        text = lessons.repeat_report(root, found=found)
+    except Exception as exc:  # noqa: BLE001 - a reporting lane must never fail a close
+        sdlc_md.debug("sprint._close_lesson_repeats", exc)
+        return False
+    if not text:
+        return False
+    print()
+    print(text)
+    print("  A lesson repeated after being carried is a missing guard: consider "
+          "`lessons.py propose` to turn it into work.")
+    return True
+
+
+def _no_negative_verdict(root, uid: str, critic) -> bool:
+    """True unless a per-unit verdict exists and is not an APPROVE.
+
+    Split out so the rule reads as one sentence at its call site. A ledger that cannot be read
+    answers True - the unit is then judged by the lanes, which report "not covered" on their own
+    terms; treating an unreadable ledger as a rejection would manufacture a verdict nobody gave.
+    """
+    try:
+        rec = critic.verdict_for(root, uid)
+    except Exception as exc:  # noqa: BLE001 - a missing ledger is "no verdict", not "rejected"
+        sdlc_md.debug("sprint._no_negative_verdict", exc)
+        return True
+    if not rec:
+        return True
+    return str(rec.get("verdict") or "").strip().upper() == "APPROVE"
+
+
+def review_coverage(root, units: list[str]) -> dict:
+    """Per unit: is it covered by an INDEPENDENT adversarial pass, and by what.
+
+    Two records can cover a unit, and both prove independence the same way - the reviewer is not
+    the author: a per-unit critic verdict, or a frozen batch review naming the unit, dated
+    before `critic.REPAIR_VERB_RETIRED` (`critic.sprint_reviews`). The retired evidence ledger
+    covers nothing. A self-review covers NOTHING: it is the context that wrote the code agreeing
+    with itself, which is the whole failure the two-role rule exists to stop.
+
+    The surface is the units passed in - the BATCH's units - not the run's whole set. A review
+    recorded over batch 1 therefore leaves batch 2 uncovered, which is the point: the review
+    happens at the cadence the work lands on.
+    """
+    import critic  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+    out: dict[str, dict] = {}
+    for raw in units:
+        uid = sdlc_md.norm_id(raw)
+        if not uid:
+            continue
+        # A recorded NEGATIVE verdict is TERMINAL for the unit: no later lane reconsiders it.
+        # The lanes below are tried in order and `continue` on a miss, so a REJECT must not fall
+        # through to the batch lane. Absence of a verdict must still fall through (that is what
+        # the batch lane is FOR); only a verdict that exists and is not an APPROVE stops here.
+        if not _no_negative_verdict(root, uid, critic):
+            out[uid] = {"covered": False, "by": None}
+            continue
+        by = None
+        for label, getter in (("per-unit verdict", critic.verdict_for),
+                              ("batch review", critic.sprint_review_for)):
+            try:
+                rec = getter(root, uid)
+            except Exception as exc:  # noqa: BLE001 - a missing ledger is "not covered"
+                sdlc_md.debug("sprint.review_coverage", exc)
+                rec = None
+            if not rec:
+                continue
+            # `sprint_covers_independently` is THE predicate: an APPROVE - or a REJECT whose
+            # findings are ALL tagged `[pre-existing]` - whose reviewer and author are both
+            # recorded and distinct. Reimplementing the independence half here
+            # and forgetting the verdict half let a recorded REJECT clear this gate while the
+            # tool printed "it clears no unit's gate" - the exact drift a second copy of a rule
+            # produces, in the function whose docstring claimed to avoid it.
+            if not critic.sprint_covers_independently(root, uid, rec):
+                continue
+            # ...and the grandfather marker is not independence. `critic.is_independent`
+            # rejects PRE_GATE explicitly; `sprint_covers_independently` only tests
+            # non-empty-and-distinct, so a migration sentinel cleared this gate. Both
+            # predicates have to agree before a unit counts as reviewed.
+            if not critic.is_independent(rec):
+                continue
+            by = label
+            break
+        out[uid] = {"covered": by is not None, "by": by}
+    return out
+
+
+def uncovered_units(root, units: list[str]) -> list[str]:
+    """The units in `units` no independent review covers, in the order given."""
+    cov = review_coverage(root, units)
+    return [u for u, rec in cov.items() if not rec["covered"]]
+
+
+def _close_review_coverage(root, retro, state):
+    """Close step: REFUSE while any unit in the run's batch carries no independent review.
+
+    This is the whole placement change. The close asserts that coverage EXISTS; it does not
+    perform the review. A close that performs it turns every finding into close work by
+    definition, which is how the previous run spent longer closing than delivering.
+
+    First in the chain, deliberately: it is a cheap read, and refusing here costs seconds
+    instead of refusing after the full gate run. It does NOT precede the retro - `cmd_close`
+    resolves (and scaffolds) the retro before the chain starts, so a first close still mints
+    one. Stated exactly, because an independent reviewer caught the stronger claim being false.
+    """
+    batch = [u for u in (sdlc_md.norm_id(x) for x in (state.get("batch") or [])) if u]
+    if not batch:
+        dropped = [c.get("id") for c in (state.get("batch_changes") or [])
+                   if c.get("action") == "drop" and c.get("id")]
+        why = ("no batch on the run state" if not dropped else
+               f"the batch is EMPTY because {len(dropped)} unit(s) were dropped from it "
+               f"({', '.join(str(d) for d in dropped[:8])}"
+               f"{', ...' if len(dropped) > 8 else ''}) - nothing is left to review, but a "
+               f"batch emptied by drops is not a batch that passed review")
+        return True, why, ""
+    missing = uncovered_units(root, batch)
+    covered = f"{len(batch) - len(missing)}/{len(batch)} unit(s) covered by an independent pass"
+    if not missing:
+        return True, covered, ""
+    # The status line and the prose are printed for the operator and kept out of the detail,
+    # whose every line the close hands over as a known issue: only the gap is a gap.
+    print(f"  {covered}\n  The close certifies that a review happened; it does not perform "
+          f"one.", file=sys.stderr)
+    detail = (f"  {len(missing)} unit(s) in this batch are covered by NO independent review: "
+              f"{', '.join(missing)}")
+    remedy = ("review each uncovered unit and record its delivery verdict - "
+              f"`critic.py record --units {','.join(missing[:6])}"
+              f"{',...' if len(missing) > 6 else ''} --reviewer <who> --author <who> "
+              "--verdict APPROVE`. A self-review does not clear this: the reviewer must differ "
+              "from the author.")
+    return False, detail, remedy
+
+
+#: Why a batch unit is unanswered. Fixed wording, because the close and `stop` print the same
+#: `why` and an operator reading either must be able to act on it.
+WHY_REJECT = "unanswered delivery REJECT"
+WHY_PASS_OWED = "adversarial pass owed"
+WHY_AT_REVIEW = "remaining work at Review"
+
+
+def seal_bar_unmet(root, uid: str) -> list[str]:
+    """What the operator's signature cannot seal this unit over: the review bar, as
+    `conformance` judges `critiqued` - an independent delivery APPROVE at the depth the unit's
+    risk band demands. Empty when met.
+
+    ONE reader for the close and the seal. The close answers a pre-terminal story or bug that
+    meets it (only the signature is owed) and `sign` stops on a unit that does not, so the close names
+    every unit the signature will refuse: short of its terminal as a known issue, already at
+    Done in the pre-flight's `review-coverage` row.
+    """
+    import conformance  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+    return conformance.critiqued_unmet(root, sdlc_md.norm_id(uid))
+
+
+def awaits_only_signature(root, uid: str, kind: str, status: str) -> bool:
+    """True when the run's signature is the one step this pre-terminal unit still owes.
+
+    The seal's own bar (`seal_bar_unmet`) at EVERY pre-terminal status for a kind `sign` moves
+    (`_SIGNOFF_TERMINAL`: story, bug), and at a Review status only for any other kind, which
+    `sign` never moves. ONE predicate for every close reader that asks it - the unanswered-unit
+    hold and the `[status]` preflight - so the close never names a unit the signature seals.
+    `kind` and `status` are the caller's reading: the artefact type and its canonical status.
+    """
+    import critic  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+    if not kind or sdlc_md.is_terminal_status(kind, status):
+        return False
+    return ((kind in _SIGNOFF_TERMINAL or critic.is_awaiting_signoff(status))
+            and not seal_bar_unmet(root, uid))
+
+
+def _carried_rulings(root: Path, state: dict, retro_id: str | None) -> tuple:
+    """`(retro id or None, carried rows or None, why unreadable)` for the unanswered-unit hold.
+
+    The NAMED retro when the caller has one (the close's `--retro`). Otherwise the latest retro,
+    by id, whose text carries the run's recorded `run_id` - never simply the newest, because a
+    later run's retro ruling this run's unit would answer a question it was never asked. No
+    such retro means the rulings are UNREADABLE, which answers nothing.
+    """
+    import retro as retro_mod  # noqa: PLC0415 - deferred, as everywhere else in this module
+    if retro_id:
+        path = retro_mod.find_retro(root, retro_id)
+        if path is None:
+            return None, None, f"{retro_id} not found"
+        return (sdlc_md.norm_id(retro_id),
+                retro_mod.carried_issues(sdlc_md.read_text_safe(path), root=root), "")
+    run_id = str((state or {}).get("run_id") or "").strip()
+    if not run_id:
+        return None, None, "the run records no run_id, so no retro can be tied to it"
+    carries = re.compile(rf"(?<![\w-]){re.escape(run_id)}(?![\w-])")
+    best: tuple | None = None
+    for path in sorted((Path(root) / retro_mod.RETRO_DIR).glob("*.md")):
+        rid = sdlc_md.norm_id(sdlc_md.stem_record_id(path.stem) or "")
+        if not rid.startswith("RETRO") or not carries.search(sdlc_md.read_text_safe(path)):
+            continue
+        # Latest BY ID: a sequential id by its number, and a v3 id (time-ordered, no ordinal)
+        # above every sequential one and by its own sort order among its kind.
+        num = sdlc_md.id_number(rid)
+        key = (num is None, num or 0, rid)
+        if best is None or key > best[0]:
+            best = (key, rid, path)
+    if best is None:
+        return None, None, f"no retro carries {run_id}"
+    return best[1], retro_mod.carried_issues(sdlc_md.read_text_safe(best[2]), root=root), ""
+
+
+def unanswered_units(root, state, retro_id=None) -> dict:
+    """The batch units this run cannot end over: `{"unanswered": [{"unit", "status", "why",
+    "filed"}], "rulings_from": <retro id or None>}`.
+
+    ONE predicate, read by the close's checklist step and by `stop`, so the two can never name
+    different sets. It walks the live batch and every id a recorded drop took out of it that
+    the live batch no longer holds (a unit dropped and re-added is walked as live, not dropped).
+
+    A stop-ship ruling holds its unit whatever its status, abandoned included. A unit carrying
+    a standing delivery REJECT is held at every non-abandoned status, whatever else would answer
+    it - evidence, a hand drop, a park or a ruling - unless `critic.coverage_state` reads it
+    approved or it was carried at the review cap (a drop `critic.carried_to` accepts): the
+    REJECT's two exits (`critic.REJECT_EXITS`). Otherwise a unit is answered by its status:
+    delivered-terminal or abandoned (a terminal reached by a ruling, derived and never listed),
+    owing nothing but the run's signature (`seal_bar_unmet`, the bar `sprint sign` stops on) -
+    a story or bug at any pre-terminal status, any other kind at Review - at its run's rung-end status off the build rung, dropped, parked on a pending
+    decision or depending on one (`_parked_units`, the closure `blocked_by_pending` reads), or
+    ruled not-stop-ship, accepted-risk or deferred in the carried table. `filed` names the bug a
+    carry filed its findings to.
+    """
+    import critic  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+    import retro as retro_mod  # noqa: PLC0415
+    root = Path(root)
+    state = state or {}
+    live = [u for u in (sdlc_md.norm_id(str(x)) for x in (state.get("batch") or [])) if u]
+    dropped = [sdlc_md.norm_id(str(c.get("id"))) for c in (state.get("batch_changes") or [])
+               if isinstance(c, dict) and c.get("action") == "drop" and c.get("id")]
+    dropped = [u for u in dropped if u and u not in live]
+    walked = list(dict.fromkeys(live + dropped))
+    # The carry at the cap drops the unit naming the bug that holds its findings; a hand drop
+    # worded like one is not a carry (`critic.carried_to`).
+    carried: dict[str, str] = {}
+    for c in state.get("batch_changes") or []:
+        if not isinstance(c, dict) or c.get("action") != "drop":
+            continue
+        uid = sdlc_md.norm_id(str(c.get("id")))
+        if uid in dropped and (bug := critic.carried_to(root, uid, c.get("reason"), state)):
+            carried[uid] = bug
+    rid, rows, unreadable = _carried_rulings(root, state, retro_id)
+    ruled: dict[str, set] = {}
+    discharged: set[str] = set()
+    for row in rows or []:
+        if not row.get("ok"):
+            continue
+        # A stop-ship ruling whose finding has since reached a terminal status has been ANSWERED
+        # by the work. Holding it anyway made a ruling outlive its finding and blocked every
+        # later close permanently, with editing a retro by hand the only escape. The rows carry
+        # `terminal` only when the caller passed a root, so a reader without one sees no
+        # discharge and behaves exactly as before.
+        if row["ruling"] == retro_mod.STOP_SHIP and row.get("terminal"):
+            discharged.add(row["id"])
+            continue
+        ruled.setdefault(row["id"], set()).add(row["ruling"])
+    answering = {r for r in retro_mod.KNOWN_ISSUE_RULINGS if r != retro_mod.STOP_SHIP}
+    rung = run_rung(state)
+    rung_end = RUNG_TERMINALS.get(rung) if rung not in COMPLETING_RUNGS else None
+    info: dict[str, tuple[str, str]] = {}
+    for uid in walked:
+        hit = sdlc_md.find_by_id(root, uid)
+        if hit is None:
+            info[uid] = ("", "")
+            continue
+        raw = sdlc_md.extract_field(sdlc_md.read_text_safe(hit[0]), "Status") or ""
+        info[uid] = (hit[1], sdlc_md.canonical_status(raw, sdlc_md.status_vocab(hit[1], root))
+                     or raw.strip())
+    # The stop's own closure over the stop's own unit set, never a second one: a unit parked
+    # before its artefact exists is parked for both readers, and so are its dependants.
+    _pending, _remaining, parked = _parked_units(root, state)
+    out: list[dict] = []
+    for uid in walked:
+        kind, status = info[uid]
+        rulings = ruled.get(uid, set())
+        # A STOP-SHIP ruling holds its unit WHATEVER its status - Done, awaiting only a
+        # signature, parked, dropped, abandoned or at its rung's end - because the close's own
+        # stop-ship branch refuses on it at every one, and a reader of this predicate alone
+        # (`stop`, and every route that reads it) must refuse the same state. The ONE exception
+        # is a ruling already discharged above, where the close's own branch no longer refuses
+        # either: the two readers still agree, which is what this comment is really asserting.
+        stop_ship = retro_mod.STOP_SHIP in rulings
+        terminal = bool(kind) and sdlc_md.is_terminal_status(kind, status)
+        abandoned = terminal and not sdlc_md.is_delivered_terminal(kind, status)
+        if abandoned and not stop_ship:
+            continue                      # abandoned by a ruling: nothing left to answer
+        row = critic.verdict_for(root, uid)
+        rejected = (not abandoned and uid not in carried and bool(row)
+                    and str(row.get("verdict") or "").upper() == critic.REJECT
+                    and critic.coverage_state(root, uid) != critic.COVERAGE_APPROVED)
+        why = [WHY_REJECT] if rejected else []
+        review_why = ""
+        # The seal's own bar, at EVERY pre-terminal status for a kind `sign` moves: it seals a
+        # story or a bug (`_SIGNOFF_TERMINAL`) the loop left at Ready or In Progress as readily
+        # as one at Review, so one that meets the bar owes only the run's signature, the step
+        # after this close. Any other kind (a CR, say) is never moved by `sign`, so it awaits the
+        # signature only at a Review status, as it always did - otherwise the close would pass a
+        # unit the signature then leaves where it stood.
+        awaits_signature = awaits_only_signature(root, uid, kind, status)
+        if not awaits_signature and critic.is_awaiting_signoff(status):
+            if row or critic.sprint_covers_independently(
+                    root, uid, critic.sprint_review_for(root, uid)):
+                # A pass is on record - a delivery verdict, or a frozen batch review - and the
+                # bar is still unmet. The verdict ledger says a pass ran; the retired evidence
+                # ledger is read by nothing.
+                review_why = WHY_AT_REVIEW
+            else:
+                review_why = WHY_PASS_OWED
+        answered = not stop_ship and (
+            terminal or awaits_signature or uid in dropped or uid in parked
+            or (rung_end is not None and kind
+                and status == _terminal_in_type_vocab(root, rung, kind, rung_end))
+            or bool(rulings & answering))
+        if not answered:
+            if stop_ship:
+                why.append(f"ruled {retro_mod.STOP_SHIP} in {rid}")
+            elif review_why:
+                why.append(review_why)
+            elif rows is None:
+                why.append(f"ruling unreadable: {unreadable}")
+            else:
+                why.append(f"unfinished and not ruled in {rid}'s carried table")
+        if not why:
+            continue
+        out.append({"unit": uid, "status": status or "no artefact on disk",
+                    "why": " + ".join(why), "filed": [carried[uid]] if uid in carried else []})
+    return {"unanswered": out, "rulings_from": rid}
+
+
+def unanswered_rows(held: list[dict]) -> str:
+    """Each held unit as `<id> (<status>) - <why> - findings filed to <artefacts>`, or
+    `NONE filed`, joined by `; ` - the one row shape every route that names the set prints."""
+    return "; ".join(f"{h['unit']} ({h['status']}) - {h['why']} - findings "
+                     + (f"filed to {', '.join(h['filed'])}" if h.get("filed") else "NONE filed")
+                     for h in held)
+
+
+def unanswered_line(held: list[dict]) -> str:
+    """The held units as ONE line, each with its status, why, and where its findings went.
+    The ways out go on a line of their own, so this line carries the held units' ids alone."""
+    return (f"known-issues: {len(held)} batch unit(s) the run cannot end over: "
+            + unanswered_rows(held))
+
+
+def unanswered_record(ua: dict | None, error: str = "") -> dict:
+    """The run-record fields a route that ends a run writes before `close_run` archives it: the
+    predicate's `unanswered` list as returned (`[]` when none) and the retro whose carried table
+    it read. A predicate that could not be computed records None and the reason - never `[]`,
+    which would read as a run that ended over nothing."""
+    if ua is None:
+        return {"unanswered": None, "unanswered_rulings_from": None,
+                "unanswered_error": error or "not computed"}
+    return {"unanswered": ua["unanswered"], "unanswered_rulings_from": ua["rulings_from"]}
+
+
+def unanswered_ways_out(held: list[dict], rulings_from: str | None,
+                        run_id: str | None = None) -> str:
+    """What answers a held unit, named for the reasons actually present - one line, no ids."""
+    whys = " ".join(h["why"] for h in held)
+    table = (f"{rulings_from}'s `## Known issues carried`" if rulings_from
+             else "the run's retro (`## Known issues carried`)")
+    ways = []
+    if WHY_REJECT in whys:
+        import critic  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+        ways.append(f"a standing REJECT has two exits: {critic.REJECT_EXITS} - no ruling or "
+                    f"hand drop answers it")
+    if WHY_PASS_OWED in whys:
+        ways.append("dispatch the owed adversarial pass (`critic.py brief --unit <id> "
+                    "--seat qa`)")
+    if WHY_AT_REVIEW in whys:
+        ways.append("record the independent delivery APPROVE a Review unit still owes, and "
+                    "`sprint sign` seals it; or take its Done transition "
+                    "(`transition.py set <id> Done`)")
+    if "ruling unreadable" in whys:
+        ways.append("rule it in a retro whose text carries the run id"
+                    + (f" {run_id}" if run_id else "") + ", or name the retro with --retro")
+    ways += [f"finish it, or rule it not-stop-ship, accepted-risk or deferred in {table}",
+             "or `sprint.py batch drop <id> --reason '<why>'`, which answers only a unit "
+             "carrying no standing REJECT"]
+    return "ways out: " + "; ".join(ways)
+
+
+def _close_checklist(root, retro, state, read_root=None):
+    """The compulsory checklist, as a chain step. Refuses on an unanswered item, naming it.
+
+    Placed after the retro and lessons steps and before the gate, because the rows it reads are
+    produced by everything up to here; a row the close itself discharges (`discharged_by:
+    close`) is reported and never held, or the chain would refuse on the step it is on its way
+    to perform.
+
+    A checklist nothing enforces is the state this was built from: the seat ceremony was
+    compulsory in prose and was skipped twice in one session without a warning being printed.
+    """
+    try:
+        import sprint_report  # noqa: PLC0415 - deferred, like the chain's sibling imports
+        # `live_gate`: inside a close attempt the delivered set is the gate asked now, never the
+        # previous attempt's frozen verdict (D0308).
+        ck = sprint_report.checklist(root, retro, read_root=read_root or root, live_gate=True)
+    except Exception as exc:  # noqa: BLE001 - a step that cannot check must not report a pass
+        return (False, f"the sprint checklist could not be composed: {type(exc).__name__}: {exc}",
+                "fix the error above, or run `sprint_report.py checklist --id "
+                f"{retro}` to see it directly")
+    # A row this run gave nothing to measure is no known issue: recorded for the report's
+    # appendix, where it reads `not measured` with its reason, and never outstanding here.
+    unmeasured = [{"id": r["id"], "title": r["title"], "detail": r["detail"]}
+                  for r in ck["items"] if r.get("state") == sprint_report.UNMEASURABLE]
+    run_state.update(root, **{sprint_report.CLOSE_NOT_MEASURED: unmeasured})
+    # EXPIRED rows are reported on EVERY exit from this step. They do not HOLD the close - their
+    # enforcer ran hours ago and a waiver would be the only exit - but the close's report is
+    # where an operator learns what went unsatisfied, and naming them only in `render_checklist`
+    # took information out of it: four rows named at the base ref were named nowhere after.
+    # The first repair put this inside the `none outstanding` branch only - the branch that does
+    # not fire when anything IS outstanding, which is exactly the case the story cites. Reported
+    # and not held has to mean reported on the refusal path too, and on the stop-ship path.
+    expired = [r for r in ck["items"] if r["id"] in set(ck.get("expired") or [])]
+    past = ("; " + f"{len(expired)} past their window, reported not held: "
+            + ", ".join(f"{r['id']} (enforce at `{sprint_report._window(r)}`)" for r in expired)
+            if expired else "")
+    # THE UNFINISHED-UNIT HOLD, read before any return below so it is named on every refusal
+    # path and holds even where nothing else is outstanding. It is part of the stop-ship step,
+    # not a gate of its own, and NO checklist waiver reaches it: a waiver never expires, so one
+    # standing waiver of the known-issues row would release every later run's unfinished units.
+    try:
+        ua = unanswered_units(root, state, retro)
+    except Exception as exc:  # noqa: BLE001 - a hold that cannot be computed must not pass
+        return (False, f"known-issues: the unanswered-unit hold could not be computed: "
+                       f"{type(exc).__name__}: {exc}",
+                "fix the error above, then re-run the close")
+    held_line = unanswered_line(ua["unanswered"]) if ua["unanswered"] else ""
+    held_way = (unanswered_ways_out(ua["unanswered"], ua["rulings_from"],
+                                    (state or {}).get("run_id")) if held_line else "")
+
+    def _with_hold(detail: str, remedy: str) -> tuple:
+        return (False, detail + (f"\n{held_line}" if held_line else ""),
+                remedy + (f"\n{held_way}" if held_way else ""))
+
+    named = [r for r in ck["items"] if r["id"] in set(ck["outstanding"])]
+    detail = "\n".join(f"  {r['id']}: {r['title']} - {r['value']}"
+                       + (f"\n      {r['detail']}" if r["detail"] else "") for r in named)
+    if ck["stop_ship"]:
+        # ANSWERED, and the answer stops the ship. Held separately from the unanswered items
+        # because the remedy is the opposite one: an unanswered item needs somebody to look, a
+        # stop-ship ruling needs the defect fixed or the ruling revised by whoever made it. The
+        # unanswered items travel with it: each is a known issue in its own right.
+        return _with_hold(
+            "known-issues: " + ", ".join(ck["stop_ship"]) + " "
+            + ("is" if len(ck["stop_ship"]) == 1 else "are")
+            + " ruled STOP-SHIP in the retro's carried-issues table" + past
+            + (f"\n{detail}" if detail else ""),
+            "fix the finding, or have the ruler revise the ruling in the retro - a close "
+            "that proceeds over a stop-ship ruling makes every future ruling a note")
+    if not ck["outstanding"]:
+        if held_line:
+            return (False, f"{len(ck['items'])} compulsory item(s), none outstanding{past}"
+                           f"\n{held_line}", held_way)
+        pending = (f"; {len(ck['pending_in_close'])} item(s) this close discharges itself"
+                   if ck.get("pending_in_close") else "")
+        nm = (f"; {len(unmeasured)} not measured, listed in the report's appendix"
+              if unmeasured else "")
+        return (True,
+                f"{len(ck['items'])} compulsory item(s), none outstanding{pending}{nm}{past}", "")
+    return _with_hold(
+        f"{len(named)} compulsory checklist item(s) unanswered{past}:"
+        f"\n{detail}",
+        "answer each item by running the stage it names, or record a waiver naming it and "
+        "why (`decisions.py waive --subject "
+        f"{sprint_report.WAIVER_SUBJECT}:<item> --rationale '<why>'`) - closing without an "
+        "item and forgetting it must be different events in the record")
+
+
+# Chain order is the ceremony's order; cmd_close resolves each step through globals() at
+# call time so a test can patch one step without rebuilding the table.
+_CLOSE_CHAIN = ("review-coverage", "retro-validate", "retro-extract", "retro-accuracy",
+                "lessons-summary", "checklist",
+                "gate", "reconcile", "review-anchor")
+
+#: The machine-maintained status block inside the review anchor. DELIMITED, because the anchor is
+#: a hand-written document a fresh context is told to read first: the close must refresh the facts
+#: without overwriting a word of the reading around them. Before this, only the blocked
+#: `--file-and-close` path touched the anchor, so a SUCCESSFUL close left the previous run's state
+#: standing - and an anchor that says a landed sign-off is still owed misleads the very reader the
+#: doctrine sends there.
+ANCHOR_BEGIN = "<!-- close-status:begin -->"
+ANCHOR_END = "<!-- close-status:end -->"
+
+
+def anchor_status_block(run_id: str, outcome: str, units: int, signature_owed: bool,
+                        rung: str = "done") -> str:
+    """The status the close stamps on the anchor. It states what is owed, or states plainly that
+    nothing is - a reader must never have to diff this against the run state to learn which.
+
+    RUNG-AWARE, because Done is not every rung's terminal. A `design` rung grooms units and they
+    correctly end at Ready with RED acceptance criteria - that is the bar it exists to prove, and
+    its done-gate refusals are the gate working. Telling such a run that a sign-off is owed to
+    reach Done names an action for a state the run never targeted, in the one file every fresh
+    session is ordered to read first, where there is no other context to correct it.
+    """
+    if str(rung or "done").lower() != "done":
+        owed = (f"This was a `{rung}` rung, not a build - its units end at their own terminal "
+                f"and no Done sign-off is owed.")
+    else:
+        owed = ("**The run signature is OWED and is the operator's** - `sprint sign` seals the "
+                "batch in one signature." if signature_owed else
+                "**The run is SIGNED** - nothing is owed on this run.")
+    return (f"{ANCHOR_BEGIN}\n"
+            f"> **{run_id} closed {outcome}.** {units} unit(s) in the batch. {owed}\n"
+            f"> Stamped by `sprint close` - edit the prose below, not this block.\n"
+            f"{ANCHOR_END}")
+
+
+def refresh_review_anchor(repo_root: Path | str, run_id: str, outcome: str, units: int,
+                          signature_owed: bool, rung: str = "done") -> str:
+    """Replace (or insert) the status block in `sdlc-studio/reviews/LATEST.md`. Returns the verb
+    for the close line. Never rewrites the narrative: an existing block is swapped in place, and
+    a missing one is inserted just after the H1."""
+    anchor = Path(repo_root) / "sdlc-studio" / "reviews" / "LATEST.md"
+    block = anchor_status_block(run_id, outcome, units, signature_owed, rung)
+    if not anchor.is_file():
+        anchor.parent.mkdir(parents=True, exist_ok=True)
+        sdlc_md.atomic_write(anchor, f"# Reviews - LATEST (anchor)\n\n{block}\n")
+        return "created"
+    text = anchor.read_text(encoding="utf-8")
+    if ANCHOR_BEGIN in text and ANCHOR_END in text:
+        start = text.index(ANCHOR_BEGIN)
+        end = text.index(ANCHOR_END) + len(ANCHOR_END)
+        sdlc_md.atomic_write(anchor, text[:start] + block + text[end:])
+        return "refreshed"
+    lines = text.splitlines()
+    at = next((i + 1 for i, ln in enumerate(lines) if ln.startswith("# ")), 0)
+    sdlc_md.atomic_write(anchor, "\n".join(lines[:at] + ["", block] + lines[at:]) + "\n")
+    return "inserted"
+
+
+def _close_review_anchor(root, retro, state):
+    """Refresh the review anchor so it states THIS run's outcome rather than the previous run's."""
+    try:
+        st = run_state.read(root) or state or {}
+    except Exception as exc:  # noqa: BLE001 - a close must not die on a state read
+        sdlc_md.debug("sprint._close_review_anchor", exc)
+        st = state or {}
+    run_id = st.get("run_id") or "(unknown run)"
+    outcome = st.get("outcome") or "closed"
+    units = len(st.get("batch") or [])
+    try:
+        verb = refresh_review_anchor(root, run_id, outcome, units,
+                                     not st.get("signature"), run_rung(st))
+    except OSError as exc:
+        return False, f"the review anchor could not be written: {exc}", \
+               "check sdlc-studio/reviews/LATEST.md is writable, then re-run close"
+    if run_rung(st) == "design":
+        print(render_grooming_report(grooming_report(root, st.get("batch") or [])),
+              file=sys.stderr)
+    return True, f"review anchor {verb}: {run_id} closed {outcome}", ""
+
+
+def _retro_path(root, rid: str):
+    """The retro file for an id (e.g. `RETRO0047` or `RETRO-0047`), or None if none exists.
+
+    DELEGATES to `retro.find_retro`, which is the shared resolver and says so: "one resolver,
+    shared, so the gate and this script cannot disagree about which file they are talking
+    about". This function used to hand-roll the match, which is the divergent-reader class
+    this project keeps filing bugs about.
+
+    The divergence is LATENT, not observed: the hand-rolled split on the first hyphen accepts
+    only `RETRO0085-slug`, while the shared resolver accepts `RETRO-0085-slug` too, and no
+    file of the second shape exists in this repo today. So this is delegation for the reason
+    the shared resolver's own docstring gives - two readers of one key eventually answer
+    differently - rather than a repair of a failure anyone has seen.
+
+    `extract_record_id` is NOT the answer here, though it is for this bug's two sibling sites:
+    `RETRO` is a meta prefix that ID_RE (EP/US/BG/... only) does not recognise, so reaching for
+    it returns None for every retro there is."""
+    d = Path(root) / "sdlc-studio" / "retros"
+    if not rid or not rid.strip() or not d.is_dir():
+        return None
+    try:
+        import retro  # noqa: PLC0415 - deferred, like the chain's other retro imports
+        return retro.find_retro(root, rid)
+    except Exception as exc:  # noqa: BLE001 - a resolver failure is "not found", never a crash
+        sdlc_md.debug("sprint._retro_path", exc)
+        return None
+
+
+def _prefill_retro(root, path, batch, state) -> None:
+    """Fill the scaffolded retro's objective front-matter (Batch/Goal) from run state - the
+    close already holds them, so the author never re-transcribes what the run recorded. The
+    Run line and the empty Known issues carried table are rendered with the scaffold
+    (`retro.fill_run_scaffold`, given the run id by `_scaffold_run_retro`). The narrative
+    placeholders (Keep, Stop, Try) are left for the author to fill."""
+    import retro  # noqa: PLC0415 - deferred, like the chain's other retro imports
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    text = text.replace("{{batch}}", ", ".join(sdlc_md.display_id(root, b) for b in batch) or "-")
+    text = text.replace("{{goal}}", state.get("sprint_goal") or "-")
+    sdlc_md.atomic_write(p, text)
+    # A run accepted over its standing appetite records the over-commitment in the retro, so a
+    # later reader asking why it overran finds the trace. No-op for a within-appetite run.
+    retro.record_overage_in_retro(root, p)
+
+
+def _scaffold_run_retro(root, state) -> dict:
+    """Mint the run's retro (`artifact.meta_new`: allocated id, template, index row) with its
+    Batch and Goal filled from the run state. The close and its dry run both mint through here,
+    so the preview judges the retro the close would write: a bare scaffold names no batch, and
+    every checklist row that finds its run through the retro's units then read no goal, no units
+    and no start time for a run whose state holds all three."""
+    import artifact  # noqa: PLC0415 - deferred, like the chain's retro/handoff imports
+    # Through the shared helper: a Sprint Goal is a sentence, and an H1 keeping its full stop
+    # fails markdownlint MD026 and blocks the commit carrying this retro.
+    title = sdlc_md.heading_title(state.get("sprint_goal") or state.get("run_id") or "sprint retro")
+    res = artifact.meta_new(root, "retro", title, {"run_id": str(state.get("run_id") or "")})
+    _prefill_retro(root, res["path"], state.get("batch") or [], state)
+    return res
+
+
+def _resolve_retro(root, args, state) -> int | None:
+    """Ensure the close has a retro to gate on, through the deterministic path.
+
+    - `--retro` omitted: SCAFFOLD one via `artifact.meta_new` (allocated id + rendered template
+      + index row), pre-fill Batch/Goal from run state, print the id, and STOP so the author
+      fills it. This is the forced-scaffold path: a retro is never hand-authored into a missing
+      index row that only the reconcile step would catch. Idempotent: the scaffolded id is
+      stashed on run state, so a second bare close REUSES it rather than minting a duplicate.
+    - `--retro` names an existing retro: proceed, and self-heal a missing index row
+      (`reconcile.apply_meta`) so a retro made any other way still never stalls the close.
+    - `--retro` names a missing retro: refuse (the sequential allocator cannot mint a chosen id).
+
+    Returns an exit code to stop the close, or None to continue (args.retro is then the id)."""
+    import reconcile  # noqa: PLC0415
+    rid = (args.retro or "").strip()
+    if rid:
+        if _retro_path(root, rid) is None:
+            print(f"close refused: retro {rid} not found. Omit --retro and close will scaffold "
+                  f"one for you (id + index row), or create it with `artifact.py new --type "
+                  f"retro`.", file=sys.stderr)
+            return 2
+        reconcile.apply_meta(root)  # B safety net: add the index row if a prior author skipped it
+        return None
+    # Reuse an already-scaffolded retro for this run if it still exists - a bare close re-run
+    # (or a wrapper that retries on non-zero) must not mint a second empty retro.
+    prior = (state.get("scaffolded_retro") or "").strip()
+    if prior and _retro_path(root, prior) is not None:
+        disp, verb = prior, "already scaffolded"
+    else:
+        res = _scaffold_run_retro(root, state)
+        # The id the FILE carries (`RETRO0001`), not the allocator's display form
+        # (`RETRO-0001`): it is printed as the `--retro` to pass back and recorded on the run.
+        disp = sdlc_md.any_record_id(Path(res["path"]).stem) or res["id"]
+        verb = f"scaffolded (indexed={res['indexed']})"
+        run_state.update(root, scaffolded_retro=disp)
+    # Don't silently drop a --goal-verdict passed on the scaffold call: record it now so the
+    # re-run reuses it (the goal-verdict block below runs only once the retro is supplied).
+    if args.goal_verdict and args.note and not state.get("sprint_goal_verdict"):
+        run_state.record_goal_verdict(root, args.goal_verdict, args.note)
+        print(f"close: goal-verdict recorded ({args.goal_verdict}) - reused on the re-run")
+    verdict_hint = ("" if (args.goal_verdict or state.get("sprint_goal_verdict"))
+                    else " --goal-verdict <achieved|partial|missed> --note \"...\"")
+    print(f"close: retro {disp} {verb} -> {_retro_path(root, disp)}")
+    print(f"fill its sections, then re-run: sprint.py close --retro {disp}{verdict_hint}")
+    return 1
+
+
+def plan_critic_refusal(rep: dict) -> str:
+    """The refusal `--write` gives while any plan-critic finding is undispositioned.
+
+    The retro already enforces file-or-decline, and silence is not an answer there either. A
+    plan critic whose findings can be ignored is advice nobody has to take, and the whole reason
+    for spending tokens before any value is delivered is that the findings change the plan.
+    """
+    import critic  # noqa: PLC0415
+    open_findings = critic.undispositioned_plan_findings(rep)
+    if not open_findings:
+        return ""
+    titles = ", ".join(f.get("title", "?") for f in open_findings[:6])
+    return (f"plan REFUSED: {len(open_findings)} plan-critic finding(s) are undispositioned "
+            f"({titles}). File each as an artefact or decline it WITH A REASON - a decline whose "
+            f"reason is a placeholder records that someone clicked past it, which is worse than "
+            f"no record because it looks like a decision. Nothing was written and no run opened.")
+
+
+def _print_test_strategy(args, data) -> None:
+    """The plan-time strategy block, with the TSD's own staleness reported FIRST.
+
+    Order matters: a reader who sees the areas before being told the document is rotted has
+    already believed them. Reviewing a batch against a stale TSD produces confident wrong
+    answers, which is the class EP0071 spent a sprint repairing.
+    """
+    root = getattr(args, "root", ".")
+    # A TSD the operator chose not to write has no staleness to report.
+    stale = {"known": True} if tsd_declined(root) else tsd_staleness(root)
+    if stale.get("stale"):
+        print(f"  test strategy: the TSD is STALE - {stale['why']}. The areas below are derived "
+              f"from a document the code has moved past; re-read it before trusting them.",
+              file=sys.stderr)
+    elif not stale.get("known"):
+        print(f"  test strategy: TSD staleness UNKNOWN - {stale.get('why')}", file=sys.stderr)
+    # data["batch"] is a list of unit RECORDS (dicts with id/priority/...); test_strategy's
+    # contract is a list of ids. Project to ids at the boundary - passing the records straight
+    # through hands a dict to norm_id and crashes every `sprint plan` with a non-empty batch.
+    batch_ids = [b["id"] if isinstance(b, dict) else b for b in (data.get("batch") or [])]
+    strat = test_strategy(root, batch_ids)
+    # RECORDED, not only printed. A strategy that leaves no record is advice: it cannot be
+    # reviewed at plan time, cannot be signed off with the goal, and cannot be compared
+    # afterwards with what actually ran. `data` is what the plan writes to sprint-plan.json,
+    # so putting it here is what makes it survive the terminal.
+    data["test_strategy"] = {**strat, "tsd_staleness": stale,
+                             "recorded_at": sdlc_md.now_iso8601()}
+    for line in render_test_strategy(strat):
+        print(line, file=sys.stderr)
+
+
+def claimed_proof_gaps(root, batch: list[str]) -> list[str]:
+    """Units whose plan-time proof requirement is not matched by the evidence recorded for them.
+
+    A stated intent nobody checks at the end is a comment. The whole value of writing the proof
+    requirement at plan time is being measured against it at the close, so this is the half that
+    makes the other half worth having.
+
+    Only the `mutation` band is checkable mechanically today: every mutation run appends a series
+    row naming its targets and whether it judged anything, so a file a run measured can be looked
+    up. A band nobody can check is not reported as a gap - claiming a unit failed a bar that
+    cannot be measured would be exactly the false precision this project refuses.
+    """
+    demanded = set(strategy_mutation_targets(root, batch))
+    if not demanded:
+        return []
+    try:
+        import mutation  # noqa: PLC0415
+        rows = mutation.series_rows(Path(root))
+    except Exception as exc:  # noqa: BLE001 - a close must not die on a series read
+        sdlc_md.debug("sprint.claimed_proof_gaps", exc)
+        return sorted(demanded)
+    mutated_files = {str(t) for r in rows if r.get("evidence") for t in (r.get("targets") or [])}
+    gaps = []
+    for uid in sorted(demanded):
+        hit = sdlc_md.find_by_id(Path(root), uid)
+        if not hit:
+            continue
+        affects = sdlc_md.extract_field(sdlc_md.read_text_safe(Path(hit[0])), "Affects") or ""
+        files = [f.strip() for f in re.split(r"[,\s]+", affects) if f.strip()]
+        if not any(any(f.endswith(mf) or mf.endswith(f) for mf in mutated_files) for f in files):
+            gaps.append(uid)
+    return gaps
+
+
+def strategy_mutation_targets(root, batch: list[str]) -> list[str]:
+    """The units whose risk band demands mutation evidence.
+
+    This is what replaces the blanket close-scoped sweep: a stated decision about which units
+    are worth mutating, made at plan time from the TSD, instead of a whole-sprint-diff sweep
+    that spends its ceiling on whatever it reaches first.
+    """
+    strat = test_strategy(root, batch)
+    if not strat.get("available"):
+        return []
+    return sorted(u for u, bands in strat["units"].items() if "mutation" in bands)
+
+
+def _ungroomed_blocks_at(args) -> bool:
+    """Whether an ungroomed batch REFUSES the plan at this rung.
+
+    Only the design rung is exempt, and only when it says so: an absent, empty or unrecognised
+    goal blocks like a build. An escape that opens when the rung cannot be read is an escape
+    that opens by accident.
+    """
+    return str(getattr(args, "goal", "") or "").lower() != "design"
+
+
+def _oversized_blocks_at(args) -> bool:  # noqa: ARG001 - the rung is deliberately not consulted
+    """Whether an oversized or unplaceable unit refuses the plan. It does, at EVERY rung: a
+    design rung cannot forecast an unsized unit either, and cannot place one whose collisions
+    are invisible. Written as a function so the asymmetry with the ungroomed leg is stated
+    rather than implied by its absence."""
+    return True
+
+
+def _rung_grades(type_: str) -> bool:
+    """Whether a RUNG can grade this type at all.
+
+    A CONTAINER is a request or a parent: its product is the units beneath it, not acceptance
+    criteria of its own, so grading one asks a question it has no answer to. ONE definition,
+    because two of them is the very defect this predicate closes - the report skipped epics while
+    the pre-flight blocked on them, so a single close carried two answers to one question about
+    one batch.
+
+    THREE container types, not one, per D0172. `TSHIRT_SIZED_TYPES` is exactly the set the sizing
+    model already treats as containers, and `executes_verifiers` is False for all three: a CR and
+    an RFC are decomposed into units rather than delivered, the same as an epic. Naming the set
+    here rather than repeating `!= "epic"` is what stops the three surfaces drifting again."""
+    return (type_ or "").lower() not in TSHIRT_SIZED_TYPES
+
+
+def grooming_report(root, batch: list[str]) -> dict:
+    """What a design rung actually groomed: {"total", "groomed", "ungroomed", "names"}.
+
+    The counterweight to the goal-aware breakdown gate. Letting a design rung plan over an
+    ungroomed batch is only safe if the close then says what it produced - otherwise "accepted
+    because this rung will groom them" is a promise nobody checks, and a rung that groomed
+    nothing closes exactly like one that groomed everything.
+    """
+    import conformance  # noqa: PLC0415 - one definition of ungroomed, never a second copy
+    names: list[str] = []
+    total = 0
+    for uid in batch or []:
+        hit = sdlc_md.find_by_id(Path(root), uid)
+        # EVERY TYPE, and the SAME definition the pre-flight uses. This counted stories and
+        # asked `story_is_ungroomed`, while the pre-flight asks `unit_is_ungroomed` of every
+        # type - so one close carried two answers to one question, and a batch of bugs read
+        # "no story units in this batch" beside a pre-flight blocking on those very bugs.
+        if not hit or not _rung_grades(hit[1]):
+            continue
+        total += 1
+        ungroomed, _why = conformance.unit_is_ungroomed(hit[1],
+                                                        sdlc_md.read_text_safe(Path(hit[0])))
+        if ungroomed:
+            names.append(sdlc_md.norm_id(uid))
+    return {"total": total, "groomed": total - len(names),
+            "ungroomed": len(names), "names": sorted(names)}
+
+
+def render_grooming_report(rep: dict) -> str:
+    """The close line. A rung that groomed NOTHING is stated as such rather than reported as an
+    ordinary close - accepting an ungroomed batch and grooming none of it is the abuse the
+    relaxation invites, so it must be the loudest thing the close says about the rung."""
+    if not rep["total"]:
+        return "grooming: no gradeable units in this batch"
+    if rep["ungroomed"] and not rep["groomed"]:
+        return (f"grooming: NOTHING WAS GROOMED - all {rep['total']} unit(s) are as ungroomed as "
+                f"they were at plan time ({', '.join(rep['names'][:6])}). This rung was accepted "
+                f"over an ungroomed batch on the promise it would groom it.")
+    if rep["ungroomed"]:
+        return (f"grooming: {rep['groomed']}/{rep['total']} groomed, {rep['ungroomed']} still "
+                f"ungroomed ({', '.join(rep['names'][:6])})")
+    return f"grooming: {rep['groomed']}/{rep['total']} groomed, none outstanding"
+
+
+def _batch_unfanned_units(root, batch) -> list[tuple[str, str, str]]:
+    """The batch units the sign-off fan-out does NOT reach, as (id, kind, status).
+
+    The fan-out once reached stories only. The claim that made that safe - that a bug or CR in a
+    mixed batch is "already terminal by the time the close runs" - is not true and was measured
+    false: a 28-unit batch closed `goal-reached` with its 10 bugs still Open, while the handoff
+    the same close wrote said "10 remaining". The close's own artefacts contradicted its own
+    verdict, and the next sprint inherited ten units it believed undelivered.
+
+    Bugs are now IN the fan-out (`_SIGNOFF_TERMINAL`), so they are no longer listed here - a unit
+    counted in both lists would break the invariant the caller states: every batch unit is either
+    fanned into or reported outstanding, never both and never neither. Types the fan-out still
+    does not reach are looked up and reported with the status they actually hold; a terminal one
+    is not listed. This function only refuses to guess.
+    """
+    out: list[tuple[str, str, str]] = []
+    for uid in batch:
+        hit = sdlc_md.find_by_id(Path(root), uid)
+        if not hit or hit[1] in _SIGNOFF_TERMINAL:
+            continue
+        kind = hit[1]
+        status = sdlc_md.extract_field(sdlc_md.read_text_safe(Path(hit[0])), "Status") or ""
+        if not sdlc_md.is_terminal_status(kind, status):
+            out.append((sdlc_md.norm_id(uid), kind, status or "unknown"))
+    return out
+
+
+#: Types the sign-off fan-out reaches, and the terminal status each one takes. Bugs were once
+#: left out on the ground that "conformance is story-scoped". The consequence was that a
+#: bug-heavy run could not close at all - `sprint close` refuses at step 1 on units no
+#: independent pass covers, and the only mechanism for covering them skipped every bug in the
+#: batch. A 41-bug programme had no route to a close.
+_SIGNOFF_TERMINAL = {"story": "Done", "bug": "Fixed"}
+
+
+def _abandoned_status(root, hit) -> str:
+    """The unit's status when it already sits at an ABANDONMENT terminal (Won't Implement,
+    Superseded, Won't Fix - reached by a ruling, not by building it), else `""`.
+
+    Read through `sdlc_md`'s own terminal predicates rather than a list of statuses here, so a
+    status added to a type's vocabulary lands on the correct side without an edit in this file.
+    """
+    kind = hit[1]
+    status = sdlc_md.canonical_status(
+        sdlc_md.extract_field(sdlc_md.read_text_safe(Path(hit[0])), "Status"),
+        sdlc_md.status_vocab(kind, root)) or ""
+    if sdlc_md.is_terminal_status(kind, status) and not sdlc_md.is_delivered_terminal(kind,
+                                                                                      status):
+        return status
+    return ""
+
+
+def _batch_abandoned_units(root, batch) -> list[tuple[str, str]]:
+    """The fan-out's types in the batch that sit at an abandonment terminal, as (id, status).
+
+    `_batch_story_units` leaves them out, and apply-signoff names them from this, so a unit the
+    fan-out does not reach is still said aloud rather than silently skipped.
+    """
+    out: list[tuple[str, str]] = []
+    for uid in batch:
+        hit = sdlc_md.find_by_id(Path(root), uid)
+        if hit and hit[1] in _SIGNOFF_TERMINAL:
+            status = _abandoned_status(root, hit)
+            if status:
+                out.append((sdlc_md.norm_id(uid), status))
+    return out
+
+
+def _lanes_never_returned(state: dict) -> set[str]:
+    """The units a lane was briefed on and has not returned from, read from the run state the
+    caller already holds (`run_state.IN_FLIGHT`, set by `lane brief`, cleared by `lane return`)."""
+    return {sdlc_md.norm_id(r.get("unit") or "") for r in state.get(run_state.IN_FLIGHT) or []
+            if isinstance(r, dict) and r.get("unit")}
+
+
+def _batch_story_units(root, batch) -> list[str]:
+    """The units in the batch the sign-off fan-out reaches, in batch order.
+
+    Kept under its original name because callers and tests reach for it; the SET it returns is
+    what changed. A type outside `_SIGNOFF_TERMINAL` is still counted and named by
+    `_batch_unfanned_units` rather than assumed terminal.
+
+    A unit already at an ABANDONMENT terminal is not reached. The fan-out's whole job is a
+    sign-off ON a delivered terminal, and a unit ruled Won't Implement, Superseded or Won't Fix
+    was never built: reaching it moved a ruled-out unit to Done, and once the delivered close
+    refused an unanswered delivery REJECT, it stopped the whole close at a unit nobody will
+    build. The close pre-flight's sign-off and done-gate previews read this same list, so the
+    preview and the fan-out skip the same units.
+    """
+    out = []
+    for uid in batch:
+        hit = sdlc_md.find_by_id(Path(root), uid)
+        if hit and hit[1] in _SIGNOFF_TERMINAL and not _abandoned_status(root, hit):
+            out.append(sdlc_md.norm_id(uid))
+    return out
+
+
+def _signoff_author(root, unit) -> str:
+    """The author id the sign-off must be independent OF - read from the unit's recorded critic
+    verdict, or the frozen sprint-level review that covers it (a unit reviewed only at sprint scope
+    still records its author there). Empty when none exists: a sign-off with no author to be
+    independent of cannot be judged independent, so the caller refuses rather than invent one."""
+    import critic  # noqa: PLC0415
+    for getter in (critic.verdict_for, critic.sprint_review_for):
+        rec = getter(root, unit)
+        if rec and (rec.get("author") or "").strip() not in ("", "-"):
+            return rec["author"]
+    return ""
+
+
+def _filed_retro(root, state) -> str | None:
+    """The retro the filed page records (`retro_id`): the one the close judged. None when the
+    page cannot be read, and the caller then falls back to the latest retro naming the run."""
+    import sprint_report  # noqa: PLC0415
+    try:
+        page = sprint_report.read_report(root, str((state or {}).get("report") or ""))
+    except (sprint_report.ReportError, OSError, ValueError):
+        return None
+    return str(page.get("retro_id") or "").strip() or None
+
+
+def _seal_units(root, state) -> int:
+    """SEAL's per-unit half: each batch unit to its terminal status, and no per-unit row.
+
+    The operator signs ONCE, for the run (`_write_the_signature`). What that signature cannot
+    seal a unit over is the review bar (`seal_bar_unmet`) and the unit's own terminal gate (its
+    criteria, run by the transition). The review bar is judged over EVERY unit the seal reaches,
+    one already terminal included, BEFORE anything moves: an unreviewed unit leaves every unit
+    where it stood and the run open, and a unit moved by hand does not walk round the bar. A
+    terminal gate that refuses stops the walk at that unit; a re-run resumes, skipping the units
+    already terminal, whose review stands.
+    """
+    import artifact  # noqa: PLC0415
+    import transition  # noqa: PLC0415
+    batch = state.get("batch") or []
+    for uid, status in _batch_abandoned_units(root, batch):
+        print(f"sign: {uid} is {status} - ruled out, not built, so it is not moved")
+    units = _batch_story_units(root, batch)
+    owed = [(unit, unmet) for unit in units if (unmet := seal_bar_unmet(root, unit))]
+    for unit, unmet in owed:
+        print(f"sign STOPPED at {unit}: it owes: {'; '.join(unmet)}", file=sys.stderr)
+    if owed:
+        print("  nothing was moved and the run is still open - record the review each unit owes "
+              "(`critic.py brief --unit <id> --seat qa`, then `critic.py record`), then sign "
+              "again", file=sys.stderr)
+        return 1
+    pending, already, kept = [], 0, []
+    # A unit the close's retro carries with a usable ruling was ruled on and left where it stands
+    # on purpose (a not-stop-ship bug kept Open to watch it, say). The seal records that ruling;
+    # it never overrules it by moving the unit to its terminal status. The retro read is the one
+    # the filed page names, the one the close judged, never the latest that happens to mention
+    # the run; a row the close reads as no ruling (`ok` false) carries nothing here either.
+    retro_id, carried_rows, unread = _carried_rulings(Path(root), state, _filed_retro(root, state))
+    if unread:
+        print(f"sign: the carried known issues could not be read ({unread}) - no unit is held "
+              f"back as carried", file=sys.stderr)
+    carried = {sdlc_md.norm_id(str(r.get("id") or "")) for r in carried_rows or []
+               if r.get("id") and r.get("ok")}
+    for unit in units:
+        hit = sdlc_md.find_by_id(Path(root), unit)
+        # Each unit's OWN type decides its terminal: a bug's is `Fixed`, not `Done`.
+        terminal = _SIGNOFF_TERMINAL.get(hit[1], "Done")
+        status = sdlc_md.canonical_status(
+            sdlc_md.extract_field(hit[0].read_text(encoding="utf-8"), "Status"),
+            sdlc_md.status_vocab(hit[1], root))
+        if status == terminal:
+            already += 1
+        elif sdlc_md.norm_id(unit) in carried:
+            kept.append((unit, status))
+        else:
+            pending.append((unit, terminal))
+    for unit, status in kept:
+        print(f"sign: {unit} is carried as a known issue by {retro_id} - it stays {status}, "
+              f"not moved")
+    for unit, terminal in pending:
+        try:
+            if terminal == "Done":
+                artifact.close(root, unit)  # Done + cascade + telemetry; AC-verify gated
+            else:
+                # A bug's terminal runs the gate `transition.py` enforces by hand, not the
+                # Done-shaped `artifact.close`, so no route skips the checks its type demands.
+                transition.transition(root, unit, terminal)
+        except Exception as exc:  # noqa: BLE001 - a red terminal gate must stop the walk loudly
+            print(f"sign STOPPED at {unit}: {terminal} transition refused - {exc}",
+                  file=sys.stderr)
+            return 1
+        print(f"sign: {unit} -> {terminal}")
+    unfanned = _batch_unfanned_units(root, batch)
+    if unfanned:
+        # Named, never silently skipped, and stated beside the count so an outcome of
+        # goal-reached cannot be read over a batch that is not done.
+        print(f"sign: {len(unfanned)} batch unit(s) NOT reached - these are not terminal:",
+              file=sys.stderr)
+        for uid, kind, status in unfanned:
+            print(f"  {uid} ({kind}) is {status} - transition it before the run is read as "
+                  f"delivered", file=sys.stderr)
+    print(f"sign: {len(pending)} moved to their terminal status, {already} already there"
+          + (f", {len(kept)} carried and left as they stand" if kept else "")
+          + (f", {len(unfanned)} NOT reached (see above)" if unfanned else ""))
+    return 0
+
+
+def _declared_breakdown_ids(text: str) -> list[str]:
+    """The epic's declared breakdown ids - see `reconcile.declared_breakdown_ids`.
+
+    Delegates rather than parsing: the close-owed detector must read a breakdown exactly
+    the way this derivation does, and two private copies of the rule is how they drifted.
+    """
+    import reconcile  # noqa: PLC0415
+    return reconcile.declared_breakdown_ids(text)
+
+
+def _derive_parent_epics(root, units=None, who: str = "close") -> list[str]:
+    """Transition an epic whose breakdown units are ALL terminal to its derived terminal.
+
+    The per-unit cascade ticks an epic's breakdown checkbox but never sets the epic's own
+    Status, and with `two_backlog.enforce` off (the default) reconcile does not derive it
+    either - so after a close transitioned all of an epic's stories Done, the epic sat at
+    Draft and had to be moved by hand.
+
+    Deriving completion is a claim, so it is made only where the evidence is complete:
+
+    - Scoped to the PARENTS OF THIS RUN'S UNITS (`units`). A close must never write
+      completion onto an epic the run did not touch.
+    - An epic with no breakdown units is skipped: "no children" is not "all children
+      complete".
+    - An epic with any UNRESOLVABLE child - a breakdown id with no backing file, or a unit
+      with no Status - is skipped. Those are unknown, not finished, and treating them as
+      absent would mark an incrementally-written epic Done off its one delivered story.
+    """
+    import reconcile  # noqa: PLC0415
+    import transition  # noqa: PLC0415
+    root = Path(root)          # callers pass either; the census helpers need a Path
+    # No units means NOTHING to derive from - never "derive everywhere". A bug/CR-only batch
+    # yields no story units at all (`_batch_story_units` is story-scoped by design), so a
+    # truthiness escape here would silently restore the full-repo sweep on exactly the batch
+    # shape that has no business touching any epic.
+    wanted = {sdlc_md.norm_id(u) for u in (units or [])}
+    if not wanted:
+        return []
+    moved: list[str] = []
+    for epath in sdlc_md.artifact_files("epic", root):
+        text = sdlc_md.read_text_safe(epath)
+        eid = sdlc_md.extract_record_id(epath.stem) or epath.stem
+        if sdlc_md.is_terminal_status("epic", sdlc_md.canonical_status(
+                sdlc_md.extract_field(text, "Status"), sdlc_md.status_vocab("epic", root))):
+            continue                                   # already terminal: nothing to derive
+        declared = _declared_breakdown_ids(text)
+        if not declared:
+            continue                                   # no children to be complete
+        if not ({sdlc_md.norm_id(d) for d in declared} & wanted):
+            continue                                   # not this run's epic - not our claim
+        resolved = list(reconcile._breakdown_units(root, text))
+        if len(resolved) != len(declared):
+            print(f"{who}: {eid} not derived - {len(declared) - len(resolved)} of "
+                  f"{len(declared)} breakdown unit(s) could not be read (no file, or no "
+                  f"Status); an unreadable child is unknown, not done", file=sys.stderr)
+            continue
+        if not all(sdlc_md.is_terminal_status(utype, canon)
+                   for _ln, _ticked, _uid, utype, canon in resolved):
+            continue
+        # Done only when a unit was DELIVERED; an epic of abandoned units closes Superseded.
+        target = reconcile.epic_derived_status([(u, c) for _l, _t, _i, u, c in resolved])
+        try:
+            transition.transition(root, eid, target)
+            moved.append(eid)
+        except (ValueError, OSError) as exc:
+            print(f"{who}: {eid} not derived {target} ({exc})", file=sys.stderr)
+    return moved
+
+
+def _derive_parent_requests(root, scope_ids=None, who: str = "close") -> list[str]:
+    """Transition a parent request (CR/RFC) whose children are ALL terminal to its successful
+    terminal - the step the epic derivation leaves undone. `apply-signoff` derived the epics this
+    run completed, but a CR/RFC ABOVE those epics was left non-terminal, so an operator had to
+    hand-transition every delivered request to Complete.
+
+    Scoped to THIS run, like `_derive_parent_epics`: a request is derived only when one of its
+    children is a unit of this run (or an epic this close just derived). A request that was already
+    fully resolved before this run is left as ordinary drift for `reconcile` - a close must not
+    sweep and name in its own output requests it did not complete. `scope_ids=None` means unscoped
+    (every derivable request), for direct callers/tests; an explicit (possibly empty) scope filters.
+
+    Asks the SAME predicate the terminal gate enforces (every child resolved) and goes through
+    `transition`, so the index row, any parent cascade and the telemetry all happen exactly as a
+    hand transition would. A request with any non-terminal child is refused and left unchanged;
+    returns the ids actually derived."""
+    import reconcile  # noqa: PLC0415
+    import transition  # noqa: PLC0415
+    root = Path(root)
+    scope = None if scope_ids is None else {sdlc_md.norm_id(x) for x in scope_ids}
+    done: list[str] = []
+    for d in reconcile.derivable_request_drift(root, explain=False):
+        if scope is not None:
+            kids = {sdlc_md.norm_id(c) for c, _ in sdlc_md.children_of(root, d["id"])}
+            if not (scope & kids):
+                continue  # not a request this run completed - leave it as ordinary drift
+        target = sdlc_md.default_terminal_status(d["type"])
+        try:
+            transition.transition(root, d["id"], target)
+            done.append(d["id"])
+        except (ValueError, FileNotFoundError) as exc:  # a refusal is information, not a crash
+            print(f"{who}: {d['id']} not derived terminal ({str(exc).splitlines()[0]})",
+                  file=sys.stderr)
+    return done
+
+
+def _derive_close_parents(root, units, who: str) -> list[str]:
+    """Derive terminal the parent epics of `units` whose every child is terminal, then the
+    requests above them, printing each as `who`. Idempotent: an already-terminal parent is
+    skipped, so the reconcile step and the tail may both call it. Returns the ids derived."""
+    derived = _derive_parent_epics(root, units, who)
+    if derived:
+        print(f"{who}: derived {', '.join(derived)} terminal (all children terminal)")
+    # A request ABOVE those epics reaches its terminal by derivation too - run it AFTER the epics,
+    # so a CR/RFC whose last child was an epic just marked Done is now itself derivable and the
+    # close no longer leaves it for a manual `reconcile apply`. Scoped to this run's units plus the
+    # epics just derived, so the close never sweeps unrelated requests.
+    requests = _derive_parent_requests(root, scope_ids=list(units or []) + derived, who=who)
+    if requests:
+        print(f"{who}: derived parent request(s) {', '.join(requests)} terminal "
+              f"(all children resolved)")
+    return derived + requests
+
+
+def _apply_signoff_tail(root, state, units=None, retro_arg: str | None = None) -> int:
+    """The close tail: derive parent epics terminal, write the run's velocity row,
+    and run a final reconcile. The per-unit cascade ticks each epic's breakdown checkbox but
+    does not set the epic's own Status, so the derivation happens here - scoped to the
+    parents of THIS run's units, never the whole repo. Idempotent: an already-terminal epic
+    is skipped, the velocity row is upserted by retro id, and reconcile is read-only
+    detection."""
+    import reconcile  # noqa: PLC0415
+    import retro  # noqa: PLC0415
+    _derive_close_parents(root, units, "close")
+    # The run-state field is set only when THIS close scaffolded the retro. A retro made
+    # the documented way (`artifact.py new --type retro`) never sets it, so fall back to
+    # the id the close was given. With neither, say so - a close that skips the
+    # measurement it owes must not print unqualified success.
+    retro_id = (state.get("scaffolded_retro") or "").strip() or (retro_arg or "").strip()
+    if retro_id:
+        # `retro accuracy --write` records the velocity row (record_velocity), keyed by retro id so
+        # a re-run upserts rather than duplicating. Advisory: a mixed-model or unmeasured sprint
+        # refuses the accuracy row, and that refusal never fails the close.
+        # `--tokens-from-harness`: the close captures the sprint's harness-tracked token
+        # actual itself (or states why it could not) - the close is the one moment the
+        # current session IS the sprint's session, so the capture is attributed correctly.
+        rc, out = _run_cli(retro.main,
+                           ["--root", str(root), "accuracy", "--id", retro_id, "--write",
+                            "--tokens-from-harness"])
+        if rc == 0:
+            for line in out.splitlines():
+                if line.startswith("token actual"):
+                    print(f"close: {line}")
+            print(f"close: velocity row recorded for {retro_id}")
+        else:
+            print(f"close: velocity not recorded ({out.splitlines()[-1] if out else 'see retro'})")
+    else:
+        print("close: velocity NOT recorded - no retro id on the run state or the "
+              "command line; record it with `retro.py accuracy --id RETROxxxx --write`",
+              file=sys.stderr)
+    unconformant = _post_transition_conformance(root, units)
+    if unconformant:
+        # REPORTED, never a refusal. The harm this fixes is SILENCE - the next committer
+        # inheriting a red gate they did not cause and having to prove it was not theirs. Naming
+        # it here, attributed to this close, ends that. Failing instead would strand a completed
+        # and signed-off delivery behind ceremony debt the sign-off did not depend on.
+        print(f"close: the tree is NOT conformant after the transitions - "
+              f"{', '.join(unconformant)}. The close's earlier gate judged these at Review, "
+              f"where the evidence they now owe was not required. Clear them (`verify_ac` then "
+              f"back-annotate `- **Verified:**`) - otherwise the next commit inherits this.",
+              file=sys.stderr)
+    rc, _ = _run_cli(reconcile.main, ["detect", "--root", str(root)])
+    if rc != 0:
+        # Same exemption as the close's reconcile step, and for the same reason: a derivable
+        # request another gate refuses cannot be cleared by the command this message names, so
+        # blocking on it strands the sign-off behind a decision nobody in this run can make.
+        blocked = [d for d in reconcile.derivable_request_drift(root) if d.get("blocked_by")]
+        if not (blocked and _only_blocked_derivable_drift(root, blocked)):
+            print("close: final reconcile reports drift - run `reconcile.py apply`",
+                  file=sys.stderr)
+            return 1
+        print(f"close: {len(blocked)} request(s) awaiting another gate "
+              f"({', '.join(d['id'] for d in blocked)}) - reported, not clearable by apply")
+    # THE GATE MUST JUDGE THE STATE THE CLOSE LEAVES BEHIND, not the one it started from. The
+    # chain runs `gate` at step 4, while every unit still sits at Review; this cascade then moves
+    # them to Done, and conformance requires evidence at Done that Review does not. So a close
+    # could print `gate: ok` and still leave the tree red - which is what happened, and the next
+    # person to commit inherited a failure they did not cause and had to prove was not theirs.
+    # A step reporting a superseded state is the defect class this ordering exists to avoid.
+    # The anchor is stamped by the chain's review-anchor step and re-stamped by `sign`, the one
+    # step that changes what it says: the tail signs nothing.
+    _finalise_outcome(root, state)
+    record_close_tree(root)
+    return 0
+
+
+def _post_transition_conformance(root, units=None) -> list[str]:
+    """The units this close left non-conformant, judged AFTER their Done transitions.
+
+    Scoped to THIS run's units: a close reports the state it created, never the whole repo's
+    pre-existing debt. Fail-safe - a conformance error must not lose a completed sign-off, so an
+    unreadable census reports nothing rather than raising."""
+    try:
+        import conformance  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+        result = conformance.detect_conformance(Path(root))
+    except Exception as exc:  # noqa: BLE001 - never lose a sign-off to a census error
+        sdlc_md.debug("sprint._post_transition_conformance", exc)
+        return []
+    # AN EMPTY SCOPE IS NOT "EVERYTHING". `_batch_story_units` is story-scoped, so a BUG-ONLY
+    # batch - the themed clearance shape this project runs constantly - yields no units, and a
+    # truthiness escape then reported every non-conformant unit in the repo as though this close
+    # had caused it. `_derive_parent_epics` guards the identical hazard a hundred lines above.
+    if not units:
+        return []
+    scope = {sdlc_md.norm_id(u) for u in units}
+    out = []
+    for unit in result.get("units", []):
+        if unit.get("conformant") or unit.get("exempt"):
+            continue
+        uid = sdlc_md.norm_id(str(unit.get("id") or ""))
+        if scope and uid not in scope:
+            continue
+        out.append(f"{uid} (missing: {', '.join(unit.get('missing') or []) or 'unstated'})")
+    return sorted(out)
+
+
+def _finalise_outcome(root, state) -> None:
+    """Record the outcome the completed close earned, at the end of the SUCCESS path.
+
+    The outcome field was written on every failure path - blocked, budget spent, an
+    operator stop - and forgotten here, so a run that stopped earlier and then completed
+    its whole close chain kept `stopped`. Run state is archived per cycle, so that is the
+    permanent record, and every consumer of the archive (sprint report, velocity, boundary
+    regeneration, the close-owed detector) then reads a goal-reached sprint as an abandoned
+    one.
+
+    Only an `achieved` verdict promotes: following the fact that a close RAN rather than
+    what it judged would make every close report goal-reached, which is this same defect
+    inverted. A `partial` or `missed` verdict leaves the recorded outcome alone, because
+    the vocabulary has no term for "closed cleanly, goal not met" and inventing a fifth is
+    a schema change, not a bug fix. `close_run` is documented idempotent and re-stamps the
+    outcome, so this is its intended use rather than a blind overwrite.
+    """
+    live = run_state.read(root)
+    verdict = ((live.get("sprint_goal_verdict") or state.get("sprint_goal_verdict") or {})
+               .get("verdict"))
+    if verdict != "achieved":
+        return
+    if live.get("outcome") == run_state.GOAL_REACHED:
+        return                               # already stamped; do not re-stamp `ended_at`
+    if live.get("outcome") not in run_state.CLOSED:
+        # PROMOTE a closed outcome; never CLOSE an open run. BG0208 is about a run that ended
+        # `stopped` and then completed its chain with an `achieved` verdict - the archive read
+        # it as abandoned, and promoting it is the fix. An OPEN run is a different animal: under
+        # D0213 ending it belongs to SEAL, so stamping it here sealed the run with nothing
+        # signed on it and `sign` then refused its own run as already sealed. Measured on
+        # RUN-01M2SPNS, whose PREPARE filed RPT0001 and closed the run in the same breath.
+        return
+    # `close_run` re-stamps `ended_at` to now. When the close and a later `--apply-signoff`
+    # are separated in time, that would stretch the archived run's elapsed span, which
+    # `retro` reads - so the original end time is put back. The outcome is the correction;
+    # when the run ENDED is not.
+    ended_at = live.get("ended_at")
+    try:
+        run_state.close_run(root, run_state.GOAL_REACHED, handoff=live.get("handoff"))
+    except (OSError, ValueError) as exc:   # never lose a completed ceremony to its own bookkeeping
+        print(f"outcome not stamped goal-reached ({exc}) - the close itself completed; "
+              f"re-stamp with `run_state.close_run`", file=sys.stderr)
+        return
+    if ended_at:
+        # Reported separately from the stamp above: a failure HERE leaves the outcome
+        # correctly promoted, so saying "not stamped" would be a wider claim than the fact.
+        try:
+            run_state.update(root, ended_at=ended_at)
+            run_state.archive(root, run_state.read(root))   # keep the archive in step
+        except (OSError, ValueError) as exc:
+            print(f"outcome stamped goal-reached, but `ended_at` was left at the re-stamped "
+                  f"time ({exc}) - the archived elapsed span reads long", file=sys.stderr)
+    print("close: run outcome recorded goal-reached")
+
+
+def _tell_the_operator(root, deferred: list | None = None) -> None:
+    """Emit the close report: shipped, carried, cost, findings, and any deferrals.
+
+    Being informed is the operator's half of human-in-the-lead. A report that exists only as a
+    function nobody calls tells nobody anything - which is what shipped, and what US0604 asked
+    for. Advisory like `_draw_report`: a missing report must never lose a completed ceremony.
+
+    `deferred` is passed by the `--file-and-close` route alone. That route returned before both
+    of the emitters, so the one exit designed for a close that could NOT complete cleanly was
+    the one that reported least - and it is exactly where the account matters most.
+    """
+    # BOTH deferred siblings, not just one. `critic` has no module-scope import in this file -
+    # every use is a local one - so reading the review rounds below without importing it here
+    # raised NameError for any non-empty batch, and the advisory `except` swallowed it. The
+    # report therefore printed only when the batch was empty, which no real close has: the
+    # feature was dead on arrival at the one input it exists to serve.
+    try:
+        # INSIDE the advisory `try`, not above it. Both imports sat outside, so an ImportError -
+        # a consuming project without `critic.py`, a partial install, a syntax error introduced
+        # in a sibling - escaped this function AFTER the close had already completed every
+        # step. The whole principle here is that the close outranks its own report: a missing
+        # report must never lose a completed ceremony, and an import that throws from outside
+        # the guard does exactly that. The guard covered the body and left the door open.
+        import critic  # noqa: PLC0415 - deferred, like the chain's sibling imports
+        import sprint_report  # noqa: PLC0415 - deferred, like the chain's sibling imports
+        state = run_state.read(root) or {}
+        batch = [sdlc_md.norm_id(u) for u in (state.get("batch") or [])]
+        shipped, carried = [], []
+        for uid in batch:
+            found = sdlc_md.find_by_id(root, uid)
+            text = sdlc_md.read_text_safe(found[0]) if found else ""
+            status = (sdlc_md.extract_field(text or "", "Status") or "").strip()
+            # Terminal per the unit's OWN type, which `find_by_id` already returns - a story's
+            # terminal set is not a bug's, and either hardcoded here misreports the other. No
+            # `hasattr` guard: a renamed accessor must break loudly, not silently report every
+            # unit carried.
+            terminal = sdlc_md.terminal_statuses(found[1]) if found else set()
+            (shipped if status in terminal else carried).append(
+                f"{uid} ({status or 'unresolved'})")
+        findings = []
+        for uid in batch:
+            for row in critic.unit_review_rounds(root, uid):
+                if str(row.get("verdict", "")).upper() == "REJECT":
+                    findings.append(f"{uid}: REJECT by {row.get('reviewer') or 'unknown'}")
+        print()
+        print(sprint_report.close_report({
+            "run_id": state.get("run_id"),
+            "shipped": shipped, "carried": carried, "findings": findings,
+            "cost": _close_cost(root, state, shipped),
+            "deferred": deferred or [],
+        }))
+    except Exception as exc:  # noqa: BLE001 - advisory: the close outranks its own report
+        print(f"close: close report not emitted ({type(exc).__name__}: {exc}) - the close is "
+              f"unaffected", file=sys.stderr)
+
+
+def _close_cost(root, state: dict, shipped: list) -> dict:
+    """Tokens and points for the close report. An unavailable figure is left ABSENT rather than
+    zeroed - `close_report` names an absent cost absent, and "not attributable" and "nothing
+    spent" are different facts."""
+    cost: dict = {}
+    # `token_forecast` is written as a plain INT by the plan,
+    # so `.get("actual")` on it raised AttributeError for every run that carried a forecast -
+    # swallowed by the report's advisory `except`, which is why the report went missing rather
+    # than complaining. Both shapes are read here: the mapping a later schema may use, and the
+    # int the plan writes today. A forecast is not an actual, so it is NOT reported as the
+    # spend - an absent actual stays absent, which `close_report` names absent.
+    forecast = state.get("token_forecast")
+    tokens = forecast.get("actual") if isinstance(forecast, dict) else None
+    if isinstance(tokens, int):
+        cost["tokens"] = tokens
+    # D0390: the headline is the run's priced cost, from its meter over the window the page
+    # measured to, as `sprint_report._ck_cost` reads it. A run whose stamps carry no priced
+    # figure keeps the line it had.
+    import sprint_report  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+    metered = sprint_report._metered(state, sprint_report._at(state.get(REPORT_WINDOW_END)))
+    total = run_state.run_token_total(metered)
+    if isinstance(total.get("priced"), int):
+        # A delegated total the run's actual adds is outside the priced figure, and is said so.
+        actual, agents = sprint_report._run_tokens_actual(metered, total)
+        cost.update(priced=total["priced"], components=total["components"],
+                    includes_subagents=total["includes_subagents"],
+                    supplied=(actual - total["tokens"]) if agents else 0, agents=agents,
+                    rebased=total.get("rebased") or 0)
+    points = 0
+    for entry in shipped:
+        found = sdlc_md.find_by_id(root, entry.split()[0])
+        if not found:
+            continue
+        raw = (sdlc_md.extract_field(sdlc_md.read_text_safe(found[0]) or "", "Points") or "")
+        try:
+            points += int(raw.strip())
+        except (TypeError, ValueError):
+            continue
+    if points:
+        cost["points"] = points
+    return cost
+
+
+def _draw_report(root, retro_id) -> None:
+    """Draw the sprint report on the page the operator signs off, immediately before the
+    decision brief - what the sprint delivered and cost belongs in the decision, not in a
+    command someone has to remember afterwards.
+
+    Read-only and advisory, so it is idempotent across a resumed close and CANNOT fail one:
+    `report.enabled: false` skips the page (the switch gates drawing only), an uncomposable
+    report is rendered as `unavailable`, and any error is noted on stderr and stepped over.
+    Never the reverse - a missing garnish must not lose a completed ceremony."""
+    import sprint_report  # noqa: PLC0415 - deferred, like the chain's sibling imports
+    try:
+        if not sprint_report.rendering_enabled(Path(root)):
+            return
+        print(sprint_report.render(sprint_report.report(root, retro_id)))
+        print()
+    except Exception as exc:  # noqa: BLE001 - advisory: the close outranks its own report
+        print(f"close: sprint report not drawn ({type(exc).__name__}: {exc}) - the close is "
+              f"unaffected; draw it with `sprint.py report --id {retro_id}`", file=sys.stderr)
+
+
+def _pre_delivery_status(root, unit: str) -> str:
+    """The unit's status when it is BEFORE delivery, or "" when it is not (or cannot be read).
+
+    Derived from the shared vocabulary rather than from a list of `Ready` and `In Progress` kept
+    here: a project that adds its own pre-delivery status would be exempted by a name list, which
+    is the enumeration failure this repository keeps meeting. A unit is pre-delivery when its
+    status is neither TERMINAL nor AWAITING SIGN-OFF, and both predicates are asked of their one
+    owner - `sdlc_md.is_terminal_status`, and `critic.is_awaiting_signoff` beside
+    `awaits_only_signature`, the close's own hold predicate. The status alone is not enough: a
+    story or bug with an independent delivery APPROVE owes only the signature at any
+    pre-terminal status, and a bug has no Review status to be moved to.
+
+    Unreadable answers "" - cannot say is not the same as not delivered.
+    """
+    import critic  # noqa: PLC0415 - deferred sibling, as elsewhere in the close path
+    try:
+        found = sdlc_md.find_by_id(Path(root), unit)
+        if not found:
+            return ""
+        path, type_ = found
+        text = sdlc_md.read_text_safe(path)
+        status = sdlc_md.canonical_status(sdlc_md.extract_field(text, "Status"),
+                                          sdlc_md.status_vocab(type_, Path(root)))
+        if not status or sdlc_md.is_terminal_status(type_, status):
+            return ""
+        if critic.is_awaiting_signoff(status) or awaits_only_signature(root, unit, type_, status):
+            return ""
+        return status
+    except Exception as exc:  # noqa: BLE001 - a read-only report never fails the preflight
+        sdlc_md.debug("sprint._pre_delivery_status", exc)
+        return ""
+
+
+def _delivery_evidence(root, unit: str) -> str:
+    """Why this unit looks DELIVERED to git, or "" when it does not.
+
+    Two signals, and the stronger one is preferred because they discriminate differently:
+
+    * a commit in the run window whose MESSAGE names the unit id. Decisive - nothing else names
+      a unit in a commit subject.
+    * a commit in the run window touching the unit's declared `Affects`. Weaker, because a
+      sibling unit sharing a file makes it true too, so it is reported in those words rather
+      than as proof. It is kept because it is the signal that catches the commit whose subject
+      forgot the id, which is the population this check exists for.
+
+    The window is the run's own recorded base ref, not a date: `git log <base>..HEAD` is exactly
+    "what this run committed", and a `--since` on the wall clock would sweep in a neighbouring
+    run's commits on a busy day. No base ref recorded means no window, so no claim is made.
+    """
+    base = str((run_state.read(root) or {}).get(run_state.BASE_REF) or "")
+    if not base:
+        return ""
+    named = _git(root, "log", "--format=%H", f"{base}..HEAD", "--grep", unit, "-i")
+    if named and named.returncode == 0 and named.stdout.strip():
+        n = len(named.stdout.split())
+        return f"{n} commit(s) in this run name it"
+    text = sdlc_md.read_text_safe(Path(sdlc_md.find_by_id(Path(root), unit)[0]))
+    paths = sdlc_md.affects_files(text)
+    if not paths:
+        return ""
+    touched = _git(root, "log", "--format=%H", f"{base}..HEAD", "--", *paths)
+    if touched and touched.returncode == 0 and touched.stdout.strip():
+        n = len(touched.stdout.split())
+        return (f"{n} commit(s) in this run touch its declared Affects "
+                f"({', '.join(paths[:3])}{', ...' if len(paths) > 3 else ''})")
+    return ""
+
+
+def run_rung(state) -> str:
+    """The rung this run was opened at, lowercased; `done` (the build rung) when unset.
+
+    THE reader for the close chain - `refresh_review_anchor`, the grooming report, the
+    seal's re-stamp, `undelivered_blockers` and `_seal_preview` all come here, and
+    the three that derived it inline were converted rather than left beside this one. A review
+    of the first cut of this function caught it claiming to be the single reader while adding a
+    fifth spelling and consolidating none, which is the claim-versus-code gap the `claim-drift`
+    lane exists to report.
+
+    It matters because a second derivation is exactly how BG0582 happened: `anchor_status_block`
+    knew the rung and stated that a design rung's "done-gate refusals are the gate working",
+    while every lane that could actually refuse read no rung at all. A fact with two owners is a
+    fact with one wrong owner. The `plan`/`triage` half of that same gap was still live in the
+    inline `str(st.get("goal") or "").lower() == "design"` this replaced.
+
+    The planner's own goal-review readers are deliberately NOT folded in: they normalise a
+    Sprint Goal string, a different fact that happens to share the key name.
+    """
+    return str((state or {}).get("goal") or "done").strip().lower() or "done"
+
+
+def _rung_product_blockers(root, state, rung: str) -> list:
+    """What a NON-`done` rung owes at its close: its own product, not a delivery terminal.
+
+    THE HALF THAT MAKES THIS A FIX RATHER THAN A BYPASS. Skipping the delivery gates for a
+    design rung is correct - its units end at Ready with red criteria by design - but skipping
+    them and checking NOTHING would close any run that declared a rung, which is a far worse
+    defect than the one being repaired. A rung is exempt from the OTHER rung's bar, never from
+    a bar.
+
+    So the delivery question ("did the status move?") is replaced by the grooming question
+    ("did this rung produce what it exists to produce?"), asked of `conformance.unit_is_ungroomed`
+    - the one definition, the same one `sprint plan` and `transition` consult, never a second.
+    """
+    import conformance  # noqa: PLC0415 - deferred; one definition of "ungroomed", never a second
+    out: list[dict] = []
+    units = [u for u in (sdlc_md.norm_id(x) for x in (state.get("batch") or [])) if u]
+    # DID THE RUNG PRODUCE ANYTHING? A batch groomed BEFORE the run opened, with no commit in
+    # the run naming any of its units, closes identically to one that groomed everything - the
+    # per-unit checks below all pass, because they ask whether the product EXISTS rather than
+    # whether this run made it. Reported once for the batch, not per unit: the finding is about
+    # the run.
+    pre_work = {u for u in units if _unit_recorded_as_pre_work(state, u)}
+    judged = [u for u in units if u not in pre_work]
+    if judged and not _rung_touched_any(root, state, judged):
+        out.append({"stage": "status",
+                    "cause": f"a `{rung}` rung produced nothing in this run",
+                    "detail": (f"every unit in this batch was already groomed when the run "
+                               f"opened and no commit in the run names one of them, so this "
+                               f"close cannot be told from one where the rung did nothing. "
+                               f"Units judged: {', '.join(sorted(judged))}"
+                               + (f"; recorded as pre-work and not judged: "
+                                  f"{', '.join(sorted(pre_work))}" if pre_work else "")),
+                    "remedy": ("record what this rung produced - or close it `partial` with "
+                               "`sprint.py close --goal-verdict partial --note '<why>'`, which "
+                               "is the honest verdict for a rung that found its work done")})
+    for unit in units:
+        try:
+            found = sdlc_md.find_by_id(Path(root), unit)
+            if not found:
+                continue
+            path, type_ = found
+            # The SAME predicate the report uses, so the two cannot disagree about WHAT WAS
+            # GROOMED - and only about that. A type this rung cannot grade is treated as having
+            # nothing outstanding and then falls through to the TERMINAL question below, which is
+            # a different question with a real answer for it: an epic holds `Ready`, so a design
+            # rung does move one. `continue`ing here instead skipped both, and silently reverted
+            # the terminal check BG0588 shipped.
+            if _rung_grades(type_):
+                ungroomed, why = conformance.unit_is_ungroomed(
+                    type_, sdlc_md.read_text_safe(path))
+            else:
+                ungroomed, why = False, ""
+        except Exception as exc:  # noqa: BLE001 - a read-only report never fails the preflight
+            sdlc_md.debug("sprint._rung_product_blockers", exc)
+            continue
+        if not ungroomed:
+            # GROOMED IS NOT FINISHED. A unit whose criteria are authored and which sits at
+            # Draft or Blocked has the rung's product and has not reached the rung's terminal,
+            # so the close read it as complete. The rung is exempt from the build rung's bar,
+            # not from having a terminal of its own.
+            terminal = RUNG_TERMINALS.get(rung.lower(), RUNG_TERMINALS["done"])
+            status = (sdlc_md.extract_field(sdlc_md.read_text_safe(path), "Status") or "").strip()
+            vocab = sdlc_md.status_vocab(type_, Path(root))
+            canon = sdlc_md.canonical_status(status, vocab)
+            if canon and canon != terminal and terminal in vocab:
+                out.append({"stage": "status",
+                            "cause": f"a `{rung}` rung unit is groomed but not at its terminal",
+                            "detail": (f"{unit}: this run's rung is `{rung}`, whose terminal is "
+                                       f"`{terminal}`, and this unit is groomed but sits at "
+                                       f"`{status or '?'}`. Producing the criteria and leaving "
+                                       f"the unit short of the terminal closes a run that did "
+                                       f"only half of what the rung exists to do"),
+                            "remedy": (f"move {unit} to `{terminal}`, or drop it from the batch "
+                                       f"with `sprint.py batch drop --id {unit} "
+                                       f"--reason '<why>'`")})
+            continue
+        out.append({"stage": "status",
+                    "cause": f"a `{rung}` rung did not produce its own output",
+                    "detail": (f"{unit}: this run's rung is `{rung}`, whose product is authored "
+                               f"acceptance criteria rather than a delivery - and this unit is "
+                               f"still ungroomed ({why}). The rung is exempt from the build "
+                               f"rung's bar, not from its own"),
+                    "remedy": (f"groom {unit} - author criteria whose `Verify:` line executes - "
+                               f"or drop it from the batch with `sprint.py batch drop --id "
+                               f"{unit} --reason '<why>'`")})
+    return out
+
+
+
+def _unit_recorded_as_pre_work(state: dict, unit: str) -> bool:
+    """Was this unit declared as PRE-WORK when the batch was formed?
+
+    A legitimate close may carry a unit somebody groomed before the run - what it may not do is
+    let that be invisible. Declared pre-work is named and not judged; undeclared pre-work is
+    exactly the shape the batch-level check above refuses.
+    """
+    declared = state.get("pre_work") or state.get("prework") or []
+    return sdlc_md.norm_id(unit) in {sdlc_md.norm_id(x) for x in declared if x}
+
+
+def _rung_touched_any(root, state: dict, units: list) -> bool:
+    """True when any commit in the run names one of these units.
+
+    Read-only and SILENT WHEN GIT CANNOT ANSWER: a run whose history cannot be read is not
+    accused of having produced nothing, which is the same rule `undelivered_blockers` follows.
+    """
+    base = (state.get("base_ref") or "").strip()
+    if not base:
+        return True                       # unanswerable, so not accused
+    try:
+        res = _git(root, "log", f"{base}..HEAD", "--format=%s%n%b")
+        if res.returncode != 0:
+            return True
+        out = res.stdout
+        log = (out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)).upper()
+    except Exception as exc:  # noqa: BLE001 - a read-only report never fails the preflight
+        sdlc_md.debug("sprint._rung_touched_any", exc)
+        return True
+    return any(sdlc_md.norm_id(u).upper() in log for u in units)
+
+
+def undelivered_blockers(root, state) -> list:
+    """Batch units whose code landed and whose STATUS never moved, as preflight blockers.
+
+    THE FIRST QUESTION the close should ask, and until now nothing asked it. Eight of one run's
+    twelve units were committed with a green suite and left at `Ready`; the close then reported
+    twenty unmet prerequisites across four categories - no review coverage, no verdict, no
+    sign-off, a blocked Done gate on each story - and not one of them named the cause. Every
+    message described a downstream consequence of a status that had not moved, so the run was
+    held open for over a day while the real fault was one command away.
+
+    It belongs in the PRE-FLIGHT rather than at the sign-off step because the pre-flight is the
+    command that promises every blocker in one pass, and a blocker it cannot see makes the other
+    nineteen unreadable.
+
+    Read-only, and silent when git cannot answer: a unit whose delivery cannot be evidenced is
+    not accused of anything.
+
+    RUNG-AWARE. "Its status never moved" presumes the build rung's terminal. On a
+    `design` rung the units correctly END at Ready with red criteria, and the commits this
+    function reads as "code landed" are the GROOMING itself - so the inference is wrong at the
+    root, not merely strict. Such a run is judged against its own product instead.
+
+    SCOPED TO `design`, NOT TO "not `done`", and the distinction is the whole of a review
+    finding against the first cut of this repair. `plan` and `triage` are also non-build rungs
+    and their product is NOT grooming - `--goal plan` selects, sequences and estimates, then
+    stops. Judging them against the design rung's output told a plan run it "did not produce its
+    own output ... authored acceptance criteria", which is false, and because `status` is not a
+    deferrable stage it also made such a run refuse `--file-and-close`. That is the filed defect
+    MOVED one rung over rather than closed. Those rungs keep the behaviour they already had -
+    EXACTLY it, which is the bar: a plan-rung unit whose code landed in the window is accused
+    here, as it was before this function knew about rungs at all. Whether that question is the
+    right one to ask a plan rung is a separate argument this repair deliberately does not make.
+    """
+    rung = run_rung(state)
+    if rung == "design":
+        return _rung_product_blockers(root, state, rung)
+    out: list[dict] = []
+    for unit in [u for u in (sdlc_md.norm_id(x) for x in (state.get("batch") or [])) if u]:
+        try:
+            status = _pre_delivery_status(root, unit)
+            if not status:
+                continue
+            evidence = _delivery_evidence(root, unit)
+        except Exception as exc:  # noqa: BLE001 - a read-only report never fails the preflight
+            sdlc_md.debug("sprint.undelivered_blockers", exc)
+            continue
+        if not evidence:
+            continue
+        out.append({"stage": "status",
+                    "cause": "a unit was delivered and never transitioned",
+                    "detail": (f"{unit}: its code landed - {evidence} - and its status is still "
+                               f"{status!r}, which is neither terminal nor awaiting sign-off. "
+                               f"Every review, sign-off and Done-gate blocker reported below "
+                               f"for it is a consequence of this"),
+                    "remedy": _status_remedy(root, unit)})
+    return out
+
+
+def _status_remedy(root, unit: str) -> str:
+    """What moves a delivered, untransitioned unit on, in transitions its type HAS.
+
+    The move to the type's review status when its vocabulary carries one (a story's Review).
+    A bug has none, and is answered by the independent review itself, which lets the signature
+    seal it where it stands (`awaits_only_signature`). Any other kind without one - a CR, which
+    `sign` never moves - is moved to its type's delivered terminal.
+    """
+    import critic  # noqa: PLC0415 - deferred sibling, as elsewhere in the close path
+    try:
+        found = sdlc_md.find_by_id(Path(root), unit)
+        type_ = found[1] if found else ""
+        vocab = sdlc_md.status_vocab(type_, Path(root))
+    except Exception as exc:  # noqa: BLE001 - a read-only report never fails the preflight
+        sdlc_md.debug("sprint._status_remedy", exc)
+        return "move it to its type's terminal"
+    review = next((s for s in vocab if critic.is_awaiting_signoff(s)), "")
+    if review:
+        return (f"`transition.py set --id {unit} --status {review}` (then the sign-off steps), "
+                f"or move it to its type's terminal")
+    if type_ in _SIGNOFF_TERMINAL:
+        return (f"record its independent review, `critic.py record --unit {unit} --verdict "
+                f"APPROVE --reviewer <who> --author <who>` ({type_} has no review status; "
+                f"`sprint.py sign` then moves it to {_SIGNOFF_TERMINAL[type_]})")
+    done = next((s for s in vocab if sdlc_md.is_delivered_terminal(type_, s)), "")
+    if done:
+        return f"`transition.py set --id {unit} --status {done}`, its type's terminal"
+    return "move it to its type's terminal"
+
+
+def coverage_blockers(root, state) -> list:
+    """The review-coverage chain step, asked READ-ONLY, as a list of preflight blockers.
+
+    Module-level rather than a closure so it can be tested by CALLING it. The first test of
+    this asserted the call site's text appeared in `close_preflight`'s source - which the
+    closure's own `def` line supplied, so deleting the call left the test green."""
+    batch = [u for u in (sdlc_md.norm_id(x) for x in (state.get("batch") or [])) if u]
+    if not batch:
+        return []
+    try:
+        missing = uncovered_units(root, batch)
+    except Exception as exc:  # noqa: BLE001 - a read-only report never fails the preflight
+        sdlc_md.debug("sprint.coverage_blockers", exc)
+        return []
+    if not missing:
+        return []
+    return [{"stage": "review-coverage",
+             "detail": (f"{len(missing)} of {len(batch)} unit(s) are covered by no independent "
+                        f"review: {', '.join(sdlc_md.display_id(root, u) for u in missing[:8])}"
+                        f"{', ...' if len(missing) > 8 else ''}"),
+             "remedy": ("review each one and record its delivery verdict with "
+                        "`critic.py record --units <ids> --reviewer <who> --author <who> "
+                        "--verdict APPROVE` - a self-review does not clear it")}]
+
+
+def close_preflight(root, retro_id: str | None = None, *, record_cost: bool = True,
+                    goal_verdict: str | None = None, writes_anchor: bool = False) -> dict:
+    """Every unmet close prerequisite, in ONE read-only pass.
+
+    The close is a chain that stops at its first failure, and the sign-off prerequisites are not
+    part of the gate block at all - they surface only after the whole chain has passed. So a
+    close took as many invocations as it had unmet prerequisites, each costing a full gate run,
+    and it read as the tool moving the goalposts. Every fact below was available before the
+    first attempt.
+
+    PERFORMS NO STEP OF THE CLOSE. It scaffolds no retro, regenerates no summary and records no
+    verdict, so it can be asked the question without committing to a close. That is also why it
+    cannot simply run the chain with a dry-run flag: three of the chain's steps exist to DO
+    something, and a preview that performed half a close would be a worse answer than none.
+
+    It makes exactly ONE write, and it is a measurement rather than an action: the seconds its
+    own gate run cost, appended to the test-execution ledger. `record_cost=False` suppresses
+    even that, for the ONE caller whose contract is stricter still - `close --dry-run`, a
+    preview that must leave the tree byte-identical. The default is to record, so a caller that
+    forgets fails towards a measured close rather than an unmeasured one. Every attempt used to run a full
+    gate and record nothing, so the close's cost report was the chain's single run standing for
+    all of them. The `preflight` mode keeps that row out of the reuse path - see
+    `reusable_close_verdict`, where only a `full` run is reusable, because the pre-flight's gate
+    scopes conformance to the batch and the chain's does not.
+
+    Returns {"ready": bool, "blockers": [{"stage", "detail", "remedy"}],
+    "gate_ran": bool}. `gate_ran` is load-bearing: the dry run reports the gate's
+    verdict from here rather than re-running it, and an early return that never
+    reached the gate must not be reportable as a gate that passed.
+
+    `goal_verdict` is the verdict the calling close records before its chain runs: the run is
+    judged as it will stand once recorded, so neither the goal-verdict row nor the checklist's
+    goal-judged row is listed. With `writes_anchor` - the caller's close runs the chain whose last
+    step writes the review anchor, which `--file-and-close` never does - a review-currency lane
+    the close's own output alone fails is not listed either, as the gate step does not count it.
+    """
+    import gate   # noqa: PLC0415 - deferred, so `plan` never pays for the gate import graph
+    import retro  # noqa: PLC0415 - deferred, like the planner's retro import
+    root = Path(root)
+    blockers: list[dict] = []
+
+    def block(stage: str, detail: str, remedy: str) -> None:
+        blockers.append({"stage": stage, "detail": detail, "remedy": remedy})
+
+
+    try:
+        state = run_state.read(root)
+    except run_state.RunStateError as exc:
+        return {"ready": False, "gate_ran": False,
+                "blockers": [{"stage": "run-state", "detail": str(exc),
+                              "remedy": "repair or remove the run state"}]}
+    if not state:
+        return {"ready": False, "gate_ran": False, "blockers": [{
+            "stage": "run-state", "detail": "no run state",
+            "remedy": "`sprint plan --write` opens the run this close would end"}]}
+    if not state.get("sprint_goal"):
+        block("sprint-goal", "no sprint goal recorded on this run",
+              "set one at plan time with --sprint-goal; a close cannot invent what the run "
+              "aimed at")
+    if not (state.get("sprint_goal_verdict") or goal_verdict):
+        block("goal-verdict", "the Sprint Goal is unjudged",
+              '`sprint.py goal-verdict --verdict achieved|partial|missed --note "..."`')
+    # AHEAD of the review-coverage check, because it is upstream of it in fact as well as in
+    # order: a unit that was never transitioned has no coverage, no verdict and no sign-off
+    # BECAUSE of that, and reporting the consequences first buries the cause under them.
+    for entry in undelivered_blockers(root, state):
+        blockers.append(entry)
+    for entry in coverage_blockers(root, state):
+        block(entry["stage"], entry["detail"], entry["remedy"])
+
+    # The retro: reported, never scaffolded. `close` mints one when omitted; that is an action.
+    if retro_id:
+        try:
+            res = retro.validate(root, retro_id)
+        except (OSError, ValueError) as exc:
+            block("retro", f"{retro_id}: {exc}", "fix the retro, or name the right id")
+        else:
+            for err in res.get("errors", []):
+                block("retro", f"{retro_id}: {err}", "fill the retro's missing sections")
+    else:
+        block("retro", "no retro named",
+              "`sprint.py close` scaffolds one and stops, or pass --retro RETROxxxx")
+
+    # The compulsory checklist - chain step 6, and until now the one chain step the pre-flight
+    # never asked about. It ran the gate, the coverage rules and the sign-off prerequisites, said
+    # READY, and the close then died at step 6 on rows that had been readable from the first
+    # attempt. Measured on the run that paid for this: the close attempts recorded 1, 1, 1, 1, 0
+    # outstanding across six rounds, three of them reporting a single gate item and then stopping
+    # on checklist rows nothing had looked at.
+    #
+    # Only with a retro named, because the checklist is composed FOR one - and when none is named
+    # the retro blocker above already says so, so a second blocker would be one fact twice.
+    if retro_id:
+        answered = {"goal-judged"} if goal_verdict else set()
+        for entry in _checklist_blockers(root, retro_id, state, answered=answered):
+            # Appended WHOLE, never rebuilt through `block()`. That helper takes three strings and
+            # constructs a fresh dict, so it silently drops `blocking` - and `_checklist_blockers`
+            # is the one producer that sets it False, for an expired window. Rebuilt, the entry
+            # arrived flagless, `held_blockers` defaulted it to held, and the close was stopped by
+            # the exact row this change claims to have stopped holding it. The claim was in the
+            # changelog and in the comment beside this line, in the past tense, while the code did
+            # the opposite: found by an independent pass driving `close_preflight` with one expired
+            # item and nothing else wrong.
+            blockers.append(entry)
+
+    # The gate block, which already reports all of its lanes at once. Conformance is scoped to
+    # THIS run's batch: on a clean tree the diff scope is empty, so the unscoped lane judges the
+    # whole workspace and an out-of-batch unit's debt - a different author, a different epic -
+    # blocks a fully delivered in-batch close. The batch is what this close owns.
+    batch_scope = {sdlc_md.norm_id(b) for b in (state.get("batch") or [])}
+    gate_ran = False
+    import time  # noqa: PLC0415 - local, only this path measures
+    started = time.monotonic()
+    try:
+        report = gate.run_gate(str(root), require_retro=retro_id, require_review=True,
+                               conformance_scope=batch_scope)
+    except Exception as exc:  # noqa: BLE001 - a broken lane must not hide the other blockers
+        block("gate", f"gate could not run: {exc}", "run `gate.py` directly for detail")
+    else:
+        gate_ran = True
+        # THE PRE-FLIGHT'S OWN GATE, MEASURED. Every attempt ran one and recorded none, so
+        # `close_cost` reported the chain's single run as the whole cost of a close: one row of
+        # 77.6s stood for 21m27s of actual attempts on RUN-01KZ79C1. A cost report that is a
+        # sixth of the truth is worse than none, because it is believed.
+        #
+        # This is the one write the pre-flight makes, and it is a MEASUREMENT of work that has
+        # already happened rather than a step of the close: no retro is scaffolded, no summary
+        # regenerated, no verdict recorded. `record_execution_run` never raises into the caller,
+        # so an unwritable ledger costs the cost figure and nothing else.
+        if record_cost:
+            record_execution_run(root, moment="close", mode="preflight",
+                                 seconds=time.monotonic() - started,
+                                 verdict="pass" if report.get("ok") else "fail",
+                                 run_id=(state or {}).get("run_id"))
+        # EVERY failing lane, carrying the lane's OWN blocking flag. Dropping the non-blocking
+        # ones made "reported, not blocking" mean invisible: the review-current lane declares
+        # itself cadence debt and non-blocking when this run's units are all independently
+        # covered, and that declaration reached no surface at all - not the pre-flight's page,
+        # and not the bounded exit whose whole job is to file ceremony debt. A lane that says
+        # "reported" and is reported nowhere has been switched off, not relaxed.
+        for c in report.get("checks", []):
+            if c.get("status") != "fail":
+                continue
+            # The gate step's own attribution: a lane only this close's output fails (the anchor
+            # its review-anchor step writes) is not counted there, so it is not listed here.
+            if (writes_anchor and c["check"] in _CLOSE_SELF_LANES
+                    and close_review_currency(root, state)["self_caused"]):
+                continue
+            entry = {"stage": "gate", "blocking": bool(c.get("blocking")),
+                     "detail": f"{c['check']}: {c.get('detail', '')}",
+                     "remedy": (sdlc_md.remediation_lines("gate", [c["check"]])[0]
+                                if sdlc_md.remediation_lines("gate", [c["check"]])
+                                else f"address the {c['check']} lane")}
+            blockers.append(entry)
+
+    # A close that ships work while the installed copy still holds the previous version leaves
+    # every other project on the machine loading the old code. The verdict has ONE owner
+    # (status), so the close and the hint cannot disagree about whether the mirror is stale;
+    # a project with no drift check answers None and this is silent.
+    import status  # noqa: PLC0415 - deferred, like the other close-path siblings
+    try:
+        drift = status.installed_copy_drift(root)
+    except Exception as exc:  # noqa: BLE001 - a broken lane must not hide the other blockers
+        sdlc_md.debug("sprint.close_preflight.drift", exc)
+        drift = None
+    if drift:
+        block("installed-copy",
+              f"{drift['count']} file(s) differ between this repository's skill source and the "
+              f"installed copy - the work this close is signing off is in force nowhere else",
+              drift["remedy"])
+
+    blockers.extend(_seal_preview(root, state))
+    # READY is decided by what HOLDS the close, not by what is reported. A row that declares
+    # itself non-blocking - an expired checklist window, a cadence lane - was still counted here,
+    # so "reported, not held" was true of the flag and false of the answer, which is the only
+    # place the distinction is read.
+    return {"ready": not held_blockers(blockers), "blockers": blockers, "gate_ran": gate_ran}
+
+
+#: Every reason `conformance.unit_is_ungroomed` can return, and how `breakdown` and `plan` say
+#: it. Lifted to module scope so a test can assert the vocabulary is COMPLETE: the consumer is a
+#: bare `_AC_MISS[ac_why]` subscript, so a reason with no entry here is a `KeyError` that takes
+#: down both commands for every batch holding such a unit. A plan review found that hole while
+#: reviewing the very change that adds the fourth reason.
+_AC_MISS_RENDERINGS: dict[str, str] = {
+    "no-criteria": "Acceptance Criteria (none at all - a terminal status will refuse it)",
+    "placeholder": "Acceptance Criteria (still the grooming placeholder)",
+    "derived-only": "Acceptance Criteria (every one tool-derived from the finding's own "
+                    "prose - restates the summary, so nothing states what passing is)",
+    "no-verifier": "Acceptance Criteria (authored, but none carries an executable `Verify:` "
+                   "line or a `manual` marker - so nothing can check them, and the unit would "
+                   "reach a terminal status with no criterion ever run)",
+}
+
+
+def ac_miss_vocabulary() -> tuple[str, ...]:
+    """The ungroomed reasons this module can render. Public so the suite can pin completeness
+    against `conformance`'s own vocabulary rather than against a copy of it."""
+    return tuple(_AC_MISS_RENDERINGS)
+
+
+def held_blockers(blockers: list) -> list:
+    """The rows that actually HOLD the close: everything except the explicitly non-blocking.
+
+    Default TRUE for a row carrying no flag, so a producer that forgets to say fails towards
+    holding the close rather than towards a silent pass.
+    """
+    return [b for b in blockers if b.get("blocking", True)]
+
+
+def preflight_headline(blockers: list) -> str:
+    """The `N unmet prerequisite(s)` phrase the close's pre-flight report prints.
+
+    The count is the number that HOLDS the close, never the length of the blocker list. Those
+    diverge whenever a row declares itself non-blocking, and rendering the length once gave one
+    fact two answers, the louder one overstating. An operator told `8 unmet prerequisite(s)`
+    when 3 hold is being told the close is nearly twice as far away as it is, and a count that
+    cries wolf is one whose real refusals get waved through.
+
+    The total is stated BESIDE the blocking count rather than in place of it, so the advisory
+    rows stay visible without inflating the headline - they are still printed, and a page that
+    silently dropped them would be the opposite failure. When nothing is advisory the two
+    numbers coincide and the phrase is byte-identical to the one this replaces, so the common
+    case gains no cosmetic churn.
+    """
+    held = len(held_blockers(blockers))
+    total = len(blockers)
+    return (f"{held} unmet prerequisite(s)" if held == total
+            else f"{held} unmet prerequisite(s) of {total} reported")
+
+
+def _checklist_blockers(root: Path, retro_id: str, state: dict,
+                        answered: set[str] | frozenset[str] = frozenset()) -> list[dict]:
+    """Every compulsory checklist row the close would stop on, ASKED of the one authority.
+
+    `sprint_report.checklist` decides what is outstanding and what a waiver has answered; this
+    function translates its rows into the pre-flight's blocker shape and decides nothing. A
+    pre-flight enumerating the rows itself would be a second answer to the question the chain
+    already answers, and the two drift the moment a row is added - which is the case the test
+    pins by adding one and changing nothing here.
+
+    READ-ONLY, like everything else in the pre-flight: `checklist` composes and returns.
+
+    A resolver that raises is reported as its own blocker rather than allowed to propagate. The
+    pre-flight's whole value is reporting every unmet prerequisite in ONE pass, and an exception
+    escaping here would take the other blockers with it - the caller would learn one fact and
+    lose the rest, which is the behaviour this pass exists to replace.
+    """
+    try:
+        import sprint_report  # noqa: PLC0415 - deferred, like the close path's other siblings
+        units = [sdlc_md.norm_id(b) for b in (state.get("batch") or [])]
+        ck = sprint_report.checklist(root, retro_id, unit_ids=units or None, live_gate=True)
+    except Exception as exc:  # noqa: BLE001 - a step that cannot check must not report a pass
+        return [{"stage": "checklist",
+                 "detail": f"the sprint checklist could not be composed: "
+                           f"{type(exc).__name__}: {exc}",
+                 "remedy": f"see it directly with `sprint_report.py checklist --id {retro_id}`"}]
+    out: list[dict] = []
+    # ANSWERED, and the answer stops the ship - held separately because the remedy is the
+    # opposite one. An unanswered item needs somebody to look; a stop-ship ruling needs the
+    # defect fixed or the ruling revised by whoever made it.
+    for item in ck.get("stop_ship") or []:
+        out.append({"stage": "checklist",
+                    "detail": f"{item} is ruled STOP-SHIP in the retro's carried-issues table",
+                    "remedy": "fix the finding, or have the ruler revise the ruling in the "
+                              "retro - a close that proceeds over a stop-ship ruling makes "
+                              "every future ruling a note"})
+    rows = {r["id"]: r for r in (ck.get("items") or [])}
+    for item_id in ck.get("expired") or []:
+        row = rows.get(item_id, {})
+        # Reported by the pre-flight, never a blocker: `blocking` False keeps it out of the
+        # refusal while keeping it in the operator's view, which is what "reported not held"
+        # has to mean at every surface, not just the rendered page.
+        out.append({"stage": "checklist", "blocking": False,
+                    "detail": f"{item_id}: {row.get('title', '')} - past its window "
+                              f"(`{sprint_report._window(row)}`)".rstrip(" -"),
+                    "remedy": "gate it where it can still be answered; a waiver here is a "
+                              "receipt, not an answer"})
+    for item_id in ck.get("outstanding") or []:
+        if item_id in answered:          # the calling close supplies the answer
+            continue
+        row = rows.get(item_id, {})
+        detail = f"{item_id}: {row.get('title', '')} - {row.get('value', '')}".rstrip(" -")
+        out.append({"stage": "checklist", "detail": detail,
+                    "remedy": row.get("detail")
+                              or ("run the stage it names, or record a waiver naming it "
+                                  f"(`decisions.py waive --subject "
+                                  f"{sprint_report.WAIVER_SUBJECT}:{item_id} "
+                                  f"--rationale '<why>'`)")})
+    # THE UNFINISHED-UNIT HOLD, asked of the predicate chain step 6 reads and rendered by the
+    # same two helpers, so the pre-flight cannot read ready over a unit the checklist step then
+    # stops on. No waiver reaches it here either. A hold that cannot be computed is a blocker,
+    # as it is at the step: an unanswerable question must not read as a pass.
+    try:
+        ua = unanswered_units(root, state, retro_id)
+    except Exception as exc:  # noqa: BLE001 - a hold that cannot be computed must not pass
+        out.append({"stage": "checklist",
+                    "detail": f"known-issues: the unanswered-unit hold could not be computed: "
+                              f"{type(exc).__name__}: {exc}",
+                    "remedy": "fix the error above, then re-run the pre-flight"})
+    else:
+        if ua["unanswered"]:
+            out.append({"stage": "checklist", "detail": unanswered_line(ua["unanswered"]),
+                        "remedy": unanswered_ways_out(ua["unanswered"], ua["rulings_from"],
+                                                      (state or {}).get("run_id"))})
+    return out
+
+
+def _seal_preview(root: Path, state: dict) -> list[dict]:
+    """What `sprint sign` will do to each batch unit - its terminal transition - previewed.
+
+    RUNG-AWARE. Only the build rung ends its units at a delivered terminal; a `design` rung
+    grooms them and they correctly end at Ready with red criteria. The skip states itself as a
+    NON-BLOCKING row rather than going quiet, because a check that did not run must not read like
+    one that passed. SCOPED TO `design`, not "not `done`": `plan` and `triage` keep the preview,
+    since no substitute bar stands behind them.
+    """
+    if run_rung(state) == "design":
+        return [{"stage": "done-gate", "blocking": False,
+                 "detail": (f"this run's rung is `{run_rung(state)}`, not a build - its units "
+                            f"end at their own terminal, so no Done transition was previewed. "
+                            f"Independent review coverage is unaffected and still reported, "
+                            f"by the `review-coverage` lane"),
+                 "remedy": ("nothing - this row is the record that the delivery gates did not "
+                            "apply. The bar this rung IS held to is that every batch unit is "
+                            "groomed, reported above as a blocking `status` row when it is not")}]
+    return _done_gate_preflight(root, state)
+
+
+def _done_gate_preflight(root: Path, state: dict) -> list[dict]:
+    """The Done transition `sprint sign` performs on each unit, previewed.
+
+    `artifact.close` is AC-verify gated, so a pre-flight that did not ask it would report READY
+    for a unit whose executable criteria were never run, and the seal would then refuse it.
+    Asked by previewing the real close, not by restating its gates.
+    """
+    import artifact  # noqa: PLC0415
+    out: list[dict] = []
+    for key in _batch_story_units(root, state.get("batch") or []):
+        # The gate's own refusal echoes the id it is handed, so it is handed the file's
+        # spelling: the run stores comparison keys.
+        unit = sdlc_md.display_id(root, key)
+        try:
+            artifact.close(root, unit, dry_run=True)
+        except (ValueError, OSError) as exc:
+            # OSError, not just FileNotFoundError. A PermissionError escaped and, because the
+            # report correctly runs above EVERY refusal, took down closes that would otherwise
+            # have refused cleanly for an unrelated reason - a pre-flight must never be able to
+            # turn a clean refusal into a traceback. Matches the retro branch above.
+            out.append({"stage": "done-gate",
+                        # The CAUSE is what is owed - the done gate refuses - and it is the
+                        # same owed action for every unit. The per-unit criterion stays in
+                        # `detail` for the artefact's body, where it belongs; keying on it
+                        # filed one change request per unit for one thing to fix.
+                        "cause": "the Done transition's AC-verify gate refuses",
+                        "detail": f"{unit}: {str(exc).strip().splitlines()[0]}",
+                        "remedy": "clear the gate this names (commonly `verify_ac.py run "
+                                  "--story <id>`), then re-run"})
+    return out
+
+
+#: Stages only the SEAL owes. PREPARE performs no terminal transition - under D0213 that is
+#: `sprint.py sign`'s - so a close can never clear these rows. They still HOLD; what they are
+#: excluded from is the CONVERGENCE SERIES - see `_record_close_attempt`.
+_SEAL_ONLY_STAGES = ("done-gate",)
+
+
+def _stage_label(stage: str) -> str:
+    return f"{stage}, for sprint sign" if stage in _SEAL_ONLY_STAGES else stage
+
+
+def _blocker_label(b: dict) -> str:
+    """The bracketed prefix for one row. A non-blocking row SAYS so on the page: an operator
+    reading a list of blockers has no other way to tell which of them stop the close."""
+    label = _stage_label(b["stage"])
+    return label if b.get("blocking", True) else f"{label}, reported not blocking"
+
+
+#: Steps a dry run does NOT re-run against the scratch copy, and where their verdict comes from
+#: instead. `gate` is the only one: the PREFLIGHT has already run it against the real tree, so
+#: running it again in the copy would pay twice for the one genuinely expensive step of a
+#: preview whose whole point is to be cheap.
+#:
+#: It is still ACCOUNTED FOR in the report - a step absent from a preview is indistinguishable
+#: from one that passed, which is the single way a preview can actively mislead. A first attempt
+#: at that noted it `unevaluated` unconditionally, which made `clean` unreachable and every dry
+#: run exit 1: an absent step became a permanently-unanswered one, trading a silent gap for a
+#: guaranteed false negative. The verdict is taken from the preflight that already computed it.
+DRY_RUN_FROM_PREFLIGHT = {
+    "gate": "run by the preflight against the real tree, not re-run against the copy",
+}
+
+#: DERIVED from the chain it previews, never restated beside it. As a hand-maintained list this
+#: had silently lost `gate`: the step reached the report as neither `ok`, nor `refuse`, nor
+#: among the unevaluated, so its silence read exactly like a pass.
+DRY_RUN_ACTION_STEPS = tuple(_CLOSE_CHAIN)
+
+
+def close_dry_run(root, retro_id: str | None = None, goal_verdict: str | None = None) -> dict:
+    """Every refusal the close chain would raise, in ONE pass, writing nothing.
+
+    `close_preflight` answers the PREREQUISITES and is read-only by construction, but three of
+    the chain's steps exist to DO something and so cannot be judged without doing it - and one
+    of those, the retro's CONTENT, is the class that actually refused three closes in a row.
+    A preview that performed half a close would be worse than none, so the action steps run
+    against a scratch copy of the workspace instead: the real tree is never opened for writing.
+
+    Returns `{"clean", "steps", "blockers", "unevaluated", "scratch"}`. `clean` is true only
+    when nothing refused AND nothing was left unevaluated - a pass with an unanswered step is
+    not a clean pass, and reporting it as one would make the whole preview untrustworthy in
+    exactly the direction that matters.
+    """
+    import shutil  # noqa: PLC0415 - local; only this path copies a tree
+    import tempfile  # noqa: PLC0415
+    root = Path(root)
+    steps: list[dict] = []
+
+    def note(step: str, status: str, detail: str = "", remedy: str = "") -> None:
+        steps.append({"step": step, "status": status, "detail": detail, "remedy": remedy})
+
+    # A DRY RUN LEAVES THE TREE BYTE-IDENTICAL, which is stricter than the pre-flight's own
+    # contract: this is a preview, and a preview that wrote to the real tree would be a close.
+    # So the cost row is suppressed here and only here.
+    # The pre-flight of the close it previews: the chain's last step writes the anchor, and a
+    # verdict the invocation supplies is recorded before the chain.
+    pre = close_preflight(root, retro_id, record_cost=False, goal_verdict=goal_verdict,
+                          writes_anchor=True)
+    for blocker in pre["blockers"]:
+        note(blocker["stage"], "refuse", blocker.get("detail", ""), blocker.get("remedy", ""))
+    if pre["ready"]:
+        note("prerequisites", "ok", "every prerequisite the preflight reads is met")
+
+    scratch = None
+    try:
+        scratch = Path(tempfile.mkdtemp(prefix="close_dry_run_"))
+        shutil.copytree(root / "sdlc-studio", scratch / "sdlc-studio", symlinks=True)
+        # THE READ ROOT, carried BESIDE the scratch rather than reconstructed inside it.
+        #
+        # Only `sdlc-studio/` is copied, so every probe reading `.git`, `.claude/skills/`,
+        # `tools/` or `changelog.d/` from the copy root found nothing and degraded to a softer
+        # verdict than the close it previews - the tick row read `diff unreadable` in a preview
+        # and `24 ticked criteria supported` outside it, two answers to one question within one
+        # invocation.
+        #
+        # SYMLINKING those surfaces was the first fix and it was WRONG. With `.git` linked, git
+        # resolves the git directory to the REAL repository: `git add -A` run from the scratch
+        # wrote two loose objects into the real object database, measured. "The real tree is
+        # never opened for writing" is the property this copy exists for, and a link makes it
+        # true only while nothing writes - which is a hope, not a guarantee. An independent
+        # review found it by executing rather than reading.
+        #
+        # So the scratch stays a pure copy that nothing outside `sdlc-studio/` can reach, and
+        # the READ root travels separately. A probe that only reads - the diff against the base
+        # ref is a commit-to-commit read that never touches the working tree - is given the real
+        # root; a step that writes gets the scratch and can reach nothing else.
+        read_root = Path(root)
+    except OSError as exc:
+        sdlc_md.debug("sprint.close_dry_run.copy", exc)
+        for step in DRY_RUN_ACTION_STEPS:
+            note(step, "unevaluated",
+                 f"the scratch copy could not be made ({exc}), so this step was not run",
+                 "free some disk or set TMPDIR, then re-run the dry run")
+        return _dry_run_result(steps, scratch)
+
+    try:
+        if goal_verdict:
+            # Recorded on the COPY, as the close records it before its chain runs, so the
+            # previewed checklist judges the goal the close will have judged.
+            run_state.record_goal_verdict(scratch, goal_verdict, "supplied to the dry run")
+        state = run_state.read(scratch) or {}
+        rid = retro_id or _dry_run_retro(scratch, state, note)
+        gate_refused = any(b["stage"] == "gate" for b in pre["blockers"])
+        # Did the preflight ACTUALLY reach the gate? It has early returns that come back on a
+        # run-state fault without ever calling `run_gate`, and "no gate blocker" cannot tell
+        # that from a clean pass. Reporting `ok` there stated a fact about the most expensive
+        # step in the chain that was simply untrue - a false positive traded for the false
+        # negative the previous attempt produced. Absent key = did not run.
+        gate_ran = bool(pre.get("gate_ran"))
+        for step in DRY_RUN_ACTION_STEPS:
+            if step in DRY_RUN_FROM_PREFLIGHT:
+                # Its verdict is the preflight's. A refusal is already on the report as a
+                # blocker, so noting it again would double-count the same refusal.
+                if gate_refused:
+                    pass
+                elif gate_ran:
+                    note(step, "ok", DRY_RUN_FROM_PREFLIGHT[step])
+                else:
+                    note(step, "unevaluated",
+                         "the preflight returned before reaching the gate, so it was not run",
+                         "clear the refusal above, then re-run the dry run")
+                continue
+            if rid is None and step.startswith("retro"):
+                note(step, "unevaluated", "no retro to run this step against",
+                     "name one with --retro, or let `close` scaffold it")
+                continue
+            fn = globals().get("_close_" + step.replace("-", "_"))
+            if fn is None:
+                note(step, "unevaluated", "no read-only probe exists for this step", "")
+                continue
+            try:
+                # The READ ROOT reaches only the steps that accept one. A step that writes is
+                # handed the scratch and can reach nothing else, which is what keeps "the real
+                # tree is never opened for writing" true by construction rather than by hope.
+                kw = {}
+                try:
+                    import inspect  # noqa: PLC0415 - deferred, one call per dry run
+                    params = inspect.signature(fn).parameters
+                    if "read_root" in params:
+                        kw["read_root"] = read_root
+                    elif any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                        # A step taking `**kwargs` cannot be inspected for `read_root`, so it
+                        # would be handed the scratch with nothing said - the degradation this
+                        # fix removes, restored silently one construct over. Pass it, and let a
+                        # step that does not want it ignore it.
+                        kw["read_root"] = read_root
+                except (TypeError, ValueError) as exc:
+                    # A builtin, a C callable, or a decorator without `functools.wraps`: the
+                    # signature cannot be read, so the read root cannot be routed. REPORTED
+                    # rather than dropped - a probe silently handed the wrong tree is exactly
+                    # what this step exists to stop.
+                    sdlc_md.debug(f"sprint.close_dry_run.signature.{step}", exc)
+                    note(step, "unevaluated",
+                         f"this step's signature could not be read ({type(exc).__name__}), so "
+                         f"it could not be told which tree to read from",
+                         "give the step an explicit `read_root=None` parameter")
+                    continue
+                with _on_the_copy():
+                    ok, detail, remedy = fn(scratch, rid, run_state.read(scratch) or state, **kw)
+            except Exception as exc:  # noqa: BLE001 - a step that explodes is UNEVALUATED
+                # Never "ok". A step whose probe failed for a reason peculiar to the copy has
+                # told us nothing about the real close, and calling that a pass is the single
+                # way this preview could actively mislead.
+                sdlc_md.debug(f"sprint.close_dry_run.{step}", exc)
+                note(step, "unevaluated", f"the probe raised {exc!r} in the scratch copy",
+                     f"run the step directly against the repository to see its real verdict")
+            else:
+                note(step, "ok" if ok else "refuse", detail, remedy)
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+    return _dry_run_result(steps, scratch)
+
+
+def _dry_run_retro(scratch: Path, state: dict, note) -> str | None:
+    """Scaffold a retro IN THE COPY so its content can be judged before one exists.
+
+    This is the whole reason a dry run beats the preflight. `close` mints the retro itself and
+    then refuses on what it contains, so the content class cannot be reported by anything that
+    declines to create one - which is why three closes in a row each discovered it separately.
+    """
+    try:
+        with _on_the_copy():
+            rid = _scaffold_run_retro(scratch, state)["file_id"]
+    except Exception as exc:  # noqa: BLE001
+        sdlc_md.debug("sprint._dry_run_retro", exc)
+        note("retro-scaffold", "unevaluated", f"a retro could not be scaffolded ({exc})", "")
+        return None
+    note("retro-scaffold", "ok",
+         f"{rid} scaffolded IN THE COPY - the steps below judge the content `close` "
+         f"would mint, so a content gap is reported before the real retro exists")
+    return rid
+
+
+#: The mark on every line a dry-run step prints while it acts on the scratch copy.
+COPY_MARK = "[copy]"
+
+
+@contextlib.contextmanager
+def _on_the_copy():
+    """Re-print, marked `COPY_MARK`, every line printed inside: a dry-run step acts on the
+    scratch copy, and its own `close: derived EP0001 terminal` read as a write to the real tree
+    that the preview never made."""
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            yield
+    finally:
+        for buf, stream in ((out, sys.stdout), (err, sys.stderr)):
+            for line in buf.getvalue().splitlines():
+                print(f"{COPY_MARK} {line}", file=stream)
+
+
+def _dry_run_result(steps: list[dict], scratch) -> dict:
+    blockers = [s for s in steps if s["status"] == "refuse"]
+    unevaluated = [s for s in steps if s["status"] == "unevaluated"]
+    return {"clean": not blockers and not unevaluated, "steps": steps,
+            "blockers": blockers, "unevaluated": unevaluated,
+            "scratch": str(scratch) if scratch else None}
+
+
+def dry_run_report(result: dict) -> str:
+    """The dry run as an operator reads it: every step, its verdict, and what to do."""
+    icon = {"ok": "ok  ", "refuse": "STOP", "unevaluated": "??  "}
+    lines = [f"close --dry-run: nothing was written. {len(_CLOSE_CHAIN)} chain step(s) previewed."]
+    for step in result["steps"]:
+        # The CONTINUATION lines, not just the first. `_close_checklist` builds a multi-line block
+        # naming every outstanding item, and truncating at the first newline threw exactly the
+        # part written to name the cause away - a refusal that says "1 item unanswered" and not
+        # WHICH one sends the reader back to run the command again to find out. Indented under
+        # their step so the shape still reads as one verdict per line.
+        body = (step["detail"] or step["status"]).splitlines() or [""]
+        lines.append(f"  {icon.get(step['status'], '?')} {step['step']}: {body[0][:160]}")
+        lines.extend(f"       {ln[:160]}" for ln in body[1:] if ln.strip())
+        if step["remedy"]:
+            remedy = step["remedy"].splitlines()
+            lines.append(f"       -> {remedy[0][:160]}")
+            lines.extend(f"          {ln[:160]}" for ln in remedy[1:] if ln.strip())
+    if result["clean"]:
+        lines.append("dry run CLEAN - every step was evaluated and none refused.")
+    else:
+        lines.append(f"dry run: {len(result['blockers'])} refusal(s), "
+                     f"{len(result['unevaluated'])} step(s) UNEVALUATED. An unevaluated step "
+                     f"is not a passing one.")
+    return "\n".join(lines)
+
+
+def _report_preflight(root, retro_id: str | None, goal_verdict: str | None = None,
+                      writes_anchor: bool = False) -> dict:
+    """Print every unmet prerequisite to stderr. Returns the pre-flight result.
+
+    Never changes the caller's control flow or exit code: `close`'s own refusals and its chain
+    decide what stops a close, so nothing that succeeded before this existed now fails.
+    """
+    pre = close_preflight(root, retro_id, goal_verdict=goal_verdict,
+                          writes_anchor=writes_anchor)
+    if not pre["ready"]:
+        print(f"close pre-flight: {preflight_headline(pre['blockers'])} - this is ALL "
+              f"of them, not the first:", file=sys.stderr)
+        for b in pre["blockers"]:
+            # `_blocker_label`, not `_stage_label`: the first says "reported not blocking" and
+            # the second cannot. A page that renders an advisory row identically to a refusal
+            # makes an operator count eight blockers where three block.
+            print(f"  [{_blocker_label(b)}] {b['detail']}\n      -> {b['remedy']}",
+                  file=sys.stderr)
+    elif [b for b in pre["blockers"] if not b.get("blocking", True)]:
+        # A READY close still has something to say. A non-blocking row records a check that did
+        # NOT run - the rung-skipped delivery gates are the case in hand - and suppressing it
+        # here is what makes a skipped gate read exactly like a satisfied one. Printed on the
+        # ready path too, or "reported, never silent" is true only of the failing path.
+        print("close pre-flight: ready. Recorded, not checked:", file=sys.stderr)
+        for b in pre["blockers"]:
+            if not b.get("blocking", True):
+                print(f"  [{_blocker_label(b)}] {b['detail']}", file=sys.stderr)
+    return pre
+
+
+#: Blocker stages `--file-and-close` may file and defer: ceremony debt, whose absence is
+#: honestly recordable as outstanding work. Everything else - a red gate lane, a unit whose
+#: Done gate refuses (failing/unrun executable ACs), a broken run state, a run with NO
+#: sprint goal (the plain close refuses that unconditionally, and a post-close CR to "set
+#: one at plan time" is unsatisfiable) - is a CORRECTNESS signal, and filing it away would
+#: be the bypass this exit exists to prevent. No shipped pre-flight row carries `sign-off` any
+#: more (the per-unit sign-off preview is gone); it stays deferrable because the file-and-close
+#: and grouping fixtures model per-unit ceremony debt with it, and no live stage is both.
+_DEFERRABLE_CLOSE_STAGES = ("goal-verdict", "retro", "sign-off")
+
+def hard_blockers(blockers: list) -> list:
+    """The rows `--file-and-close` must REFUSE to file: correctness, never ceremony.
+
+    A row is filable when its STAGE is deferrable ceremony, or when the lane that produced it
+    DECLARED ITSELF NON-BLOCKING - a row that does not hold the close cannot be the reason a
+    filing is refused. Both facts are read from the row; neither is restated here as a list of
+    lane names, because a second list drifts from the first and a lane added tomorrow is
+    silently classed correctness.
+
+    A prose classifier used to sit beside the flag: any blocker whose detail contained the
+    string `CADENCE DEBT` was filable. It has been WITHDRAWN rather than repaired, because it
+    was a second reader of one fact and it could never fire - the only lane that emits the
+    string emits it on the branch where it also sets the flag, so the string test was reachable
+    only through a row the flag had already classified. It was measurably dead: deleting it left
+    701 tests green. One declaration, structured, and the join to it is driven through a close.
+
+    Named and module-level for that join: behind a closure the classification was reachable only
+    by driving a whole close, which is why nothing ever exercised it.
+    """
+    return [b for b in blockers
+            if b["stage"] not in _DEFERRABLE_CLOSE_STAGES
+            and b.get("blocking", True)]
+
+
+#: A unit rejected this many times by the panel goes to the operator. TWO, not one: a first
+#: REJECT is the loop working - the finding gets repaired. Escalating on the first would fire
+#: on every ordinary finding and train the operator to ignore the channel, which is how a
+#: notification stops meaning anything.
+_PANEL_REJECT_LIMIT = 2
+
+
+def panel_escalation(rounds: list, seat_verdicts: dict) -> tuple[bool, str]:
+    """Whether a unit must go to the operator, and why - delegated to `critic.panel_escalation`.
+
+    The rule moved next to the ledgers it judges, because the commands that record a round were
+    consulting it from opposite sides of two different files. Kept here as a delegation rather
+    than deleted, and honestly: after the move this has no PRODUCTION caller - `critic record`
+    goes through `critic.escalation_notice` - so it is a named shim for the tests and for any
+    consuming project that reached for it. One rule with two homes is the shape that produced the
+    defect, and the looser copy is the one that runs, so the body lives in exactly one place.
+    """
+    import critic  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+    return critic.panel_escalation(rounds, seat_verdicts)
+
+
+def _record_close_attempt(root, pre: dict) -> None:
+    """Append this close attempt's outstanding count to the run state. A record, never a cap:
+    the close runs once and finishes, so the count is evidence for the report, not a brake.
+
+    Counted AFTER the early refusals (no goal, no retro, no verdict), so a trivial refusal is
+    not an attempt. The held rows only, less the ones only the signature can clear."""
+    attempts = list((run_state.read(root) or {}).get("close_attempts") or [])
+    movable = [b for b in held_blockers(pre["blockers"])
+               if b["stage"] not in _SEAL_ONLY_STAGES]
+    attempts.append({"at": sdlc_md.now_iso8601(), "outstanding": len(movable),
+                     "stages": sorted({b["stage"] for b in movable})})
+    run_state.update(root, close_attempts=attempts)
+
+
+_CHECKLIST_ROW_RE = re.compile(r"^  (?! )(\S+): (.+)$", re.MULTILINE)
+#: The checklist step's stop-ship line, as `_close_checklist` writes it.
+_STOP_SHIP_RE = re.compile(r"^known-issues: (.+?) (?:is|are) ruled STOP-SHIP", re.MULTILINE)
+#: The gate step's note naming the lanes it attributed to this close's own output, as
+#: `_close_gate` writes it. Those lanes are the close's paperwork, never a known issue.
+_SELF_LANES_RE = re.compile(r"own output and are not counted: ([\w, -]+)$", re.MULTILINE)
+
+
+def close_known_issues_from(step: str, detail: str) -> list[dict]:
+    """A failed close step as known issues, `[{"source", "detail"}]`: one per failing gate lane,
+    one per stop-ship ruling (marked `stop_ship`), one per unanswered checklist item, else one
+    per non-empty detail line - a step's last line alone can name no unit."""
+    if step == "gate":
+        own = {n.strip() for m in _SELF_LANES_RE.finditer(detail or "")
+               for n in m.group(1).split(",")}
+        lanes = [(name, why) for name, why in gate_failed_lanes(detail) if name not in own]
+        if lanes:
+            return [{"source": "gate", "detail": f"{name}: {why}"} for name, why in lanes]
+    if step == "checklist":
+        stop = [{"source": "checklist", "stop_ship": True,
+                 "detail": f"{fid} is ruled STOP-SHIP in the retro's carried-issues table"}
+                for m in _STOP_SHIP_RE.finditer(detail or "") for fid in m.group(1).split(", ")]
+        rows = [f"{rid}: {rest}" for rid, rest in _CHECKLIST_ROW_RE.findall(detail or "")]
+        rows += [ln.strip() for ln in (detail or "").splitlines()
+                 if ln.startswith("known-issues:") and not _STOP_SHIP_RE.match(ln)]
+        if stop or rows:
+            return stop + [{"source": "checklist", "detail": row} for row in rows]
+    lines = [ln.strip() for ln in (detail or "").splitlines() if ln.strip()]
+    return [{"source": step, "detail": ln} for ln in lines or ["failed with no detail"]]
+
+
+#: The stamp kinds `run_state` writes where a unit's span opens and where it closes.
+_SPAN_START, _SPAN_END = "unit-start", "unit-end"
+
+
+def _unit_priced_spans(state: dict) -> dict:
+    """Each batch unit's priced span cost, or None where it cannot be read back: no span, a
+    span still open, ends read on two meters, or recorded totals no opening and closing stamp
+    reproduce (a unit that entered In Progress twice records the sum of its spans).
+
+    A span records the run's token total at each end, not a priced figure, so its priced cost
+    is read back by the meter's own rule: `run_token_total` over the stamps up to the span's
+    closing reading, less the same up to its opening one. Each end is the stamp at which that
+    total equals the one the span recorded, so a reading is never matched by its time alone."""
+    stamps = [s for s in state.get(run_state.TOKEN_STAMPS) or [] if isinstance(s, dict)]
+    totals: dict[int, dict] = {}
+
+    def upto(k: int) -> dict:
+        if k not in totals:
+            totals[k] = run_state.run_token_total({**state,
+                                                   run_state.TOKEN_STAMPS: stamps[:k + 1]})
+        return totals[k]
+
+    def ends(src: str, kind: str, after: int = -1):
+        return (k for k in range(after + 1, len(stamps)) if stamps[k].get("kind") == kind
+                and str(stamps[k].get("source") or "") == src)
+
+    actuals = {sdlc_md.norm_id(u): e for u, e in (state.get(run_state.UNIT_ACTUALS) or {}).items()
+               if isinstance(e, dict)}
+    out: dict = {}
+    for unit in state.get("batch") or []:
+        uid = sdlc_md.norm_id(unit)
+        entry = actuals.get(uid) or {}
+        src, start, spent = (str(entry.get("start_source") or ""), entry.get("start_tokens"),
+                             entry.get("tokens"))
+        out[uid] = None
+        if entry.get("open") or not src or not isinstance(start, int) \
+                or not isinstance(spent, int):
+            continue
+        for i in ends(src, _SPAN_START):
+            if upto(i)["tokens"] != start:
+                continue
+            j = next((k for k in ends(src, _SPAN_END, i)
+                      if isinstance(upto(k)["tokens"], int) and upto(k)["tokens"] - start == spent),
+                     None)
+            if j is None:
+                continue
+            a, b = upto(i)["priced"], upto(j)["priced"]
+            out[uid] = b - a if isinstance(a, int) and isinstance(b, int) else None
+            break
+    return out
+
+
+def _close_priced_total(root, state: dict) -> dict:
+    """The run's total as the page this close files will state it: over the window the first
+    filed page ended at on a re-close, as `_file_the_report` reads it; on a first close, over
+    every stamp and a reading taken now, as that report stamp will be, held and not written."""
+    import sprint_report  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+    end = state.get(REPORT_WINDOW_END)
+    if end:
+        return run_state.run_token_total(sprint_report._metered(state, sprint_report._at(end)))
+    probe = dict(state)
+    # The meter's own reading and re-derivations, so the probe holds the stamp list
+    # `stamp_tokens` would leave behind, without writing it.
+    stamp = run_state._stamp(root, "report")  # noqa: SLF001
+    if stamp:
+        run_state._append_stamp(probe, stamp,  # noqa: SLF001
+                                run_state._rederivations(state, stamp))  # noqa: SLF001
+    return run_state.run_token_total(probe)
+
+
+def close_cost_regression(root, state: dict, retro_id: str) -> dict:
+    """The close's cost check: `{"line", "issue"}`, `issue` None unless the run is over.
+
+    The run's priced cost per gate-cleared point against `retro.cost_baseline`, the run's own
+    retro excluded. No unit is terminal until `sign`, so the points are those whose terminal gate
+    clears, which the report states as delivered. Over `COST_REGRESSION_RATIO` x the baseline,
+    `issue` is the close known issue: the run's figure, the baseline and the runs it came from,
+    the ratio, each batch unit's priced span cost (NOT MEASURED where it has none) and the
+    unattributed remainder. Never a refusal: what cannot be formed is an UNMEASURED line."""
+    import retro  # noqa: PLC0415 - deferred, like the chain's other retro imports
+    head = "close: cost per point:"
+    total = _close_priced_total(root, state)
+    priced = total.get("priced")
+    if not isinstance(priced, int):
+        return {"issue": None, "line": f"{head} UNMEASURED - the run's priced cost cannot be "
+                f"formed ({total.get('priced_reason') or total.get('reason') or 'no reading'})"}
+    points, unsized = 0, []
+    for uid, why in sorted(_report_gate_verdicts(root, state).items()):
+        if why:
+            continue
+        found = sdlc_md.find_by_id(root, uid)
+        pts = sdlc_md.read_points(sdlc_md.read_text_safe(found[0])) if found else None
+        if isinstance(pts, int) and pts > 0:
+            points += pts
+        else:
+            unsized.append(uid)
+    if unsized or not points:
+        why = (f"{', '.join(unsized)} cleared the gate with no Points" if unsized else
+               "no unit cleared its terminal gate")
+        return {"issue": None, "line": f"{head} UNMEASURED - {why}, so the run has no per-point "
+                                       f"figure"}
+    rid = sdlc_md.norm_id(retro_id).upper()
+    base = retro.cost_baseline(root, exclude=rid)
+    per_point = round(priced / points)
+    figure = (f"{per_point:,} {run_state.PRICED_LABEL} per gate-cleared point ({priced:,} over "
+              f"{points} point(s))")
+    limit = retro.COST_REGRESSION_RATIO
+    if base["per_point"] is None:
+        return {"issue": None, "line": f"{head} {figure}; against its baseline UNMEASURED - "
+                                       f"{base['basis']}, so no cost issue is recorded"}
+    ratio = priced / points / base["per_point"]
+    against = (f"{ratio:.2f} x the baseline {round(base['per_point']):,} per point, "
+               f"{base['basis']}")
+    if not priced > limit * base["per_point"] * points:
+        return {"issue": None, "line": f"{head} {figure}, {against}: within {limit} x"}
+    units = _unit_priced_spans(state)
+    rest = priced - sum(c for c in units.values() if isinstance(c, int))
+    remainder = (f"unattributed remainder 0, clamped from {rest:,}: the unit spans overlap, so "
+                 f"their costs sum past the run's total" if rest < 0 else
+                 f"unattributed remainder {rest:,}")
+    per_unit = "; ".join(f"{u} {c:,}" if isinstance(c, int) else f"{u} NOT MEASURED"
+                         for u, c in units.items())
+    detail = (f"{rid}: {figure} is {against}, over {limit} x. Per unit (priced span): "
+              f"{per_unit}; {remainder}. The retro names the cause under `## "
+              f"{retro.COST_SECTION}`")
+    return {"line": f"{head} {figure}, {against}: OVER {limit} x - a known issue, and the "
+                    f"retro names its cause under `## {retro.COST_SECTION}`",
+            "issue": {"source": retro.COST_ISSUE, "retro": rid, "detail": detail,
+                      "per_point": per_point, "baseline": base["per_point"],
+                      "baseline_kind": base["kind"], "retros": base["retros"],
+                      "ratio": round(ratio, 2), "units": units, "remainder": max(rest, 0),
+                      "remainder_clamped": rest < 0}}
+
+
+def _cost_cause_named(root, gap) -> bool:
+    """Is `gap` a cost known issue whose retro names its cause? Then it is handed over on the
+    report, as the close hands it over, and does not stop a rolling boundary."""
+    import retro  # noqa: PLC0415 - deferred, like the chain's other retro imports
+    if not (isinstance(gap, dict) and gap.get("source") == retro.COST_ISSUE and gap.get("retro")):
+        return False
+    path = retro.find_retro(root, gap["retro"])
+    return bool(path) and not retro.cost_cause_errors(root, gap["retro"],
+                                                      path.read_text(encoding="utf-8"))
+
+
+def _print_close_strategy(root, state: dict) -> dict:
+    """State the strategy the close is judging against, and its execution policy.
+
+    Returns it, so the caller can act on it; never raises - a close must not die on reading
+    its own paperwork, and a strategy that could not be read is reported as unread rather
+    than silently replaced with a fresh one.
+    """
+    try:
+        got = close_test_strategy(root, (state or {}).get("batch") or [])
+    except Exception as exc:  # noqa: BLE001 - a close never dies on a plan read
+        sdlc_md.debug("sprint._print_close_strategy", exc)
+        print(f"close: the recorded test strategy could NOT be read ({exc}) - this close is "
+              f"judging against no agreed strategy", file=sys.stderr)
+        return {"strategy": {}, "source": "unreadable", "why": str(exc)}
+    print(f"close: test strategy {got['source']} - {got['why']}")
+    for line in render_execution_policy((got["strategy"] or {}).get("execution") or {}):
+        print(line)
+    return got
+
+
+def _file_and_close(root, args, state: dict, pre: dict) -> int:
+    """The bounded exit: file every deferrable blocker as a real artefact linked to the run,
+    name the deferrals in the retro and the review anchor, and close the run with an outcome
+    that states plainly that work is outstanding. Refused outright while any HARD blocker
+    (a red gate, a refusing Done gate) is present - filing is for ceremony debt, never for
+    a failing test."""
+    import file_finding  # noqa: PLC0415
+    import retro as retro_mod  # noqa: PLC0415
+    # A completed filing is FINAL: the filed CRs do not clear the pre-flight blockers, so a
+    # re-run would see the same set and file a duplicate pair, append second sections to the
+    # retro and the anchor, and overwrite the first filing's linkage. Refused, with the next
+    # step named - re-running a close is the habit the resumable chain trains.
+    # Gate on what the refusal actually protects: a COMPLETED close. `budget-spent` and
+    # `stopped` are mid-flight states - loop_guard's own recommended flow stamps them, and such
+    # a run has filed nothing - so refusing them as "already closed, would duplicate the
+    # filing" is false on both counts and denies the bounded exit to one of its natural
+    # customers. Duplication itself is caught by the `deferred_blockers` record just below,
+    # which is the fact that proves a filing happened rather than a string that implies it.
+    outcome = (state.get("outcome") or run_state.RUNNING)
+    if outcome in (run_state.GOAL_REACHED, run_state.CLOSED_OUTSTANDING):
+        print(f"file-and-close REFUSED: this run's close already completed (outcome "
+              f"`{outcome}`) - re-running would duplicate the filing. Open the next run with "
+              f"`sprint plan --write`", file=sys.stderr)
+        return 2
+    if state.get("deferred_blockers"):
+        already = ", ".join(d.get("id", "?") for d in state["deferred_blockers"])
+        print(f"file-and-close REFUSED: this run already filed its blockers ({already}) - "
+              f"a re-run would duplicate them", file=sys.stderr)
+        return 2
+    blockers = pre["blockers"]
+    hard = hard_blockers(blockers)
+    if hard:
+        print(f"file-and-close REFUSED: {len(hard)} hard blocker(s) - a correctness gate is "
+              f"never filed away:", file=sys.stderr)
+        for b in hard:
+            print(f"  [{b['stage']}] {b['detail']}\n      -> {b['remedy']}", file=sys.stderr)
+        return 2
+    retro_id = (args.retro or "").strip()
+    # THE UNANSWERED-UNIT HOLD, read before anything is filed. Filing defers ceremony debt; it
+    # cannot answer whether an unfinished unit stops the ship, so this exit reads the close's
+    # own predicate, with the close's own retro, and refuses on the set the checklist step
+    # would. Above "nothing outstanding", so a run whose only problem is an unanswered unit
+    # hears the real reason rather than being sent to a close that will refuse it anyway.
+    try:
+        ua = unanswered_units(root, state, retro_id or None)
+    except Exception as exc:  # noqa: BLE001 - a hold that cannot be computed must not pass
+        print(f"file-and-close refused: the unanswered-unit hold could not be computed: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    held = ua["unanswered"]
+    if held:
+        print(f"file-and-close REFUSED: unanswered stop-ship question(s) on {len(held)} batch "
+              f"unit(s): " + unanswered_rows(held), file=sys.stderr)
+        # The answering paths first, `stop --force` last and named as the override it is. A
+        # ruling is the operator's to make: printed to an agent as a bare instruction, it is
+        # the session writing the row that releases its own unit.
+        print(f"  {unanswered_ways_out(held, ua['rulings_from'], state.get('run_id'))}; a "
+              f"ruling there is the operator's act at the close, never the session's. "
+              f"file-and-close files ceremony debt - a stop-ship question is answered, never "
+              f"filed; `stop --force` ends the run over them and records them as waived - it "
+              f"answers none", file=sys.stderr)
+        return 2
+    if not blockers:
+        print("file-and-close: nothing outstanding - run the close without --file-and-close",
+              file=sys.stderr)
+        return 2
+    retro_path = retro_mod.find_retro(root, retro_id) if retro_id else None
+    if retro_path is None:
+        print("file-and-close refused: --retro RETROxxxx is required - the deferrals are "
+              "named IN the retro, so there must be one", file=sys.stderr)
+        return 2
+    run_id = (state.get("run_id") or "unopened run")
+    filed: list[tuple[str, dict]] = []
+    groups = group_blockers(blockers)
+    for group in groups:
+        b = group["blockers"][0]
+        covers = group["units"]
+        scope = (f" It covers {len(covers)} unit(s): {', '.join(covers)}." if covers else "")
+        res = file_finding.file_finding(
+            Path(root), "cr",
+            f"Deferred close blocker ({b['stage']}): {group['cause'][:80]}",
+            {"priority": "High", "ctype": "Process", "size": "S",
+             "affects": str(retro_path.relative_to(Path(root))),
+             "summary": (f"Deferred at the close of {run_id} by an explicit file-and-close "
+                         f"decision. The close prerequisite was not met and was recorded as "
+                         f"outstanding rather than fixed inline or waived. Remedy when picked "
+                         f"up: {b['remedy']}.{scope}\n\nEvery blocker this artefact "
+                         f"covers:\n" + "\n".join(
+                             f"- [{m.get('stage')}] {m.get('detail')}"
+                             for m in group["blockers"])),
+             # EVERY member's detail, and a criterion over EVERY unit. The close prints that
+             # the merged blockers "are listed inside the artefact that covers them"; keyed on
+             # the first member alone that sentence was false, and a criterion naming one
+             # unit's remedy closed the artefact while the rest were still owed.
+             "acs": ([f"the deferred prerequisite is met: {b['remedy']}"]
+                     + [f"the prerequisite is met for {u}" for u in covers]
+                     + ["the close-owed record for every blocker listed above is cleared"]),
+             "impact": (f"{run_id} closed with this work outstanding; until it is done, the "
+                        f"sprint's record is complete but its ceremony debt is real")})
+        filed.append((res["id"], b))
+        # Filed BY the close, so it is this close's own output and is carried into the next
+        # run - never counted as an unreviewed change against the close that wrote it.
+        record_close_finding(root, res["id"], _repo_rel(root, res.get("path")))
+    note_lines = [f"- {fid}: [{b['stage']}] {b['detail']} (deferred, not waived)"
+                  for fid, b in filed]
+    # SAY what the fan-out was, at the moment it happened. One owed sign-off arriving as 23
+    # identical change requests is discovered later, in the backlog, by someone who has to work
+    # out that they are one thing - and by then the cost has been paid twice.
+    print(f"file-and-close: filed {len(filed)} artefact(s) for {len(blockers)} blocker(s) "
+          f"across {len(groups)} distinct cause(s).")
+    if len(filed) < len(blockers):
+        print(f"  {len(blockers) - len(filed)} blocker(s) shared a cause with another and are "
+              f"listed inside the artefact that covers them, rather than filed again.")
+    text = retro_path.read_text(encoding="utf-8")
+    text = (text.rstrip("\n")
+            + "\n\n## Deferred at close\n\n"
+            + f"Closed with known outstanding work ({run_id}): the operator chose "
+              f"file-and-close over another fix cycle. Nothing here was waived - each "
+              f"blocker is a filed artefact:\n\n" + "\n".join(note_lines) + "\n")
+    sdlc_md.atomic_write(retro_path, text)
+    record_close_output(root, _repo_rel(root, retro_path))
+    anchor = Path(root) / "sdlc-studio" / "reviews" / "LATEST.md"
+    if anchor.is_file():
+        atext = anchor.read_text(encoding="utf-8").rstrip("\n")
+        atext += ("\n\n## Deferred at close (" + run_id + ")\n\n"
+                  + "\n".join(note_lines) + "\n")
+        sdlc_md.atomic_write(anchor, atext)
+        anchor_note = "retro and review anchor"
+    else:
+        anchor_note = "retro (NO review anchor found to annotate)"
+    # `unanswered` rides on the same write, before `close_run` archives the record: every route
+    # that ends a run leaves the predicate's set on it, empty when nothing was unanswered.
+    run_state.update(root, deferred_blockers=[
+        {"id": fid, "stage": b["stage"], "detail": b["detail"]} for fid, b in filed],
+        **unanswered_record(ua))
+    run_state.close_run(root, run_state.CLOSED_OUTSTANDING, handoff=state.get("handoff"))
+    print(f"file-and-close: {len(filed)} blocker(s) filed ({', '.join(f for f, _ in filed)}) "
+          f"and named in the {anchor_note}.")
+    carried = carried_findings_line(carried_close_findings(root, run_state.read(root) or {}))
+    if carried:
+        print(carried)
+    print(f"{run_id} closed with known outstanding work - outcome "
+          f"`{run_state.CLOSED_OUTSTANDING}`, nothing waived.")
+    # The report, on THIS route too. It was emitted from `cmd_close`'s success path and the
+    # `--apply-signoff` tail, and this route returns before both - so the one exit designed for
+    # a close that could not complete cleanly was the one that reported least, though it is
+    # exactly where the operator most needs an account of what shipped, what is carried and what
+    # was deferred. Emitted last, after the deferral lines, so the report is read in the context
+    # of the filings rather than before them.
+    _tell_the_operator(root, deferred=[
+        f"{fid}: [{b['stage']}] {b['detail']}" for fid, b in filed])
+    record_close_tree(root)
+    return 0
+
+
+def appetite_overage_line(root: Path | str) -> str | None:
+    """One line stating an accepted over-appetite as the over-commitment it was - N units against a
+    standing appetite of M, on each axis actually raised - or None for an ordinary run. Read by the
+    close and the retro, so the overage cannot be reported as the raised ceiling."""
+    over = run_state.appetite_overage(root)
+    if not over:
+        return None
+    parts: list[str] = []
+    u, m = over["units"], over["minutes"]
+    if u["over"]:
+        parts.append(f"{u['accepted']} units against a standing appetite of {u['standing']}")
+    if m["over"]:
+        parts.append(f"{m['accepted']:g}min against a standing {m['standing']:g}min")
+    return "OVER APPETITE - this batch was " + "; ".join(parts) + " (the ceiling was raised to "\
+           "accept it, and the run is reported against the standing appetite, not that ceiling)"
+
+
+def _swap_points(root: Path, ids) -> int:
+    """Points for a set of unit ids, skipping any the tree cannot resolve."""
+    total = 0
+    for uid in ids:
+        found = sdlc_md.find_by_id(root, uid)
+        if not found:
+            continue
+        text = sdlc_md.read_text_safe(found[0]) or ""
+        # THE shared reader, not a hand-rolled parse. The hand-rolled one asked `extract_field`
+        # for `Points` and matched neither the `Story Points` spelling nor a decorated value, so
+        # `batch add-epic` and `batch swap` priced whole epics at 0 and reported a capacity
+        # effect of nothing.
+        pts = sdlc_md.read_points(text)
+        if pts is not None:
+            total += pts
+    return total
+
+
+def _epic_units(root: Path, epic: str, status: str) -> list[str]:
+    """The epic's stories at `status`, through `select_batch` - the shared selector.
+
+    Read fresh at call time, so a story added to the epic between two calls is picked up and one
+    at a different status is not. A snapshot would make this command mean "the stories that were
+    there when somebody last looked".
+
+    The first version hand-rolled the walk and compared the Epic field with an exact string
+    equality. This corpus writes that field two ways - `EP0005`, and the link form
+    `[EP0005: Quality & Drift Control](../epics/EP0005-quality-drift.md)` - and the second form
+    failed the compare silently. 33 stories were invisible to it, including all 13 on EP0005,
+    and the command then reported the epic as having nothing at that status. `select_batch`
+    resolves the id out of the field with `ID_SEARCH_RE`, which is why the criterion named it:
+    a second selector is a second answer to the same question, and this one was wrong.
+    """
+    return [sdlc_md.norm_id(u["id"])
+            for u in select_batch(root, "story", str(status).strip(),
+                                  epics={sdlc_md.norm_id(epic)})]
+
+
+def cmd_appetite(args: argparse.Namespace) -> int:
+    """Resize the ACCEPTED appetite on an open run, on the record.
+
+    A run that turns out bigger than planned has two honest endings - stop at the planned
+    ceiling, or raise it deliberately - and one dishonest one, where the appetite is quietly
+    rewritten so the close reports a run that fitted. The standing pair forecloses the third:
+    raising the accepted number MAKES the overage true rather than hiding it.
+    """
+    root = Path(args.root)
+    if args.action != "resize":
+        print(f"sprint appetite: unknown action {args.action}", file=sys.stderr)
+        return 2
+    try:
+        state = run_state.resize_appetite(
+            root, units=args.units, minutes=args.minutes, reason=args.reason or "")
+    except run_state.RunStateError as exc:
+        print(f"sprint appetite resize REFUSED: {exc}", file=sys.stderr)
+        return 2
+    ap = state.get("appetite") or {}
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps({"appetite": ap,
+                          "changes": state.get("appetite_changes") or []}, indent=2))
+        return 0
+    print(f"appetite resized to {ap.get('minutes'):g}min/{ap.get('units')}units "
+          f"(standing: {ap.get('standing_minutes'):g}min/{ap.get('standing_units')}units).")
+    over = appetite_overage_line(root)
+    if over:
+        # The raise is reported AS an over-commitment straight away, not discovered at the
+        # close. The number moved because somebody decided it should; the record says so.
+        print(f"  {over}")
+    return 0
+
+
+def _cmd_batch_add_epic(args: argparse.Namespace, root: Path) -> int:
+    """Add an epic's stories at a named status as ONE priced set.
+
+    Adding them one at a time is the same batch and a worse record: the ledger reads as several
+    unrelated decisions, and nobody sees the POINTS the batch just grew by - which is the number
+    that decides whether the appetite still holds.
+    """
+    epic = sdlc_md.norm_id(getattr(args, "epic", "") or "")
+    status = (getattr(args, "status", None) or "Ready").strip()
+    if not epic:
+        print("sprint batch add-epic: --epic EPxxxx is required", file=sys.stderr)
+        return 2
+    try:
+        state = run_state.read(root) or {}
+    except run_state.RunStateError as exc:
+        print(f"sprint batch add-epic: {exc}", file=sys.stderr)
+        return 1
+    if not state.get("run_id"):
+        print("sprint batch add-epic: no run is open to add to", file=sys.stderr)
+        return 2
+    units = _epic_units(root, epic, status)
+    if not units:
+        # LOUD, and nothing written. Silently adding nothing reads exactly like adding
+        # everything, and the operator would only find out at the close.
+        print(f"sprint batch add-epic: {epic} has no stories at status {status!r} - nothing "
+              f"was added. Check the status, or the epic id.", file=sys.stderr)
+        return 2
+    already = [u for u in units if u in {sdlc_md.norm_id(b) for b in (state.get("batch") or [])}]
+    fresh = [u for u in units if u not in already]
+    # THE SAME CENSUS `plan --write` REFUSES ON. `sprint plan` will not open a run holding an
+    # ungroomed unit, because a plan over unsized units is false authority - but the in-flight
+    # batch verbs added straight to the batch without asking, so a unit the plan gate would have
+    # refused could walk in through `batch add-epic` and be delivered from a run that never
+    # judged it. The gate was on the door and not on the window.
+    if fresh:
+        # Batch items carry the resolved PATH as well as the id - `breakdown` reads the file to
+        # judge grooming, and an item with only an id raised KeyError rather than judging
+        # anything. Built the same way the planner builds them, so the two cannot drift.
+        items = []
+        for u in fresh:
+            found = sdlc_md.find_by_id(root, u)
+            if found:
+                items.append({"id": u, "path": str(found[0]), "type": found[1]})
+        bd = breakdown(root, items)
+        if bd["ungroomed"]:
+            # The same census, said in this verb's own name. Reusing `plan`'s refusal verbatim
+            # printed "sprint plan REFUSED" for a `batch add-epic` call, which sends the reader
+            # to the wrong command.
+            print(f"sprint batch add-epic REFUSED: {len(bd['ungroomed'])} of {len(fresh)} "
+                  f"unit(s) are ungroomed. NOTHING was added to the batch.\n", file=sys.stderr)
+            print("\n".join(_breakdown_detail(bd)), file=sys.stderr)
+            print(_breakdown_fix(bd, f"--epic {epic}"), file=sys.stderr)
+            return 2
+    for uid in fresh:
+        state = run_state.add_to_batch(root, uid)
+    points = _swap_points(root, fresh)
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps({"epic": epic, "status": status, "added": fresh,
+                          "already": already, "points": points,
+                          "batch": state.get("batch") or []}, indent=2))
+        return 0
+    print(f"added {len(fresh)} unit(s) from {epic} at {status} ({points}pts): "
+          f"{', '.join(fresh) or 'none'}; batch is now "
+          f"{len(state.get('batch') or [])} unit(s).")
+    if already:
+        # NAMED, not silently skipped - and their points are not counted again, or the number
+        # the appetite is judged against would grow without the batch growing.
+        print(f"  already in the batch, not added again: {', '.join(already)}")
+    return 0
+
+
+def _cmd_batch_swap(args: argparse.Namespace, root: Path) -> int:
+    """Trade units in ONE recorded call: `--out A,B --in C`.
+
+    Drop-then-add reaches the same batch but records two unrelated changes, so a reader of the
+    ledger cannot tell a trade from a cut followed later by an unrelated addition. The swap is
+    the intent, and the record should say so.
+
+    ATOMIC on the outgoing side. Every outgoing unit is checked to be in the batch BEFORE
+    anything is written, because a half-applied swap leaves the batch in a state nobody chose -
+    and the operator's next move would be to guess which half landed.
+    """
+    reason = (getattr(args, "reason", None) or "").strip()
+    if not reason:
+        print("sprint batch swap: --reason is required - a swap is a recorded decision about "
+              "what this run is for, not a silent edit", file=sys.stderr)
+        return 2
+    out_ids = sdlc_md.split_id_list(getattr(args, "out_units", None))
+    in_ids = sdlc_md.split_id_list(getattr(args, "in_units", None))
+    if not out_ids or not in_ids:
+        print("sprint batch swap: give both --out and --in - a swap with one side is a drop "
+              "or an add, and those record themselves as such", file=sys.stderr)
+        return 2
+    try:
+        state = run_state.read(root) or {}
+    except run_state.RunStateError as exc:
+        print(f"sprint batch swap: {exc}", file=sys.stderr)
+        return 1
+    batch = [sdlc_md.norm_id(u) for u in (state.get("batch") or [])]
+    absent = [u for u in out_ids if sdlc_md.norm_id(u) not in batch]
+    if absent:
+        print(f"sprint batch swap: {', '.join(absent)} is not in this run's batch - refusing "
+              f"before anything is written, because a half-applied swap leaves the batch in a "
+              f"state nobody chose", file=sys.stderr)
+        return 2
+    out_pts, in_pts = _swap_points(root, out_ids), _swap_points(root, in_ids)
+    try:
+        for uid in out_ids:
+            state = run_state.drop_from_batch(root, uid, reason=f"swap: {reason}")
+        for uid in in_ids:
+            state = run_state.add_to_batch(root, uid)
+    except run_state.RunStateError as exc:
+        print(f"sprint batch swap: {exc}", file=sys.stderr)
+        return 1
+    # ONE swap record beside the individual changes, so the ledger carries the intent as well
+    # as the mechanics.
+    swaps = list(state.get("batch_swaps") or [])
+    swaps.append({"out": [sdlc_md.norm_id(u) for u in out_ids],
+                  "in": [sdlc_md.norm_id(u) for u in in_ids],
+                  "reason": reason, "out_points": out_pts, "in_points": in_pts,
+                  "at": sdlc_md.now_iso8601()})
+    state = run_state.update(root, batch_swaps=swaps)
+    delta = in_pts - out_pts
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps({"batch": state.get("batch") or [], "swap": swaps[-1]}, indent=2))
+        return 0
+    print(f"swapped out {', '.join(out_ids)} ({out_pts}pts) for {', '.join(in_ids)} "
+          f"({in_pts}pts); batch is now {len(state.get('batch') or [])} unit(s).")
+    if delta:
+        # WARNS and applies. The operator asked for this trade; refusing it would make the
+        # command useless for the case it exists for - a swap is rarely balanced to the point.
+        print(f"  note: this swap is NOT balanced - {delta:+d} points against the plan. "
+              f"Applied as asked; the appetite is what decides whether that is affordable.")
+    return 0
+
+
+def cmd_batch(args: argparse.Namespace) -> int:
+    """`sprint batch drop/add`: mutate an OPEN run's approved batch.
+
+    Drop removes a unit from the batch the done-gate reads (with a recorded reason) - distinct
+    from `Deferred`, a status on the WORK that leaves the unit in the batch and still blocks the
+    close. Add appends a unit under the same gates. Both are recorded in the run's `batch_changes`
+    so the delivered batch can be reconciled against the planned one.
+    """
+    root = Path(getattr(args, "root", "."))
+    action = args.action
+    if action == "swap":
+        return _cmd_batch_swap(args, root)
+    if action == "add-epic":
+        return _cmd_batch_add_epic(args, root)
+    if action == "drop" and not (getattr(args, "reason", None) or "").strip():
+        print("sprint batch drop: --reason is required - a drop is recorded, not silent",
+              file=sys.stderr)
+        return 2
+    # REFUSED BEFORE THE WRITE. The check used to run after `add_to_batch`, so the operator was
+    # told "refused" about a unit the done-gate could already see - a refusal that is a message
+    # rather than a refusal. Applied on every output format: the json path skipped the check
+    # entirely, holding a machine caller to a weaker rule than a human one.
+    if action == "add" and affects_check_mode(root) == "block":
+        offenders = list(affects_findings(root, [sdlc_md.norm_id(args.id)]))
+        if offenders:
+            for it in offenders:
+                if it.get("unresolvable"):
+                    print(f"  {it['id']}: Affects declares path(s) not on disk - "
+                          f"{', '.join(it['unresolvable'])}", file=sys.stderr)
+                if it.get("undeclared"):
+                    print(f"  {it['id']}: targeted by its own Verify lines but undeclared - "
+                          f"{', '.join(it['undeclared'])}", file=sys.stderr)
+            print(f"sprint batch add REFUSED {sdlc_md.norm_id(args.id)}: "
+                  f"sprint.affects_check is `block`. The unit was NOT added - declare the path "
+                  f"or correct the Verify line.", file=sys.stderr)
+            return 2
+    try:
+        if action == "drop":
+            state = run_state.drop_from_batch(root, args.id, reason=args.reason)
+        else:
+            state = run_state.add_to_batch(root, args.id, reason=args.reason or "")
+    except run_state.RunStateError as exc:
+        print(f"sprint batch {action}: {exc}", file=sys.stderr)
+        return 1
+    change = (state.get("batch_changes") or [])[-1]
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps({"batch": state.get("batch") or [], "change": change}, indent=2))
+    elif action == "drop":
+        print(f"dropped {change['id']} from the batch (reason: {change['reason']}); "
+              f"batch is now {len(state.get('batch') or [])} unit(s). The done-gate no longer "
+              f"demands it - this is not Deferred, which would leave it gated.")
+    else:
+        note = " (already present)" if change.get("note") else ""
+        print(f"added {change['id']} to the batch{note}; batch is now "
+              f"{len(state.get('batch') or [])} unit(s), held to the same gates as the rest.")
+        # The SAME check the plan ran over the original batch. Without it, joining a batch after
+        # the plan was printed is a way past a gate every other unit in that batch passed.
+        for it in affects_findings(root, [change["id"]]):
+            if it.get("unresolvable"):
+                print(f"  {it['id']}: Affects declares path(s) not on disk - "
+                      f"{', '.join(it['unresolvable'])} (a file the unit CREATES is fine)")
+            if it.get("undeclared"):
+                print(f"  {it['id']}: targeted by its own Verify lines but undeclared - "
+                      f"{', '.join(it['undeclared'])}")
+            # The `block` refusal now happens BEFORE the write, above - reaching here means
+            # the mode is `warn`, so these are reported and nothing is refused.
+    return 0
+
+
+def _lane_unit_ids(args: argparse.Namespace) -> list[str]:
+    """The units this lane covers: the ones named, else the OPEN run's approved batch. Derived
+    from the run rather than retyped, so a lane brief cannot quietly cover a different set from
+    the one the sprint approved."""
+    if getattr(args, "units", None):
+        return [u.strip() for u in args.units if u and u.strip()]
+    try:
+        return list((run_state.read(args.root) or {}).get("batch") or [])
+    except Exception as exc:  # noqa: BLE001 - a missing run state is reported, not fatal
+        sdlc_md.debug("sprint._lane_unit_ids", exc)
+        return []
+
+
+def _lane_positive_int(raw: str) -> int:
+    """`--tokens`: a positive integer, refused by the parser otherwise - a 0 recorded as an
+    agent's total would be added into the run's spend as an agent that cost nothing."""
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expects a positive integer, got {raw!r}") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"expects a positive integer, got {raw!r}")
+    return value
+
+
+def _lane_positive_minutes(raw: str) -> float:
+    """`--minutes`: a positive finite number of minutes, refused by the parser otherwise."""
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expects a positive number, got {raw!r}") from None
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"expects a positive finite number, got {raw!r}")
+    return value
+
+
+def _lane_agent_totals(root: Path, args: argparse.Namespace, results: list[dict]) -> None:
+    """Record the builder's own `--tokens` (and `--minutes`) for the one unit returned, through
+    the delegated record `retro.py accuracy --delegated-unit` writes, so the figure counts once
+    in the run's delegated total and reads as the unit's agent total on the page.
+
+    Optional and never a refusal. Recorded whatever the outcome: a blocked lane spent its
+    tokens too. Two cases record nothing and say so, because the figure cannot be placed:
+    `--minutes` with no `--tokens` or `--agent` (a delegated record IS a token total), and a
+    total given for several units at once (it cannot be split between them).
+
+    `--agent` names the builder's own transcript (`run_state.agent_transcript_tokens`): its
+    priced cost and components land on the record, and its token sum is the total when no
+    `--tokens` is given. An agent with no readable transcript is warned about, naming the id and
+    the directory searched, and the return records no priced cost."""
+    tokens, minutes = getattr(args, "tokens", None), getattr(args, "minutes", None)
+    agent = getattr(args, "agent", None)
+    if tokens is None and minutes is None and agent is None:
+        return
+    if tokens is None and agent is None:
+        print("WARNING --minutes was not recorded: an agent's minutes are recorded with its "
+              "token total, so pass the builder's --tokens beside them", file=sys.stderr)
+        return
+    if len(results) != 1:
+        print(f"WARNING {'--tokens' if tokens is not None else '--agent'} was not recorded: "
+              f"one total cannot be split between {len(results)} units - return each unit with "
+              f"its own builder's total", file=sys.stderr)
+        return
+    res = results[0]
+    reading = None
+    if agent is not None:
+        reading = run_state.agent_transcript_tokens(root, agent)
+        if reading.get("priced") is None:
+            print(f"WARNING --agent {agent} was not priced: {reading['reason']}, so "
+                  f"{res['unit']}'s return records no priced cost", file=sys.stderr)
+            reading = None
+    if tokens is None and reading is None:
+        if minutes is not None:
+            print("WARNING --minutes was not recorded: no token total was supplied or read "
+                  "beside them", file=sys.stderr)
+        return
+    unreadable = object()
+    got = _lane_run_state(
+        "record_agent_total",
+        lambda: run_state.record_delegated_tokens(
+            root, tokens if tokens is not None else reading["tokens"],
+            agent=f"agent-{agent}" if agent is not None else "build lane",
+            note=f"sprint lane return ({res['outcome']})", unit=res["unit"], minutes=minutes,
+            reading=reading, provenance=(run_state.SUPPLIED if tokens is not None
+                                         else run_state.READ_FROM_TRANSCRIPT)),
+        unreadable,
+        f"{res['unit']}'s builder total could not be recorded (the run state is unreadable), so "
+        f"its tokens and minutes will not reach the page")
+    res["agent_total"] = None if got is unreadable else got
+    if got is None:
+        print("WARNING --tokens was not recorded: no run is open, so there is no run to count "
+              "the builder's total against", file=sys.stderr)
+    elif got is not unreadable and got.get("unit") not in _lane_run_state(
+            # the page's own unit set (planned, added or dropped), so a unit dropped at the cap,
+            # whose per-unit row does show the total, is not warned about
+            "agent_total_batch", lambda: _page_units(run_state.read(root)), [],
+            "the run state could not be read, so whether the total is on the batch is UNKNOWN"):
+        print(f"WARNING --tokens was recorded off the batch: {got.get('unit')} was never in the "
+              f"open run's batch, so the total counts in the run's but no per-unit row shows it",
+              file=sys.stderr)
+
+
+#: `lane return` and `lane accept`'s per-verifier timeout in seconds when `--timeout` is not given.
+LANE_VERIFY_TIMEOUT = 300
+
+
+def _lane_run_refusal(args: argparse.Namespace, units: list[str]) -> str | None:
+    """Why `lane run` cannot start, before anything is recorded, or None: no `--harness`, other
+    than one unit (one fresh session per lane, priced on its own), or the CLI not on PATH."""
+    import shutil  # noqa: PLC0415 - only a lane run looks a CLI up
+    from lib import lanes  # noqa: PLC0415 - only a lane run needs it
+    if not getattr(args, "harness", None):
+        return f"name the CLI with --harness ({', '.join(lanes.BINARIES)})"
+    if len(units) != 1:
+        return (f"a lane run takes one unit, one fresh session per lane priced on its own; got "
+                f"{len(units)} ({', '.join(units)})")
+    binary = lanes.BINARIES[args.harness]
+    if shutil.which(binary) is None:
+        return f"{binary} is not on PATH, so no {args.harness} lane can run"
+    return None
+
+
+def _lane_run_totals(root: Path, args: argparse.Namespace, results: list[dict]) -> None:
+    """Price each returned unit from its `lane run` records (`lanes.run_readings`): each
+    session's usage as its own CLI printed it, weighed by `run_state.price` and costed in US
+    dollars by `lib/prices.py`, recorded as one delegated record per session, so a repair's
+    session adds to its builder's and a second return of the same session counts it once. A
+    return that names its builder's own total (`--tokens` or `--agent`) is priced from that
+    instead. An unmetered session, or a record another run wrote, is warned about and records
+    nothing, never a zero."""
+    if getattr(args, "tokens", None) is not None or getattr(args, "agent", None) is not None:
+        return
+    from lib import lanes, prices  # noqa: PLC0415 - only a lane run's return needs them
+    run_id = _lane_run_state(
+        "lane_run_totals", lambda: run_state.read(root).get("run_id"), None,
+        "the run state could not be read, so no lane run record is priced")
+    unreadable = object()
+    sessions = [(res, got) for res in results
+                for got in lanes.run_readings(root, res["unit"], run_id)]
+    for res, (reading, why) in sessions:
+        if why:
+            print(f"WARNING {why}", file=sys.stderr)
+        if reading is None:
+            continue
+        reading["priced"] = run_state.price(reading["components"])
+        try:
+            cost = prices.cost(reading["model"], reading["components"], prices.load(root))
+            usd, note = cost.usd, cost.unpriced
+        except (prices.PriceTableError, ValueError) as exc:
+            usd, note = None, f"not priced: {exc}"
+        got = _lane_run_state(
+            "record_lane_run_total",
+            lambda res=res, reading=reading: run_state.record_delegated_tokens(
+                root, reading["tokens"], agent=f"lane-run-{reading['harness']}",
+                note=f"sprint lane run return ({res['outcome']})", unit=res["unit"],
+                reading=reading, provenance=lanes.HARNESS_OUTPUT),
+            unreadable,
+            f"{res['unit']}'s lane run usage could not be recorded (the run state is "
+            f"unreadable), so its cost will not reach the page")
+        res.setdefault("lane_runs", []).append(
+            {"agent_total": None if got is unreadable else got,
+             "lane_run_cost": {"usd": usd, "unpriced": note, "model": reading["model"]}})
+        if got is None:
+            print(f"WARNING {res['unit']}'s lane run usage was not recorded: no run is open, so "
+                  f"there is no run to count it against", file=sys.stderr)
+
+
+def _page_units(state: dict) -> list[str]:
+    """The units the page lists a per-unit row for: planned, added or dropped."""
+    import sprint_report  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+    return sprint_report._unit_order(state)[4]
+
+
+def _lane_pairs(values: list[str] | None, flag: str) -> dict:
+    """`--proof band=evidence` pairs. A malformed pair raises rather than being dropped: a proof
+    silently discarded on a typo is the undischarged obligation this command exists to surface."""
+    out: dict = {}
+    for raw in values or []:
+        if "=" not in raw:
+            raise ValueError(f"{flag} expects `obligation=text`, got {raw!r}")
+        band, text = raw.split("=", 1)
+        if not band.strip() or not text.strip():
+            raise ValueError(f"{flag} expects `obligation=text` with both sides set, got {raw!r}")
+        out[band.strip()] = text.strip()
+    return out
+
+
+#: Unit ids inside a blocker's prose, masked out before the cause is keyed. THE SHARED
+#: grammar, not a local copy: the local pattern knew only the v2 four-digit form, so a v3
+#: ULID id was neither masked nor collected and a third era would need this edited again.
+_UNIT_IN_DETAIL = sdlc_md.ID_SEARCH_RE
+
+
+#: The two ends of the bookend goal review. At PLAN the seats judge whether the chosen content
+#: will deliver the goal; at CLOSE they judge whether what was delivered did. Same question,
+#: two moments, and the pair is what makes either answer worth recording - a plan-time yes
+#: nobody ever revisits is a prediction with no scoring, and an answer nobody scores is one
+#: given carelessly.
+CONTENT_REVIEW_KEY = "goal_content_review"
+CONTENT_ANSWERS = ("yes", "partial", "no")
+
+
+def record_content_review(repo_root: Path | str, phase: str, goal: str, answer: str,
+                          missing: str = "", shortfall: dict | None = None) -> dict:
+    """Record one end of the bookend goal review. `phase` is `plan` or `close`.
+
+    A PARTIAL or NO that names nothing missing is REFUSED. The value of the question is the
+    list of what the batch does not cover; an unexplained partial records a doubt that nobody
+    can act on and that the close cannot score against.
+
+    At `close`, `shortfall` carries the undelivered units and the defects raised - SUPPLIED to
+    the seats rather than recalled by them. The judgement rests on the evidence in front of the
+    panel, which is the difference between a review and a recollection.
+    """
+    if phase not in ("plan", "close"):
+        raise ValueError(f"phase must be 'plan' or 'close', got {phase!r}")
+    # REFUSED with no run open. `run_state.open_run` treats a state carrying no `run_id` as
+    # spent and blanks it, so a review recorded before the plan is written lands on a record
+    # the very next call replaces - silently, and `prediction_miss` is then permanently None.
+    # Refusing is the sibling behaviour `record_lane_start` already has, and it is the right
+    # direction: a review nobody can read later was not recorded, whatever the file said.
+    if not (run_state.read(repo_root) or {}).get("run_id"):
+        raise ValueError(
+            "no run is open, so this review would be written where the next `sprint plan "
+            "--write` destroys it. Open the run first - the review belongs to a run, and one "
+            "recorded against no run cannot be scored at its close")
+    # ...and refused with no GOAL, for the same reason. A bookend answer detached from the
+    # question it answered cannot be scored against anything at the close, which is the entire
+    # purpose of recording it. This is not hypothetical: replacing the goal with `""` at the
+    # call site survived the whole suite, so the review could be recorded about nothing and
+    # `prediction_miss` would compare an answer with no question.
+    if not str(goal or "").strip():
+        raise ValueError(
+            "a content review must name the GOAL it answers - an answer with no question "
+            "cannot be scored at the close, and a review recorded about nothing reads exactly "
+            "like one about the sprint")
+    a = str(answer or "").strip().lower()
+    if a not in CONTENT_ANSWERS:
+        raise ValueError(f"answer must be one of {', '.join(CONTENT_ANSWERS)}, got {answer!r}")
+    if a in ("partial", "no") and not str(missing or "").strip():
+        raise ValueError(
+            f"a {a!r} answer must NAME what is missing - the value of this question is the "
+            f"list of what the content does not cover, and an unexplained doubt is one nobody "
+            f"can act on and the close cannot score against")
+    entry = {"phase": phase, "goal": goal, "answer": a, "missing": str(missing or "").strip(),
+             "shortfall": shortfall or {}, "recorded_at": sdlc_md.now_iso8601()}
+    state = run_state.read(repo_root) or {}
+    rows = [r for r in (state.get(CONTENT_REVIEW_KEY) or []) if r.get("phase") != phase]
+    run_state.update(repo_root, **{CONTENT_REVIEW_KEY: rows + [entry]})
+    return entry
+
+
+def content_reviews(repo_root: Path | str) -> dict:
+    """`{plan, close}` - the two recorded answers, either of which may be None."""
+    rows = (run_state.read(repo_root) or {}).get(CONTENT_REVIEW_KEY) or []
+    return {phase: next((r for r in rows if r.get("phase") == phase), None)
+            for phase in ("plan", "close")}
+
+
+def _close_shortfall(root, state: dict) -> dict:
+    """The evidence the close-time content question is answered AGAINST.
+
+    Supplied to the seats rather than recalled by them - `record_content_review` takes it for
+    exactly that reason. A judgement made from memory of what shipped is a recollection, and
+    this project has twice recorded a completion claim that reading the evidence would have
+    refused."""
+    batch = [b.get("id") if isinstance(b, dict) else b for b in ((state or {}).get("batch") or [])]
+    batch = [str(b) for b in batch if b]
+    undelivered = []
+    for uid in batch:
+        hit = sdlc_md.find_by_id(root, uid)
+        if not hit:
+            undelivered.append(uid)
+            continue
+        status = (sdlc_md.extract_field(sdlc_md.read_text_safe(hit[0]), "Status") or "").strip()
+        if status.lower() not in ("done", "fixed", "closed", "complete", "verified"):
+            undelivered.append(f"{uid} ({status or 'no status'})")
+    return {"undelivered": undelivered, "defects": [d["id"] for d in _open_defects(root)]}
+
+
+def close_goal_judgement(root, state: dict, seats: list | None = None) -> list[str]:
+    """The close's goal judgement, as lines to print. BG0385's repair.
+
+    RUN-01KYMJEM built `goal_panel`, `judge_defects_against_goal`, both ends of the bookend
+    content review and `prediction_miss` - and shipped all five with no caller. The tests were
+    green, the mutants were killed and not one line of it could run, so the per-clause verdict
+    that close recorded was assembled by hand and the panel's author-exclusion never fired.
+    This is the caller. It reports rather than refuses: the mechanisms inform the operator's
+    sign-off, and a reporting lane that can block a close is a lane that gets switched off.
+    """
+    import critic  # noqa: PLC0415 - deferred, like the chain's other siblings
+    lines: list[str] = []
+    goal = (state or {}).get("sprint_goal") or ""
+    clauses = run_state.goal_clauses(goal)
+    batch = [b.get("id") if isinstance(b, dict) else b for b in ((state or {}).get("batch") or [])]
+    batch = [str(b) for b in batch if b]
+
+    # 1. The per-clause verdict, from the panel that REFUSES the author.
+    if clauses:
+        # The author and the seats must be in ONE namespace or the exclusion is theatre:
+        # `_recorded_goal_seats` returns seat NAMES and `_signoff_author` an author id, so
+        # comparing them excluded nobody while the report said "author excluded". An author
+        # that cannot be identified now REFUSES the panel rather than producing one wearing a
+        # claim the record cannot support.
+        recorded = _recorded_goal_seats(root)
+        author = str((state or {}).get("author") or "").strip()
+        if not author and batch:
+            author = str(_signoff_author(root, batch[0]) or "").strip()
+        if not author:
+            lines.append("goal panel: NOT RUN - no author is identified on this run, so the "
+                         "panel cannot prove it excluded them. A verdict from a panel that "
+                         "may contain the author is the thing this judgement exists to refuse")
+            panel = None
+        else:
+            seats = [s for s in recorded if not critic.same_identity(s, author)]
+            excluded = len(recorded) - len(seats)
+            try:
+                panel = critic.goal_panel(root, clauses, seats, author,
+                                          verdicts=_recorded_clause_verdicts(root, clauses))
+            except ValueError as exc:
+                lines.append(f"goal panel: not run - {exc}")
+                panel = None
+        if panel is None:
+            pass
+        else:
+            # SAY how many were excluded, so "author excluded" is a count a reader can check
+            # rather than a claim they have to believe.
+            note = (f", {excluded} seat(s) excluded as the author" if excluded
+                    else ", no seat matched the author")
+            lines.append(f"goal panel: {panel['verdict'] or 'UNANSWERED'} over "
+                         f"{len(clauses)} clause(s), {len(panel['panel'])} seat(s){note}")
+            for row in panel["clauses"]:
+                unanswered = (f" ({len(row['unanswered'])} seat(s) silent)"
+                              if row["unanswered"] else "")
+                lines.append(f"    {row['verdict'] or 'UNANSWERED'}{unanswered}: "
+                             f"{row['clause'][:100]}")
+
+    # 2. The open defects, judged against those clauses rather than a guessed severity.
+    defects = _open_defects(root)
+    if defects and clauses:
+        ruling = critic.judge_defects_against_goal(defects, clauses)
+        lines.append(f"defects vs goal: {len(ruling['blocking'])} BLOCKING, "
+                     f"{len(ruling['leavable'])} leavable")
+        for d in ruling["blocking"][:8]:
+            lines.append(f"    BLOCKING {d.get('id')}: {d.get('why', '')[:110]}")
+
+    # 3. Every unit shipping a mechanism nothing calls - the check this repo already owned and
+    #    had never run over a batch. The reason BG0385 was found by a question, not a tool.
+    if batch:
+        try:
+            inert = critic.caller_findings(root, batch)
+        except (OSError, ValueError) as exc:
+            lines.append(f"caller-check: not run - {exc}")
+        else:
+            lines.append(f"caller-check: {len(inert)} unit(s) of {len(batch)} ship a mechanism "
+                         f"with no named caller")
+            lines.extend(f"    {line.strip()}" for line in critic.render_caller_findings(inert))
+
+    # 4. The bookend: did the plan's prediction hold?
+    # Same class as the in-flight read below: `prediction_miss` reaches `content_reviews`,
+    # which reads the run state, and this function never blocks a close.
+    try:
+        miss = prediction_miss(root)
+    except Exception as exc:  # noqa: BLE001 - this judgement never blocks a close
+        sdlc_md.debug("sprint.close_goal_judgement.prediction", exc)
+        miss = ("prediction check: UNREADABLE - the run state could not be parsed, so whether "
+                "the plan-time content review held is UNKNOWN, not clear")
+    if miss:
+        lines.append(miss)
+
+    # 5. Any lane still marked in flight. `close_run` leaves these markers set, so a run can be
+    #    signed off while a marker says a lane never returned - and the working tree may carry
+    #    work nobody attributed. Reported at the one moment somebody is reading.
+    # `lanes_in_flight` reaches `run_state.read`, which RAISES on an unparseable file. This
+    # function is documented as never blocking a close, so it reports the unreadable state
+    # rather than raising out of it - an absence stated, not a traceback.
+    try:
+        in_flight = run_state.lanes_in_flight(root)
+    except Exception as exc:  # noqa: BLE001 - this judgement never blocks a close
+        sdlc_md.debug("sprint.close_goal_judgement.in_flight", exc)
+        in_flight = []
+        lines.append("IN FLIGHT at close: UNREADABLE - the run state could not be parsed, so "
+                     "whether any lane never returned is UNKNOWN, not none")
+    for row in in_flight:
+        lines.append(f"IN FLIGHT at close: {row['unit']} was briefed at {row['started_at']} and "
+                     f"never returned - its work may be in this tree unattributed")
+    return lines
+
+
+def _recorded_goal_seats(root) -> list[str]:
+    """The seats that reviewed the Sprint Goal at plan time, from the recorded round."""
+    data = sdlc_md.read_json(Path(root) / "sdlc-studio/.local/goal-review.json", {})
+    rounds = data.get("rounds") if isinstance(data, dict) else None
+    latest = (rounds or [{}])[-1] if isinstance(rounds, list) and rounds else {}
+    return [str(s.get("seat")) for s in (latest.get("seats") or []) if s.get("seat")]
+
+
+def _recorded_clause_verdicts(root, clauses: list[str]) -> dict | None:
+    """Per-clause verdicts a seat has actually recorded PER CLAUSE, or None when none has.
+
+    Two things this deliberately no longer does.
+
+    It does not FAN a whole-goal answer across every clause. A plan-time seat answers one
+    question about the goal entire; copying that answer onto each clause manufactures per-clause
+    evidence nobody gave, and it does so most confidently exactly where the goal has several
+    clauses and the seat was thinking about one of them. A clause no seat answered per-clause
+    reads UNANSWERED, which the panel already knows how to report.
+
+    It does not carry a second polarity mapping. `verdict_polarity` is the one reading of a
+    seat's answer; the local copy here mapped everything that was not yes to `partial`, so a
+    seat answering NO - the strongest signal a review can give - was recorded as a partial
+    success while `verdict_polarity` sat unused two hundred lines above.
+    """
+    data = sdlc_md.read_json(Path(root) / "sdlc-studio/.local/goal-review.json", {})
+    rounds = data.get("rounds") if isinstance(data, dict) else None
+    latest = (rounds or [{}])[-1] if isinstance(rounds, list) and rounds else {}
+    out: dict = {}
+    for seat in latest.get("seats") or []:
+        per_clause = seat.get("clauses")
+        if not isinstance(per_clause, dict):
+            continue          # a whole-goal answer is not a per-clause one
+        for clause in clauses:
+            answer = per_clause.get(clause)
+            if answer is None:
+                continue
+            polarity = verdict_polarity(answer)
+            if polarity == "unclear":
+                continue      # an unclear answer is not a verdict; the clause stays unanswered
+            verdict = "achieved" if polarity == "yes" else "missed"
+            out.setdefault(clause, {})[str(seat.get("seat"))] = verdict
+    return out or None
+
+
+def _open_defects(root) -> list[dict]:
+    """Every open bug, as `judge_defects_against_goal` reads them."""
+    out: list[dict] = []
+    for path in sdlc_md.artifact_files("bug", Path(root)):
+        text = sdlc_md.read_text_safe(path)
+        status = (sdlc_md.extract_field(text, "Status") or "").strip().lower()
+        if status not in ("open", "in progress"):
+            continue
+        out.append({"id": sdlc_md.extract_record_id(path.stem),
+                    "title": sdlc_md.extract_h1_title(text) or path.stem,
+                    "priority": (sdlc_md.extract_field(text, "Severity") or "").strip()})
+    return out
+
+
+def prediction_miss(repo_root: Path | str) -> str | None:
+    """The plan-time prediction against the close-time judgement, when they disagree.
+
+    Reported so that over several sprints an operator can see whether the plan-time question is
+    being answered seriously. A question whose answer is never checked is one that gets a
+    confident yes every time."""
+    rev = content_reviews(repo_root)
+    plan, close = rev["plan"], rev["close"]
+    if not plan or not close:
+        return None
+    if plan["answer"] == "yes" and close["answer"] != "yes":
+        return (f"PREDICTION MISS: at plan the seats said this content WOULD deliver the goal; "
+                f"at close they judged it {close['answer']}"
+                + (f" - {close['missing']}" if close["missing"] else ""))
+    if plan["answer"] != "yes" and close["answer"] == "yes":
+        return (f"prediction beaten: at plan the seats said {plan['answer']} "
+                f"({plan['missing']}); at close they judged the goal delivered")
+    return None
+
+
+def group_blockers(blockers: list[dict]) -> list[dict]:
+    """Blockers grouped by CAUSE: `[{cause, stage, remedy, blockers, units}]`.
+
+    One missing sign-off across twenty-three units is ONE thing to fix and one artefact to
+    read. Filed per unit it arrives in the discovery backlog as twenty-three identical change
+    requests, and whoever picks them up has to work out that they are one - a cost paid twice,
+    once at the close and again at the triage.
+
+    The cause is the stage plus the remedy with unit ids stripped, so two blockers differing
+    only in WHICH unit they name group, and two with genuinely different remedies do not. That
+    matters as much as the grouping: merging unrelated blockers would hide one behind another.
+    """
+    groups: dict[tuple, dict] = {}
+    for b in blockers:
+        remedy = _UNIT_IN_DETAIL.sub("<unit>", str(b.get("remedy") or "")).strip()
+        raw_cause = b.get("cause") or b.get("detail") or ""
+        cause = _UNIT_IN_DETAIL.sub("<unit>", str(raw_cause)).strip()
+        # The DETAIL is part of the key, not only the remedy. Two blockers that share a remedy
+        # and differ in what is actually wrong are two things to fix: keyed on the remedy alone
+        # they merged, the second detail never reached the filed artefact, and the close said
+        # they were "listed inside the artefact that covers them" while one of them was not.
+        key = (b.get("stage"), remedy, cause)
+        g = groups.setdefault(key, {"cause": cause, "stage": b.get("stage"),
+                                    "remedy": b.get("remedy"), "blockers": [], "units": []})
+        g["blockers"].append(b)
+        for m in _UNIT_IN_DETAIL.finditer(f"{b.get('detail', '')} {b.get('remedy', '')}"):
+            # group(0): the shared grammar is unanchored and uncaptured, unlike the local
+            # pattern it replaced. Reading group(1) raised IndexError on every match.
+            uid = sdlc_md.norm_id(m.group(0))
+            if uid not in g["units"]:
+                g["units"].append(uid)
+    return list(groups.values())
+
+
+def _lane_run_state(label: str, call, fallback, warning: str):
+    """Run one run-state call for `lane`, best-effort. Returns `fallback` if it raises.
+
+    Every run-state read in `cmd_lane` goes through here. The rule they all share is the same:
+    the run state is BOOKKEEPING for this command, never its purpose, so an unreadable state
+    must degrade the command's knowledge and say so - it must never stop the command or discard
+    its work. Three consecutive review rounds each found one more unguarded copy of that rule
+    open-coded in this function, so it is stated once, in one place, and a test asserts no call
+    site bypasses it. Fixing the line a reviewer names, rather than the class they describe, is
+    what produced the second and third occurrences.
+    """
+    try:
+        return call()
+    except Exception as exc:  # noqa: BLE001 - bookkeeping never fails the command it serves
+        sdlc_md.debug(f"sprint.cmd_lane.{label}", exc)
+        print(f"WARNING {warning}", file=sys.stderr)
+        return fallback
+
+
+def _at_terminal_status(root: Path, uid: str) -> bool:
+    """True when `uid`'s artefact carries a terminal status for its type."""
+    hit = sdlc_md.find_by_id(root, uid)
+    if hit is None:
+        return False
+    raw = sdlc_md.extract_field(sdlc_md.read_text_safe(hit[0]), "Status") or ""
+    status = sdlc_md.canonical_status(raw, sdlc_md.status_vocab(hit[1], root)) or raw.strip()
+    return sdlc_md.is_terminal_status(hit[1], status)
+
+
+def cmd_cost(args: argparse.Namespace) -> int:
+    """`sprint cost --anatomy`: the open run's spend by role and its heaviest tool outputs, read
+    from the current session's records after the run's start, or the whole session's under
+    `--session` or with no run open (`lib/cost_anatomy.py`). Exit 2 with no `--anatomy`, the one
+    view this command prints; 1 when no reading can be had, with the reason.
+
+    With no Claude Code session transcript and no `--transcripts`, the harness meter's own
+    reading (`run_state.session_tokens`) is printed as one total under `other`, its counts and
+    contexts not available."""
+    if not args.anatomy:
+        print("sprint cost: name --anatomy, the one view this command prints", file=sys.stderr)
+        return 2
+    from lib import cost_anatomy  # noqa: PLC0415 - only this command needs it
+    root = Path(args.root)
+    try:
+        got = cost_anatomy.anatomy(root, args.transcripts, session=args.session)
+    except cost_anatomy.AnatomyError as exc:
+        reading = (run_state.session_tokens(root)
+                   if not exc.store and not args.transcripts else {"tokens": None})
+        if reading.get("tokens") is None or reading.get("harness") in (None, "claude"):
+            print(f"sprint cost --anatomy: no reading: {exc}"
+                  + (f"; the meter: {reading['reason']}" if reading.get("reason") else ""),
+                  file=sys.stderr)
+            return 1
+        got = cost_anatomy.from_reading(reading)
+    print(json.dumps(got, indent=2) if args.format == "json" else cost_anatomy.render(got))
+    return 0
+
+
+def cmd_lane(args: argparse.Namespace) -> int:
+    """`sprint lane brief|return|land`: the two ends of a delegated unit, and its landing.
+
+    `brief` dispatches lanes onto the units and prints what each is held to, refusing any unit
+    whose acceptance criteria cannot be read. `return` runs a unit's own criteria and prints the
+    outcome, which is `blocked` whenever a criterion is red, unresolved or unspecified, whatever
+    the lane claimed. Exit 2 on a refusal, 1 on a blocked return - so a wrapper script cannot
+    treat either as a delivery. `land` commits a builder's staged worktree and lands it, and
+    `accept` records its reviewer's verdict and on an APPROVE verifies, moves and returns it;
+    the steps and exit statuses of both are `lib/lanes.py`'s.
+    """
+    if args.action == "land":
+        from lib import lanes  # noqa: PLC0415 - only the landing needs it
+        return lanes.land(args.root, getattr(args, "worktree", None),
+                          getattr(args, "units", None) or [], getattr(args, "author", None))
+    if args.action == "accept":
+        from lib import lanes  # noqa: PLC0415 - only the accept needs it
+        # handed to the `lane return` an APPROVE ends with, exactly as given here
+        passthrough = [arg for flag, value in (("--agent", args.agent), ("--tokens", args.tokens),
+                                               ("--minutes", args.minutes))
+                       if value is not None for arg in (flag, str(value))]
+        for flag, values in (("--proof", args.proof), ("--gap", args.gap)):
+            passthrough += [arg for value in values or [] for arg in (flag, value)]
+        return lanes.accept(args.root, getattr(args, "unit", None),
+                            getattr(args, "verdict", None), getattr(args, "reviewer", None),
+                            _SIGNOFF_TERMINAL, author=getattr(args, "author", None),
+                            timeout=args.timeout or LANE_VERIFY_TIMEOUT,
+                            passthrough=passthrough)
+    root = Path(args.root)
+    units = _lane_unit_ids(args)
+    if not units:
+        print("sprint lane: no units - name them with --units, or open a run whose batch has "
+              "some. An empty lane is reported, never treated as a lane with nothing to do.",
+              file=sys.stderr)
+        return 2
+    if args.action == "run" and (refusal := _lane_run_refusal(args, units)):
+        print(f"sprint lane run: {refusal}", file=sys.stderr)
+        return 2
+    if args.action in ("brief", "run"):
+        for flag in ("tokens", "minutes"):
+            if getattr(args, flag, None) is not None:
+                print(f"WARNING --{flag} was not recorded: a brief records no agent total - "
+                      f"pass the builder's total to `sprint lane return`", file=sys.stderr)
+        dispatch = lane_dispatch(root, units)
+        if args.action == "run" and dispatch["refused"]:
+            for ref in dispatch["refused"]:
+                print(f"REFUSED {ref['refusal']}", file=sys.stderr)
+            return 2
+        # An IN-FLIGHT marker per briefed unit, taken at dispatch and cleared at return. A lane
+        # that dies mid-flight leaves real code in the working tree behind a unit still marked
+        # Ready, and a restart cannot tell a delivered unit from an untouched one - the revision
+        # row is written BEFORE the work, so it cannot answer this. Reported to the operator on
+        # the next brief rather than discovered when a restarted lane redoes work already there.
+        # EVERY stale marker, not only those naming a unit in THIS dispatch. Filtering to the
+        # briefed set meant a lane that died on US0001 went unmentioned when the operator
+        # briefed US0002 - which is the restart case the marker exists for, and the only case
+        # in which the operator has not already noticed.
+        # BOTH of these read the run state, and BOTH must not stop a brief being issued. The
+        # first repair guarded `lane_dispatch` and left these three statements later in the same
+        # command, so the artefact's own reproduction still produced a traceback and issued no
+        # brief - and the test written for it exercised the library function, not the command it
+        # names. A library test is not a lane test.
+        in_flight = _lane_run_state(
+            "in_flight", lambda: run_state.lanes_in_flight(root), [],
+            "the run state could not be read, so whether any lane never returned is UNKNOWN, "
+            "not none - check the diff before starting")
+        for row in in_flight:
+            print(f"WARNING {row['unit']} was briefed at {row['started_at']} and never "
+                  f"returned - the working tree MAY ALREADY CARRY its work. Check the diff "
+                  f"before starting: a lane redoing a repair that is already present is how "
+                  f"a partial edit reached a commit.", file=sys.stderr)
+        def start_lane(b: dict) -> None:
+            _lane_run_state(
+                "record_lane_start", lambda b=b: run_state.record_lane_start(root, b["id"]), None,
+                f"{b['id']}'s lane start could not be recorded (the run state is unreadable), "
+                f"so a restart will not know this lane was briefed")
+            # The brief is where a lane's work starts, so it opens the unit's span by the
+            # transition's own rule: a batch unit of the open run, and never a second span over
+            # one already open (a unit moved to In Progress keeps the span it opened). A unit
+            # built through lanes never passes through In Progress, so without this it read
+            # NOT MEASURED on the page (RPT0014: 29 of 34 units). Never for a unit already at a
+            # terminal status: a whole-batch brief would reopen its measured span, and a lane
+            # that never returns would leave it reading NOT MEASURED.
+            if _at_terminal_status(root, b["id"]):
+                return
+            _lane_run_state(
+                "open_unit_span",
+                lambda b=b: run_state.record_unit_actual(root, b["id"],
+                                                         run_state.UNIT_START_STATUS, False),
+                None,
+                f"{b['id']}'s span could not be opened (the run state is unreadable), so its "
+                f"time and tokens will read NOT MEASURED")
+
+        if args.action == "run":
+            # A lane run takes its marker and opens its span only once `lanes.run`'s own
+            # refusals have passed (`on_start`), so a run refused before its CLI started (exit
+            # 2) leaves no unit in flight that no lane is working on.
+            from lib import lanes  # noqa: PLC0415 - only a lane run needs it
+            [brief] = dispatch["briefs"]
+            run_id = _lane_run_state("lane_run_id", lambda: run_state.read(root).get("run_id"),
+                                     None, "the run state could not be read, so the lane record "
+                                           "names no run and its return will not price it")
+            return lanes.run(root, brief["id"], args.harness, lane_brief_text(brief),
+                             model=args.model, worktree=getattr(args, "worktree", None),
+                             timeout=args.timeout or lanes.RUN_TIMEOUT, run_id=run_id,
+                             on_start=lambda: start_lane(brief))
+        for b in dispatch["briefs"]:
+            start_lane(b)
+        if getattr(args, "format", "text") == "json":
+            print(json.dumps(dispatch, indent=2))
+        else:
+            for brief in dispatch["briefs"]:
+                print(lane_brief_text(brief))
+                print("")
+            for ref in dispatch["refused"]:
+                print(f"REFUSED {ref['refusal']}", file=sys.stderr)
+        return 2 if dispatch["refused"] else 0
+    try:
+        proof = _lane_pairs(getattr(args, "proof", None), "--proof")
+        gaps = _lane_pairs(getattr(args, "gap", None), "--gap")
+    except ValueError as exc:
+        print(f"sprint lane return: {exc}", file=sys.stderr)
+        return 2
+    results = [lane_return(root, uid, claimed=args.claimed, proof=proof, proof_gaps=gaps,
+                           timeout=args.timeout or LANE_VERIFY_TIMEOUT) for uid in units]
+    # Cleared on RETURN, whatever the outcome: a blocked return is still a lane that came back,
+    # and leaving the marker set would warn about a unit nobody is mid-way through.
+    for res in results:
+        # Guarded like its two siblings above. This one matters MOST, not least: by the time it
+        # runs, `lane_return` has already executed the unit's acceptance criteria, so a raise
+        # here discards a completed verification and the operator cannot tell from the traceback
+        # whether the unit passed. Three review rounds each found one more unguarded copy of
+        # this read in this function, because each repair fixed the line the reviewer named
+        # rather than the class they described - hence one helper, and a test over the call
+        # sites rather than over any single command's output.
+        _lane_run_state(
+            "record_lane_return", lambda res=res: run_state.record_lane_return(root, res["unit"]),
+            None,
+            f"{res['unit']}'s lane return could not be recorded (the run state is unreadable), "
+            f"so it may still be reported as briefed and never returned. Its acceptance "
+            f"criteria HAVE been run and their result is reported below")
+        # A PASSING return is where the lane's work ended, so it closes the span the brief
+        # opened. A blocked one leaves it open: the lane came back without the work, and the
+        # span runs on to the return that delivers it. A brief never returned stays open too,
+        # and the close leaves it so (`_lanes_never_returned`) - it reads NOT MEASURED.
+        if res["outcome"] != "blocked":
+            _lane_run_state(
+                "close_unit_span",
+                lambda res=res: run_state.record_unit_actual(root, res["unit"], "", True),
+                None,
+                f"{res['unit']}'s span could not be closed (the run state is unreadable), so "
+                f"its time and tokens may read NOT MEASURED. Its acceptance criteria HAVE been "
+                f"run and their result is reported below")
+    _lane_agent_totals(root, args, results)
+    _lane_run_totals(root, args, results)
+    if getattr(args, "format", "text") == "json":
+        print(json.dumps(results, indent=2))
+    else:
+        for res in results:
+            print(f"{res['unit']}: {res['outcome']} (claimed {res['claimed']})")
+            # one entry per lane run session priced, else the builder's own total
+            for priced in res.get("lane_runs") or [res]:
+                if got := priced.get("agent_total"):
+                    timed = f", {got['minutes']:g} minutes" if got.get("minutes") else ""
+                    read_from = Path(got.get("transcript") or "").name
+                    how = ("supplied, not measured"
+                           if got.get("provenance") == run_state.SUPPLIED
+                           else f"read from {read_from}")
+                    print(f"  agent total recorded ({how}): {got['tokens']:,} tokens{timed}")
+                    if got.get("priced") is not None:
+                        print(f"  agent priced cost recorded (read from {read_from}): "
+                              f"{got['priced']:,} {run_state.PRICED_LABEL}")
+                if cost := priced.get("lane_run_cost"):
+                    print(f"  lane run cost: US${cost['usd']:.4f} ({cost['model']})"
+                          if cost["usd"] is not None
+                          else f"  lane run cost: {cost['unpriced']}")
+            for crit in res["verification"]["criteria"]:
+                print(f"  {crit['ac']}: {crit['state']} (exit {crit['exit_code']}) "
+                      f"<- {crit['verifier']}")
+                if crit["state"] not in LANE_NON_BLOCKING_STATES and crit["output"]:
+                    for line in crit["output"].splitlines()[-12:]:
+                        print(f"      | {line}")
+            for got in res["proof"]["discharged"]:
+                print(f"  proof {got['obligation']}: {got['evidence']}")
+            for gap in res["proof"]["undischarged"]:
+                print(f"  proof {gap['obligation']}: NOT DISCHARGED - {gap['why']}")
+            if not res["proof"]["available"] and res["proof"]["why"]:
+                print(f"  proof obligations UNDERIVABLE: {res['proof']['why']}")
+            if res["why"]:
+                print(f"  {res['why']}", file=sys.stderr)
+    return 1 if any(r["outcome"] == "blocked" for r in results) else 0
+
+
+def tree_digest(root) -> str:
+    """A digest of the working tree's CONTENT, as a real git tree object, or "".
+
+    Built in a throwaway index - read HEAD, stage everything, write the tree - so it is a
+    function of CONTENT alone and cannot tell a staged change from an unstaged one. That
+    matters here for the same reason it matters to the suite verdict: `git add` is not an edit,
+    and a digest that moved when work was staged would make the close's no-op unreachable in
+    the normal mid-session state.
+
+    HEAD alone would be the wrong question. A close is followed by commits - its own paperwork -
+    so an idempotence check keyed on the commit id would report "changed" after every close and
+    never short-circuit; and, worse, would report "unchanged" while an uncommitted repair sat in
+    the tree. The tree is what the account describes.
+
+    Returns "" when git cannot be read. The caller treats that as "cannot prove it is unchanged"
+    and does the work, which is the safe direction: a close that runs twice costs time, one that
+    wrongly skips loses the ceremony.
+    """
+    import tempfile  # noqa: PLC0415 - deferred, as elsewhere in this module
+    idx = None
+    try:
+        fd, idx = tempfile.mkstemp(prefix="sdlc-close-index.")
+        os.close(fd)
+        os.unlink(idx)
+        env = {**os.environ, "GIT_INDEX_FILE": idx}
+        subprocess.run(["git", "-C", str(root), "read-tree", "HEAD"], env=env,
+                       capture_output=True, timeout=30)
+        add = subprocess.run(["git", "-C", str(root), "add", "-A", "--", "."],
+                             env=env, capture_output=True, timeout=60)
+        if add.returncode != 0:
+            return ""
+        # Dropped from the INDEX rather than excluded by pathspec: `add -- ':(exclude)<p>'`
+        # errors when <p> is also gitignored, which is this repository's own shape. The
+        # tracked run records go too: they are the runs' own bookkeeping, filed by the close
+        # after this digest is taken and again by the signature, and a tree another clone
+        # computes must match the close's without the object the close wrote.
+        subprocess.run(["git", "-C", str(root), "rm", "--cached", "-r", "-q",
+                        "--ignore-unmatch", "--", "sdlc-studio/.local",
+                        run_state.TRACKED_REL.as_posix()],
+                       env=env, capture_output=True, timeout=30)
+        out = subprocess.run(["git", "-C", str(root), "write-tree"], env=env,
+                             capture_output=True, text=True, timeout=30)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    finally:
+        if idx:
+            with contextlib.suppress(OSError):
+                os.unlink(idx)
+
+
+def _file_awaiting_record(root) -> None:
+    """File the run's record, still running, beside the report the close just filed.
+
+    A run is open until it is signed, and `.local` says so only on the machine that closed it:
+    another clone would plan a second run beside it and could not sign it. The tracked record
+    says so in every clone - `plan` refuses while one awaits its signature, and `sign` takes
+    the run up from it. Filed after the tree is stamped, so it carries the tree the signer
+    compares against; the digest leaves the records out, so filing it moves nothing."""
+    state = run_state.read(root) or {}
+    if state.get("outcome") != run_state.RUNNING or not state.get("report"):
+        return
+    # A SIGNATURE IS NEVER STRIPPED. Only `sign` writes one. A sealed, signed record this copy
+    # has not reopened past is left as it is; any other signed record is superseded with its
+    # signature carried forward, so a reopen made here before a signature elsewhere was pulled
+    # cannot file an unsigned record over it and leave the signed page INVALID in every clone.
+    try:
+        existing = run_state.read_tracked(root, state["run_id"])
+    except run_state.RunStateError:
+        existing = {}
+    if len(existing.get("reopened") or []) > len(state.get("reopened") or []):
+        print(f"close: {state['run_id']}'s tracked record records more reopens than this copy, "
+              f"so it is newer and is left as it is", file=sys.stderr)
+        return
+    if existing.get("signature"):
+        if (existing.get("outcome") in run_state.CLOSED
+                and len(state.get("reopened") or []) <= len(existing.get("reopened") or [])):
+            print(f"close: {state['run_id']}'s tracked record is sealed and no reopen here "
+                  f"supersedes it, so it is left as it is", file=sys.stderr)
+            return
+        state = {**state, "signature": existing["signature"]}
+    try:
+        path = run_state.file_tracked(root, state)
+    except OSError as exc:
+        print(f"close: the run record could not be filed at "
+              f"{run_state.tracked_path(root, state['run_id'])} ({exc}) - no other checkout "
+              f"can see that {state['run_id']} awaits its signature until it is",
+              file=sys.stderr)
+        return
+    print(f"close: {state['run_id']} awaits its signature - commit "
+          f"{path.relative_to(root).as_posix()} with the close's paperwork, so every "
+          f"checkout sees the run is open")
+
+
+def _newer_record(root, state: dict) -> dict:
+    """The tracked record of the run this checkout holds open, when it is newer than this copy
+    (`run_state.supersedes`: another checkout signed the run, or reopened and re-closed it,
+    since this copy last wrote the record); else {}. Reads only."""
+    rid = state.get("run_id")
+    if not rid or state.get("outcome") != run_state.RUNNING:
+        return {}
+    try:
+        rec = run_state.read_tracked(root, rid)
+    except run_state.RunStateError:
+        return {}
+    return rec if run_state.supersedes(state, rec) else {}
+
+
+def _newer_record_line(rec: dict, held: dict) -> str:
+    """What happened to the run in another checkout, in the words a refusal or take-up uses."""
+    if rec.get("outcome") in run_state.CLOSED:
+        return (f"{rec['run_id']} was signed in another checkout ({rec.get('outcome')}, "
+                f"{(rec.get('signature') or {}).get('report') or 'its report'})")
+    return (f"{rec['run_id']} was reopened and re-closed in another checkout: its tracked record "
+            f"records {len(rec.get('reopened') or [])} reopen(s) to this copy's "
+            f"{len(held.get('reopened') or [])}, and awaits a signature on "
+            f"{rec.get('report') or 'its report'}")
+
+
+def _take_up_signature(root, state: dict, verb: str) -> dict | None:
+    """Take up the tracked record of this checkout's open run when it is newer than this copy
+    (`_newer_record`), sealed or awaiting its signature; the state taken up, or None when there
+    was nothing to take up."""
+    rec = _newer_record(root, state)
+    if not rec:
+        return None
+    adopted = run_state.adopt_tracked(root, rec)
+    print(f"{verb}: {_newer_record_line(rec, state)}; this checkout's copy of it is now its "
+          f"tracked record", file=sys.stderr)
+    return adopted
+
+
+def _run_held_elsewhere(root) -> str:
+    """Why `plan --write` may not open a run here, or "": a tracked record awaits its
+    signature for a run this checkout does not hold open. A run this checkout holds open is
+    judged as before, by `open_run`, unless another checkout signed it and this copy has not
+    moved past that signature: then it is taken up sealed and no longer stands in the way. An
+    unreadable live state is refused here, by name, and nothing is written."""
+    try:
+        state = run_state.read(root) or {}
+        if (taken := _take_up_signature(root, state, "plan")) is not None:
+            state = taken
+    except run_state.RunStateError as exc:
+        return f"plan REFUSED: {exc}"
+    held = state.get("run_id") if state.get("outcome") == run_state.RUNNING else None
+    try:
+        waiting = [r for r in run_state.awaiting_signature(root) if r.get("run_id") != held]
+    except run_state.RunStateError as exc:
+        return f"plan REFUSED: {exc}"
+    if not waiting:
+        return ""
+    lines = ["plan REFUSED: a project holds one run at a time, and the tracked run records "
+             "say a run is closed and awaits its signature:"]
+    for r in waiting:
+        lines.append(f"  {r.get('run_id')} awaits a signature on {r.get('report')} "
+                     f"({run_state.tracked_path(root, r['run_id']).relative_to(root).as_posix()})"
+                     f" - sign it, from any checkout that holds the record: sprint.py sign "
+                     f"--report {r.get('report')} --principal \"<the operator who signs>\"")
+    return "\n".join(lines)
+
+
+def _committed_run_to_sign(root, state: dict, report_id: str | None) -> tuple[dict, str, bool]:
+    """`(state, refusal, take_up)`: the run state `sign` judges, and whether it must be taken up
+    as this checkout's live state before the seal is written.
+
+    This checkout's own state whenever it holds a run open - one it closed, or one it reopened,
+    whose report the reopen cleared - and that run is never taken up from a record, which would
+    still name the page the reopen broke. Otherwise the tracked record awaiting a signature
+    (the one naming `report_id`, or the only one when none is named), judged as it stands and
+    taken up only once every check has passed, so a refused sign writes nothing. A different
+    run this checkout holds open is refused, never discarded."""
+    held = state.get("run_id")
+    held_open = state.get("outcome") == run_state.RUNNING
+    if held_open and state.get("report"):
+        return state, "", False
+    try:
+        waiting = run_state.awaiting_signature(root)
+    except run_state.RunStateError as exc:
+        return state, f"sign: {exc}", False
+    if report_id:
+        waiting = [r for r in waiting
+                   if sdlc_md.norm_id(str(r.get("report") or "")) == sdlc_md.norm_id(report_id)]
+    waiting = [r for r in waiting if r.get("run_id") != held]
+    if len(waiting) != 1:
+        return state, "", False
+    record = waiting[0]
+    if held_open:
+        return state, (f"sign REFUSED: this checkout holds {held}, still open, so "
+                       f"{record.get('run_id')} cannot be taken up here without discarding it - "
+                       f"close or stop {held} first"), False
+    return record, "", True
+
+
+def record_close_tree(root) -> None:
+    """Stamp the tree this close's account describes, so a later re-run can prove it unchanged.
+
+    Written AFTER the close has stamped its outcome, because the account includes whatever the
+    close itself wrote. Silent when the digest is unavailable: `close_is_a_noop` then declines to
+    short-circuit, which is the safe direction.
+    """
+    if digest := tree_digest(root):
+        with contextlib.suppress(Exception):
+            run_state.update(root, close_tree=digest)
+
+
+def _close_forward_port(root, pre: dict) -> list[dict]:
+    """Mirror the skill into the installed copy when the pre-flight found it drifted.
+
+    Reporting the drift was not enough: Sprint 1's close printed the count and the mirror was
+    forgotten until the operator asked. So where the repository ships the forward-port tool
+    (`status.DRIFT_CHECK`), the close applies it and re-checks. It acts only on the pre-flight's
+    own drift row, so a consuming project (no tool), and a copy the check answers as in sync,
+    absent or pinned, is never written. A failure is a known issue for the report, never a
+    refusal. Returns the known-issue rows.
+    """
+    if not any(b.get("stage") == "installed-copy" for b in pre.get("blockers") or []):
+        return []
+    import subprocess  # noqa: PLC0415
+    import status  # noqa: PLC0415 - deferred, like the other close-path siblings
+    tool = ["bash", str(Path(root).joinpath(*status.DRIFT_CHECK))]
+    for flag in ("--yes", "--check"):
+        try:
+            proc = subprocess.run([*tool, flag], cwd=root, capture_output=True, text=True,
+                                  timeout=600)
+        except (OSError, subprocess.SubprocessError) as exc:
+            detail = f"`forward-port.sh {flag}` could not run: {exc}"
+            break
+        if proc.returncode:
+            said = (proc.stderr.strip() or proc.stdout.strip()).splitlines()[-1:]
+            detail = (f"`forward-port.sh {flag}` exited {proc.returncode}"
+                      + (f": {said[0]}" if said else "")
+                      + f" - the installed copy is not in sync; run `{status.DRIFT_REMEDY}`")
+            break
+    else:
+        print("close: installed copy forward-ported - in sync")
+        return []
+    print(f"close: installed-copy: known issue - {detail}", file=sys.stderr)
+    return [{"source": "installed-copy", "detail": detail}]
+
+
+def close_is_a_noop(root, state: dict) -> str:
+    """The already-accounted message when re-running would change nothing, else "".
+
+    The close was run three times on RUN-01KYMJEM and repeatedly on RUN-01KYZKY5, and the
+    operator's reading was that the sprint was never being closed. It was: each close was
+    undone by the next repair, and each re-run re-derived an account that could differ from the
+    one before it. This is the fixed point stated as an invariant - the close is IDEMPOTENT over
+    an unchanged tree - so re-running is free and the operator can check rather than guess,
+    which is the behaviour a close-time gate makes people want.
+    """
+    if state.get("outcome") in (None, "", run_state.RUNNING):
+        return ""                     # still open: a close here is the first one, not a re-run
+    recorded = str(state.get("close_tree") or "")
+    if not recorded:
+        return ""                     # closed before this was recorded - cannot prove anything
+    now = tree_digest(root)
+    if not now or now != recorded:
+        return ""
+    return (f"close: {state.get('run_id') or 'this run'} is already accounted for - its close "
+            f"completed (outcome `{state.get('outcome')}`) and the tree has not moved since "
+            f"({recorded[:12]}). Nothing re-derived, nothing written.")
+
+
+def batch_repair_in_tree(root, state: dict) -> list:
+    """Uncommitted changes to files a BATCH UNIT declares, as `[(unit_id, path)]`.
+
+    The close's fixed point. A close writes a retro accounting for its batch and then
+    stamps the ledger; anything reaching terminal after that is unaccounted, so a repair made
+    DURING the close re-opens the account written moments earlier. It happened twice in one
+    close of RUN-01KYZKY5, and the operator's reading was that the sprint was never being
+    closed - it was, repeatedly, and each close was undone by the next repair.
+
+    Scoped to the batch's OWN declared surface, never to any dirty file. A guard that stopped
+    every close over an unrelated edit - a scratch note, an unrelated project file - would be
+    switched off inside a sprint, and then it would guard nothing. What it refuses is a repair
+    to the very work being certified.
+
+    Degrades to "nothing found" when git cannot be read: this is a discipline gate, and a close
+    that cannot run because git is unavailable is a worse failure than one that proceeds.
+    """
+    import engagement_floor  # noqa: PLC0415 - read only here; sibling script on sys.path
+    changed = _changed_paths(root)
+    if not changed:
+        return []
+    hits: list = []
+    for uid in [sdlc_md.norm_id(u) for u in (state.get("batch") or [])]:
+        found = sdlc_md.find_by_id(root, uid)
+        if not found:
+            continue
+        # ONE reading of a declaration, shared with the commit-msg hook's ownership check
+        # (LL0016): `engagement_floor.declared_keys` normalises each token - a note holding a
+        # comma, a `..` segment, a skill-relative spelling, a `.claude/` dot prefix - and
+        # `declaration_covers` lets a DIRECTORY or glob cover what sits under it. A second copy
+        # of either here is how the hook came to refuse owners this guard credits.
+        declared = engagement_floor.declared_keys(root, sdlc_md.read_text_safe(found[0]) or "")
+        for path in sorted(changed):
+            if any(engagement_floor.declaration_covers(path, d) for d in declared):
+                hits.append((uid, path))
+    return hits
+
+
+def _changed_paths(root) -> set:
+    """Every path the working tree has changed, repo-relative, as FILES.
+
+    Deliberately NOT `git status --porcelain` parsing. That format reports a rename as
+    `R  <new>\0<orig>\0`, where the original is a BARE field with no XY prefix - so stripping
+    three characters from every record mangles it, and a `git mv` of a batch unit's own file got
+    a close straight through. It also collapses a wholly-new directory to `?? newpkg/` and never
+    names the files inside, which is the ordinary shape of a unit that adds a module.
+
+    Two plumbing commands instead, each answering one question exactly: `diff HEAD --name-only`
+    for tracked changes (staged and unstaged, with renames reported as the names they are), and
+    `ls-files --others` for untracked FILES, which expands the directory case by construction.
+    """
+    # A BASELINE is required before anything can be called a change. In a repo with no commits
+    # every file is untracked, so an untracked-aware guard would refuse EVERY close there - the
+    # refuses-always shape, and it reddened seven rolling-boundary fixtures the moment untracked
+    # detection landed. No HEAD means no baseline, and the guard declines rather than inventing
+    # one, on the same terms it declines when git cannot be read at all.
+    try:
+        head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if head.returncode != 0:
+        return set()
+    paths: set = set()
+    for argv in (["diff", "HEAD", "--name-only", "-z"],
+                 ["ls-files", "--others", "--exclude-standard", "-z"]):
+        try:
+            out = subprocess.run(["git", "-C", str(root), *argv],
+                                 capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return set()
+        if out.returncode != 0:
+            continue          # a repo with no commits has no HEAD to diff against
+        paths |= {e for e in out.stdout.split("\0") if e}
+    return paths
+
+
+def _refuse_batch_repair(root, state: dict, verb: str) -> str:
+    """The refusal text for `verb`, or "" when the tree is clean of batch repairs.
+
+    Names the unit, the path, and BOTH ways out. A refusal that leaves the operator to work out
+    the remedy is the shape that gets bypassed, and this one has an honest remedy on each side:
+    the change is either batch work, in which case commit it before the ceremony starts, or it
+    is a finding, in which case file it and let the next run carry it.
+    """
+    hits = batch_repair_in_tree(root, state)
+    if not hits:
+        return ""
+    lines = [f"{verb} REFUSED: the working tree carries {len(hits)} uncommitted change(s) to "
+             f"files this batch's own units declare, so the account this {verb} is about to "
+             f"write would be out of date before it is read."]
+    lines += [f"  {uid}: {path}" for uid, path in hits]
+    lines.append("  Either COMMIT it as batch work before the ceremony starts, or FILE it and "
+                 "defer it to the next run. A finding surfaced during a close is filed and "
+                 "deferred - that rule is what gives the close a fixed point.")
+    return "\n".join(lines)
+
+
+def cmd_close(args: argparse.Namespace) -> int:
+    """The sprint close ceremony as one deterministic, resumable chain."""
+    root = args.root
+    try:
+        state = run_state.read(root)
+    except run_state.RunStateError as exc:
+        print(f"close refused: {exc}", file=sys.stderr)
+        return 2
+    if not state:
+        print("close refused: no run state - `sprint plan --write` opens the run this "
+              "close would end", file=sys.stderr)
+        return 2
+    # MOVED ON IN ANOTHER CHECKOUT: signed there, or reopened and re-closed there, since this
+    # copy last wrote the record. A close here would file a second page for a sealed run, or
+    # file this older copy over the newer record and erase that checkout's reopen, so the
+    # record is taken up instead (not on a preview, which writes nothing) and the close refused.
+    if rec := _newer_record(root, state):
+        dry = getattr(args, "dry_run", False)
+        if not dry:
+            run_state.adopt_tracked(root, rec)
+        sealed = rec.get("outcome") in run_state.CLOSED
+        nxt = ("To change it, `sprint.py reopen --reason ...`" if sealed else
+               f"Sign it: sprint.py sign --report {rec.get('report')} --principal "
+               f"\"<the operator who signs>\"")
+        print(f"close refused: {_newer_record_line(rec, state)}, so this copy is older than it"
+              + ("" if dry else "; this checkout's copy of it is now its tracked record")
+              + f". {nxt}", file=sys.stderr)
+        return 2
+    # EVERYTHING OWED, BEFORE ANY REFUSAL CAN SHORT-CIRCUIT IT. This sits above the sprint-goal,
+    # retro and goal-verdict refusals deliberately: each of those returns early, so a pre-flight
+    # placed after them reported nothing whenever one of them fired - which is exactly the serial
+    # discovery this exists to end, reintroduced by its own placement. Reported, never a refusal:
+    # the refusals below and the chain after them still decide what stops the close.
+    # The verdict this invocation records before its chain runs is an answer, not a gap: the
+    # `--file-and-close` path records none (nor writes the review anchor), and a bare verdict
+    # with no note is refused below.
+    filing = bool(getattr(args, "file_and_close", False))
+    supplied = args.goal_verdict if args.goal_verdict and args.note and not filing else None
+    if getattr(args, "dry_run", False):
+        # Before `_record_close_attempt`: a preview is not an attempt, and counting it as one
+        # would make the attempt trend report the tool being used carefully as a tool failing.
+        result = close_dry_run(root, args.retro, goal_verdict=supplied)
+        print(dry_run_report(result))
+        if refusal := _refuse_batch_repair(root, state, "close"):
+            print(refusal)          # REPORTED on a preview, refused on the real thing
+        return 0 if result["clean"] else 1
+    # THE FIXED POINT, before anything is written. A repair to a batch unit sitting in the tree
+    # will land after this close's account and re-open the ledger it is about to satisfy, so the
+    # ceremony refuses rather than producing an account with a known expiry.
+    if refusal := _refuse_batch_repair(root, state, "close"):
+        print(refusal, file=sys.stderr)
+        return 2
+    # IDEMPOTENT over an unchanged tree. Checked after the repair guard, so a dirty tree is
+    # still refused rather than reported as already-accounted.
+    if noop := close_is_a_noop(root, state):
+        print(noop)
+        return 0
+    if getattr(args, "apply_signoff", False):
+        # Refused before anything runs: the flag signs nothing, and `sign` is the one verb that
+        # writes a signature.
+        print("close: `--apply-signoff` no longer signs anything.", file=sys.stderr)
+        print(f"  Sign the run with: sprint.py sign --report "
+              f"{state.get('report') or '<report id>'} --principal \"<name>\"", file=sys.stderr)
+        return 2
+    pre = _report_preflight(root, args.retro, goal_verdict=supplied, writes_anchor=not filing)
+    # An OVER-APPETITE batch is reported as the over-commitment it was, not as the raised ceiling
+    # Placed above every refusal so a close that stops later still states it.
+    overage = appetite_overage_line(root)
+    if overage:
+        print(f"close: {overage}")
+    # WHICH strategy this close is judging against, stated above every refusal so a close
+    # that stops later has still said it. `recorded` means the plan's own agreed strategy;
+    # `re-derived` means nobody agreed this one and the close says so rather than letting it
+    # pass for the plan's.
+    _print_close_strategy(root, state)
+    # What this close FILED, stated as carried rather than as debt against itself. Filing an
+    # honest finding mid-close is the behaviour the doctrine asks for, and it used to cost
+    # another full gate.
+    carried = carried_findings_line(carried_close_findings(root, state))
+    if carried:
+        print(carried)
+    # The close IS a stop: the decisions deferred while the batch ran are asked HERE,
+    # together and structured - mechanically, not by a reference file hoping someone reads it.
+    pending_dec = state.get("pending_decisions") or []
+    if pending_dec:
+        print()
+        _render_pending_decisions(pending_dec)
+        print()
+    if getattr(args, "file_and_close", False):
+        return _file_and_close(root, args, state, pre)
+    if not state.get("sprint_goal"):
+        print("close refused: no sprint goal recorded on this run - set one at plan time "
+              "with --sprint-goal; a close cannot invent what the run aimed at",
+              file=sys.stderr)
+        return 2
+    # Resolve the retro through the deterministic path: scaffold + stop when omitted,
+    # heal a missing index row when present, refuse a named-but-missing id. Runs BEFORE the
+    # goal-verdict so a first `close` (scaffold) records nothing until the retro is filled.
+    rc = _resolve_retro(root, args, state)
+    if rc is not None:
+        return rc
+    # Goal-verdict: record it here when given, reuse it when already judged, refuse when
+    # neither - a defaulted verdict would be invented alignment.
+    if args.goal_verdict:
+        if not args.note:
+            print("close refused: --goal-verdict needs --note - a bare verdict is an "
+                  "assertion, not a review", file=sys.stderr)
+            return 2
+        run_state.record_goal_verdict(root, args.goal_verdict, args.note)
+        state = run_state.read(root)
+        print(f"close: goal-verdict recorded ({args.goal_verdict})")
+    elif state.get("sprint_goal_verdict"):
+        print(f"close: goal-verdict already judged "
+              f"({state['sprint_goal_verdict'].get('verdict')}) - reused")
+    else:
+        print("close STOPPED at goal-verdict: the Sprint Goal is unjudged - run "
+              "`sprint.py goal-verdict --verdict achieved|partial|missed --note \"...\"` "
+              "(or pass --goal-verdict/--note here), then re-run close", file=sys.stderr)
+        return 1
+    # THE ATTEMPT IS COUNTED HERE, after every early refusal: a close refused for a missing
+    # goal, retro or verdict has not attempted anything.
+    _record_close_attempt(root, pre)
+    # THE CLOSE IS THE MOMENT THE PAGE MEASURES. Each unit the sign will move has its open In
+    # Progress span settled here, on one meter reading, before anything derives from the run:
+    # the page then states the span to the close, and the sign's terminal move finds nothing
+    # open to close or stamp, so the page it seals still re-derives.
+    # Except a unit whose lane was briefed and never returned: the close is not when its work
+    # ended, so its span stays open and the page reads it NOT MEASURED rather than a time
+    # measured to a moment nobody chose.
+    unreturned = _lanes_never_returned(state)
+    if settled := run_state.settle_open_spans(
+            root, [u for u in _batch_story_units(root, state.get("batch") or [])
+                   if u not in unreturned]):
+        print(f"close: measured to the close the open span of {', '.join(settled)}")
+        state = run_state.read(root) or state
+    for uid in sorted(unreturned & set(_batch_story_units(root, state.get("batch") or []))):
+        if ((state.get(run_state.UNIT_ACTUALS) or {}).get(uid) or {}).get("open"):
+            print(f"close: {uid}'s lane was briefed and never returned - its span is left "
+                  f"open and reads NOT MEASURED")
+    # THE COST CHECK, before the chain: its retro-validate step reads the run's cost issue to
+    # decide whether the retro owes a `## Cost` cause, so the record holds this close's finding,
+    # never the last one's. A known issue, never a refusal: the close completes either way.
+    try:
+        cost = close_cost_regression(root, state, args.retro)
+    except Exception as exc:  # noqa: BLE001 - advisory: the close outranks its own cost check
+        cost = {"issue": None, "line": f"close: cost per point: UNMEASURED - the check could not "
+                                       f"run ({type(exc).__name__}: {exc})"}
+    print(cost["line"])
+    # ONE PASS. A step that fails is recorded as a known issue for the report and the chain runs
+    # on; the report is the page that hands those issues over, so a gap no longer stops it.
+    known: list[dict] = [cost["issue"]] if cost["issue"] else []
+    run_state.update(root, **{run_state.CLOSE_KNOWN_ISSUES: [
+        g for g in state.get(run_state.CLOSE_KNOWN_ISSUES) or []
+        if not (isinstance(g, dict) and g.get("source") == "cost")] + known})
+    state = run_state.read(root) or state
+    module = sys.modules[__name__]
+    for i, name in enumerate(_CLOSE_CHAIN, start=1):
+        step = getattr(module, "_close_" + name.replace("-", "_"))
+        ok, detail, remedy = step(root, args.retro, state)
+        if ok:
+            print(f"close [{i}/{len(_CLOSE_CHAIN)}] {name}: ok - "
+                  f"{detail.splitlines()[-1] if detail else 'ok'}")
+        else:
+            issues = close_known_issues_from(name, detail)
+            known += issues
+            print(f"close [{i}/{len(_CLOSE_CHAIN)}] {name}: {len(issues)} known issue(s), "
+                  f"carried to the report", file=sys.stderr)
+            print(detail or "    failed with no detail", file=sys.stderr)
+            if remedy:
+                print(f"  remedy: {remedy}", file=sys.stderr)
+    # A carried lesson violated anyway is reported HERE, on both close paths, before the brief or
+    # the sign-off fan-out: the operator is about to decide, and a repeat is evidence for that
+    # decision. Never blocking - see `_close_lesson_repeats`.
+    _close_lesson_repeats(root)
+    # BG0385: the goal panel, the defect judgement, the close end of the bookend review and
+    # the caller-check, all of which RUN-01KYMJEM built and left with no caller. Reported here,
+    # before the sign-off decision, because that is the decision they exist to inform.
+    if getattr(args, "content_review", None):
+        try:
+            record_content_review(root, "close", (state or {}).get("sprint_goal") or "",
+                                  args.content_review,
+                                  missing=getattr(args, "content_missing", "") or "",
+                                  shortfall=_close_shortfall(root, state))
+        except ValueError as exc:
+            print(f"close: the content review was NOT recorded - {exc}", file=sys.stderr)
+    for line in close_goal_judgement(root, state):
+        print(f"  {line}")
+    known += _close_forward_port(root, pre)
+    # What this close itself cost, on BOTH paths and before the decision, so the next reduction
+    # is measured against a number rather than an impression. Read from the execution ledger:
+    # an unrecorded component reads as UNMEASURED, never as zero seconds.
+    print(close_cost_line(close_cost(root, (state or {}).get("run_id"))))
+    # The report holds are known issues too: the page states them rather than being withheld.
+    held = _report_holds(root, state)
+    for h in held:
+        # The index-drift hold reads the same sweep the reconcile step carried item by item;
+        # carrying it as well would hand one drift item over twice.
+        if h["hold"] == "index-drift" and any(k["source"] == "reconcile" for k in known):
+            print(f"close: report hold [index-drift]: carried by the reconcile step above - "
+                  f"{h['detail']}", file=sys.stderr)
+            continue
+        known.append({"source": f"report-hold:{h['hold']}", "detail": h["detail"]})
+        print(f"close: report hold [{h['hold']}]: known issue - {h['detail']}", file=sys.stderr)
+    for name in _REPORT_HOLDS:
+        if name not in {h["hold"] for h in held}:
+            print(f"close: report hold {name}: passed")
+    # The tail is PREPARE's, not SEAL's. The velocity row and the final
+    # reconcile both CHANGE FACTS the report states, so they run BEFORE the page is derived and
+    # long before anyone signs it. They rode inside `--apply-signoff` before, which is precisely
+    # how RUN-01M2JA6J spent two hours writing facts after its operator had already said yes.
+    # ADVISORY here, and the reason is recorded rather than smoothed over: the tail's velocity
+    # row counts DELIVERED units by status, and under D0213 no unit is terminal until SEAL, so
+    # at PREPARE it has nothing to count. Failing the close on that would make the split
+    # undeliverable; hiding it would file a report whose cost row nobody could trust. Filed as
+    # the debt it is - the counter must read a cleared terminal gate, or the row must move into
+    # the signature's consequences.
+    rc_tail = _apply_signoff_tail(root, state, units=list(state.get("batch") or []),
+                                  retro_arg=getattr(args, "retro", None))
+    if rc_tail != 0:
+        print("close: the tail could not complete at PREPARE time - the velocity row counts "
+              "delivered units by status and no unit is terminal until `sign`", file=sys.stderr)
+    # The gate verdict is RECORDED, not left to be re-derived. Under D0213 no unit is terminal
+    # until SEAL, so the page cannot say Done and must not: what is true of every unit here is
+    # that its terminal gate cleared, and the report says that instead. Written before the
+    # report is built, because the composer reads it from the run state as a sourced figure.
+    # The commit this close's gate ran against, stamped beside it: the page states it as the
+    # commit the run was verified on, and the base ref is the commit it was planned from.
+    head = _git(root, "rev-parse", "HEAD")
+    run_state.update(root, report_gate_clear=sorted(
+        u for u, why in _report_gate_verdicts(root, state).items() if not why),
+                     verified_sha=(head.stdout.strip() or None)
+                     if head is not None and head.returncode == 0 else None,
+                     **{run_state.CLOSE_KNOWN_ISSUES: known})
+    report_id, _fingerprint = _file_the_report(root, args.retro)
+    if report_id and (line := goal_note_contradiction(root, report_id)):
+        print(line, file=sys.stderr)
+    # The tree the close LEFT, stamped after the last thing it writes: `sign` refuses a tree
+    # that has moved since.
+    record_close_tree(root)
+    _file_awaiting_record(root)
+    if known:
+        print(f"close: finished with {len(known)} known issue(s), recorded on the run and "
+              + (f"handed over on the report {report_id}" if report_id else
+                 "NOT handed over - no report was filed"))
+    # The sign-off BRIEF is gone from this path, and its absence is the point of US0832 AC5.
+    # It was a second account of the run - per-unit rows and a cost block of its own, derived
+    # from a different root object than the page being signed - and its closing instruction was
+    # the per-unit sign-off route, which is the two-command shape D0213 rejected. An operator
+    # reading it would have been told to hand-sign each unit by the very command that had just
+    # filed the one page they are meant to sign. Both the brief and that route are retired.
+    #
+    # AC1: the last line names the ONLY action left. Printed here rather than inside
+    # `_file_the_report`, so nothing can be appended after it without moving this line.
+    if report_id:
+        print(f"\nsign it with: sprint.py sign --report {report_id} "
+              f"--principal \"<the operator who signs>\"")
+    return 0
+
+
+#: The three holds, named so the clean path can report each as PASSED by its own name. A hold
+#: passed in silence is indistinguishable from a hold that never ran, which is how a scheduled
+#: lane in this project once sat red for three weeks unread.
+_REPORT_HOLDS = ("terminal-gate", "unanswered-review", "index-drift")
+
+
+def _report_gate_verdicts(root, state) -> dict:
+    """Each batch unit's TERMINAL GATE verdict: `None` when clear, the refusal otherwise.
+
+    The gate, never the Status line. Under D0213 the fan-out belongs to SEAL, so at PREPARE
+    every unit is still at Review or In Progress by design - a status test here would refuse the
+    exact state the split creates, and no report could ever be produced. Asked by previewing the
+    real terminal transition (`artifact.close(dry_run=True)`), which is the same question
+    `_done_gate_preflight` asks, so the two can never disagree about one unit.
+    """
+    import artifact  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+    out: dict = {}
+    for unit in state.get("batch") or []:
+        uid = sdlc_md.norm_id(unit)
+        try:
+            artifact.close(root, uid, dry_run=True)
+        except (ValueError, OSError) as exc:
+            # OSError as well as ValueError, for `_done_gate_preflight`'s reason: a
+            # PermissionError here must not turn a clean refusal into a traceback.
+            out[uid] = str(exc).strip().splitlines()[0]
+        else:
+            out[uid] = None
+    return out
+
+
+def _report_index_drift(root) -> list:
+    """The index paths `reconcile detect` reports as disagreeing with the tree.
+
+    Its own module, asked its own question - a second reader of index drift would be a second
+    answer to it. Named at module level rather than inlined so a test can drive the hold without
+    building a drifted tree, and so the hold is reachable without running a whole close.
+    """
+    import reconcile  # noqa: PLC0415
+    try:
+        # `detect_all` is THE sweep - the one definition of what drift is on this tree, which
+        # `reconcile detect`'s own exit code and the gate's blocking lane both read. A hold
+        # assembling its own subset would be the smaller second definition that ruling exists
+        # to prevent.
+        _per_type, items = reconcile.detect_all(root)
+    except Exception as exc:               # noqa: BLE001 - an unreadable index is drift, not a crash
+        sdlc_md.debug("sprint.report_holds.index_drift", exc)
+        return [f"reconcile.detect_all failed: {type(exc).__name__}: {exc}"]
+    # Name the INDEX PATH and the row, because those are what the reader has to go and fix.
+    # A drift item carries `type`, `id` and `kind` and NO path, so a fallback chain ending at
+    # `type` printed the word "story" and called it an index - true of nothing the operator
+    # could open. The path is derived from the type through `sdlc_md.ARTIFACT_TYPES`, the same
+    # table `reconcile` itself indexes by, and each row is named rather than deduped away: a
+    # count of types is not a count of drifted rows.
+    named = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            named.append(str(item))
+            continue
+        type_ = item.get("type") or ""
+        folder = (sdlc_md.ARTIFACT_TYPES.get(type_) or ("",))[0] if type_ else ""
+        where = item.get("path") or (f"{folder}/_index.md" if folder else "")
+        row = " ".join(x for x in (item.get("id"), item.get("kind")) if x)
+        entry = f"{where}: {row}".strip(": ") if (where or row) else str(item)
+        if entry and entry not in named:
+            named.append(entry)
+    return named
+
+
+def _report_holds(root, state) -> list:
+    """Every reason the report is refused, ALL of them, never the first.
+
+    Serial discovery - clear one, pay the whole of PREPARE again, meet the next - is the cost
+    this returns a list to avoid. Each hold names every failure it found in one row.
+    """
+    holds = []
+    unmet = {u: why for u, why in _report_gate_verdicts(root, state).items() if why}
+    if unmet:
+        named = "; ".join(f"{u}: {why}" for u, why in sorted(unmet.items()))
+        holds.append({
+            "hold": "terminal-gate",
+            "detail": f"{len(unmet)} batch unit(s) whose terminal gate is UNMET - {named}",
+            "remedy": "clear each gate this names (commonly `verify_ac.py run --story <id>`, "
+                      "for a story or a bug), then re-run the close"})
+    # The one predicate the rest of the close already reads (US0823), never a second opinion
+    # about what an unanswered review is: D0193, D0194.
+    try:
+        # The predicate returns `{"unanswered": [{"unit", "status", "why", "filed"}], ...}`;
+        # read its own rows rather than re-deriving a set from them, or this becomes the second
+        # opinion about what is owed that D0193 and D0194 refused.
+        owed = {r["unit"]: f"{r.get('status', '?')} - {r.get('why', 'owed')}"
+                for r in (unanswered_units(root, state) or {}).get("unanswered", [])}
+    except Exception as exc:               # noqa: BLE001
+        owed = {"<unreadable>": f"{type(exc).__name__}: {exc}"}
+    if owed:
+        named = "; ".join(f"{u}: {why}" for u, why in sorted(owed.items()))
+        holds.append({
+            "hold": "unanswered-review",
+            "detail": f"{len(owed)} batch unit(s) whose review is unanswered - {named}",
+            "remedy": "answer the review this names - repair the REJECT and record the repair, "
+                      "or rule it in the retro's `## Known issues carried`"})
+    drifted = _report_index_drift(root)
+    if drifted:
+        holds.append({
+            "hold": "index-drift",
+            "detail": f"{len(drifted)} index/indexes disagree with the tree - "
+                      f"{', '.join(drifted)}",
+            "remedy": "`reconcile.py apply`, then re-run the close - a report describing an "
+                      "index that disagrees with its own tree is not a fact, and filing a "
+                      "ticket for it would stand a receipt in place of the figure being right"})
+    return holds
+
+
+#: The window end of the first page a close filed for the run, which every re-close re-derives
+#: against.
+REPORT_WINDOW_END = "report_window_end"
+
+
+def _file_the_report(root, retro_id):
+    """PREPARE's last act: derive the run's report, file it, and name it on the run state.
+
+    Re-derived on EVERY prepare, never reused: a late fix between two prepares moves a figure,
+    and an operator signing a fingerprint over facts that have moved underneath it is the
+    failure this whole split exists to end (US0832 AC4).
+    """
+    import sprint_report  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+    # The forge and the verdict ledger are read HERE, fresh, and frozen on the run: the page and
+    # every later re-derivation of it read the CI runs and the rows each unit's rounds count
+    # from the record, never a per-clone cache or a later run's record.
+    try:
+        sprint_report.freeze_ci_runs(root)
+        sprint_report.freeze_review_rows(root)
+    except sprint_report.ReportError as exc:
+        print(f"close: the run cannot be reported yet - {exc}", file=sys.stderr)
+        return "", ""
+    # THE REPORT-TIME STAMP, taken here because here is the only place it can be. `open_run`
+    # takes the `open` reading; without a closing one from the same session no delta exists,
+    # and the cost row reads NOT MEASURED on every run - which is what a library function with
+    # no caller buys you. `stamp_tokens` was shipped with its only caller a test, and this is
+    # the lane that was missing. Taken BEFORE the report is derived, so the figure the page
+    # states is the one the run actually spent up to the moment it was written.
+    # A RE-CLOSE takes no reading and re-derives its cost figures against the window the first
+    # filed page ended at: the work done after that close is paperwork about the run, not the
+    # run's cost. Its open findings, waivers and DORA run to the re-close, as the close's
+    # checklist does, so a finding filed since is on the page (`FINDINGS_END`).
+    first_end = (run_state.read(root) or {}).get(REPORT_WINDOW_END)
+    try:
+        if not first_end:
+            if run_state.stamp_tokens(root, "report"):
+                run_state.stamp_cost_roles(root)   # the page's spend by role, frozen here
+    except sdlc_md.AllocationLockTimeout as exc:   # the close goes on; the missing stamp is said
+        print(f"warning: the report-time token stamp was not recorded - {exc.reason}",
+              file=sys.stderr)
+    except Exception as exc:               # noqa: BLE001 - an unreadable meter is not a failed close
+        sdlc_md.debug("sprint.file_the_report.stamp", exc)
+    try:
+        now = sdlc_md.now_iso8601() if first_end else None
+        report = sprint_report.build_report(str(root), retro_id, as_of=now,
+                                            window_end=first_end, findings_end=now)
+        report_id = sprint_report.file_report(str(root), report)
+    except sprint_report.ReportError as exc:
+        # The composer refuses a run it cannot report honestly - no goal, no run record, a
+        # figure whose deriver produced no source. PREPARE reports the refusal and its reason
+        # and leaves the run open: an operator with nothing to sign is the correct outcome,
+        # and a report invented around the gap would be the wrong one.
+        print(f"close: the run cannot be reported yet - {exc}", file=sys.stderr)
+        return "", ""
+    except AttributeError as exc:          # composer not yet shipped - say so, never pretend
+        print(f"close: the report composer is not available ({exc}) - the run is prepared but "
+              f"carries no report to sign", file=sys.stderr)
+        return "", ""
+    fingerprint = report.get("fingerprint", "")
+    run_state.update(root, report=report_id, report_fingerprint=fingerprint,
+                     **{REPORT_WINDOW_END: first_end or report.get("window_end")})
+    print(f"\nreport filed: {report_id} (fingerprint {fingerprint})")
+    # The page is put in front of the operator before the sign command asks for a signature:
+    # the Markdown twin as filed, and its HTML rendering under the ignored `.local/reports/`, so
+    # no rendered page churns in git and the tree `sprint sign` checks is the one the close left.
+    reports = sprint_report.report_dir(root)
+    for twin in sorted(reports.glob(f"{report_id}-*.md")):
+        print(f"  read it before signing: {_repo_rel(root, twin)}")
+    html = Path(root) / "sdlc-studio" / ".local" / "reports" / f"{report_id}.html"
+    try:
+        sdlc_md.atomic_write(html, sprint_report.render_html(
+            sprint_report.read_report(root, report_id)))
+    except (sprint_report.ReportError, OSError) as exc:
+        print(f"  the HTML twin was not written - {exc}", file=sys.stderr)
+    else:
+        print(f"  read it before signing: {_repo_rel(root, html)}")
+    return report_id, fingerprint
+
+
+#: A ratio as written: a number and x, X or the multiplication sign. The page writes its own
+#: with a lower-case x; a note may write any of the three.
+_RATIO = r"(?<![\w.])\d+(?:\.\d+)?[xX\u00d7](?!\w)"
+_NOTE_RATIO_RE = re.compile(_RATIO)
+
+
+def _note_ratios(note: str, measures) -> list[str]:
+    """The ratios `note` quotes for one of `measures`, as written: each the first ratio within
+    three words after a measure's name, singular or plural, and behind any punctuation
+    (`tokens at 1.7x`, `Tokens (1.7X)`, `token ratio 1.7x`). A ratio beside no measure name,
+    such as `10x faster`, is not a claim about the page and is not read."""
+    names = "|".join(re.escape(m[:-1] if m[-1] in "sS" else m) + "s?" for m in measures if m)
+    if not names:
+        return []
+    lead = r"[^\w\s]*"     # punctuation before the number: `(1.7x)`, `~1.7x`, `=1.7x`
+    # Either the rest of the name's own word runs into the ratio (`tokens=1.7x`), or it ends at
+    # whitespace and up to three words follow. Kept as two branches so no character can be
+    # claimed by both a lazy run and the lead: one pattern doing both backtracked
+    # quadratically on a long punctuation run after the name.
+    beside = re.compile(rf"\b(?:{names})\b(?:\S*?|\S*\s+(?:(?!{lead}{_RATIO})\S+\s+){{0,3}}?"
+                        rf"{lead})({_RATIO})", re.IGNORECASE)
+    # Tried at each name in turn. A one-word name that reads no ratio fails for every later
+    # one-word name in the same whitespace-free run too (each sees a tail of the same run and
+    # the same words after it), so those are passed over: re-trying each ran every attempt to
+    # the end of the run, quadratic on a long run of repeated names. A name spanning words
+    # sees other words, so it is always tried.
+    name = re.compile(rf"\b(?:{names})\b", re.IGNORECASE)
+    spaced = "|".join(re.escape(m[:-1] if m[-1] in "sS" else m) + "s?"
+                      for m in measures if m and re.search(r"\s", m))
+    multi = re.compile(rf"\b(?:{spaced})\b", re.IGNORECASE) if spaced else None
+    found, pos, dead = [], 0, -1
+    while hit := name.search(note, pos):
+        at = hit.start()
+        crosses = bool(multi and multi.match(note, at))
+        m = None if at < dead and not crosses else beside.match(note, at)
+        if m:
+            found.append(m.group(1))
+            pos, dead = m.end(), -1
+            continue
+        pos = at + 1
+        if not crosses and at >= dead:
+            gap = re.compile(r"\s").search(note, at)
+            dead = gap.start() if gap else len(note)
+    return found
+
+
+def goal_note_contradiction(root, report_id: str) -> str | None:
+    """One line naming each ratio the goal verdict's note quotes that the filed page does not
+    derive, or None. Read off the page as filed, never a re-derivation: the note is
+    judged against what the operator will sign. A warning, never a refusal."""
+    import sprint_report  # noqa: PLC0415 - deferred sibling, as elsewhere in this module
+    try:
+        page = sprint_report.read_report(root, report_id)
+    except (sprint_report.ReportError, OSError, ValueError) as exc:
+        sdlc_md.debug("sprint.goal_note_contradiction", exc)
+        return None
+    goal = next((s for s in page.get("sections") or [] if s.get("key") == "goal"), {})
+    note = str(((goal.get("figures") or {}).get("goal_verdict_note") or {}).get("value") or "")
+    est = next((s for s in page.get("sections") or [] if s.get("key") == "estimates"), {})
+    derived = {str(r["est_measure"]["value"]): str(r["est_ratio"]["value"])
+               for r in est.get("rows") or []
+               if _NOTE_RATIO_RE.fullmatch(str(r.get("est_ratio", {}).get("value") or ""))}
+    quoted = _note_ratios(note, [str((r.get("est_measure") or {}).get("value") or "")
+                                 for r in est.get("rows") or []])
+    # As numbers at the page's precision, so 1.70x and the page's 1.7x agree.
+    stated = {round(float(r[:-1]), 2) for r in derived.values()}
+    unmatched = [q for q in dict.fromkeys(quoted) if round(float(q[:-1]), 2) not in stated]
+    if not unmatched:
+        return None
+    page_says = (", ".join(f"{m} {r}" for m, r in derived.items()) if derived
+                 else "no ratio")
+    return (f"close: the goal verdict note quotes {', '.join(unmatched)}, which {report_id} "
+            f"does not derive - its Estimates read {page_says}; correct the note with "
+            f"`sprint.py goal-verdict` and re-close before signing")
+
+
+def _cascade_after_signature(root, state, units) -> None:
+    """What the SIGNATURE entails, and nothing else.
+
+    SEAL has just transitioned each batch unit, so three things follow from that and could not
+    have been true before it: the parent epics whose children are now all terminal, the requests
+    above them whose children are now all resolved, and the velocity row, which counts delivered
+    units by status. It is NOT `_apply_signoff_tail`: the velocity row and the final reconcile
+    change facts the report states, so they run in PREPARE, before anyone signs.
+    """
+    derived = _derive_parent_epics(root, units, "sign")
+    if derived:
+        print(f"sign: derived {', '.join(derived)} terminal (all children terminal)")
+    derived_requests = _derive_parent_requests(root, scope_ids=list(units or []) + derived,
+                                               who="sign")
+    if derived_requests:
+        print(f"sign: derived parent request(s) {', '.join(derived_requests)} terminal")
+    # The velocity row joins the cascade for the same reason the epics do: it counts DELIVERED
+    # units by status, and those statuses exist only because this signature wrote them. Filing
+    # it at PREPARE would count zero. It is one row, upserted by retro id, and it is the last
+    # thing the signature entails - not the tail, whose reconcile still belongs before the page.
+    try:
+        import retro as _retro  # noqa: PLC0415
+        rc, out = _run_cli(_retro.main, ["--root", str(root), "accuracy", "--id",
+                                         (state.get("scaffolded_retro") or "").strip()
+                                         or "RETRO0001", "--write", "--tokens-from-harness"])
+        if rc == 0:
+            # the capture line itself, not a paraphrase: the operator needs to read WHAT was
+            # attributed and from which session, which is the half a summary always drops
+            for line in out.splitlines():
+                if line.startswith("token actual"):
+                    print(f"sign: {line}")
+            print("sign: velocity row recorded")
+    except Exception as exc:  # noqa: BLE001 - a missing row must not lose a written signature
+        print(f"sign: velocity row NOT recorded ({exc})", file=sys.stderr)
+
+
+def _principal_refusals(root, state, principal: str | None, author_default: str | None) -> list:
+    """Every unit of the batch this principal may not seal: THE principal-independence rule.
+
+    One principal signs the run once, so the question is whether THIS principal sits outside the
+    authoring session for every unit - neither the unit's author nor a reviewer recorded on it
+    (`critic.session_reviewer_ids`) - asked before anything is written.
+    """
+    import critic  # noqa: PLC0415
+    # A principal NAMES someone: a letter or a digit. Stripping the raw string let `-`, the empty
+    # cell `critic.same_identity` reads as no id, seal the run under an empty principal; every
+    # value that id normaliser empties has no letter or digit, and nor does `_`.
+    if not any(ch.isalnum() for ch in principal or ""):
+        return [f"--principal {principal or ''!r} names nobody - sign needs the operator "
+                "who signs, and a signature with no named principal is not a review"]
+    out = []
+    for unit in _batch_story_units(root, state.get("batch") or []):
+        # EVERY unit, including ones already terminal: the run's signature is written on a
+        # resumed seal too, and skipping them would let the author sign a resumed run off.
+        author = author_default or _signoff_author(root, unit)
+        if not author:
+            # NOT this check's business. A unit with no recorded author owes a review, not a
+            # different principal, and the seal's review bar stops on it with that remedy.
+            continue
+        if critic.same_identity(principal, author):
+            out.append(f"{unit}: principal {principal!r} is the author - a self-sign-off "
+                       "never clears the gate")
+        elif any(critic.same_identity(principal, rid)
+                 for rid in critic.session_reviewer_ids(root, unit)):
+            out.append(f"{unit}: principal {principal!r} is an authoring-session subagent (a "
+                       "recorded reviewer on this unit) - the operator who signs must sit "
+                       "outside the author's control")
+    return out
+
+
+#: The outcome a signature records for each goal verdict. No verdict reads as `stopped`.
+SIGNED_OUTCOMES = {"achieved": run_state.GOAL_REACHED, "partial": run_state.PARTIAL,
+                   "missed": run_state.MISSED}
+
+
+def tree_moved_since_close(root, state: dict) -> list[str] | None:
+    """Paths whose content differs from the tree the close left: `[]` when none, None when no
+    tree was recorded. A recorded tree that cannot be compared is itself named, never passed.
+
+    Content, not commits: committing the close's paperwork moves nothing. A file ADDED since the
+    close and still untracked is not counted - scratch nobody staged - but one the close wrote
+    (its report, uncommitted when sign runs) is. The signature's own writes never are, because
+    `sign` re-records the tree after writing."""
+    recorded = str(state.get("close_tree") or "")
+    if not recorded:
+        return None
+    now = tree_digest(root)
+    if not now:
+        return [f"(git cannot read this tree, so it cannot be compared with the one the close "
+                f"recorded, {recorded[:12]})"]
+    if now == recorded:
+        return []
+    try:
+        diff = subprocess.run(["git", "-C", str(root), "diff", "--name-status", "--no-renames",
+                               "-z", recorded, now], capture_output=True, text=True, timeout=30)
+        others = subprocess.run(["git", "-C", str(root), "ls-files", "--others",
+                                 "--exclude-standard", "-z"],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [f"(git could not compare this tree with the close's, {recorded[:12]}: {exc})"]
+    if diff.returncode != 0:
+        return [f"(the tree the close recorded, {recorded[:12]}, cannot be read)"]
+    untracked = set(others.stdout.split("\0")) if others.returncode == 0 else set()
+    parts = diff.stdout.split("\0")
+    # A tree recorded before the digest left the run records out still holds them; they are
+    # never a change to the tree the report describes.
+    records = run_state.TRACKED_REL.as_posix() + "/"
+    return sorted(p for status, p in zip(parts[0::2], parts[1::2])
+                  if p and not (status == "A" and p in untracked)
+                  and not p.startswith(records))
+
+
+def cmd_sign(args: argparse.Namespace) -> int:
+    """SEAL. One command, one principal, one signature, and only what the signature entails.
+
+    Everything that can change a fact ran in PREPARE. This writes the terminal transitions and
+    the cascades they imply, then the run's own signature and its outcome - and stops. No
+    per-unit sign-off row is written: the operator signs the run once. It does NOT run
+    `_apply_signoff_tail`: the velocity row and the final reconcile are
+    PREPARE's, because a fact that moves after a signature is a fact the signature did not cover
+    (D0213, RUN-01M2JA6J's own two hours).
+    """
+    root = Path(args.root)
+    live = run_state.read(root) or {}
+    if (taken := _take_up_signature(root, live, "sign")) is not None:
+        live = taken                     # sealed elsewhere: refused below as already sealed
+    state, refused, take_up = _committed_run_to_sign(root, live, getattr(args, "report", None))
+    if refused:
+        print(refused, file=sys.stderr)
+        return 2
+    if state.get("outcome") in run_state.CLOSED:
+        print(f"sign: {state.get('run_id')} is already sealed ({state.get('outcome')}) - "
+              f"`sprint.py reopen --reason ...` to break the seal", file=sys.stderr)
+        return 2
+    report_id = getattr(args, "report", None) or state.get("report") or ""
+    if not report_id:
+        print("sign: this run names no report - run `sprint.py close --retro RETROxxxx` "
+              "first, which prepares the run and files the page you are signing",
+              file=sys.stderr)
+        return 2
+    # A SIGNATURE SEALS THE RUN'S OWN REPORT, over the tree the close left.
+    recorded = state.get("report") or ""
+    if sdlc_md.norm_id(report_id) != sdlc_md.norm_id(recorded):
+        print(f"sign REFUSED: {report_id} is not this run's report - {state.get('run_id')} "
+              f"records {recorded or 'no report'}. Sign the page the close filed.",
+              file=sys.stderr)
+        return 2
+    moved = tree_moved_since_close(root, state)
+    if moved:
+        print(f"sign REFUSED: {len(moved)} file(s) changed since the close, so "
+              f"{report_id} no longer describes this tree: {', '.join(moved)}. Re-run the "
+              f"close, or restore the files.", file=sys.stderr)
+        return 2
+    if moved is None:
+        print("sign: the close recorded no tree to compare with - signing on the report alone",
+              file=sys.stderr)
+    # THE PAGE IS JUDGED BEFORE THE SEAL IS WRITTEN, by `sprint_report check`'s own reading: an
+    # unchanged tree says nothing of the run state the page is derived from.
+    stale = _page_no_longer_matches(root, report_id)
+    if stale:
+        print(f"sign REFUSED: {report_id} no longer matches what it re-derives to, so it is not "
+              f"sealed - {stale}", file=sys.stderr)
+        return 2
+    verdict = (state.get("sprint_goal_verdict") or {}).get("verdict")
+    outcome = SIGNED_OUTCOMES.get(verdict, run_state.STOPPED)
+    # THE PRINCIPAL IS JUDGED OVER THE WHOLE BATCH, BEFORE ANYTHING IS WRITTEN: a principal the
+    # authoring session controls, or a unit's own author, is refused with every refusal named
+    # at once, nothing written and the run left open.
+    refused = _principal_refusals(root, state, getattr(args, "principal", None),
+                                  getattr(args, "author", None))
+    if refused:
+        for line in refused:
+            print(f"sign REFUSED: {line}", file=sys.stderr)
+        print("  the run is untouched and still open - sign as an operator outside "
+              "the authoring session's control", file=sys.stderr)
+        return 2
+    if take_up:
+        # Every check above read the record as it stands; only now does it become this
+        # checkout's run, so a refused sign leaves the live state as it found it.
+        try:
+            state = run_state.adopt_tracked(root, state)
+        except run_state.RunStateError as exc:
+            print(f"sign REFUSED: {exc}", file=sys.stderr)
+            return 2
+        print(f"sign: {state.get('run_id')} was closed in another checkout - taken up from "
+              f"{run_state.tracked_path(root, state['run_id']).relative_to(root).as_posix()}",
+              file=sys.stderr)
+    # A STOP-SHIP RULING DOES NOT REFUSE THE SEAL (D0257): the signer decides, and so is shown
+    # every one before the seal is written.
+    stop_ship = [g for g in state.get(run_state.CLOSE_KNOWN_ISSUES) or []
+                 if isinstance(g, dict) and g.get("stop_ship")]
+    for g in stop_ship:
+        print(f"sign: STOP-SHIP known issue on {report_id}: {g.get('detail')}")
+    if stop_ship:
+        print(f"sign: sealing over {len(stop_ship)} STOP-SHIP known issue(s), listed first on "
+              f"{report_id}, on {args.principal}'s decision")
+    try:
+        rc = _seal_units(root, state)
+        if rc != 0:
+            return rc
+        _cascade_after_signature(root, state, list(state.get("batch") or []))
+        try:
+            ua = unanswered_units(root, state)
+        except Exception as exc:           # noqa: BLE001 - a seal records what it ended over
+            run_state.update(root, **unanswered_record(None, f"{type(exc).__name__}: {exc}"))
+        else:
+            run_state.update(root, **unanswered_record(ua))
+        signature = _write_the_signature(root, report_id, args.principal)
+        sealed = run_state.close_run(root, outcome, handoff=state.get("handoff"))
+        try:
+            # THE SEALED RECORD IS TRACKED, beside the page, so any full clone can re-derive
+            # the page and read the signature from committed history. Before the tree is
+            # re-recorded, so the seal commit carries it and the tree check never counts it.
+            run_state.file_tracked(root, sealed)
+        except OSError as exc:
+            print(f"sign: the sealed run record could not be filed at "
+                  f"{run_state.tracked_path(root, sealed['run_id'])} ({exc}) - the report "
+                  f"checks only in this clone until it is", file=sys.stderr)
+        try:
+            # The anchor the close stamped said the signature was owed; it now says it landed.
+            refresh_review_anchor(root, state.get("run_id") or "(unknown run)", outcome,
+                                  len(state.get("batch") or []), False, run_rung(state))
+        except OSError as exc:
+            print(f"sign: the review anchor could not be re-stamped ({exc}) - it still says "
+                  f"the signature is owed", file=sys.stderr)
+    finally:
+        # What the signature wrote is its own, so a resumed sign is judged against this tree.
+        record_close_tree(root)
+    print(f"sealed {state.get('run_id')} {outcome}: signed by {args.principal} over "
+          f"{report_id}" + (f" (fingerprint {signature.get('fingerprint')})"
+                            if signature.get("fingerprint") else ""))
+    return 0
+
+
+def _page_no_longer_matches(root, report_id: str) -> str:
+    """Why the filed page fails its own check, naming each figure that moved; "" when it holds.
+
+    `sprint_report.revalidate` is the check's reading, so sign refuses exactly the page `check`
+    would call INVALIDATED or INVALID, and nothing else. A page that cannot be re-derived here
+    (none filed, another schema, a shallow clone) or that predates tracked records is not
+    judged, said on stderr, and signed on the report alone, as before."""
+    import sprint_report  # noqa: PLC0415
+    try:
+        state = sprint_report.revalidate(root, report_id)
+    except (sprint_report.ReportError, OSError) as exc:
+        print(f"sign: {report_id} could not be re-derived ({exc}) - signing on the report alone",
+              file=sys.stderr)
+        return ""
+    if state.get("valid") or state.get("predates"):
+        return ""
+    named = [f"{c['key']} filed {c['signed']!r}, now {c['current']!r}"
+             for c in state.get("changes") or []]
+    named += [f"{e['figure']} edited ({e['detail']})" for e in state.get("edited") or []]
+    return (f"{'; '.join(named) or 'an unnamed figure moved'}. To re-file it, "
+            f"{sprint_report._refile_remedy(state)}")
+
+
+def _write_the_signature(root, report_id: str, principal: str) -> dict:
+    """The run's own signature: the principal, the date, the report and THAT report's fingerprint.
+
+    The fingerprint is read back off the filed report rather than taken from the run state or
+    recomputed here. "Signed RPT0001" says nothing about WHICH RPT0001 - PREPARE re-derives the
+    page on every run and files it under a fresh id, but a re-prepare that reused an id would
+    leave a signature naming a document that had moved underneath it. The fingerprint is what
+    makes the signature point at one version of one page.
+
+    It also lands ON the report, because the report is the artefact that gets read, sent and
+    filed; a signature only the run state carries is one nobody signing the page can see. The
+    figure SET is untouched, so the fingerprint the signature just recorded still re-derives -
+    signing a report must not be what invalidates it.
+    """
+    import sprint_report  # noqa: PLC0415
+    signature = {"principal": principal, "signed_at": sdlc_md.now_iso8601(),
+                 "report": report_id, "fingerprint": ""}
+    try:
+        report = sprint_report.read_report(root, report_id)
+        signature["fingerprint"] = report.get("fingerprint") or ""
+        report["signature"] = signature
+        sprint_report.write_report(root, report)
+    except (sprint_report.ReportError, AttributeError, OSError) as exc:
+        # The run is signed either way - the operator said yes, and that fact is not contingent
+        # on a file write succeeding. What is NOT done is pretend it landed on the page.
+        print(f"sign: the signature was recorded on the run but could not be written onto "
+              f"{report_id} ({type(exc).__name__}: {exc})", file=sys.stderr)
+    run_state.update(root, signature=signature)
+    return signature
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """`sprint report`: the command surface over the report composer.
+
+    A pure delegation - the composer owns the composing, this owns being findable. Every flag
+    is threaded through and its exit code returned unchanged, so the route and the module can
+    never report different things about the same sprint."""
+    import sprint_report  # noqa: PLC0415 - deferred, like the chain's sibling imports
+    argv = ["--root", str(args.root), "show", "--id", args.id, "--format", args.format]
+    if args.tokens is not None:
+        argv += ["--tokens", str(args.tokens)]
+    if args.elapsed_hours is not None:
+        argv += ["--elapsed-hours", str(args.elapsed_hours)]
+    return sprint_report.main(argv)
+
+
+def _abandon_open_run(root, state) -> None:
+    """Remove a run opened moments ago whose plan then failed to persist.
+
+    Not a close: nothing happened, so there is no outcome to record and no retro to owe. The
+    run object is deleted outright, leaving the workspace exactly as the plan found it. Silent
+    on failure - the caller is already reporting the real error, and a cleanup error must not
+    replace it with a less useful one."""
+    if not state:
+        return
+    try:
+        p = run_state.path(root)
+        if p.is_file():
+            p.unlink()
+    except OSError as exc:  # noqa: BLE001 - never mask the failure that brought us here
+        sdlc_md.debug("sprint._abandon_open_run", exc)
+
+
+#: A Sprint Goal is one sentence somebody can say back. Inclusive: 20 words plans, 21 is refused.
+GOAL_WORD_LIMIT = 20
+
+
+def goal_length_refusal(goal: str | None, refusing: str = "plan refused",
+                        unwritten: str = "Nothing is written and no run is opened.") -> str | None:
+    """The refusal for a goal over the word limit, or None. Binds a goal being AUTHORED (the
+    plan, or an amendment's new wording); a run already under way is never refused over the
+    goal it recorded. A word carries a letter or digit, so a spaced hyphen is punctuation, not
+    a word."""
+    words = sum(1 for tok in (goal or "").split() if any(c.isalnum() for c in tok))
+    if words <= GOAL_WORD_LIMIT:
+        return None
+    return (f"{refusing}: the Sprint Goal is {words} words and the limit is {GOAL_WORD_LIMIT}. "
+            f"Say the user value in one sentence somebody can repeat. {unwritten}")
+
+
+# ---------------------------------------------------------------------------
+# The goal trace: which PRD outcome or persona the Sprint Goal serves (D0266).
+# ---------------------------------------------------------------------------
+# ADVICE, NEVER A REFUSAL (LC-008). A goal serving none, or only the Negative persona, is flagged
+# on the plan the operator approves; the exit code and the batch are identical either way.
+
+_OUTCOME_ITEM_RE = re.compile(r"^\s*[-*]\s+\*\*(O\d+):?\*\*:?\s*(.+?)\s*$")
+
+
+def prd_outcomes(root: Path | str) -> dict[str, str]:
+    """`{O-id: text}` from the `## Outcomes` section of `sdlc-studio/prd.md` (items shaped
+    `- **O1:** text`); empty when the PRD or the section is absent."""
+    try:
+        text = (Path(root) / "sdlc-studio" / "prd.md").read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    inside = False
+    for line in text.splitlines():
+        if re.match(r"^#{1,2}\s", line):
+            inside = bool(re.match(r"^##\s+(?:[\d.]+\s+)?Outcomes\s*$", line, re.I))
+            continue
+        m = _OUTCOME_ITEM_RE.match(line) if inside else None
+        if m and "{{" not in m.group(2):   # an unfilled template item is not an outcome
+            out.setdefault(m.group(1), m.group(2))
+    return out
+
+
+def _end_goals(text: str) -> list[tuple[str, str]]:
+    """`[(number, text)]` from a card's `## End Goals` section (a Negative card's `End Goals
+    (stated to exclude)` too), numbered as on the card."""
+    goals: list[tuple[str, str]] = []
+    inside = False
+    for line in text.splitlines():
+        if re.match(r"^#{1,2}\s", line):
+            inside = bool(re.match(r"^##\s+End Goals\b", line, re.I))
+            continue
+        m = re.match(r"^\s*(\d+)[.)]\s+(.+?)\s*$", line) if inside else None
+        if m and "{{" not in m.group(2):   # an unfilled template End goal is not one
+            goals.append((m.group(1), m.group(2)))
+    return goals
+
+
+def persona_cards(root: Path | str) -> list[dict]:
+    """`[{name, role, end_goals}]` for each persona card in `sdlc-studio/personas/` - the name
+    from its `# ` heading, the role from its Quick Reference `Cast role` (None when undeclared),
+    the End goals numbered as on the card."""
+    from validate import _persona_cast_role  # noqa: PLC0415 - the one cast-role reader
+    pdir = Path(root) / "sdlc-studio" / "personas"
+    cards = []
+    for p in sorted(pdir.glob("*.md")) if pdir.is_dir() else ():
+        if p.name.lower() in {"index.md", "readme.md", "consult-guide.md"} \
+                or p.name.startswith("_"):
+            continue
+        text = sdlc_md.read_text_safe(p)
+        m = re.search(r"^#\s+(.+?)\s*$", text, re.M)
+        if m and "{{" not in m.group(1):   # an unfilled template card names nobody
+            cards.append({"name": m.group(1), "role": _persona_cast_role(text),
+                          "end_goals": _end_goals(text)})
+    return cards
+
+
+def _names_persona(text: str, name: str) -> bool:
+    """True when `text` names the persona by full or first name, as a whole word."""
+    return any(re.search(rf"(?<!\w){re.escape(n)}(?!\w)", text)
+               for n in dict.fromkeys((name, name.split()[0])))
+
+
+def goal_trace(root: Path | str, goal: str | None, serves: list[str] | None = None
+               ) -> dict | None:
+    """Which PRD outcome or persona the goal serves: named by `--serves` values or as a whole
+    word in the goal. None when there is nothing to trace: no goal and no `--serves`, or no
+    outcomes, no persona cards and no `--serves`. `flagged` when it serves none, or only a Negative persona; `unknown` holds
+    the `--serves` values nothing on disk names."""
+    wanted = [s.strip() for v in (serves or []) for s in v.split(",") if s.strip()]
+    outcomes, cards = prd_outcomes(root), persona_cards(root)
+    if not ((goal or "").strip() or wanted) or not (outcomes or cards or wanted):
+        return None
+    goal = goal or ""
+    served: list[dict] = []
+    unknown: list[str] = []
+
+    def _add(item: dict) -> None:
+        if item not in served:
+            served.append(item)
+
+    for value in wanted:
+        oid = value.upper()
+        card = next((c for c in cards if value.lower()
+                     in (c["name"].lower(), c["name"].split()[0].lower())), None)
+        if oid in outcomes:
+            _add({"kind": "outcome", "id": oid, "text": outcomes[oid]})
+        elif card:
+            _add({"kind": "persona", "name": card["name"], "role": card["role"]})
+        else:
+            unknown.append(value)
+    for oid, text in outcomes.items():
+        if re.search(rf"(?<!\w){oid}(?!\w)", goal):
+            _add({"kind": "outcome", "id": oid, "text": text})
+    for card in cards:
+        if _names_persona(goal, card["name"]):
+            _add({"kind": "persona", "name": card["name"], "role": card["role"]})
+    designed_for = [s for s in served if s.get("role") != "negative"]
+    return {"goal": goal or None, "serves": served, "unknown": unknown,
+            "flagged": not designed_for,
+            "could_serve": {"outcomes": list(outcomes),
+                            "personas": [c["name"] for c in cards if c["role"] != "negative"]}}
+
+
+def _trace_label(s: dict) -> str:
+    """One thing a goal serves: `O2 - <text>`, or `Maya Okafor (Primary)`."""
+    if s["kind"] == "outcome":
+        return f"{s['id']} - {s['text']}"
+    return f"{s['name']} ({(s.get('role') or 'no cast role').capitalize()})"
+
+
+def _trace_none_why(trace: dict) -> str:
+    """Why a flagged trace serves none, and what the goal could serve instead."""
+    could = trace["could_serve"]
+    options = ", ".join([*could["outcomes"], *could["personas"]]) or "nothing on disk"
+    negative = [_trace_label(s) for s in trace["serves"]]
+    why = (f"only {', '.join(negative)}, a persona the product declines to design for"
+           if negative else "the goal names no PRD outcome or persona")
+    return f"{why}; it could serve {options}"
+
+
+def _render_goal_trace(data: dict) -> None:
+    """`goal serves:` lines on the text plan; nothing when no trace was recorded."""
+    trace = data.get("goal_trace")
+    if not trace:
+        return
+    if not trace["flagged"]:
+        for s in trace["serves"]:
+            print(f"goal serves: {_trace_label(s)}")
+    else:
+        print(f"goal serves: NONE - {_trace_none_why(trace)}. Name one with "
+              f"--serves <O-id|persona> or in the goal (advice: the plan is not refused)")
+    for value in trace["unknown"]:
+        what = (f"the PRD lists no outcome {value.upper()}" if re.fullmatch(r"[Oo]\d+", value)
+                else f"no persona card is named {value}")
+        print(f"  --serves {value}: {what}")
+
+
+def _resolve_sprint_goal(args: argparse.Namespace) -> str | None:
+    """The goal from `--sprint-goal`, else a prompt on an interactive `--write`, else none.
+    An explicit empty value means none and never prompts."""
+    raw = getattr(args, "sprint_goal", None)
+    if raw is not None:
+        return raw.strip() or None
+    if getattr(args, "write", False) and sys.stdin.isatty():
+        try:
+            return input("Sprint Goal (one sentence of user value, 20 words or fewer; blank "
+                         "for none): ").strip() or None
+        except (EOFError, KeyboardInterrupt):
+            return None
+    return None
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    """Print the ordered batch the operator approves before a run."""
+    #: Why the queue did not advance, or "" when it did. A run whose charter stayed Queued has
+    #: half-succeeded, and the exit code is the only part of the answer a caller reads.
+    charter_refused = ""
+    # The standing policy is validated FIRST, before any selection, write or run-state
+    # mutation: an incomplete policy must leave no trace at all, or a refused run would
+    # still have half-recorded the rule it refused.
+    err = policy_error(getattr(args, "cycles", None), getattr(args, "sprint_goal", None),
+                       getattr(args, "worklist", None), getattr(args, "prd", None))
+    if err:
+        print(f"policy refused: {err}", file=sys.stderr)
+        return 2
+    # ONE RUN AT A TIME, ACROSS CHECKOUTS. Whether a run is open was a fact about the machine
+    # that closed it; the tracked run records make it one every clone holds.
+    if getattr(args, "write", False) and (held := _run_held_elsewhere(args.root)):
+        print(held, file=sys.stderr)
+        return 2
+    if getattr(args, "prd", None):  # greenfield authoring - the batch is a PRD
+        return _plan_authoring(args)
+    # THE SPRINT GOAL - one sentence of user value, judged at the close (goal-verdict). Resolved
+    # and length-checked FIRST, so a refusal costs nothing and leaves no trace. Never invented:
+    # absent and non-interactive records none.
+    sprint_goal = _resolve_sprint_goal(args)
+    if refusal := goal_length_refusal(sprint_goal):
+        print(refusal, file=sys.stderr)
+        return 2
+    queries, worklist, rc = _plan_batch_source(args)
+    if rc is not None:
+        return rc
+    # reconcile before plan - a plan must be built on a drift-free census.
+    kinds = (list(dict.fromkeys(k for k, _ in queries)) if queries
+             else list(sdlc_md.ARTIFACT_TYPES))
+    preplan: dict = {}
+    rc = _preplan_reconcile(args, kinds, record=preplan)
+    if rc is not None:
+        return rc
+    # blocker sweep before plan - newly-unblocked work should be eligible for the batch. Advisory:
+    # it proposes Blocked -> Ready candidates; the gated transition stays the actor (never auto).
+    sweep = pre_plan_blocker_sweep(Path(args.root))
+    if sweep["now_unblocked"]:
+        print(f"blocker sweep: {len(sweep['now_unblocked'])} newly-unblocked unit(s) "
+              f"({', '.join(sweep['now_unblocked'])}) - propose Blocked -> Ready via the gated "
+              f"transition, then re-plan to include them", file=sys.stderr)
+    # The last run's tail, surfaced where the next batch is chosen: what its signed report
+    # handed over, and what a forced stop waived. An UNREADABLE run state stops the plan rather
+    # than being shrugged off: `--write` would otherwise overwrite the wreckage with a blank
+    # record, losing the previous run's id, batch and outcome.
+    try:
+        notice = last_run_notice(Path(args.root))
+    except run_state.RunStateError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    for line in notice:
+        if not (worklist and str(worklist).strip().upper() in line):
+            print(line, file=sys.stderr)
+    epics, rc = _validate_epic_scope(args, worklist, kinds)
+    if rc is not None:
+        return rc
+    try:
+        data = build_plan(args.root, order=args.order, goal=getattr(args, 'goal', None) or 'done',
+                          skip_personas=getattr(args, "skip_personas", False), epics=epics,
+                          queries=queries or None, worklist=worklist,
+                          appetite_minutes=getattr(args, "appetite_minutes", None),
+                          appetite_units=getattr(args, "appetite_units", None))
+    except ValueError as exc:  # dependency cycle / bad status / unknown worklist id
+        print(f"cannot order the batch: {exc}", file=sys.stderr)
+        return 2
+    # THE DISCOVERY GATE (G1). A sprint plans the DELIVERY backlog - stories and bugs. An RFC, CR
+    # or Issue is a DISCOVERY-backlog item: it has no executable ACs to close on, so it can neither
+    # be sprinted nor verified Done (a request is refined into stories, an Issue triaged into
+    # bugs, and those are what a sprint plans). Refused ahead of the grooming gate (a discovery
+    # item cannot be groomed as a sprint unit anyway), blocking and no plan at all. Fires ONLY when
+    # the project enforces the two-backlog workflow - an existing project that has not opted in
+    # plans a CR as before.
+    requests = ([it for it in data["batch"] if sdlc_md.is_discovery(it["type"])]
+                if sdlc_md.two_backlog_enforced(args.root) else [])
+    if requests:
+        _refuse_requests(requests)
+        return 2
+    # THE BREAKDOWN GATE. Before anything is printed, written, or opened: is this batch groomed
+    # enough to plan, and is any unit too big to have been estimated at all? Either failure is
+    # REFUSED - blocking, non-zero, and no plan at all, because a plan over unsized or unsizeable
+    # units is exactly the false authority the gate exists to abolish. It fires here, ahead of
+    # the drift preflight, so a refusal costs no fetch.
+    #
+    # The two are reported TOGETHER but refused in one go: an operator fixing a backlog wants the
+    # whole census, not one failure per re-run.
+    bd = data.get("breakdown")
+    # The ungroomed leg is GOAL-AWARE; the size and Affects legs are not.
+    #
+    # A design rung exists to PRODUCE the grooming, so refusing it for the absence of what it
+    # produces is a circularity: the debt can then only be cleared by unbatched hand-work with
+    # no unit, no estimate and no review behind it - which is the ad-hoc work the engagement
+    # floor exists to catch. Clearing it once cost 27 hand-edited artefacts.
+    #
+    # What this deliberately does NOT relax: a unit nobody can size, and a unit that names no
+    # files, are unplannable at EVERY rung. The design rung cannot forecast an unsized unit
+    # either, and it cannot place a unit whose collisions are invisible. The counterweight that
+    # stops this becoming a blanket escape is on the close, which reports what the rung actually
+    # groomed.
+    # The affects-check block, performed where every other refusal is performed: BEFORE the run
+    # is opened and before the plan is written, with a non-zero exit. The renderer that prints
+    # `REFUSED` runs later and is a renderer; it decided nothing, which is BG0542.
+    _aff = (bd or {}).get("affects_advisories") or []
+    if _aff and _affects_blocking(args.root):
+        _refuse_affects_blocked(_aff, args.root)
+        return 2
+    ungroomed_blocks = bool(bd and bd["ungroomed"]) and _ungroomed_blocks_at(args)
+    if bd and (bd["ungroomed"] or bd["oversized"]):
+        if bd["blocking"]:
+            if ungroomed_blocks:
+                _refuse_ungroomed(bd, data["count"], _selector_hint(args, queries, worklist))
+            if bd["oversized"] and _oversized_blocks_at(args):
+                _refuse_oversized(bd, data["count"])
+            if ungroomed_blocks or bd["oversized"]:
+                return 2
+            if bd["ungroomed"]:
+                print(f"design rung: {len(bd['ungroomed'])} ungroomed unit(s) ACCEPTED - this "
+                      f"rung exists to groom them. The close reports what it actually produced.",
+                      file=sys.stderr)
+        if bd["ungroomed"]:
+            _report_ungroomed(bd, data["count"])
+        if bd["oversized"]:
+            _report_oversized(bd, data["count"])
+    _print_test_strategy(args, data)
+    rc = _origin_drift_preflight(args, data)
+    if rc is not None:
+        return rc
+    data["sprint_goal"] = sprint_goal
+    # THE SEAT READ ADVISES. What the seats said is recorded beside the goal and printed with the
+    # plan; an objection is advice for the operator approving the plan, never a refusal.
+    data["goal_review"] = goal_review_status(args.root, sprint_goal,
+                                             skip_personas=getattr(args, "skip_personas", False))
+    # THE GOAL TRACE ADVISES too: which outcome or persona the goal serves, flagged when none.
+    # Absent when there is nothing to trace against, so it never becomes a line nobody reads.
+    trace = goal_trace(args.root, sprint_goal, getattr(args, "serves", None))
+    if trace is not None:
+        data["goal_trace"] = trace
+    # THE ONE-RUN-SLOT GATE. A --write plan against an open run holding a DISJOINT batch is
+    # refused: a project holds one run slot, and folding an unrelated batch into the open run
+    # strands its goal verdict. Checked here, ahead of the forecast record and the sprint-plan
+    # write, so a refusal leaves no sibling artefact behind; `open_run` enforces the same rule
+    # inside its lock as the real gate. An overlapping re-plan is accepted, as before.
+    if getattr(args, "write", False):
+        refusal = run_state.disjoint_refusal(args.root, [u["id"] for u in data["batch"]])
+        if refusal is not None:
+            print(str(refusal), file=sys.stderr)
+            return 2
+    write = getattr(args, "write", False)
+    out = Path(args.root) / "sdlc-studio" / ".local" / "sprint-plan.json"
+    # OPEN THE RUN FIRST, before anything is persisted. `open_run` is the AUTHORITY on whether
+    # this plan may proceed, so nothing the plan produces is written until it has said yes. The
+    # earlier order wrote the forecast record and sprint-plan.json first, so a batch refused by
+    # `open_run` (a concurrent writer opening a run between the pre-check and here) left both
+    # behind on the losing side of the race - while run-state.json's own guarantee held. The
+    # sibling artefacts now match that guarantee: a refused plan leaves NO trace.
+    state = None
+    if write:
+        try:
+            state = run_state.open_run(args.root, batch=[u["id"] for u in data["batch"]],
+                                       goal=getattr(args, "goal", None), plan=str(out))
+            # The pre-plan census verdict, recorded ON THE RUN rather than only printed. The
+            # sprint checklist's first row asks whether this batch was selected against a
+            # drift-free index, and a warning on someone's terminal answers that for nobody.
+            if preplan.get("preplan_reconcile"):
+                state = run_state.update(args.root, **preplan)
+        except run_state.DisjointBatchError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    # RECORD THE FORECAST, under --write only, AFTER open_run accepted the batch, so a refusal
+    # records nothing. A preview is not the plan: the forecast log keeps a unit's FIRST record,
+    # so a preview's row won over the plan's own, and a unit regroomed between preview and
+    # --write was judged at the size it no longer had.
+    try:
+        data["forecast_record"] = (record_forecast(args.root, data) if write
+                                   else {"recorded": [], "already": [], "preview": True})
+    except OSError as exc:
+        data["forecast_record"] = {"recorded": [], "already": [], "error": str(exc)}
+        print(f"warning: the plan's token forecast could NOT be recorded ({exc}). This batch "
+              f"will be UNFORECAST at retro time and can say nothing about the estimator - "
+              f"the retro will NOT re-derive an estimate for it.", file=sys.stderr)
+    if write:  # persist the sprint-plan artifact for review, now the run exists
+        # EVERY WRITE AFTER `open_run` IS GUARDED, and a failure TEARS THE RUN DOWN.
+        # Opening the run first is what lets a disjoint batch be refused before anything is
+        # persisted - but it also means a fault here would leave a LIVE run the old ordering
+        # could not create: no goal, no appetite, and the next plan of any other batch refused
+        # as disjoint against it. Fixing one ordering must not invent the opposite one, so the
+        # run is removed and the original failure re-raised rather than half-opened.
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError as exc:
+            _abandon_open_run(args.root, state)
+            print(f"plan refused: the sprint plan could not be written ({exc}). The run that "
+                  f"had just been opened was removed, so nothing is left half-opened and the "
+                  f"next plan is not refused against it.", file=sys.stderr)
+            return 2
+        print(f"wrote sprint plan -> {out}")
+        # Record the RESOLVED appetite and the token forecast - additive fields on the
+        # run-state object, merged, never touching its schema. The appetite was resolved once,
+        # from the sprint capacity (flag > appetite.* > capacity.*), and the plan has already
+        # sized the batch against it; stamping it here is what makes `loop_guard budget` break
+        # on the very number the operator was shown. 0 on an axis is unbounded, as before.
+        resolved = data["capacity"]["appetite"]
+        # Record the ACCEPTED appetite AND the STANDING one it was measured against (the sprint
+        # capacity), so an over-appetite batch accepted with --appetite-units does not read as
+        # though it fitted. The overage the close and retro report is derived from this.
+        std = capacity(args.root)
+        appetite = run_state.appetite_record(
+            accepted_units=resolved["units"], accepted_minutes=resolved["minutes"],
+            standing_units=std["units"], standing_minutes=std["minutes"])
+        # AN EXPLICIT RESIZE OUTRANKS A RE-RESOLUTION. `appetite resize` exists so a ceiling can
+        # be moved ON THE RECORD, with a compulsory reason, rather than overrun silently. A
+        # re-plan over an ALREADY OPEN run re-resolved from the standing capacity and wrote the
+        # result straight over that decision - leaving the resize entry sitting in
+        # `appetite_changes` describing a ceiling no longer in force, which is worse than losing
+        # it outright: the record says the operator raised the ceiling and the number says they
+        # did not. The resolution order already prefers the more specific statement at every
+        # other level (flag > appetite.* > capacity.*), and a recorded resize is the most
+        # specific statement there is.
+        prior = (run_state.read(args.root) or {})
+        if prior.get("appetite_changes") and prior.get("appetite"):
+            appetite = prior["appetite"]
+            print("sprint plan: keeping the appetite set by `appetite resize` "
+                  f"({appetite.get('minutes'):g}min/{appetite.get('units')}units) - a recorded "
+                  "resize outranks a re-resolution from the standing capacity")
+        extra: dict = {"appetite": appetite}
+        # Never erase a recorded goal on a mid-run re-cut: like open_run's rung goal,
+        # an absent value preserves, only a stated one writes (run_state never-discard).
+        if data.get("sprint_goal") is not None:
+            extra["sprint_goal"] = data["sprint_goal"]
+        # The seat verdict sits BESIDE the goal, carrying its date and the seats that gave it,
+        # so the closing goal-verdict judges the goal against what the seats said THEN rather
+        # than against a reconstruction. Recorded whether reviewed or not: "unreviewed" is a
+        # fact the close needs as much as a verdict is.
+        extra["sprint_goal_review"] = data["goal_review"]
+        # ...and the constraint that was known at plan time, so the close cites it rather than
+        # re-deriving it from a config that may have moved since.
+        if data.get("reachable_end_state"):
+            extra["reachable_end_state"] = data["reachable_end_state"]
+        # THE STANDING POLICY. Recorded on the run so every later cycle plans under the rule
+        # approved here rather than under whatever the CLI defaults to at 3am.
+        policy = None
+        if getattr(args, "cycles", None) is not None:
+            policy = build_policy(args, data, queries, epics)
+            extra["policy"] = policy
+            extra["cycle"] = {"index": 1, "remaining": max(policy["cycles"] - 1, 0),
+                              "policy_run_id": state["run_id"]}
+        state = run_state.update(args.root, **extra)
+        state = record_plan_snapshot(args.root, data["batch"])
+        print(f"{run_opened_line(state, appetite)} -> {run_state.path(args.root)}")
+        # THE QUEUE'S EXIT, and the ONE place that writes it. `Spent` shipped in the charter
+        # vocabulary and in the schema contract with no code path setting it, so a charter stayed
+        # Queued forever and re-materialised at the head of every later `next` - an operator who
+        # had run it could only cancel, which records a withdrawal, a different and misleading
+        # fact.
+        #
+        # It belongs HERE rather than in `next` because opening a run is what spends a charter,
+        # and `plan --write` is the one command that opens one. Putting it in `next` would give
+        # the charter lifecycle a second writer that could disagree with this one about whether a
+        # charter was consumed, and two readers of one fact drift apart.
+        charter = (getattr(args, "charter", "") or "").strip()
+        if charter:
+            spent = spend_charter(args.root, charter, state["run_id"])
+            print(f"  {spent['detail']}")
+            # Transition's own words, INDENTED and attributed. Unindented they read as the
+            # plan's own output, which is how a refusal travelled out of here looking like
+            # progress.
+            for line in (spent.get("output") or "").splitlines():
+                if line.strip():
+                    print(f"    transition: {line.strip()}")
+            if not spent["ok"] and spent.get("attempted"):
+                # NON-ZERO, loudly, and ONLY for a write that was attempted and did not take:
+                # that is the state the bug describes - the run open, the charter still Queued,
+                # and the next `next` re-offering it at the head of the queue. The two
+                # pre-write refusals above (no such charter, not Queued) leave a queue that
+                # CANNOT re-offer this charter, are already reported in terms, and keep the
+                # shipped contract of not failing a run that opened correctly.
+                charter_refused = spent["detail"]
+                print(f"plan: the run is OPEN but the charter was NOT spent - {charter_refused}",
+                      file=sys.stderr)
+        # BG0385: the PLAN end of the bookend goal review. `goal-review record` asks whether the
+        # goal looks achievable; this asks the different question US0545 specifies - will THIS
+        # content deliver it - and records the answer so the close can score its own judgement
+        # against the prediction. Reported as unanswered rather than assumed, because a bookend
+        # with one end is a question nobody ever checks.
+        if getattr(args, "content_review", None):
+            try:
+                record_content_review(args.root, "plan", state.get("sprint_goal") or "",
+                                      args.content_review,
+                                      missing=getattr(args, "content_missing", "") or "")
+                print(f"  content review (plan): {args.content_review}")
+            except ValueError as exc:
+                print(f"  content review NOT recorded: {exc}", file=sys.stderr)
+        elif state.get("sprint_goal"):
+            print("  content review (plan): UNANSWERED - will this content deliver the goal? "
+                  "Record it with --content-review yes|partial|no (a partial or no must name "
+                  "what is missing), so the close can score its judgement against the prediction")
+        if policy:
+            _render_policy(policy)
+    _render_plan(args, data, queries, worklist, epics)
+    export_dir = getattr(args, "export_lanes", None)
+    if export_dir:
+        lp = data.get("lane_partition") or {"lanes": [], "unplaceable": []}
+        files = _write_lane_worklists(lp["lanes"], export_dir, args.root)
+        print(f"exported {len(files)} lane worklist(s) to {export_dir}: "
+              + ", ".join(Path(f).name for f in files))
+        if lp["unplaceable"]:
+            print("  not exported (declared no Affects, cannot be placed in a disjoint lane): "
+                  + ", ".join(lp["unplaceable"]))
+    if charter_refused:
+        # 3, not 2: the plan itself was not refused - it ran and the run is open - so this must
+        # not read as "nothing happened". A caller that treats any non-zero as "re-plan" would
+        # otherwise open a second run over the first.
+        return 3
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# The rolling multi-sprint policy: N cycles driven by one standing rule.
+# ---------------------------------------------------------------------------
+# An operator wanting an unattended evening had to come back at every sprint boundary to
+# re-plan. Queueing several plans up front does not work: the backlog is GENERATED by the
+# work - a cycle raises bugs and lessons - so a frozen queue rots while it waits. So the
+# POLICY is fixed once (cycles, goal, capacity, order, stop conditions) and the PLAN is
+# regenerated at each boundary from the backlog as it actually is by then.
+#
+# Opt-in throughout: without `--cycles`, none of this exists and a sprint behaves exactly
+# as before.
+
+#: The three ways a boundary refuses to continue. Always enforced - they are not
+#: preferences, they are the conditions under which continuing would be dishonest.
+STOP_CAUSES = ("close-gate", "origin-drift", "refused-plan")
+
+#: Optional conditions an operator can add on top of the mandatory three.
+OPTIONAL_STOP_CONDITIONS = ("empty-backlog",)
+
+#: The boundary's four steps, in the order they must happen. Close the cycle before
+#: reading the backlog it changed; fetch before regenerating from it; regenerate before
+#: previewing; preview before anything executes.
+BOUNDARY_STEPS = ("close-down", "fetch", "regenerate", "preview")
+
+
+def policy_error(cycles: int | None, sprint_goal: str | None, worklist: str | None,
+                 prd: str | None) -> str | None:
+    """What is wrong with the standing policy, or None when it is complete.
+
+    A policy is REFUSED rather than defaulted. The whole point is that later cycles plan
+    under the rule the operator approved; a policy quietly completed from CLI defaults is a
+    rule nobody approved, applied while nobody is watching."""
+    if cycles is None:
+        return None                       # no rolling policy asked for
+    if cycles < 1:
+        return (f"--cycles must be 1 or more (got {cycles}) - a policy of no cycles "
+                f"describes no run")
+    if not (sprint_goal or "").strip():
+        return ("--cycles needs --sprint-goal \"<one product-outcome line>\" - every cycle "
+                "is judged against the standing goal, and a close cannot invent one")
+    if worklist:
+        return ("--cycles cannot be combined with --worklist - a rolling policy regenerates "
+                "its batch from the live backlog, and a worklist is the frozen queue that "
+                "abolishes")
+    if prd:
+        return ("--cycles cannot be combined with --prd - greenfield authoring has no "
+                "backlog to regenerate a batch from")
+    return None
+
+
+def build_policy(args: argparse.Namespace, data: dict, queries: list,
+                 epics: set | None) -> dict:
+    """The standing policy, as recorded on run-state and read by every later cycle."""
+    resolved = data["capacity"]["appetite"]
+    stop_conditions = list(STOP_CAUSES) + [c for c in (getattr(args, "stop_on", None) or [])
+                                           if c not in STOP_CAUSES]
+    return {
+        "cycles": args.cycles,
+        "sprint_goal": data.get("sprint_goal"),
+        "goal": getattr(args, "goal", None),
+        "order": args.order,
+        "capacity": {"minutes": resolved["minutes"], "units": resolved["units"]},
+        "queries": [{"kind": k, "status": s} for k, s in (queries or [])],
+        "epics": sorted(epics) if epics else None,
+        "stop_conditions": stop_conditions,
+        "skip_personas": bool(getattr(args, "skip_personas", False)),
+        "recorded_at": sdlc_md.now_iso8601(),
+    }
+
+
+def _render_policy(policy: dict) -> None:
+    print(f"rolling policy: {policy['cycles']} cycle(s), goal \"{policy['sprint_goal']}\", "
+          f"order={policy['order']}, capacity {policy['capacity']['minutes']:g}min/"
+          f"{policy['capacity']['units']}units")
+    print(f"  stop conditions: {', '.join(policy['stop_conditions'])}")
+    print("  the plan is regenerated from the live backlog at each boundary "
+          "(`sprint.py boundary`)")
+
+
+def _boundary_stop(root, cause: str, detail: str, remedy: str) -> int:
+    """STOP the rolling run at a boundary, recording why on the run.
+
+    The one stop path, shared by all three causes. Each cause could have grown its own -
+    and then each would have drifted, and the operator returning to a stopped run would
+    find a different quality of record depending on which gate happened to fire.
+
+    What it guarantees, whichever cause fired: the next cycle's batch does NOT execute
+    (nothing opens it), the run record names the cause, the cycles left unrun and the units
+    left unanswered, and the run ends recorded. No handoff is written: the next `sprint plan`
+    reads the unanswered units from the run record (`last_run_notice`)."""
+    if cause not in STOP_CAUSES:
+        raise ValueError(f"unknown boundary stop cause {cause!r} - expected one of "
+                         f"{', '.join(STOP_CAUSES)}")
+    state = run_state.read(root)
+    cycle = state.get("cycle") or {}
+    index, unrun = int(cycle.get("index") or 1), int(cycle.get("remaining") or 0)
+    # The stop records the predicate's set itself, before the close below archives the record.
+    # Reported, never a refusal - a boundary that has already failed its close-down must still
+    # end recorded.
+    ua, ua_error = None, ""
+    try:
+        ua = unanswered_units(root, run_state.read(root))
+    except Exception as exc:  # noqa: BLE001 - the stop is recorded whatever this raises
+        ua_error = f"{type(exc).__name__}: {exc}"
+        print(f"warning: the unanswered-unit set could NOT be computed ({ua_error}) - the stop "
+              f"records it as unknown, never as none", file=sys.stderr)
+    held = ua["unanswered"] if ua else None
+    run_state.update(root, stop={"cause": cause, "detail": detail, "remedy": remedy,
+                                 "cycle": index, "cycles_unrun": unrun,
+                                 "stopped_at": sdlc_md.now_iso8601()},
+                     **unanswered_record(ua, ua_error))
+    # A cycle whose close completed is ALREADY closed, with the outcome its goal-verdict
+    # earned; overwriting that with `blocked` would relabel delivered work as a failure. Only
+    # a run still running is closed here - and then `blocked` is the honest word.
+    if run_state.read(root).get("outcome") == run_state.RUNNING:
+        run_state.close_run(root, run_state.BLOCKED)
+    else:
+        run_state.archive(root)          # re-archive so the stop is in the kept record
+    print(f"boundary STOPPED ({cause}) after cycle {index}: {detail}", file=sys.stderr)
+    print(f"  {unrun} cycle(s) of the policy were not run", file=sys.stderr)
+    if held:
+        print(f"  {len(held)} stop-ship question(s) left unanswered: {unanswered_rows(held)}",
+              file=sys.stderr)
+    print(f"remedy: {remedy}", file=sys.stderr)
+    return 1
+
+
+def _boundary_close_down(root, index: int, args: argparse.Namespace) -> tuple[int, str]:
+    """Run the cycle's close ceremony, reported against the cycle it closed.
+
+    Delegates to `sprint close` rather than re-implementing it, so a rolling cycle closes
+    through exactly the chain a hand-run sprint closes through - retro validate and extract,
+    lessons summary, gate, reconcile - and cannot quietly become a weaker close."""
+    argv = ["close", "--root", str(root), "--retro", args.retro]
+    if getattr(args, "goal_verdict", None):
+        argv += ["--goal-verdict", args.goal_verdict, "--note", getattr(args, "note", "") or ""]
+    rc, out = _run_cli(main, argv)
+    for line in out.splitlines():
+        print(f"cycle {index} | {line}")
+    return rc, out
+
+
+def _regenerate_plan(root, policy: dict) -> dict:
+    """The next cycle's plan, computed fresh from the backlog as it is NOW.
+
+    Under the policy's own filters and order rule - not the CLI's defaults, and not a slice
+    of a batch selected at the start of the run. Work the last cycle raised is therefore
+    eligible, and work it finished has dropped out."""
+    queries = [(q["kind"], q["status"]) for q in policy.get("queries") or []]
+    epics = set(policy["epics"]) if policy.get("epics") else None
+    cap = policy.get("capacity") or {}
+    return build_plan(root, order=policy.get("order", "priority"), goal=policy.get("goal") or "done",
+                      skip_personas=policy.get("skip_personas", False), epics=epics,
+                      queries=queries or None,
+                      appetite_minutes=cap.get("minutes") or None,
+                      appetite_units=cap.get("units") or None)
+
+
+def _render_preview(data: dict, index: int) -> None:
+    """The dry-run preview of the regenerated plan, printed BEFORE the cycle executes."""
+    print(f"preview of cycle {index} (dry run - nothing has executed yet):")
+    ids = [u["id"] for u in data["batch"]]
+    print(f"  batch ({data['count']} unit(s), order={data['order']}): "
+          f"{', '.join(ids) if ids else '(empty)'}")
+    _render_token_forecast(data)
+    _render_cost_budget(data)
+    _render_capacity(data)
+
+
+def _open_next_cycle(root, policy: dict, data: dict, prev: dict) -> dict:
+    """Mint the next cycle's run: fresh id and start time, its own batch and forecast, the
+    standing policy carried, the counter decremented.
+
+    A fresh run rather than a continuation of the last one, because a cycle is a sprint: it
+    is forecast, judged and retrospected on its own, and an N-cycle run that shared one run
+    record would be one blurred session pretending to be N sprints."""
+    out = Path(root) / "sdlc-studio" / ".local" / "sprint-plan.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    sdlc_md.atomic_write(out, json.dumps(data, indent=2))
+    try:
+        record_forecast(root, data)
+    except OSError as exc:
+        print(f"warning: this cycle's token forecast was NOT recorded ({exc}) - it will be "
+              f"UNFORECAST at retro time", file=sys.stderr)
+    prev_cycle = prev.get("cycle") or {}
+    index = int(prev_cycle.get("index") or 1) + 1
+    remaining = max(int(prev_cycle.get("remaining") or 0) - 1, 0)
+    # The previous run is closed, so this mints a fresh identity and a fresh batch - the
+    # cumulative-batch rule applies within a run, never across cycles.
+    state = run_state.open_run(root, batch=[u["id"] for u in data["batch"]],
+                               goal=policy.get("goal"), plan=str(out))
+    cap = data["capacity"]["appetite"]
+    extra = {
+        "policy": policy,
+        "cycle": {"index": index, "remaining": remaining,
+                  # the run that recorded the policy - the thread joining every cycle
+                  "policy_run_id": prev_cycle.get("policy_run_id") or prev.get("run_id")},
+        "appetite": {"minutes": cap["minutes"], "units": cap["units"]},
+        "sprint_goal": policy.get("sprint_goal"),
+    }
+    run_state.update(root, **extra)
+    state = record_plan_snapshot(root, data["batch"])
+    print(f"opened cycle {index} of {policy['cycles']} as run {state['run_id']} "
+          f"({data['count']} unit(s), {remaining} cycle(s) left after this one)")
+    return state
+
+
+def cmd_boundary(args: argparse.Namespace) -> int:
+    """One sprint boundary of a rolling run: close down, fetch, regenerate, preview, open.
+
+    Every step is a gate. Nothing of the next cycle exists until all four have passed, so a
+    stale or ungated plan cannot be executed by a run nobody is watching."""
+    root = args.root
+    try:
+        state = run_state.read(root)
+    except run_state.RunStateError as exc:
+        print(f"boundary refused: {exc}", file=sys.stderr)
+        return 2
+    policy = state.get("policy")
+    if not policy:
+        print("boundary refused: this run carries no rolling policy - open one with "
+              "`sprint.py plan --write --cycles N --sprint-goal \"...\"`. A single sprint "
+              "closes with `sprint.py close`.", file=sys.stderr)
+        return 2
+    cycle = state.get("cycle") or {"index": 1, "remaining": max(policy["cycles"] - 1, 0)}
+    index, remaining = int(cycle.get("index") or 1), int(cycle.get("remaining") or 0)
+
+    # [1/4] CLOSE DOWN. The next cycle must plan on judged, reconciled state, so the cycle
+    # that just ran is properly closed first - retro, lessons, gate - or the run halts here.
+    print(f"boundary [1/4] {BOUNDARY_STEPS[0]}: closing cycle {index} of {policy['cycles']}")
+    rc, out = _boundary_close_down(root, index, args)
+    if rc != 0:
+        return _boundary_stop(
+            root, "close-gate",
+            f"the close-down chain for cycle {index} did not complete",
+            "fix the step the close named above, then re-run `sprint.py boundary`; the "
+            "completed steps are idempotent")
+    # A close that FINISHED with known issues is a finished close, not a clean one. A hand-run
+    # close hands those issues to a signer; a rolling boundary has no signer before the next
+    # cycle opens, so it halts rather than rolling on over them unread.
+    gaps = [g for g in (run_state.read(root) or {}).get(run_state.CLOSE_KNOWN_ISSUES) or []
+            if not _cost_cause_named(root, g)]
+    if gaps:
+        return _boundary_stop(
+            root, "close-gate",
+            f"the close-down for cycle {index} recorded {len(gaps)} known issue(s): "
+            + "; ".join(str(g.get("detail") or g) for g in gaps[:5])
+            + (f" (+{len(gaps) - 5} more)" if len(gaps) > 5 else ""),
+            "resolve the known issues the close named above and re-run `sprint.py boundary`, "
+            "or close and sign this cycle by hand")
+    # The cycle's retro belongs on its record - it is what makes the archived cycle
+    # self-describing rather than a batch with no account of itself.
+    run_state.update(root, retro=args.retro)
+    # A close whose chain was interrupted can leave the run running; the next cycle must
+    # never open over an open one.
+    if run_state.read(root).get("outcome") == run_state.RUNNING:
+        verdict = (run_state.read(root).get("sprint_goal_verdict") or {}).get("verdict")
+        run_state.close_run(root,
+                            run_state.GOAL_REACHED if verdict == "achieved"
+                            else run_state.STOPPED)
+    closed = run_state.archive(root)
+    print(f"cycle {index} closed and archived -> {closed}")
+
+    # [2/4] FETCH. At EVERY boundary, not just the first plan: a long unattended run spends
+    # hours between boundaries, which is exactly enough time for the team to move past this
+    # checkout.
+    print(f"boundary [2/4] {BOUNDARY_STEPS[1]}: comparing against origin")
+    fetched = not getattr(args, "no_fetch", False)
+    drift = origin_drift(root, do_fetch=fetched)
+    # The result is reported per cycle on EVERY path, not only the clean one: "no news" from
+    # a boundary must mean "checked and level", never "the check was skipped".
+    how = "fetched" if fetched else "compared without fetching"
+    if not drift.get("remote"):
+        outcome = "no origin to compare"
+    elif drift.get("unverified"):
+        # Never "level": the boundary cannot claim an answer it did not get.
+        outcome = f"UNVERIFIED - {drift['unverified']}"
+    elif drift.get("behind"):
+        outcome = f"{drift['behind']} commit(s) behind origin/{drift['branch']}"
+    else:
+        outcome = f"level with origin/{drift['branch']}"
+    print(f"cycle {index} | fetch: {how} - {outcome}")
+    if drift.get("behind") or drift.get("unverified"):
+        warn = _drift_warning(drift, _batch_paths(root, state.get("batch") or []))
+        print(f"cycle {index} | {warn}", file=sys.stderr)
+        if getattr(args, "strict", False):
+            reason = (f"local is {drift['behind']} commit(s) behind origin/{drift['branch']}"
+                      if drift.get("behind")
+                      else f"drift could not be verified: {drift['unverified']}")
+            return _boundary_stop(
+                root, "origin-drift", reason,
+                "fetch and rebase, then re-run `sprint.py boundary` (or drop --strict to "
+                "continue against this checkout)")
+
+    if remaining < 1:
+        print(f"policy complete: {policy['cycles']} cycle(s) run, none remaining")
+        return 0
+
+    # [3/4] REGENERATE. From the live backlog, under the standing policy.
+    print(f"boundary [3/4] {BOUNDARY_STEPS[2]}: selecting cycle {index + 1} from the live "
+          f"backlog")
+    try:
+        data = _regenerate_plan(root, policy)
+    except ValueError as exc:
+        return _boundary_stop(root, "refused-plan", f"the batch cannot be ordered: {exc}",
+                              "resolve the dependency cycle or bad status the message names")
+    bd = data.get("breakdown")
+    if bd and bd.get("blocking") and (bd["ungroomed"] or bd["oversized"]):
+        detail = (f"{len(bd['ungroomed'])} ungroomed and {len(bd['oversized'])} oversized "
+                  f"unit(s) in the regenerated batch")
+        for line in _breakdown_detail(bd) + _oversized_detail(bd):
+            print(f"cycle {index + 1} | {line}", file=sys.stderr)
+        return _boundary_stop(root, "refused-plan", detail,
+                              "groom or split the units named above, then re-run "
+                              "`sprint.py boundary`")
+    if not data["batch"] and "empty-backlog" in (policy.get("stop_conditions") or []):
+        print(f"policy complete: the backlog is empty at cycle {index + 1} - "
+              f"{remaining} cycle(s) were not needed")
+        return 0
+
+    # [4/4] PREVIEW, then open. The preview is printed BEFORE the cycle exists, so the record
+    # of what this cycle was about to do survives even if it never starts.
+    print(f"boundary [4/4] {BOUNDARY_STEPS[3]}: cycle {index + 1}")
+    _render_preview(data, index + 1)
+    _open_next_cycle(root, policy, data, run_state.read(root))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# THE STOP: expensive, and until now its cost was invisible.
+# ---------------------------------------------------------------------------
+# One unit needing an operator decision parked a whole 13-unit sprint while four units nothing
+# blocked could have been built meanwhile (RUN-01KY03GS). `sprint decision defer` already
+# existed to prevent exactly that, and nothing obliged its use, nothing prompted it and nothing
+# priced the stop - so the available-but-optional path was not taken and the expensive one was.
+#
+# The rule is now a property of the loop rather than a judgement call: continue while ANY unit
+# remains that the pending question does not block, and stop only when nothing can proceed.
+#
+# THE BLOCKED SET IS DERIVED, AND ONLY FROM DECLARED `Depends on:` EDGES (D0052). A shared-file
+# cluster is a SEQUENCING constraint, not a reason a unit cannot proceed; counting a collision
+# as blockage would let one deferred decision stop an entire file cluster, which is the
+# over-stopping this exists to end.
+STOP_PENDING_DECISION = "pending-decision"
+STOP_OPERATOR = "operator"
+
+
+def _remaining_units(root: Path, state: dict) -> list[str]:
+    """The batch units still to do: everything the run was approved to deliver, minus those
+    whose artefact has reached a terminal status. A unit with no artefact on disk COUNTS - it
+    is work the run still owes, and dropping it would quietly shrink the batch."""
+    out: list[str] = []
+    for uid in state.get("batch") or []:
+        norm = sdlc_md.norm_id(uid)
+        hit = sdlc_md.find_by_id(root, norm)
+        if hit is None:
+            out.append(norm)
+            continue
+        path, kind = hit
+        try:
+            status = sdlc_md.extract_field(path.read_text(encoding="utf-8"), "Status") or ""
+        except OSError as exc:  # noqa: PERF203
+            sdlc_md.debug("sprint._remaining_units", exc)
+            out.append(norm)
+            continue
+        vocab = sdlc_md.status_vocab(kind, root)
+        canon = sdlc_md.canonical_status(status, vocab) or status
+        if not sdlc_md.is_terminal_status(kind, canon):
+            out.append(norm)
+    return sorted(dict.fromkeys(out))
+
+
+def blocked_by_pending(repo_root: Path | str) -> dict:
+    """Which remaining units the pending operator questions block, and which they do not.
+
+    A unit is blocked when it IS a deferred unit, or when it declares a `Depends on:` edge
+    onto one (transitively - a dependant of a blocked dependant cannot proceed either).
+    Nothing else blocks: not a shared file, not a shared epic, not proximity in the batch.
+    """
+    root = Path(repo_root)
+    state = run_state.read(root)
+    pending, remaining, blocked = _parked_units(root, state)
+    return {"pending": pending, "remaining": remaining,
+            "blocked": sorted(blocked),
+            "unblocked": sorted(u for u in remaining if u not in blocked)}
+
+
+def _parked_units(root: Path, state: dict) -> tuple[list[dict], list[str], set]:
+    """`(pending decisions, remaining units, parked units)` for one run state.
+
+    ONE computation, read by `blocked_by_pending` and `unanswered_units` alike, so the stop's
+    pending-decision exit and the close's hold cannot disagree about which unit is parked: the
+    same closure over the same unit set. That set is `_remaining_units`, which COUNTS a unit
+    with no artefact on disk - so a unit parked before its file exists is parked here too, and
+    so is every unit declaring an edge onto it.
+    """
+    pending = [p for p in (state.get("pending_decisions") or []) if isinstance(p, dict)]
+    remaining = _remaining_units(root, state)
+    return pending, remaining, _pending_blocked(root, pending, remaining)
+
+
+def _pending_blocked(root: Path, pending: list[dict], units: list[str]) -> set:
+    """The units in `units` a pending operator question parks: each deferred unit, and every
+    unit declaring a `Depends on:` edge onto one, transitively. Called through `_parked_units`.
+    """
+    deferred = {sdlc_md.norm_id(p.get("unit")) for p in pending if p.get("unit")}
+    deps: dict[str, set] = {}
+    for uid in units:
+        hit = sdlc_md.find_by_id(root, uid)
+        if hit is None:
+            deps[uid] = set()
+            continue
+        try:
+            text = hit[0].read_text(encoding="utf-8")
+        except OSError:  # noqa: PERF203
+            deps[uid] = set()
+            continue
+        raw = (sdlc_md.extract_field(text, "Depends on")
+               or sdlc_md.extract_field(text, "Depends On") or "")
+        deps[uid] = _dep_ids(raw)
+    blocked = {u for u in units if u in deferred}
+    changed = True
+    while changed:                       # transitive closure over DECLARED edges only
+        changed = False
+        for uid in units:
+            if uid not in blocked and deps[uid] & blocked:
+                blocked.add(uid)
+                changed = True
+    return blocked
+
+
+def run_elapsed(repo_root: Path | str) -> dict:
+    """The run's elapsed wall-clock with its recorded idle gaps MARKED and EXCLUDED.
+
+    Delegates the deduction to `telemetry.elapsed_excluding_idle`, which is the ONE
+    implementation of the rule (D0052): the retro's elapsed reads the same function, so the
+    two cannot drift into different accounts of how long a sprint took."""
+    state = run_state.read(Path(repo_root))
+    return telemetry.elapsed_excluding_idle(state.get("started_at"), state.get("ended_at"),
+                                            state)
+
+
+def _open_idle_gap(root: Path, cause: str) -> None:
+    """Start an idle interval. Idempotent: a gap already open is not reopened, because a run
+    waiting on two questions is waiting once, not twice."""
+    state = run_state.read(root)
+    gaps = list(state.get(telemetry.IDLE_GAPS) or [])
+    if any(isinstance(g, dict) and not g.get("to") for g in gaps):
+        return
+    gaps.append({"from": sdlc_md.now_iso8601(), "to": None, "cause": cause})
+    run_state.update(root, **{telemetry.IDLE_GAPS: gaps})
+
+
+def _close_idle_gap(root: Path) -> None:
+    """End any open idle interval. Called when the operator answers - the moment the run
+    could have resumed, which is what makes the gap a measurement rather than an estimate."""
+    state = run_state.read(root)
+    gaps = list(state.get(telemetry.IDLE_GAPS) or [])
+    now = sdlc_md.now_iso8601()
+    touched = False
+    for gap in gaps:
+        if isinstance(gap, dict) and not gap.get("to"):
+            gap["to"], touched = now, True
+    if touched:
+        run_state.update(root, **{telemetry.IDLE_GAPS: gaps})
+
+
+def _render_stop_cost(out: dict) -> None:
+    """What the stop cost, named unit by unit. A count would let the operator stop a batch
+    without ever seeing what they were stopping."""
+    if out["unblocked"]:
+        print(f"stop: {len(out['unblocked'])} unit(s) that NOTHING pending blocks are being "
+              f"parked with it: {', '.join(out['unblocked'])} (work parked, not a stop-ship "
+              f"question)", file=sys.stderr)
+    if out["blocked"]:
+        print(f"stop: blocked by the pending question(s): {', '.join(out['blocked'])}",
+              file=sys.stderr)
+
+
+def cmd_reopen(args) -> int:
+    """Reopen a closed run so evidence belonging to it can still be recorded.
+
+    The close's own refusal for a late review named "or reopen it" while no reopen existed, so
+    the documented two-invocation close flow could not be completed once the first invocation
+    had sealed the run. This is the named remedy, made real.
+
+    The reason is mandatory and recorded, and the archived close record is left untouched: it is
+    the evidence of what was claimed at that moment, and rewriting it to match a later
+    correction is the failure this project exists to refuse.
+    """
+    root = args.root
+    try:
+        state = run_state.reopen_run(root, args.reason)
+    except ValueError as exc:
+        print(f"reopen refused: {exc}", file=sys.stderr)
+        return 2
+    print(f"reopened {state.get('run_id')} - outcome is `running` again and the end time is "
+          f"cleared. The archived close record is unchanged; the reason is recorded on the run.")
+    print(f"  reason: {args.reason}")
+    return 0
+
+
+def cmd_stop(args) -> int:
+    """Stop the run - refused while any batch unit is unanswered (`unanswered_units`).
+
+    `--force` is the operator's override, and it PRICES itself: the units that could have
+    proceeded are named individually on the record and on screen, so a parked run can be told
+    from a finished one and the cost of parking it is written down rather than inferred. The
+    unanswered units it waived go on the run record as `unanswered`, `[]` when there were none.
+    """
+    root = Path(args.root)
+    try:
+        state = run_state.read(root)
+    except run_state.RunStateError as exc:
+        print(f"stop refused: {exc}", file=sys.stderr)
+        return 2
+    if not run_state.is_open(root):
+        print("stop refused: no open run - there is nothing to stop", file=sys.stderr)
+        return 2
+    # A STOP writes the same account a close does, and the last run was STOPPED rather than
+    # closed - so a gate covering only `close` would leave ungated the route actually taken.
+    if refusal := _refuse_batch_repair(root, state, "stop"):
+        print(refusal, file=sys.stderr)
+        return 2
+    out = blocked_by_pending(root)
+    forced = bool(getattr(args, "force", False))
+    # The refusal reads the close's own predicate, so a stop and a close over one state name
+    # the same units. `stop` takes no --retro, so the rulings come from the latest retro that
+    # carries this run's id.
+    try:
+        ua = unanswered_units(root, state)
+    except Exception as exc:  # noqa: BLE001 - a hold that cannot be computed must not pass
+        print(f"stop refused: the unanswered-unit hold could not be computed: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    held = ua["unanswered"]
+    if held and not forced:
+        print(f"stop REFUSED: {len(held)} unit(s) remain unanswered: "
+              + "; ".join(f"{h['unit']} ({h['status']}) - {h['why']}" for h in held),
+              file=sys.stderr)
+        print(f"  build them. One undecidable unit costs one unit of progress, not the batch. "
+              f"Park the undecidable one with `sprint decision defer --unit <id> --question "
+              f"\"...\" --option \"a|...\" --option \"b|...\"`, or stop deliberately with "
+              f"--force, which records what could have proceeded.", file=sys.stderr)
+        print(f"  {unanswered_ways_out(held, ua['rulings_from'], state.get('run_id'))}",
+              file=sys.stderr)
+        return 1
+    cause = STOP_PENDING_DECISION if out["pending"] and not forced else STOP_OPERATOR
+    stop = {"cause": cause, "detail": (args.reason or "").strip() or None,
+            "blocked": out["blocked"], "could_have_proceeded": out["unblocked"],
+            "pending": len(out["pending"]), "stopped_at": sdlc_md.now_iso8601()}
+    # What --force WAIVED is the predicate's set, not `could_have_proceeded`: that list reads
+    # the pending-decision walk, which cannot see a ruling, a standing REJECT or an owed pass.
+    # The two answer different questions - what work was parked, and which stop-ship question
+    # was left open - so each is printed under its own label. A field of the run record beside
+    # `stop`, so every route that ends a run records it alike.
+    if held:
+        print(f"stop: forced over {len(held)} unanswered stop-ship question(s), recorded as "
+              f"waived: {unanswered_rows(held)}", file=sys.stderr)
+    run_state.update(root, stop=stop, **unanswered_record(ua))
+    if out["pending"]:
+        # The run is now WAITING, and the clock says so. This gap opens at the same instant
+        # `close_run` below stamps `ended_at`, so it lies ENTIRELY OUTSIDE the measured window
+        # and must deduct nothing from it - `telemetry.elapsed_excluding_idle` clamps every gap
+        # to its intersection with the run rather than subtracting it whole. The wait is still
+        # recorded, because how long the operator loop takes is a real fact; it is simply not
+        # wall-clock the sprint ever held.
+        _open_idle_gap(root, cause)
+    _render_stop_cost(out)
+    stopped = run_state.close_run(root, run_state.STOPPED)
+    if stopped.get("run_id") and run_state.tracked_path(root, stopped["run_id"]).is_file():
+        print(f"stop: commit "
+              f"{run_state.tracked_path(root, stopped['run_id']).relative_to(Path(root)).as_posix()}"
+              f", so no other checkout still reads {stopped['run_id']} as awaiting its signature")
+    el = run_elapsed(root)
+    print(f"run stopped ({cause}): {stop['detail'] or 'no reason given'}; "
+          f"{len(out['blocked'])} blocked, {len(out['unblocked'])} could have proceeded, "
+          f"{len(held)} stop-ship question(s) waived")
+    if el["hours"] is not None:
+        outside = round(el["recorded_idle_hours"] - el["idle_hours"], 3)
+        print(f"  elapsed {el['hours']}h working ({el['raw_hours']}h wall-clock less "
+              f"{el['idle_hours']}h idle INSIDE it, from {len(el['gaps'])} recorded gap(s))"
+              + (f"; a further {outside}h of recorded idle falls outside the run and is "
+                 f"deducted from nothing" if outside > 0 else ""))
+    return 0
+
+
+def _seat_from_dict(d: object) -> dict:
+    """Validate a seat verdict supplied as a JSON object (via `--fields-file`): the same three
+    required answers as the pipe-delimited form, so a fields-file seat is held to the same bar.
+    An entry that is not an object is named, as a missing key is, rather than dropped."""
+    # The keys the `--fields-file` help names, as the refusals below name them.
+    needs = "'seat', " + ", ".join(repr(k) for k in GOAL_REVIEW_FIELDS[:-1]) + \
+        f" and {GOAL_REVIEW_FIELDS[-1]!r}"
+    if not isinstance(d, dict):
+        raise ValueError(f"seat entry {d!r} in --fields-file is not an object - a seat object "
+                         f"needs {needs}")
+    out = {"seat": str(d.get("seat") or "").strip()}
+    for f in GOAL_REVIEW_FIELDS:
+        # PRESENCE first, then coerce, then test the COERCED value. `str(x or "")` collapses a
+        # JSON `false` to the empty string, so the recommended --fields-file path could record
+        # that a goal IS achievable and could not record, in the same encoding, that it is NOT -
+        # a recorder biased toward approval, and the workaround (write the string `no`) is
+        # documented nowhere.
+        #
+        # Presence ALONE would be worse than the bug: `if f not in d` admits `""`, `null` and
+        # `0`, and `verdict_polarity` reads all three as `unclear`, so the guard whose job is to
+        # refuse an incomplete verdict would start passing three of them. Both halves are
+        # needed, which is why the emptiness test moved rather than being deleted.
+        if f not in d:
+            raise ValueError(f"seat {out['seat'] or '(unnamed)'!r} in --fields-file is missing "
+                             f"{f!r} - a seat object needs {needs}")
+        # A verdict field is a STRING or a BOOLEAN, and nothing else. Coercing whatever
+        # arrives with `str()` admitted every falsey shape except the empty string - `0`, `0.0`,
+        # `[]` and `{}` were all refused at the base ref and would have started recording as
+        # `unclear`, which is precisely the incomplete verdict this guard exists to refuse. An
+        # author writing `false` as `0` is in the same JSON-encoding family as the bug being
+        # repaired, so it is the likeliest way in.
+        raw = d[f]
+        if isinstance(raw, bool):
+            val = "yes" if raw else "no"
+        elif raw is None or isinstance(raw, str):
+            val = (raw or "").strip()
+        else:
+            raise ValueError(f"seat {out['seat'] or '(unnamed)'!r} in --fields-file gives "
+                             f"{f!r} as {type(raw).__name__}, which is neither a verdict word "
+                             f"nor a boolean - `false` and `no` both read as no")
+        if not val:
+            raise ValueError(f"seat {out['seat'] or '(unnamed)'!r} in --fields-file has "
+                             f"{f!r} present but carrying no verdict - a blank is not an "
+                             f"answer. `false` and `no` are both accepted and both read `no`")
+        out[f] = val
+    if not out["seat"]:
+        raise ValueError(f"a seat verdict in --fields-file has no 'seat' (the seat's name) - "
+                         f"a seat object needs {needs}")
+    note = str(d.get("note") or "").strip()
+    if note:
+        out["note"] = note
+    if rereview := _rereview_answer(d.get("rereview"), out["seat"]):
+        out["rereview"] = rereview
+    # PER-CLAUSE answers, carried through. The reader (`_recorded_clause_verdicts`) was changed
+    # to require this key while this whitelist silently stripped it, so no writer in the shipped
+    # code could produce one and the goal panel reported UNANSWERED on every close, permanently.
+    # A wrong path was replaced by a DEAD path - which is worse, because nothing reports it.
+    clauses = d.get("clauses")
+    if isinstance(clauses, dict):
+        kept = {str(k): str(v).strip() for k, v in clauses.items() if str(v or "").strip()}
+        if kept:
+            out["clauses"] = kept
+    return out
+
+
+def _plan_path(root: Path) -> Path:
+    return Path(root) / "sdlc-studio" / ".local" / "sprint-plan.json"
+
+
+def _compose_seat_brief(plan: dict, goal: str | None, injected: dict | None = None,
+                        served: list[str] | None = None) -> str:
+    """The seat brief text, composed PURELY from the planner's output, the goal, what the
+    product serves (`_goal_served_lines`) and the lessons injected at review - so the same batch
+    and goal produce the same brief every time."""
+    bd = plan.get("breakdown") or {}
+    ungroomed = bd.get("ungroomed") or []
+    clusters = bd.get("clusters") or []
+    end = plan.get("reachable_end_state") or {}
+    lines = [f"Sprint Goal: {goal or '(none set)'}",
+             f"Batch: {plan.get('count', 0)} unit(s), order={plan.get('order', '?')}"]
+    if ungroomed:
+        ids = ", ".join(str(u.get("id", "?")) for u in ungroomed)
+        lines.append(f"Placeholder/ungroomed ACs: {ids} - unauthored acceptance criteria the "
+                     f"first live review must not read as specified")
+    else:
+        lines.append("Placeholder/ungroomed ACs: none - every unit is groomed")
+    if clusters:
+        joined = "; ".join(", ".join(c.get("units", [])) for c in clusters)
+        lines.append(f"Shared-file clusters (NOT independently parallel): {joined}")
+    else:
+        lines.append("Shared-file clusters: none")
+    lines.append(f"Reachable end state: {end.get('state', '?')} - {end.get('basis', '')}")
+    lines.extend(served or [])
+    # The failure classes injected at review, and only those: the review is the pass most likely
+    # to catch a repeat, so it must know what has been repeating. An absence is reported too - a
+    # reviewer who is not told there are none assumes they were given them.
+    lines.extend(lessons.render_phase(injected or {"phase": "review"}))
+    return "\n".join(lines)
+
+
+def _goal_served_lines(root: Path, goal: str | None) -> list[str]:
+    """What the product serves, for the seat judging whether the goal serves a user (D0266):
+    the PRD outcomes, each Primary and Secondary persona's End goals, the Negative personas
+    as declined, and the plan's own `goal_trace` of this goal. Reading, never a refusal."""
+    outcomes, cards = prd_outcomes(root), persona_cards(root)
+    if not (outcomes or cards):
+        return ["PRD outcomes and personas: none on disk - nothing to trace the Sprint Goal "
+                "against"]
+    lines = (["PRD outcomes (does the goal serve one?):",
+              *(f"  {oid} - {text}" for oid, text in outcomes.items())] if outcomes else
+             ["PRD outcomes: none - sdlc-studio/prd.md lists no `## Outcomes`"])
+    designed = [c for c in cards if c["role"] in ("primary", "secondary")]
+    if designed:
+        lines.append("Personas designed for (End goals, numbered as on the card):")
+        for c in designed:
+            lines.append(f"  {c['name']} ({c['role'].capitalize()}):")
+            lines.extend([f"    {n}. {text}" for n, text in c["end_goals"]]
+                         or ["    (no End goals on the card)"])
+    else:
+        lines.append("Personas: none - no Primary or Secondary persona card"
+                     if cards else "Personas: none - no persona cards in sdlc-studio/personas/")
+    lines.extend(f"  {c['name']} (Negative) - declined: the product does not design for them"
+                 for c in cards if c["role"] == "negative")
+    trace = goal_trace(root, goal)
+    if trace is None:
+        lines.append("Goal serves: no Sprint Goal set, so nothing is traced")
+    elif not trace["flagged"]:
+        lines.append("Goal serves (the plan's own trace): "
+                     + "; ".join(_trace_label(s) for s in trace["serves"]))
+    else:
+        lines.append(f"Goal serves: NONE - {_trace_none_why(trace)}. Name the outcome or End "
+                     f"goal it serves in your done_means or note (reading, not a refusal)")
+    return lines
+
+
+def _persisted_plan_is_stale(root: Path, plan: dict) -> str | None:
+    """Why the PERSISTED plan does not describe the batch about to be reviewed, or None.
+
+    The goal review GATES `plan --write`, so on a new sprint the persisted plan necessarily still
+    belongs to the previous run. Briefing a seat from it describes the wrong batch, silently - and
+    a confidently wrong brief is worse than an absent one."""
+    if not plan:
+        return "no plan has been written yet"
+    try:
+        state = run_state.read(root) or {}
+    except Exception as exc:  # noqa: BLE001 - a missing run state must not break the brief
+        sdlc_md.debug("sprint._persisted_plan_is_stale", exc)
+        return None
+    if state.get("outcome") and state["outcome"] != "running":
+        return (f"the persisted plan belongs to {state.get('run_id') or 'a run'}, which closed "
+                f"({state['outcome']})")
+    return None
+
+
+def seat_brief(repo_root: Path | str, worklist: str | None = None,
+               goal: str | None = None) -> str:
+    """The context a review seat is GIVEN before it judges the Sprint Goal: what the batch is, the
+    grooming state the first live review turned on (placeholder ACs, shared-file clusters, the
+    reachable end state), what the product serves (the PRD outcomes, the personas' End goals and
+    the plan's own goal trace), and THIS project's failure classes injected at review from the
+    class store - not a generic checklist.
+
+    Give it the batch it is to brief (`worklist`) and it composes from a DRY plan of exactly that
+    batch. Without one it falls back to the persisted plan, and REFUSES to render a stale one as
+    current - the goal review gates `plan --write`, so on a new sprint the persisted plan is the
+    previous sprint's by construction."""
+    root = Path(repo_root)
+    injected = lessons.phase_digest(root, "review")
+    if worklist:
+        plan = build_plan(root, worklist=worklist, skip_personas=True)
+        goal = _brief_goal(root, goal, plan)
+        return _compose_seat_brief(plan, goal, injected, _goal_served_lines(root, goal))
+    plan = sdlc_md.read_json(_plan_path(root), {})
+    stale = _persisted_plan_is_stale(root, plan)
+    if stale:
+        return (f"NO CURRENT BATCH TO BRIEF: {stale}. Give the brief the batch it is to describe "
+                f"(`goal-review brief --worklist <file>`); the previous run's plan is not rendered "
+                f"here, because a brief describing the wrong batch cannot be told from a right one.")
+    goal = _brief_goal(root, goal, plan)
+    return _compose_seat_brief(plan, goal, injected, _goal_served_lines(root, goal))
+
+
+def _brief_goal(root: Path, supplied: str | None, plan: dict) -> str | None:
+    """The goal the seats are being briefed on, in precedence order: what the CALLER passed,
+    then the plan's, then an OPEN run's.
+
+    The caller's wins because the brief is written to review a goal the caller is proposing;
+    the run state comes last and only while the run is OPEN, on exactly the reasoning the
+    stale-plan guard beside it already records - on a new sprint the previous run's goal is
+    the wrong one by construction. It used to override unconditionally, and the CLI's `--goal`
+    never reached this function at all, so the seats were briefed on the CLOSED run's goal
+    while their verdict was recorded against the new one. `plan --write` cannot catch that:
+    by then both sides name the same string, and the brief was the only place the wrong goal
+    appeared - and the only artefact the seat actually read."""
+    if (supplied or "").strip():
+        return supplied
+    if plan.get("sprint_goal"):
+        return plan.get("sprint_goal")
+    try:
+        state = run_state.read(root) or {}
+    except Exception as exc:  # noqa: BLE001 - a missing run state must not break the brief
+        sdlc_md.debug("sprint._brief_goal", exc)
+        return None
+    if state.get("run_id") and not state.get("ended_at"):
+        return state.get("sprint_goal")
+    return None
+
+
+def _rereview_answer(raw: object, seat: str) -> str | None:
+    """A seat's `rereview` answer: `yes` (it asked to read the reworded goal again), `no`, or
+    None when it gave none. Anything else is refused: an unread answer would carry the verdict
+    of a seat that asked not to be carried."""
+    if isinstance(raw, bool):
+        return "yes" if raw else "no"
+    val = raw.strip().lower() if isinstance(raw, str) else raw
+    if val in (None, ""):
+        return None
+    if val in ("yes", "no"):
+        return val
+    raise ValueError(f"seat {seat or '(unnamed)'!r} gives rereview as {raw!r} - it is yes or no")
+
+
+def _parse_seat_verdict(spec: str) -> dict:
+    """`role|achievable|what done means|one increment[|note[|rereview]]` -> a seat verdict.
+
+    Every one of the three answers is required. A verdict that says a goal is achievable
+    without saying what done means for it is an opinion about an unstated target, and the
+    close would then judge the increment against a definition nobody wrote down.
+
+    A last field (the sixth or later) of exactly yes or no, in any case, is the seat's
+    `rereview` answer; any other last field stays in the note, which keeps its pipes as it did
+    before the answer existed. The one ambiguity: a note that itself ends in `|yes` or `|no`
+    reads as the answer, so such a note goes through `--fields-file`."""
+    parts = [p.strip() for p in (spec or "").split("|")]
+    if len(parts) < 4 or not all(parts[:4]):
+        raise ValueError(
+            f"--seat must be 'role|achievable|what done means|one increment[|note[|rereview]]', "
+            f"got {spec!r}")
+    out = {"seat": parts[0], "achievable": parts[1], "done_means": parts[2],
+           "one_increment": parts[3]}
+    tail = parts[4:]
+    if len(parts) > 5 and parts[-1].lower() in ("yes", "no"):
+        out["rereview"] = parts[-1].lower()
+        tail = parts[4:-1]
+    if tail and tail[0]:
+        out["note"] = "|".join(tail)
+    return out
+
+
+def cmd_goal_review(args) -> int:
+    """Record or show the seats' review of the Sprint Goal.
+
+    A FILE, in the shape of `wsjf-inputs.json`, because a plan-time judgement has to survive
+    the command that produced it: it is read back at the STOP the operator signs off at, and
+    stamped on the run state for the close. It carries the goal it reviewed, so a file left
+    over from an earlier sprint cannot silently discharge the gate for a new one.
+    """
+    root = Path(args.root)
+    if args.action == "brief":
+        # The CLI's --goal reaches the brief. It never did, which is the whole of BG0381:
+        # the flag was accepted, documented and silently discarded.
+        print(seat_brief(root, worklist=getattr(args, "brief_worklist", None),
+                         goal=getattr(args, "goal", None)))
+        return 0
+    if args.action == "show":
+        rec = goal_review(root)
+        if args.format == "json":
+            print(json.dumps(rec, indent=2))
+            return 0
+        rounds = goal_review_rounds(rec)
+        if not rounds:
+            print("no goal review recorded - `sprint.py goal-review record --goal ... "
+                  "--seat ...`")
+            return 0
+        # Every round, so a goal accepted first time is told from one rewritten after a REJECT.
+        for i, rnd in enumerate(rounds, 1):
+            tag = f"round {i} of {len(rounds)}" if len(rounds) > 1 else "reviewed"
+            print(f"goal review ({tag}, {rnd.get('reviewed_at') or 'undated'}): "
+                  f"\"{rnd.get('goal')}\"")
+            for s in rnd.get("seats") or []:
+                mark = " NOT ACHIEVABLE" if verdict_polarity(s.get("achievable")) == "no" else ""
+                print(f"  {s.get('seat')}: achievable={s.get('achievable')}{mark}, one increment="
+                      f"{s.get('one_increment')}, done means \"{s.get('done_means')}\"")
+        return 0
+    # A --fields-file supplies the goal, seats and brief without any of it crossing a shell, so a
+    # seat note quoting a command in backticks is stored verbatim. An explicit flag wins.
+    from_file: dict = {}
+    if getattr(args, "fields_file", None):
+        import file_finding  # noqa: PLC0415 - the shared fields-file loader, as elsewhere
+        try:
+            from_file = file_finding.load_fields_file(
+                args.fields_file, allowed=("goal", "seats", "brief"))
+        except ValueError as exc:
+            print(f"goal-review record refused: {exc}", file=sys.stderr)
+            return 2
+    goal = (args.goal or "").strip() or str(from_file.get("goal") or "").strip()
+    if not goal:
+        print("goal-review record refused: --goal must name the Sprint Goal the seats "
+              "reviewed - a verdict with no goal attached reviews nothing", file=sys.stderr)
+        return 2
+    try:
+        seats = [_parse_seat_verdict(s) for s in (args.seat or [])]
+        listed = from_file.get("seats") or []
+        if not isinstance(listed, list):
+            # Iterated, a string or an object would be refused by its first character or key.
+            raise ValueError(f"--fields-file seats must be a list of seat objects, got a "
+                             f"{type(listed).__name__}: {listed!r}")
+        seats += [_seat_from_dict(s) for s in listed]
+    except ValueError as exc:
+        print(f"goal-review record refused: {exc}", file=sys.stderr)
+        return 2
+    brief = args.brief if args.brief is not None else from_file.get("brief")
+    prior_rounds = goal_review_rounds(goal_review(root))
+    # Amend vs material: a reworded goal CARRIES every seat's prior verdict forward unless that
+    # seat asked to re-review it (`rereview: yes`), so one round is the default; a MATERIAL
+    # change carries nothing. The distinction cannot be made mechanically, so the operator
+    # DECLARES it and the declaration is recorded on the round - an accountable classification,
+    # not the tool's guess.
+    amend_from = (args.amend_from or "").strip()
+    req = (args.requesting_seat or "").strip()
+    by_operator = getattr(args, "requested_by", None) == "operator"
+    change_type = None
+    carried: list[dict] = []
+    moves_run: dict | None = None
+    if by_operator and (not amend_from or args.material or req):
+        print("goal-review record refused: --requested-by operator declares who asked for an "
+              "amendment - pass it with --amend-from, without --material and without "
+              "--requesting-seat (one requester per round)", file=sys.stderr)
+        return 2
+    if amend_from:
+        change_type = "material" if args.material else "amendment"
+        # The new wording is AUTHORED here, so it is held to the plan's limit before anything
+        # is written.
+        if refusal := goal_length_refusal(goal, "goal-review record refused",
+                                          "Nothing is written."):
+            print(refusal, file=sys.stderr)
+            return 2
+        prior = next((r for r in reversed(prior_rounds)
+                      if _norm_goal(r.get("goal")) == _norm_goal(amend_from)), None)
+        if prior is None:
+            print(f"goal-review record refused: --amend-from {amend_from!r} matches no recorded "
+                  f"round; the prior goal must be one already reviewed", file=sys.stderr)
+            return 2
+        if change_type == "amendment":
+            if not req and not by_operator:
+                print("goal-review record refused: an amendment needs --requesting-seat (the "
+                      "seat that asked for the rewording) or --requested-by operator",
+                      file=sys.stderr)
+                return 2
+            fresh_roles = {str(s.get("seat") or "").strip() for s in seats}
+            prior_roles = {str(s.get("seat") or "").strip() for s in (prior.get("seats") or [])}
+            # The requesting seat must actually have a verdict on the prior goal, or the amendment
+            # carries nothing and the round would DECLARE a requesting seat that simultaneously
+            # needs a fresh verdict - a self-contradictory, dishonest trail. Refuse it. The
+            # operator is no seat, so it needs no prior verdict.
+            if req and req not in prior_roles and req not in fresh_roles:
+                print(f"goal-review record refused: --requesting-seat {req!r} has no verdict on "
+                      f"{amend_from!r}, so there is nothing to carry forward - either it reviewed "
+                      f"the prior goal (an amendment) or supply its fresh --seat verdict on the "
+                      f"new goal", file=sys.stderr)
+                return 2
+            for s in (prior.get("seats") or []):
+                role = str(s.get("seat") or "").strip()
+                if role not in fresh_roles and s.get("rereview") != "yes":
+                    carried.append({**s, "carried_from": amend_from})
+            if by_operator:
+                try:
+                    moves_run = _run_goal_to_amend(root, amend_from)
+                except (run_state.RunStateError, ValueError) as exc:
+                    print(f"goal-review record refused: {exc}", file=sys.stderr)
+                    return 2
+    elif args.material:
+        print("goal-review record refused: --material declares a change FROM a prior goal - pass "
+              "--amend-from with it (a material change of nothing is just a new goal)",
+              file=sys.stderr)
+        return 2
+    seats = seats + carried
+    # A material change may be declared before any seat has read the new wording: every seat
+    # then owes a verdict, and the plan names them.
+    if not seats and change_type != "material":
+        print("goal-review record refused: at least one seat verdict is required - "
+              + ("the --fields-file 'seats' list holds none and no --seat was given"
+                 if from_file else "pass --seat or a --fields-file 'seats' list"),
+              file=sys.stderr)
+        return 2
+    path = root / GOAL_REVIEW_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # APPEND a round rather than overwrite. A goal rewritten in answer to a REJECT must not erase
+    # the fact that it was rejected: rounds accumulate (as the sprint review's `review_rounds`
+    # does), and the plan gate reads the LATEST round, so nothing about the staleness protection
+    # changes. The round is keyed by the goal string each round judged.
+    rounds = list(prior_rounds)
+    rnd = {"goal": goal, "reviewed_at": sdlc_md.now_iso8601(), "seats": seats}
+    if amend_from:
+        rnd["amended_from"] = amend_from
+        rnd["change_type"] = change_type
+        if change_type == "amendment" and req:
+            rnd["requesting_seat"] = req
+        elif change_type == "amendment":
+            # The operator is recorded apart from the seats, so a project seat whose role is
+            # `operator` is never discharged by an amendment it did not request.
+            rnd["requested_by"] = "operator"
+    if brief is not None:
+        rnd["brief"] = brief
+    rounds.append(rnd)
+    sdlc_md.atomic_write(path, json.dumps({"rounds": rounds}, indent=2) + "\n")
+    # Report each answer as the answer it actually is. Saying "judged it NOT achievable" over a
+    # seat that judged it achievable is a false statement about a recorded verdict, and it is the
+    # sentence the operator reads when deciding whether to override. Only the requesting seat's
+    # carried objection is answered by the amendment; any other carried objection stands. The
+    # predicate is `goal_review_status`'s, so the two agree on every verdict this round holds.
+    requester = rnd.get("requesting_seat") or ""
+    objected = [s["seat"] for s in seats if verdict_polarity(s.get("achievable")) == "no"
+                and not (requester and s.get("carried_from") and s["seat"] == requester)]
+    themed_seats = [s["seat"] for s in seats
+                    if verdict_polarity(s.get("one_increment")) == "no"]
+    tail = (f" - {len(objected)} seat(s) judged it NOT achievable ({', '.join(objected)}); "
+            f"`sprint plan` prints it as advice and does not refuse" if objected else "")
+    if themed_seats and not objected:
+        tail += (f" - {len(themed_seats)} seat(s) classed it a THEMED batch, not one increment "
+                 f"({', '.join(themed_seats)}); that is advice, not an objection, and does not "
+                 f"refuse the plan")
+    carried_note = (f", carried {', '.join(s['seat'] for s in carried)} forward from "
+                    f"\"{amend_from}\"" if carried else "")
+    print(f"recorded {len(seats)} seat verdict(s) on \"{goal}\" (round {len(rounds)})"
+          f"{carried_note}{tail} -> {path}")
+    if moves_run is not None:
+        state = run_state.update(root, sprint_goal=goal, sprint_goal_amendments=[
+            *(moves_run.get("sprint_goal_amendments") or []),
+            {"from": moves_run.get("sprint_goal"), "to": goal, "requested_by": "operator",
+             "at": rnd["reviewed_at"]}])
+        print(f"run {state.get('run_id')}: the close now judges \"{goal}\", amended from "
+              f"\"{moves_run.get('sprint_goal')}\"; the plan keeps the goal as planned "
+              f"-> {run_state.path(root)}")
+    elif by_operator:
+        print(f"no open run's goal is \"{amend_from}\", so no run's goal moved")
+    return 0
+
+
+def _run_goal_to_amend(root: Path, amend_from: str) -> dict | None:
+    """The open run's state when `amend_from` is its goal - the run an operator's amendment
+    moves - or None, when no run is open or its goal is another wording. Raises ValueError once
+    the run's goal verdict is recorded: that verdict judged the wording, so moving it now would
+    leave the close judging a goal nobody judged."""
+    state = run_state.read(root)
+    if not (state.get("run_id") and state.get("outcome") == run_state.RUNNING
+            and not state.get("ended_at")):
+        return None
+    if _norm_goal(state.get("sprint_goal")) != _norm_goal(amend_from):
+        return None
+    verdict = state.get("sprint_goal_verdict") or {}
+    if verdict:
+        raise ValueError(
+            f"run {state.get('run_id')}'s goal verdict is already recorded "
+            f"({verdict.get('verdict')}: {verdict.get('note') or 'no note'}) on "
+            f"\"{state.get('sprint_goal')}\" - an amendment now would leave that verdict judging "
+            f"wording the run no longer has. Nothing is written.")
+    return state
+
+
+def _parse_labelled(spec: str, what: str) -> tuple[str, str]:
+    """'label|text' -> (label, text), refusing either half empty - a label with no
+    consequence (or a recommendation with no reason) is prose wearing a flag."""
+    label, _, text = (spec or "").partition("|")
+    if not label.strip() or not text.strip():
+        raise ValueError(f"{what} must be 'label|{'consequence' if what == '--option' else 'reason'}', got {spec!r}")
+    return label.strip(), text.strip()
+
+
+def _render_pending_decisions(pending: list[dict]) -> None:
+    """The structured surface, one stop for everything: question, named options with their
+    consequences, the recommendation marked with its reason."""
+    print(f"pending operator decisions: {len(pending)} - asked together, one stop, "
+          f"not one stop per decision:")
+    for i, p in enumerate(pending, 1):
+        print(f"\n[{i}] {p['unit']}: {p['question']}")
+        rec = p.get("recommend") or {}
+        for o in p["options"]:
+            mark = (f"   <- RECOMMENDED: {rec['reason']}"
+                    if rec.get("label") == o["label"] else "")
+            print(f"    - {o['label']}: {o['consequence']}{mark}")
+    print("\nrecord each answer: `sprint decision resolve --index N --choice <label>`")
+
+
+def cmd_decision(args) -> int:
+    """Deferred operator decisions: set the undecidable unit aside, keep the batch moving,
+    and ask everything together at the stop - structured, never prose."""
+    root = Path(args.root)
+    try:
+        run_state.read(root)   # a corrupt state must refuse with the repair guidance,
+    except run_state.RunStateError as exc:  # never escape as a traceback mid-triage
+        print(f"decision {args.action} refused: {exc}", file=sys.stderr)
+        return 2
+    if args.action == "defer":
+        if not run_state.is_open(root):
+            print("decision defer refused: no open run - a deferred decision belongs to a "
+                  "run (`sprint plan --write` opens one)", file=sys.stderr)
+            return 2
+        if not args.unit or not args.question:
+            print("decision defer refused: --unit and --question are required", file=sys.stderr)
+            return 2
+        try:
+            options = [dict(zip(("label", "consequence"), _parse_labelled(s, "--option")))
+                       for s in (args.option or [])]
+            if len(options) < 2:
+                raise ValueError("a decision needs at least two named options - one option "
+                                 "is not a decision, and none is prose")
+            recommend = None
+            if args.recommend:
+                label, reason = _parse_labelled(args.recommend, "--recommend")
+                if label not in {o["label"] for o in options}:
+                    raise ValueError(f"--recommend names {label!r}, which is not one of the "
+                                     f"options")
+                recommend = {"label": label, "reason": reason}
+        except ValueError as exc:
+            print(f"decision defer refused: {exc}", file=sys.stderr)
+            return 2
+        state = run_state.read(root)
+        pending = list(state.get("pending_decisions") or [])
+        pending.append({"unit": args.unit, "question": args.question.strip(),
+                        "options": options, "recommend": recommend,
+                        "deferred_at": sdlc_md.now_iso8601(), "resolution": None})
+        deferred = list(state.get("deferred_units") or [])
+        if args.unit not in deferred:
+            deferred.append(args.unit)
+        run_state.update(root, pending_decisions=pending, deferred_units=deferred)
+        blocked = ""
+        if args.block:
+            import transition  # noqa: PLC0415
+            try:
+                transition.transition(root, args.unit, "Blocked")
+                blocked = ", unit marked Blocked (recorded, never defaulted)"
+            except (ValueError, OSError) as exc:
+                blocked = f", unit NOT marked Blocked ({exc})"
+        # NAME what the batch continues with, not merely how many decisions are pending. A
+        # count leaves the reader to work out whether anything is still buildable, and the
+        # observed failure was a whole batch parking because nobody worked it out.
+        cont = blocked_by_pending(root)
+        with_units = (f" with {', '.join(cont['unblocked'])}" if cont["unblocked"]
+                      else " with nothing - every remaining unit is deferred or a declared "
+                           "dependant of one, so the run can now stop honestly")
+        print(f"decision deferred for {args.unit}{blocked} - the batch continues{with_units}; "
+              f"{len(pending)} pending, asked together at the stop (`sprint decision list`)")
+        return 0
+
+    state = run_state.read(root)
+    pending = list(state.get("pending_decisions") or [])
+    if args.action == "list":
+        if args.format == "json":
+            print(json.dumps(pending, indent=2))
+            return 0
+        if not pending:
+            print("no pending operator decisions")
+            return 0
+        _render_pending_decisions(pending)
+        return 0
+
+    # resolve: the ONLY path that writes an answer - autonomous runs never reach it
+    idx = (args.index or 0) - 1
+    if idx < 0 or idx >= len(pending):
+        print(f"decision resolve refused: --index must be 1..{len(pending)}", file=sys.stderr)
+        return 2
+    entry = pending[idx]
+    if args.choice not in {o["label"] for o in entry["options"]}:
+        print(f"decision resolve refused: --choice must name one of the recorded options "
+              f"({', '.join(o['label'] for o in entry['options'])})", file=sys.stderr)
+        return 2
+    entry["resolution"] = {"choice": args.choice, "note": args.note,
+                           "resolved_at": sdlc_md.now_iso8601()}
+    del pending[idx]
+    resolved = list(state.get("resolved_decisions") or []) + [entry]
+    # ...and out of `deferred_units` too. `defer` writes BOTH lists and only one had a remover,
+    # so a unit whose question was answered stayed "deferred" for ever: the close then reported
+    # it held on an operator decision while counting it delivered on the same page. A list that
+    # is only ever appended to is a log, and this one is read as a state.
+    still_deferred = [u for u in (state.get("deferred_units") or [])
+                      if sdlc_md.norm_id(u) != sdlc_md.norm_id(entry.get("unit") or "")]
+    run_state.update(root, pending_decisions=pending, resolved_decisions=resolved,
+                     deferred_units=still_deferred)
+    # The operator answered a question the run could not, so it is counted as an operator
+    # ruling, as `decisions.py add --by operator` counts one; the report's Rulings read it.
+    run_state.record_ruling(root, None, "operator",
+                            subject=f"{entry['unit']}: {args.choice}", kind="ruling")
+    if not pending:
+        # The last question is answered, so the run can work again: close the idle interval
+        # here, at the moment it could have resumed, rather than estimating it later.
+        _close_idle_gap(root)
+    try:
+        import ledger  # noqa: PLC0415
+        ledger.append_decision(root, entry["unit"],
+                               f"operator decision on {entry['unit']}: {args.choice}",
+                               rationale=args.note or entry["question"])
+    except (OSError, ValueError) as exc:   # the ruling is on the run state either way
+        print(f"ledger not appended ({exc})", file=sys.stderr)
+    print(f"decision for {entry['unit']} resolved: {args.choice} ({len(pending)} pending)")
+    return 0
+
+
+def cmd_call(args: argparse.Namespace) -> int:
+    """Call the sprint at this point - descope the remainder, then close honestly."""
+    try:
+        res = call_it_here(args.root, args.reason)
+    except (ValueError, run_state.RunStateError) as exc:
+        print(f"sprint call refused: {exc}", file=sys.stderr)
+        return 2
+    print(f"called {res['run_id']}: {len(res['delivered'])} delivered, "
+          f"{len(res['descoped'])} descoped")
+    for u in res["descoped"]:
+        print(f"  descoped {u['id']} ({u['status']}) - back in the backlog, unchanged")
+    print(f"  {res['detail']}")
+    # AC1 is the whole distinction from `stop`: a called sprint is CLOSED against its goal, not
+    # abandoned.
+    #
+    # RE-ENTERED THROUGH `main`, never by handing `cmd_close` this command's namespace. The
+    # second review round caught exactly that: `cmd_close` reads `args.goal_verdict` and
+    # `args.note` directly, `call` defines neither, and every invocation that reached the close
+    # died on an AttributeError - a verb that could not execute at all, green through the suite,
+    # `verify_ac` and the gate. Building an argv makes argparse supply every default, so the
+    # close cannot depend on which caller assembled the namespace. `_boundary_close_down` has
+    # delegated this way since the rolling cycle shipped; this now does the same.
+    argv = ["close", "--root", str(args.root)]
+    if getattr(args, "retro", None):
+        argv += ["--retro", args.retro]
+    if getattr(args, "goal_verdict", None):
+        argv += ["--goal-verdict", args.goal_verdict,
+                 "--note", getattr(args, "note", "") or ""]
+    print("  closing against the Sprint Goal - `call` finishes the run, it does not abandon it")
+    return main(argv)
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    """Inspect and edit the charter queue."""
+    try:
+        if args.qcmd == "show":
+            res = queue_show(args.root, skip_personas=getattr(args, "skip_personas", False))
+            if not res["queue"]:
+                print("queue: empty - no Queued charter")
+                return 0
+            print(f"queue: {len(res['queue'])} charter(s), head first")
+            for i, c in enumerate(res["queue"]):
+                mark = "->" if i == 0 else "  "
+                rank = f"rank={c['rank']}" if c["rank"] is not None else "unranked"
+                print(f"  {mark} {c['id']} [{rank}] {c['title']}")
+            head, hr = res["queue"][0], res["head"]
+            print(f"\nhead {head['id']}")
+            print(f"  goal:     {head['goal'] or '(none)'}")
+            print(f"  scope:    {head['scope'] or '(none)'}")
+            print(f"  appetite: {head['appetite'] or 'default'}")
+            if hr and hr.get("ok"):
+                print(f"  goal review: {hr['review']['detail']}")
+                print(f"  resolves to {len(hr['ids'])} unit(s) against the backlog as it stands "
+                      f"now: {', '.join(hr['ids'])}")
+                if hr.get("discovery"):
+                    print(_discovery_left_out(hr["discovery"]))
+            elif hr:
+                print(f"  resolves to NOTHING runnable: {hr['detail']}")
+            return 0
+        if args.qcmd == "reorder":
+            r = queue_reorder(args.root, args.charter, args.rank)
+            print(f"queue: {r['charter']} rank={r['rank']}")
+            return 0
+        if args.qcmd == "cancel":
+            r = queue_cancel(args.root, args.charter, args.reason)
+            print(f"queue: {r['charter']} Withdrawn - {r['reason']}")
+            return 0
+        if args.qcmd == "clear":
+            done = queue_clear(args.root, args.reason)
+            print(f"queue: {len(done)} charter(s) Withdrawn - {args.reason}"
+                  if done else "queue: already empty")
+            return 0
+    except ValueError as exc:
+        print(f"queue refused: {exc}", file=sys.stderr)
+        return 2
+    return 2
+
+
+def cmd_next(args: argparse.Namespace) -> int:
+    """Resolve the head charter against the backlog as it stands, and report what it selects.
+
+    It RESOLVES; it does not open. Opening is `sprint plan --write`, which records the approved
+    batch, the appetite and the goal review together - and a resolution that opened a run as a
+    side effect would make `queue show` and `next` differ only in how much they wrote. The
+    docstring claimed otherwise until the batch review caught it.
+    """
+    res = materialise_next(args.root, order=args.order,
+                           skip_personas=getattr(args, "skip_personas", False),
+                           runner=getattr(args, "runner", None))
+    if not res["ok"]:
+        print(f"sprint next: {res['detail']}", file=sys.stderr)
+        return 2
+    print(f"charter {res['charter']}: {res['title']}")
+    print(f"  scope query: {res['query']}")
+    print(f"  goal review: {res['review']['detail']}")
+    print(f"  materialised {len(res['ids'])} unit(s) against the backlog as it stands now: "
+          f"{', '.join(res['ids'])}")
+    if res.get("discovery"):
+        print(_discovery_left_out(res["discovery"]))
+    if args.dry_run:
+        print(f"  dry run - nothing opened, {res['charter']} stays Queued "
+              f"({res['queued']} charter(s) in the queue)")
+        return 0
+    print(f"  open it with: sprint.py plan --worklist <file> --write --sprint-goal "
+          f"\"{res['goal'][:60]}...\"" if res["goal"] else "")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="SDLC Studio sprint batch selection.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("plan", help="Select and order a batch of work (the triage plan).")
+    p.add_argument("--bugs", metavar="STATUS", action="append", help="Bugs with this Status "
+                   "(e.g. Open); repeatable and combinable with --crs/--stories for one merged "
+                   "mixed tranche")
+    p.add_argument("--crs", metavar="STATUS", action="append",
+                   help="CRs with this Status (e.g. Proposed); repeatable and combinable")
+    p.add_argument("--stories", metavar="STATUS", action="append",
+                   help="Stories with this Status (e.g. Ready); repeatable and combinable")
+    p.add_argument("--worklist", metavar="PATH",
+                   help="tranche file: one unit id per line (bullets/comments tolerated), or "
+                        "the last signed report's id (RPTxxxx) to plan the open items it "
+                        "handed over; a complete batch source, not combinable with status "
+                        "queries")
+    p.add_argument("--prd", metavar="PATH", help="Greenfield authoring: bootstrap from a PRD")
+    p.add_argument("--export-lanes", dest="export_lanes", metavar="DIR",
+                   help="write the report-only lane partition as one worklist per lane into DIR "
+                        "(each `sprint plan --worklist`-readable, with the undeclared-file caveat)")
+    p.add_argument("--epic", action="append", metavar="EPxxxx",
+                   help="scope a story batch to one or more epics (repeatable; with --stories)")
+    p.add_argument("--order", choices=("priority", "wsjf", "manual"), default="priority")
+    p.add_argument("--goal", choices=GOALS,
+                   help="the goal rung this run is driven to; recorded on the run state "
+                        "(with --write) so the close can say what the run aimed at")
+    p.add_argument("--content-review", dest="content_review",
+                   choices=("yes", "partial", "no"), default=None,
+                   help="the PLAN end of the bookend goal review: will this content deliver the "
+                        "Sprint Goal? A partial or no must name what is missing")
+    p.add_argument("--content-missing", dest="content_missing", default="",
+                   help="what this batch does not cover (required with a partial/no "
+                        "--content-review)")
+    p.add_argument("--sprint-goal", dest="sprint_goal", metavar="TEXT",
+                   help="the Sprint Goal - ONE product-outcome sentence unifying this batch "
+                        "(what the increment is judged against at the closing review), 20 words "
+                        "or fewer. Distinct from --goal, which is a pipeline rung. Optional: "
+                        "prompted when interactive; absent is recorded as none, never invented")
+    p.add_argument("--serves", action="append", metavar="O-ID|PERSONA",
+                   help="the PRD outcome (O1) or persona the Sprint Goal serves (repeatable, or "
+                        "comma-separated). Naming one in the goal traces it too; a goal serving "
+                        "none, or only a Negative persona, is flagged on the plan, never refused")
+    p.add_argument("--charter", default="",
+                   help="The charter this batch was materialised from. With --write, opening the "
+                        "run marks it Spent - the queue's only exit.")
+    p.add_argument("--write", action="store_true",
+                   help="persist the sprint plan to sdlc-studio/.local/sprint-plan.json AND "
+                        "open the run (id, start time, approved batch, goal) in "
+                        "sdlc-studio/.local/run-state.json - the object the close reads")
+    p.add_argument("--appetite-minutes", type=float, default=None, dest="appetite_minutes",
+                   help="wall-clock ceiling for the run; overrides the sprint capacity "
+                        "(config capacity.minutes). The unit-boundary breaker (loop_guard "
+                        "budget) stops the run cleanly when it is spent, and the plan sizes "
+                        "the batch against this same number. Never auto-extended")
+    p.add_argument("--appetite-units", type=int, default=None, dest="appetite_units",
+                   help="unit-count ceiling for the run; overrides the sprint capacity "
+                        "(config capacity.units). Evaluated at unit boundaries so no unit is "
+                        "abandoned mid-implementation, and flagged at PLAN time when the batch "
+                        "does not fit")
+    p.add_argument("--strict", action="store_true",
+                   help="refuse to plan when the index has drift or local is behind origin")
+    p.add_argument("--no-fetch", action="store_true", dest="no_fetch",
+                   help="skip the git fetch in the origin-drift preflight (compare against the "
+                        "already-fetched origin ref)")
+    p.add_argument("--skip-personas", action="store_true", dest="skip_personas",
+                   help="ignore review-seat WSJF inputs; the Cost of Delay is then derived from "
+                        "the declared Priority, which is what WSJF runs on by default")
+    p.add_argument("--cycles", type=int, default=None, metavar="N",
+                   help="Opt in to a ROLLING policy of N sprint cycles. Records the standing "
+                        "policy (goal, capacity, order, stop conditions) on the run; each "
+                        "boundary is then driven by `sprint.py boundary`. Needs --sprint-goal.")
+    p.add_argument("--stop-on", dest="stop_on", action="append",
+                   choices=OPTIONAL_STOP_CONDITIONS,
+                   help="Extra stop condition for a rolling policy (repeatable). A failed "
+                        "close gate, a strict origin-drift refusal and a refused plan always "
+                        "stop the run.")
+    p.add_argument("--root", default=".", help="Repo root (default: .)")
+    p.add_argument("--format", choices=("text", "json"), default="text")
+    p.set_defaults(func=cmd_plan)
+
+    b = sub.add_parser("breakdown", help="Report what a batch lacks before it can be planned "
+                                         "(Affects, size, shared-file clusters). Read-only.")
+    b.add_argument("--bugs", metavar="STATUS", action="append")
+    b.add_argument("--crs", metavar="STATUS", action="append")
+    b.add_argument("--stories", metavar="STATUS", action="append")
+    b.add_argument("--worklist", metavar="PATH")
+    b.add_argument("--skip-personas", action="store_true", dest="skip_personas",
+                   help="ignore review-seat sizes; judge only what the artefacts declare")
+    b.add_argument("--root", default=".", help="Repo root (default: .)")
+    b.add_argument("--format", choices=("text", "json"), default="text")
+    b.set_defaults(func=cmd_breakdown)
+
+    sg = sub.add_parser("sign", help="SEAL a prepared run: one principal moves the batch to its "
+                                     "terminal statuses and writes the run's one signature, "
+                                     "and nothing runs afterwards")
+    sg.add_argument("--report", default=None, metavar="RPTxxxx",
+                    help="the report being signed (default: the one the run names)")
+    sg.add_argument("--principal", default=None,
+                    help="the operator who signs the run - refused when it is a unit's author "
+                         "or a reviewer recorded on it")
+    sg.add_argument("--author", default=None, help="the authoring seat, for the independence check")
+    sg.add_argument("--retro", default=None, metavar="RETROxxxx")
+    sg.add_argument("--root", default=".")
+    sg.set_defaults(func=cmd_sign)
+
+    cl = sub.add_parser("close", help="Run the close ceremony as one deterministic chain "
+                                      "(goal-verdict, retro, lessons, gate, reconcile), "
+                                      "then file the report `sprint sign` seals.")
+    cl.add_argument("--retro", default=None, metavar="RETROxxxx",
+                    help="the batch retro this close validates and gates on. Omit it and close "
+                         "SCAFFOLDS one (id + template + index row) via the deterministic path, "
+                         "then stops so you fill it and re-run with the id it prints")
+    cl.add_argument("--content-review", dest="content_review",
+                    choices=("yes", "partial", "no"), default=None,
+                    help="the close end of the bookend goal review: did this content deliver "
+                         "the goal? A partial or no must name what is missing")
+    cl.add_argument("--content-missing", dest="content_missing", default="",
+                    help="what the batch did not cover (required with a partial/no "
+                         "--content-review)")
+    cl.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="report EVERY refusal the close chain would raise, in one pass, and "
+                         "write nothing. The action steps run against a scratch copy of the "
+                         "workspace, so the retro's CONTENT is judged before a retro exists - "
+                         "the class a read-only preflight cannot reach. A step that could not "
+                         "be evaluated is reported as such and the pass is not called clean")
+    cl.add_argument("--goal-verdict", dest="goal_verdict",
+                    choices=("achieved", "partial", "missed"), default=None,
+                    help="record the Sprint Goal judgement as part of the close")
+    cl.add_argument("--note", default=None,
+                    help="the judgement's one-line rationale (required with --goal-verdict)")
+    cl.add_argument("--file-and-close", dest="file_and_close", action="store_true",
+                    help="the bounded exit for a blocked close: file every remaining "
+                         "ADMINISTRATIVE blocker (ceremony debt) as a real artefact linked "
+                         "to the run, name the deferrals in the retro and the review anchor, "
+                         "and close with outcome `closed-outstanding` - stated plainly, "
+                         "nothing waived. REFUSED while any hard correctness blocker (a red "
+                         "gate lane, a refusing Done gate) is present")
+    # RETIRED: `--apply-signoff` signs nothing (`cmd_close` refuses it, naming `sprint sign`),
+    # and `--principal`/`--author` served only it. Kept so a caller still passing them meets
+    # that refusal rather than argparse's, and suppressed so the help offers none of them.
+    cl.add_argument("--apply-signoff", dest="apply_signoff", action="store_true",
+                    help=argparse.SUPPRESS)
+    cl.add_argument("--principal", default=None, help=argparse.SUPPRESS)
+    cl.add_argument("--author", default=None, help=argparse.SUPPRESS)
+    cl.add_argument("--root", default=".")
+    cl.set_defaults(func=cmd_close)
+    bo = sub.add_parser("boundary", help="Cross one sprint boundary of a rolling run: close "
+                                         "down, fetch, regenerate the plan, preview, open "
+                                         "the next cycle.")
+    bo.add_argument("--retro", required=True, metavar="RETROxxxx",
+                    help="The filled retro closing THIS cycle. Required: a boundary closes a "
+                         "sprint, and a sprint closes on a retro. Scaffold one with "
+                         "`sprint.py close` (no --retro) if it does not exist yet.")
+    bo.add_argument("--goal-verdict", dest="goal_verdict",
+                    choices=("achieved", "partial", "missed"),
+                    help="Judge this cycle's Sprint Goal here (needs --note).")
+    bo.add_argument("--note", default=None, help="The evidence behind --goal-verdict.")
+    bo.add_argument("--strict", action="store_true",
+                    help="Stop the run at a boundary where local is behind origin, instead "
+                         "of warning and continuing.")
+    bo.add_argument("--no-fetch", action="store_true", dest="no_fetch",
+                    help="Compare against origin without fetching first (offline).")
+    bo.add_argument("--root", default=".", help="Repo root (default: .)")
+    bo.set_defaults(func=cmd_boundary)
+
+    r = sub.add_parser("report", help="Compose and print the end-of-sprint report for a retro "
+                                      "(delivered, cost, velocity, estimate-vs-actual). Read-only.")
+    r.add_argument("--id", required=True, metavar="RETROxxxx",
+                   help="the retro this report is composed from")
+    r.add_argument("--tokens", type=int, default=None,
+                   help="sprint actual token total (interactive sprints, harness-tracked)")
+    r.add_argument("--elapsed-hours", dest="elapsed_hours", type=float, default=None,
+                   help="sprint elapsed hours for the primary velocity (interactive sprints)")
+    r.add_argument("--format", choices=("text", "json"), default="text")
+    r.add_argument("--root", default=".", help="Repo root (default: .)")
+    r.set_defaults(func=cmd_report)
+
+    cl = sub.add_parser("call",
+                        help="Call the sprint at this point: descope the unstarted remainder "
+                             "back to the BACKLOG and close honestly against the goal. Unlike "
+                             "`stop`, which abandons a run, this finishes one. Part of the "
+                             "charter queue lifecycle - the remainder returns to the backlog "
+                             "for a later charter, never forward to the next one.")
+    cl.add_argument("--reason", required=True,
+                    help="why it is being called - a descope nobody explained is "
+                         "indistinguishable from work that was forgotten")
+    cl.add_argument("--retro", metavar="RETROxxxx", default=None,
+                    help="the batch retro the close validates against; without it the close "
+                         "scaffolds one and stops, exactly as `sprint close` does")
+    # Forwarded to the close, so its own messages do not name flags this verb rejects.
+    cl.add_argument("--goal-verdict", choices=("achieved", "partial", "missed"), default=None,
+                    help="judge the Sprint Goal in the same act, as `sprint close` accepts it")
+    cl.add_argument("--note", default=None, help="the reasoning behind --goal-verdict")
+    cl.add_argument("--root", default=".", help="Repo root (default: .)")
+    cl.set_defaults(func=cmd_call)
+
+    q = sub.add_parser("queue", help="Inspect and edit the sprint charter queue.")
+    qs = q.add_subparsers(dest="qcmd", required=True)
+    qsh = qs.add_parser("show", help="the queue head first, and what the head resolves to NOW")
+    qsh.add_argument("--skip-personas", action="store_true")
+    qro = qs.add_parser("reorder", help="give a charter an explicit queue rank")
+    qro.add_argument("--charter", required=True)
+    qro.add_argument("--rank", type=int, required=True)
+    qca = qs.add_parser("cancel", help="withdraw one charter, keeping its record and its reason")
+    qca.add_argument("--charter", required=True)
+    qca.add_argument("--reason", required=True)
+    qcl = qs.add_parser("clear", help="withdraw every Queued charter, each with the reason")
+    qcl.add_argument("--reason", required=True)
+    for sp in (qsh, qro, qca, qcl):
+        # SUPPRESS, never ".". A per-subcommand default overwrites a `--root X queue clear`
+        # given BEFORE the verb, so the value the caller set is silently dropped and the
+        # command runs against the wrong tree. The grammar conformance guard holds this.
+        sp.add_argument("--root", default=argparse.SUPPRESS, help="Repo root (default: .)")
+    q.set_defaults(func=cmd_queue)
+
+    nx = sub.add_parser("next",
+                        help="Materialise the head sprint charter against the backlog AS IT IS "
+                             "now - a queue holds intent, not a frozen batch.")
+    nx.add_argument("--order", choices=("priority", "wsjf", "manual"), default="priority")
+    nx.add_argument("--dry-run", action="store_true",
+                    help="say so explicitly in the output; `next` resolves and reports either "
+                         "way, and opening the run is `sprint plan --write`")
+    nx.add_argument("--runner", default=None,
+                    help="who is running it - recorded beside the charter's reviewer, and a "
+                         "match is REPORTED rather than refused")
+    nx.add_argument("--skip-personas", action="store_true")
+    nx.add_argument("--root", default=".", help="Repo root (default: .)")
+    nx.set_defaults(func=cmd_next)
+
+
+    g = sub.add_parser("goal-verdict",
+                       help="Record the closing review's judgement of the Sprint Goal "
+                            "(achieved / partial / missed) on the run state.")
+    g.add_argument("--verdict", default=None, choices=("achieved", "partial", "missed"),
+                   help="the Sprint Goal judgement (required, here or in --fields-file)")
+    g.add_argument("--note", default=None,
+                   help="one line of judgement - why the verdict holds (required: a bare "
+                        "verdict is an assertion, not a review)")
+    g.add_argument("--fields-file", dest="fields_file", metavar="FIELDS.json",
+                   help="read the verdict and its note from a JSON object "
+                        "({\"verdict\": \"...\", \"note\": \"...\"}) instead of the flags, so a "
+                        "rationale carrying shell metacharacters is stored verbatim rather than "
+                        "interpreted by the shell")
+    g.add_argument("--root", default=".", help="Repo root (default: .)")
+    g.set_defaults(func=cmd_goal_verdict)
+
+    goal_review_help = (
+        "Record (or show) the review seats' read of the Sprint Goal, BEFORE the plan: is it "
+        "achievable by this batch, what does done mean for it, and does the batch read as one "
+        "increment. The read is advice printed with the plan, never a refusal: `sprint plan "
+        "--write` proceeds on a goal no seat has read, or one a seat objected to, and says so.")
+    gr = sub.add_parser("goal-review", help=goal_review_help, description=goal_review_help)
+    gr.add_argument("action", choices=("record", "show", "brief"))
+    gr.add_argument("--goal", default=None,
+                    help="the Sprint Goal the seats reviewed, verbatim - a verdict carries "
+                         "the goal it judged, so a stale file cannot discharge a new goal")
+    gr.add_argument("--seat", action="append", metavar="SPEC",
+                    help="repeatable: 'role|achievable|what done means|one increment"
+                         "[|note[|rereview]]' - rereview yes asks to read an amended goal again "
+                         "rather than have this verdict carried to it. A last field of exactly "
+                         "yes or no is that answer, so a note that itself ends in |yes or |no "
+                         "goes through --fields-file. The rounds on one wording are read "
+                         "together, so a seat owing a verdict records it alone")
+    gr.add_argument("--fields-file", dest="fields_file", metavar="FIELDS.json",
+                    help="read the goal, seat verdicts and brief from a JSON object "
+                         "({\"goal\": ..., \"seats\": [{...}], \"brief\": ...}) instead of the "
+                         "flags, so a seat note carrying shell metacharacters is stored "
+                         "verbatim. Each seat object is keyed \"seat\" (its name), "
+                         "\"achievable\", \"done_means\" and \"one_increment\", with \"note\", "
+                         "\"clauses\" and \"rereview\" (yes or no) optional")
+    gr.add_argument("--brief", default=None,
+                    help="the seat brief the verdicts were given against, stored in the round "
+                         "so a thin verdict can be told from a thin brief")
+    gr.add_argument("--amend-from", dest="amend_from", default=None, metavar="GOAL",
+                    help="the PRIOR goal wording this round amends - records the goal was "
+                         "improved, not replaced, and (for an amendment) carries every seat's "
+                         "verdict forward except a seat that asked to re-review; the new wording "
+                         "is held to the 20-word limit")
+    gr.add_argument("--requesting-seat", dest="requesting_seat", default=None, metavar="ROLE",
+                    help="the seat that asked for the reframe (with --amend-from); its carried "
+                         "objection is answered by the amendment")
+    gr.add_argument("--requested-by", dest="requested_by", choices=("operator",), default=None,
+                    help="the operator asked for the amendment (with --amend-from, in place of "
+                         "--requesting-seat): no objection is discharged, and when --amend-from "
+                         "is an open run's goal the close judges the new wording")
+    gr.add_argument("--brief-worklist", dest="brief_worklist", metavar="FILE",
+                    help="(brief) the batch the brief is to describe - one unit id per line. "
+                         "Without it the brief falls back to the persisted plan, which on a new "
+                         "sprint is the PREVIOUS run's by construction")
+    gr.add_argument("--material", action="store_true",
+                    help="declare the change MATERIAL, not an amendment: no verdict carries "
+                         "forward and every seat must review the new goal, so it may be recorded "
+                         "with no --seat (the operator's call, recorded - the distinction cannot "
+                         "be made mechanically)")
+    gr.add_argument("--format", choices=("text", "json"), default="text")
+    gr.add_argument("--root", default=".", help="Repo root (default: .)")
+    gr.set_defaults(func=cmd_goal_review)
+
+    ro = sub.add_parser(
+        "reopen",
+        help="Reopen a CLOSED run so evidence that belongs to it can still be recorded - a "
+             "late review verdict, most often. A reason is mandatory and "
+             "is recorded on the run; the archived close record is never rewritten.")
+    ro.add_argument("--reason", required=True,
+                    help="why the run is being reopened - an unattributable reopen makes every "
+                         "close provisional")
+    ro.add_argument("--root", default=".", help="Repo root (default: .)")
+    ro.set_defaults(func=cmd_reopen)
+
+    st = sub.add_parser(
+        "stop",
+        help="Stop the open run. REFUSED while any batch unit is unanswered - unfinished, "
+             "unruled, unparked and undropped, or carrying a standing REJECT - by the close's "
+             "own predicate. --force records what could have proceeded and the stop-ship "
+             "questions it waived, so the cost of parking is on the record rather than "
+             "inferred.")
+    st.add_argument("--reason", default=None, help="why the run is stopping")
+    st.add_argument("--force", action="store_true",
+                    help="stop anyway (the operator's override, which answers nothing) - the "
+                         "work that could have proceeded and the unanswered stop-ship "
+                         "questions are named individually on the record")
+    st.add_argument("--root", default=".", help="Repo root (default: .)")
+    st.set_defaults(func=cmd_stop)
+
+    dc = sub.add_parser(
+        "decision",
+        help="Defer, list and resolve operator decisions. A unit that needs one is SET "
+             "ASIDE while the batch continues; the accumulated questions are asked together "
+             "at the stop, each a structured decision - the question, named options with "
+             "their consequences, and the recommendation marked with its reason - never "
+             "prose an operator must parse a choice out of.")
+    dc.add_argument("action", choices=("defer", "list", "resolve"))
+    dc.add_argument("--unit", help="(defer) the unit the decision blocks")
+    dc.add_argument("--question", help="(defer) the question itself, one sentence")
+    dc.add_argument("--option", action="append", metavar="LABEL|CONSEQUENCE",
+                    help="(defer) a named option and what choosing it means; repeat, "
+                         "at least twice - one option is not a decision")
+    dc.add_argument("--recommend", metavar="LABEL|REASON",
+                    help="(defer) the agent's recommended option with the reason, so the "
+                         "operator can accept the default quickly or override deliberately")
+    dc.add_argument("--block", action="store_true",
+                    help="(defer) also mark the unit Blocked - the autonomous path: the "
+                         "question is recorded and the unit held, never silently defaulted")
+    dc.add_argument("--index", type=int, help="(resolve) 1-based index from `decision list`")
+    dc.add_argument("--choice", help="(resolve) the chosen option's label")
+    dc.add_argument("--note", default="", help="(resolve) the operator's note, recorded "
+                                               "with the ruling")
+    dc.add_argument("--format", choices=("text", "json"), default="text")
+    dc.add_argument("--root", default=".", help="Repo root (default: .)")
+    dc.set_defaults(func=cmd_decision)
+
+    bt = sub.add_parser(
+        "batch",
+        help="Mutate an OPEN run's approved batch: `drop <id> --reason` pulls a unit (the "
+             "close and the run's signature stop counting it) or `add <id>` puts one in under "
+             "the same gates. Drop judges THIS BATCH and is recorded - distinct from Deferred, a "
+             "status on the WORK that leaves the unit gated. Every change lands in batch_changes.")
+    bt.add_argument("action", choices=("drop", "add", "swap", "add-epic"))
+    bt.add_argument("id", nargs="?", help="the unit id, e.g. US0123 (drop/add)")
+    bt.add_argument("--reason", default=None,
+                    help="(drop/swap) why the batch is changing - recorded, and required")
+    # The house id-list grammar, so `--out A --out B` and `--out A,B` read identically and the
+    # conformance sweep covers this verb like every other multi-id one.
+    bt.add_argument("--out", action="append", dest="out_units", metavar="ID",
+                    help="(swap) unit(s) leaving the batch; repeat or pass a comma list")
+    bt.add_argument("--in", action="append", dest="in_units", metavar="ID",
+                    help="(swap) unit(s) joining the batch; repeat or pass a comma list")
+    bt.add_argument("--epic", help="(add-epic) the epic whose stories join the batch")
+    bt.add_argument("--status", default="Ready",
+                    help="(add-epic) the story status to add (default: Ready)")
+    bt.add_argument("--format", choices=("text", "json"), default="text")
+    bt.add_argument("--root", default=".", help="Repo root (default: .)")
+    bt.set_defaults(func=cmd_batch)
+
+    ap_ = sub.add_parser(
+        "appetite",
+        help="Resize the ACCEPTED appetite on an OPEN run: `resize --units N --reason <why>`. "
+             "The STANDING pair the batch was sized against is untouched, so raising the "
+             "ceiling registers as an over-commitment in the close rather than hiding one. A "
+             "reason is required - a ceiling that moved with no stated why cannot be audited.")
+    ap_.add_argument("action", choices=("resize",))
+    ap_.add_argument("--units", type=int, default=None, help="the new accepted unit ceiling")
+    ap_.add_argument("--minutes", type=float, default=None,
+                     help="the new accepted wall-clock ceiling, in minutes")
+    ap_.add_argument("--reason", default=None, help="why the ceiling is moving - required")
+    ap_.add_argument("--format", choices=("text", "json"), default="text")
+    ap_.add_argument("--root", default=".", help="Repo root (default: .)")
+    ap_.set_defaults(func=cmd_appetite)
+
+    ln = sub.add_parser(
+        "lane",
+        help="Dispatch and close ONE delegated unit of delivery. `brief` prints what each lane "
+             "is held to (its acceptance criteria, its Affects, the engineering seat card, the "
+             "history of its files, the proof its unit owes, the standing obligations, the "
+             "carried lessons, the author self-check, the commands that run its criteria and "
+             "the hand-in it stages for `land`) and REFUSES a unit whose criteria are absent "
+             "or a placeholder. `return` runs the unit's own criteria and reports blocked on a "
+             "red, unresolved or unspecified one, carrying the verifier's own output. `land` "
+             "commits a builder's staged worktree through the hooks, rebases it onto the root's "
+             "branch, fast-forwards that branch, removes the worktree, then records each unit's "
+             "self-check and writes its QA brief. `accept` records the reviewer's verdict "
+             "against that brief and, on an APPROVE, runs the criteria, moves the unit to Done "
+             "or Fixed and returns its lane. `run` briefs one unit and runs that brief headless "
+             "in a supported CLI (--harness) in the lane's worktree under a timeout, recording "
+             "the session id, model and usage the CLI printed, which `return` prices the lane "
+             "from; a CLI that fails or prints no usage leaves the lane unmetered, never zero.")
+    ln.add_argument("action", choices=("brief", "return", "land", "accept", "run"))
+    ln.add_argument("--harness", default=None, choices=("claude", "cursor", "codex", "copilot",
+                                                        "opencode"),
+                    help="(run) the CLI the lane's brief runs in, one fresh headless session")
+    ln.add_argument("--model", default=None,
+                    help="(run) the model the session runs on, passed through to the CLI")
+    ln.add_argument("--units", nargs="+", default=None,
+                    help="the unit ids this lane covers (default: the open run's batch)")
+    ln.add_argument("--claimed", default="fixed",
+                    help="(return) what the lane believes it achieved; the criteria may refuse it")
+    ln.add_argument("--proof", action="append", default=None, metavar="BAND=EVIDENCE",
+                    help="(return, accept) evidence discharging an assigned proof obligation; repeatable")
+    ln.add_argument("--gap", action="append", default=None, metavar="BAND=WHY",
+                    help="(return, accept) why an assigned obligation could NOT be discharged; repeatable")
+    ln.add_argument("--tokens", type=_lane_positive_int, default=None, metavar="N",
+                    help="(return, accept) the builder agent's OWN reported token total, recorded as a "
+                         "delegated total tagged to the unit; optional")
+    ln.add_argument("--minutes", type=_lane_positive_minutes, default=None, metavar="M",
+                    help="(return, accept) the builder agent's own reported minutes, recorded with "
+                         "--tokens; optional")
+    ln.add_argument("--agent", default=None, metavar="ID",
+                    help="(return, accept) the builder agent's id: its transcript agent-ID.jsonl in this "
+                         "session's subagents directory is read once per message and its priced "
+                         "cost recorded on the unit's delegated record; optional")
+    ln.add_argument("--timeout", type=_lane_positive_int, default=None,
+                    help="(return, accept) per-verifier timeout in seconds (default: 300); "
+                         "(run) the CLI session's timeout in seconds (default: 3600)")
+    ln.add_argument("--worktree", default=None,
+                    help="(land) the builder's worktree, holding its staged change and the "
+                         "hand-in files under sdlc-studio/.local/lane/; (run) the worktree the "
+                         "session runs in (default: sdlc-studio/.local/worktrees/lane-<unit>, "
+                         "created from HEAD when absent)")
+    ln.add_argument("--author", default=None,
+                    help="(land) the author each self-check is recorded under (default: the "
+                         "worktree's directory name); (accept) the author the verdict names (default: "
+                         "the author of the unit's latest recorded self-check)")
+    ln.add_argument("--unit", default=None,
+                    help="(accept) the unit whose verdict is recorded; its QA brief is the one "
+                         "lane land wrote to sdlc-studio/.local/briefs/<unit>-qa.txt")
+    ln.add_argument("--verdict", default=None, metavar="FILE",
+                    help="(accept) the reviewer's returned VERDICT/ISSUES/BLOCKING block")
+    ln.add_argument("--reviewer", default=None,
+                    help="(accept) the reviewer the verdict is recorded under")
+    ln.add_argument("--format", choices=("text", "json"), default="text")
+    ln.add_argument("--root", default=".", help="Repo root (default: .)")
+    ln.set_defaults(func=cmd_lane)
+
+    co = sub.add_parser(
+        "cost",
+        help="`--anatomy`: break the open run's spend down by role (orchestrator, "
+             "builder, reviewer, repair, other) and name the ten tool outputs that cost most. "
+             "Reads the transcripts the token meter reads, each message once at its largest "
+             "usage, counting only the records after the run's start; a subagent's role comes "
+             "from the open run's lane returns and the recorded verdicts, never its prompt, and "
+             "one no record names is other. A context no per-call record gives prints as not "
+             "available, never 0.")
+    co.add_argument("--anatomy", action="store_true",
+                    help="print the per-role table and the heaviest tool outputs")
+    co.add_argument("--session", action="store_true",
+                    help="read the whole session, not the open run's window (the default with "
+                         "no run open)")
+    co.add_argument("--transcripts", default=None, metavar="DIR",
+                    help="the harness transcript directory (default: the one the meter reads)")
+    co.add_argument("--format", choices=("text", "json"), default="text")
+    co.add_argument("--root", default=".", help="Repo root (default: .)")
+    co.set_defaults(func=cmd_cost)
+
+    sdlc_md.add_global_root(parser)
+    return parser
+
+
+
+def render_finding_sets(issues: str) -> str:
+    """Render a verdict's findings as TWO named sets: what held the gate, and what did not.
+
+    A reader needs to tell a finding that blocked from one that was merely noticed. Printing
+    them in one undifferentiated list is how a pre-existing observation gets repaired at close
+    time as though it were this batch's debt - the cost reference-doctrine rule 19 exists to
+    stop. The non-blocking set carries the REASON, so "this does not block" is stated rather
+    than left for the reader to infer from an absence.
+    """
+    import critic  # noqa: PLC0415 - the verdict vocabulary lives there
+    blocking = critic.blocking_findings(issues)
+    passive = critic.non_blocking_findings(issues)
+    out = [f"BLOCKING ({len(blocking)}) - this unit's diff caused these:"]
+    out += [f"  [{f['origin']}] {f['text']}" for f in blocking] or ["  none"]
+    out.append(f"NOT BLOCKING ({len(passive)}) - already true at the base ref, "
+               f"so not this unit's debt:")
+    out += [f"  [{f['origin']}] {f['text']}" for f in passive] or ["  none"]
+    return "\n".join(out)
+
+
+#: Verbs removed from the parser, each refused BY NAME. Kept out of the parser itself so neither
+#: `--help` nor the derived command surface lists them.
+RETIRED_VERBS = {
+    "preflight": "the close's prerequisites are reported by `sprint.py close` itself, which "
+                 "runs the same pre-flight first. Run `sprint.py close --dry-run` to preview a "
+                 "close",
+    "review-batch": "one verdict ledger says whether a unit was reviewed: record a per-unit "
+                    "delivery verdict with `critic.py record`",
+}
+
+
+def _retired_verb(argv: list[str] | None) -> str | None:
+    """The retired verb `argv` invokes, or None. Tokenised with the global `--root` declared, so
+    `--root X preflight` and `preflight --root X` both resolve; a malformed line is left for the
+    real parser to refuse."""
+    pre = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+    pre.add_argument("--root")
+    pre.add_argument("verb", nargs="?")
+    try:
+        known, _rest = pre.parse_known_args(sys.argv[1:] if argv is None else argv)
+    except argparse.ArgumentError:
+        return None
+    return known.verb if known.verb in RETIRED_VERBS else None
+
+
+def main(argv: list[str] | None = None) -> int:
+    retired = _retired_verb(argv)
+    if retired:
+        print(f"error: `sprint.py {retired}` is retired - {RETIRED_VERBS[retired]}. Nothing "
+              f"was written.", file=sys.stderr)
+        return 2
+    args = build_parser().parse_args(argv)
+    # Resolve the root ONCE and write it back, so every verb below anchors on the tree the
+    # run belongs to. The family default `.` means "work it out from here", not "the cwd
+    # is the project": otherwise a run from a subdirectory acts on a stray tree and exits 0.
+    args.root = str(sdlc_md.resolve_root(args))
+    try:
+        return args.func(args)
+    except (sdlc_md.AllocationLockTimeout, sdlc_md.AllocationLockError) as exc:  # wrote nothing
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Test strategy at plan time (D0060 / RFC0049 option C)
+# ---------------------------------------------------------------------------
+# Planning decided WHAT to build and in what order and said nothing about HOW each unit would be
+# proved. The TSD and the test-specs were consulted by nothing at plan time, so proof strategy
+# was settled per unit, mid-build, by whoever held the keyboard - which is how this project has
+# repeatedly shipped a test that decorates code rather than pinning it, and caught it only by
+# mutating afterwards, where repair costs most.
+#
+# The areas are the TSD's own `### ` Test Levels, and the paths are the ones it names inside
+# them. Nothing is hardcoded here: add a level to the TSD, or a path to a level, and the next
+# plan reports it. A list baked into this file would be a second copy of the document, and the
+# two would drift - which is the failure EP0071 spent a sprint repairing.
+
+#: A risk band per level: what proof a unit touching it owes. `mutation` is the strongest,
+#: because a guard whose assertions do not bind is the failure this project keeps finding.
+TSD_PROOF_BAND = {
+    "Mutation Testing": "mutation",
+    "Security Testing": "adversarial",
+    "Unit Testing": "unit",
+    "Integration Testing": "integration",
+    "Static / Lint Testing": "lint",
+    "Eval Scenarios": "eval",
+    "End-to-End Testing": "e2e",
+    "Performance Testing": "performance",
+    "Coverage Targets": "unit",
+}
+
+
+def tsd_levels(root) -> dict[str, set[str]]:
+    """{level title: {paths it names}} read from the TSD's `## Test Levels` section.
+
+    Empty when the TSD is missing or has no such section - the caller reports that as a fact
+    rather than proceeding as though the batch touched nothing, because "no areas" and "no
+    document" are different answers and only one of them is safe.
+    """
+    text = sdlc_md.read_text_safe(Path(root) / "sdlc-studio" / "tsd.md")
+    if not text:
+        return {}
+    m = re.search(r"^## Test Levels(.*?)(?=^## )", text, re.S | re.M)
+    if not m:
+        return {}
+    out: dict[str, set[str]] = {}
+    for section in re.split(r"^### ", m.group(1), flags=re.M)[1:]:
+        title = section.splitlines()[0].strip()
+        paths = set(re.findall(r"`([\w./*-]+\.(?:py|sh|md|json|yaml))`", section))
+        out[title] = paths
+    return out
+
+
+def tsd_declined(root) -> bool:
+    """Whether the operator skipped the TSD stage at `init guided` and no TSD has been written
+    since: a choice init recorded, not a document that went missing."""
+    if (Path(root) / "sdlc-studio" / "tsd.md").is_file():
+        return False
+    try:
+        import init  # noqa: PLC0415 - the onboarding checkpoint's own reader
+        state = init.read_onboarding(root) or {}
+    except Exception as exc:  # noqa: BLE001 - a checkpoint read must never break planning
+        sdlc_md.debug("sprint.tsd_declined", exc)
+        return False
+    return any(isinstance(s, dict) and s.get("name") == "tsd" and s.get("status") == "skipped"
+               for s in state.get("stages") or [])
+
+
+def _band_for(title: str) -> str:
+    for key, band in TSD_PROOF_BAND.items():
+        if title.startswith(key):
+            return band
+    return "unit"
+
+
+def test_strategy(root, batch: list[str]) -> dict:
+    """The plan-time test strategy for a batch.
+
+    Returns the areas touched, the proof each unit owes, and the coverage the TSD demands that
+    the batch would not deliver. Every part is derived from the document at plan time - so a
+    risk area added to the TSD appears in the next plan with no change here.
+    """
+    levels = tsd_levels(root)
+    # The EXECUTION policy is a property of the project, not of the TSD: it is what runs and
+    # what that costs. It is therefore attached on both branches - a batch whose proof
+    # obligations could not be derived still pays for every suite run it triggers.
+    execution = execution_policy(root)
+    if not levels:
+        if tsd_declined(root):
+            return {"available": False, "declined": True, "areas": [], "units": {},
+                    "gaps": [], "execution": execution,
+                    "why": "the TSD stage was skipped at init, so this project declares no "
+                           "test strategy and no proof obligation is derived from one"}
+        return {"available": False, "areas": [], "units": {}, "gaps": [],
+                "execution": execution,
+                "why": "no `## Test Levels` section in sdlc-studio/tsd.md - the strategy could "
+                       "not be derived, which is NOT the same as a batch that touches nothing"}
+    per_unit: dict[str, list[str]] = {}
+    touched: set[str] = set()
+    for uid in batch or []:
+        hit = sdlc_md.find_by_id(Path(root), uid)
+        if not hit:
+            continue
+        affects = sdlc_md.extract_field(sdlc_md.read_text_safe(Path(hit[0])), "Affects") or ""
+        files = [f.strip() for f in re.split(r"[,\s]+", affects) if f.strip()]
+        hits = sorted({title for title, paths in levels.items()
+                       if any(any(p in f or f.endswith(p) for p in paths) for f in files)})
+        per_unit[sdlc_md.norm_id(uid)] = [_band_for(t) for t in hits]
+        touched.update(hits)
+    gaps = sorted(t for t in levels if t not in touched and levels[t])
+    return {"available": True, "areas": sorted(touched), "units": per_unit, "gaps": gaps,
+            "execution": execution, "why": ""}
+
+
+def render_test_strategy(strat: dict) -> list[str]:
+    """The plan block. A batch that touches NO risk area says so explicitly: an empty section is
+    indistinguishable from a lane that did not run, which is the reporting failure this project
+    has already had to repair once."""
+    if strat.get("declined"):
+        return [f"  test strategy: none declared - {strat.get('why')}",
+                *render_execution_policy(strat.get("execution") or {})]
+    if not strat.get("available"):
+        return [f"  test strategy: UNAVAILABLE - {strat.get('why')}",
+                *render_execution_policy(strat.get("execution") or {})]
+    lines = []
+    if strat["areas"]:
+        lines.append(f"  test strategy: this batch touches {len(strat['areas'])} TSD risk "
+                     f"area(s): {', '.join(strat['areas'])}")
+    else:
+        lines.append("  test strategy: this batch touches NO TSD risk area - stated explicitly, "
+                     "because an empty section reads the same as a lane that did not run")
+    banded = {u: b for u, b in strat["units"].items() if b}
+    if banded:
+        lines.append(f"  proof required: " + "; ".join(
+            f"{u} -> {'+'.join(b)}" for u, b in sorted(banded.items())[:10]))
+    if strat["gaps"]:
+        lines.append(f"  coverage the TSD demands that this batch does NOT deliver: "
+                     f"{', '.join(strat['gaps'][:6])}")
+    lines.extend(render_execution_policy(strat.get("execution") or {}))
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# The EXECUTION policy: what runs, when, and what it costs
+# ---------------------------------------------------------------------------
+# The strategy above answers "what proof does each unit owe" and says nothing about
+# EXECUTION. Measured over one working day on this repository: the suites ran about 52 times
+# for about 218 minutes, against about 35 minutes of delivery. The plan named the proof each
+# unit owed. It never said "and re-run the whole suite fifty-two times". So the single
+# largest cost in a sprint was set by a habit living in a commit hook, which nobody
+# proposed, nobody reviewed and nobody signed off.
+#
+# The plan therefore states it: what runs per commit, at close and at release, and what each
+# is estimated to cost - and it REPORTS a declared policy the hook does not implement,
+# because the most expensive decision in the sprint cannot be one the two halves quietly
+# disagree about.
+
+#: The three moments a policy prices, in the order they happen.
+EXECUTION_MOMENTS = ("per_commit", "at_close", "at_release")
+
+#: What a moment may run. `selected` is the middle: the suites run only when the surface they
+#: read has changed, which is what makes the discipline cheaper than the work it guards.
+EXECUTION_MODES = ("full", "selected", "none")
+
+#: The shipped default, which is what a hooked repo already does. Declared rather than left
+#: absent, because an absent policy reads as no cost, and no cost is the one thing it is not.
+EXECUTION_DEFAULTS = {"per_commit": "selected", "at_close": "full", "at_release": "full"}
+
+_MOMENT_LABELS = {"per_commit": "per commit", "at_close": "at close",
+                  "at_release": "at release"}
+
+#: Where the hooks that actually decide the per-commit cost live, in both spellings a repo
+#: uses (a shared `core.hooksPath` tree, and git's own directory).
+HOOK_PATHS = (".githooks/pre-commit", ".githooks/commit-msg",
+              ".git/hooks/pre-commit", ".git/hooks/commit-msg")
+
+def _hook_installed(root) -> bool:
+    """Whether a commit hook FILE exists that git would run, or that the repository tracks: a
+    `pre-commit` or `commit-msg` in the hooks directory git itself resolves for `root`
+    (`git rev-parse --git-path hooks`, which applies `core.hooksPath` - husky's layout - expands
+    a `~` in it, and finds a linked worktree's hooks in the common directory), or at a
+    `HOOK_PATHS` location (the tracked `.githooks/`, and `.git/hooks` when git cannot be asked).
+    Whether it can be read is a separate question - this asks only whether one exists.
+
+    The variables that LOCATE a repository are dropped (`verify_ac._REPO_LOCATING_GIT_VARS`, the
+    one pinned list): a hook exports them, `git -C` does not override them, and git would then
+    answer for the repository whose hook is running rather than for `root`. Every other `GIT_*`
+    variable passes through, so a caller's `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_NOSYSTEM` still
+    decides which config is read rather than the host's own."""
+    root = Path(root)
+    if any((root / rel).is_file() for rel in HOOK_PATHS):
+        return True
+    import verify_ac  # noqa: PLC0415 - the one pinned list of repo-locating variables
+    env = {k: v for k, v in os.environ.items() if k not in verify_ac._REPO_LOCATING_GIT_VARS}
+    try:
+        r = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-path", "hooks"],
+                           capture_output=True, text=True, timeout=10, env=env)  # nosec B603 B607
+    except (OSError, subprocess.SubprocessError):
+        return False
+    hooks = r.stdout.strip() if r.returncode == 0 else ""
+    if not hooks:
+        return False
+    base = Path(hooks) if Path(hooks).is_absolute() else root / hooks
+    return any((base / name).is_file() for name in ("pre-commit", "commit-msg"))
+
+
+#: Evidence that the hook DECIDES whether to run the suites from what the commit touched.
+_HOOK_SELECTS = ("--suite-decision", "suites_needed")
+
+#: Evidence that the hook runs a test suite at all.
+_HOOK_RUNS = ("unittest discover", "pytest", "skill-tests.sh", "npm test", "npm run test")
+
+
+def hook_per_commit_mode(root) -> dict:
+    """What the commit hooks ACTUALLY do per commit, READ from the hooks themselves.
+
+    Derived from the hook, never restated beside it: a second copy of the rule written here
+    would be the copy that drifts, and the drift would be invisible in exactly the place the
+    declaration claims to have been checked.
+
+    `unknown` is a real answer and is reported as one. A hook nobody can read has not been
+    shown to agree with the declaration, and silence in that direction is how a policy comes
+    to look reconciled without ever having been.
+    """
+    seen, selects, runs = [], False, False
+    for rel in HOOK_PATHS:
+        text = sdlc_md.read_text_safe(Path(root) / rel)
+        if not text:
+            continue
+        seen.append(rel)
+        selects = selects or any(tok in text for tok in _HOOK_SELECTS)
+        runs = runs or any(tok in text for tok in _HOOK_RUNS)
+    if not seen:
+        return {"mode": "unknown", "read": [],
+                "why": f"no commit hook was readable at any of {', '.join(HOOK_PATHS)}"}
+    where = ", ".join(seen)
+    if selects:
+        return {"mode": "selected", "read": seen,
+                "why": f"{where} selects the suites from what the commit touched"}
+    if runs:
+        return {"mode": "full", "read": seen,
+                "why": f"{where} runs the suites on every commit, unselected"}
+    return {"mode": "none", "read": seen, "why": f"{where} runs no test suite"}
+
+
+#: The per-commit timing series the gate records after every run. The planner reads the SAME
+#: file the budget lane reads, so the two cannot report different costs for the same gate.
+GATE_TIMINGS_REL = "sdlc-studio/.local/gate-timings.json"
+
+
+def measured_gate_seconds(root) -> tuple[float | None, str]:
+    """The most recent recorded per-commit total, and WHICH series it came from.
+
+    The LATEST run, not a median, matching what the budget lane reports: a median hides a
+    ratchet for as long as it takes half the window to turn over, and the ratchet is the thing
+    worth seeing.
+
+    Reads the series this repo's commits ACTUALLY run, exactly as the budget lane does - the
+    `total.last_series` marker decides. Reading `total` unconditionally is what an independent
+    review caught: on a repo whose commits run selected, the budget lane reported 100s and the
+    planner 554s for the same gate, which is the disagreement this was supposed to end, merely
+    inverted. A selected total is not comparable with a full-run baseline, so the caller is told
+    which series it got rather than left to assume.
+    """
+    try:
+        data = json.loads((Path(root) / GATE_TIMINGS_REL).read_text(encoding="utf-8"))
+    except (OSError, ValueError, AttributeError):
+        return None, "none"
+    if not isinstance(data, dict):
+        return None, "none"
+    series = "total.selected" if data.get("total.last_series") == "selected" else "total"
+    runs = [float(x) for x in (data.get(series) or []) if isinstance(x, (int, float))]
+    if not runs:
+        # A repo whose marker says selected but whose selected series is empty falls back to the
+        # full one rather than reporting nothing - an absent number here prices the largest line
+        # in the sprint at UNKNOWN over a bookkeeping gap.
+        runs = [float(x) for x in (data.get("total") or []) if isinstance(x, (int, float))]
+        series = "total"
+    return (runs[-1] if runs else None), (series if runs else "none")
+
+
+def full_gate_seconds(root) -> float | None:
+    """The most recent FULL-suite total, whatever series the last commit happened to run.
+
+    `measured_gate_seconds` answers "what did the last commit cost", which is the per-commit
+    question. The close and release boundaries pay a FULL run, and pricing them from a selected
+    total understates them by a factor of three - this repo's own plan for RUN-01M0CT8P printed
+    `at close FULL (~295s)` against a recorded full series of ~899s.
+    """
+    # READ THE FILE, do not import the tool. `tools/` is repo-only and is NOT shipped with the
+    # skill, so `parents[4] / "tools"` resolves to nothing in every consuming project: the import
+    # failed, this returned None, and `execution_policy` priced the two most expensive moments in
+    # a sprint as NOT MEASURED for everybody except this repository. No test here could see it,
+    # because this repository HAS `tools/`; an independent review measured it from an
+    # installed-shape copy against a fixture project.
+    #
+    # The timings file is plain JSON at a fixed path and the value wanted is the last element of
+    # the FULL series - never whichever series the last commit happened to run, which is the
+    # per-commit question this function exists to avoid.
+    try:
+        data = sdlc_md.read_json(Path(root) / GATE_TIMINGS_REL, {}) or {}
+        runs = [float(x) for x in (data.get("total") or []) if isinstance(x, (int, float))]
+        return runs[-1] if runs else None
+    except Exception as exc:  # noqa: BLE001 - an unmeasured cost is reported, never invented
+        sdlc_md.debug("sprint.full_gate_seconds", exc)
+        return None
+
+
+def execution_cost(root) -> dict:
+    """The measured cost of one full run, or None with the reason it is not known.
+
+    Prefers the MEASURED series the gate records over the declared baseline. Both are
+    real measurements; the difference is when they were taken. The baseline is a number a human
+    chose on a stated date, and it goes stale silently - it read 317s while the gate lane, over
+    the same commits, reported 554s against a 380s ceiling. Planning is the only point at which
+    gate cost can be traded against scope, so a plan that quotes the older figure removes the
+    trade, and it errs low, which is the direction that under-prices the ceremony.
+
+    Never invented, and never defaulted to zero - an unmeasured cost printed as 0 is the
+    cheapest-looking claim a plan can make, and it is made about the largest line in the sprint.
+    """
+    when = config.get(root, "gate_budget.baseline_date", None)
+    declared = config.get(root, "gate_budget.baseline_seconds", None)
+    try:
+        declared = float(declared)
+    except (TypeError, ValueError):
+        declared = None
+    measured, series = measured_gate_seconds(root)
+    if measured is not None:
+        kind = "SELECTED-run" if series == "total.selected" else "full-run"
+        basis = (f"the measured per-commit series ({GATE_TIMINGS_REL}, latest {kind}, "
+                 f"the same series the budget lane reads)")
+        if declared is not None:
+            drift = (measured - declared) / declared * 100.0 if declared else 0.0
+            basis += (f"; the declared baseline is {declared:.0f}s"
+                      + (f" on {when}" if when else "") + f", {drift:+.0f}% since")
+        return {"seconds": measured, "basis": basis, "why": ""}
+    if declared is None:
+        return {"seconds": None, "basis": None,
+                "why": "no `gate_budget.baseline_seconds` is declared and no run has been "
+                       "recorded, so a full run has never been measured here - the cost is "
+                       "UNKNOWN, which is not zero"}
+    basis = ("gate_budget.baseline_seconds" + (f", measured {when}" if when else "")
+             + " - no recorded run series, so the declared baseline is the only measurement")
+    return {"seconds": declared, "basis": basis, "why": ""}
+
+
+def execution_policy(root) -> dict:
+    """The declared execution policy, its estimated cost, and whether the hook agrees.
+
+    The declaration is the project's (`test_execution.*`); the hook's behaviour is measured;
+    the divergence between them is the whole point, so it is computed here rather than left
+    for a reader to spot across two files.
+    """
+    declared = {}
+    for moment in EXECUTION_MOMENTS:
+        raw = str(config.get(root, f"test_execution.{moment}",
+                             EXECUTION_DEFAULTS[moment]) or "").strip().lower()
+        declared[moment] = raw if raw in EXECUTION_MODES else EXECUTION_DEFAULTS[moment]
+    cost = execution_cost(root)
+    # THE MOMENT DECIDES THE SERIES. `per_commit` pays whatever the last commit paid, which is
+    # what `execution_cost` reports; `at_close` and `at_release` pay a FULL run, and pricing
+    # them from a selected total understates the two most expensive moments in the sprint by a
+    # factor of three - this plan printed `at close FULL (~295s)` against a recorded full series
+    # of ~899s. An unmeasured full run stays None and renders as NOT MEASURED rather
+    # than borrowing the per-commit figure.
+    full_s = full_gate_seconds(root)
+    # `none` costs zero because nothing runs - that IS the measurement. Every other mode
+    # costs what a run at that moment costs, or None when nobody has measured one.
+    cost_s = {m: (0.0 if declared[m] == "none"
+                  else (cost["seconds"] if m == "per_commit" else full_s))
+              for m in declared}
+    # The BREACH, stated on the plan. The budget lane already computes this verdict
+    # after every commit, where the only thing that can act on it is a human reading past it.
+    # Planning is the moment the cost can still be traded against scope, so the verdict has to
+    # reach the plan or the ceiling is a bound in name.
+    over = None
+    try:
+        ceiling = float(config.get(root, "gate_budget.seconds", None))
+    except (TypeError, ValueError):
+        ceiling = None
+    if ceiling and isinstance(cost["seconds"], (int, float)) and cost["seconds"] > ceiling:
+        over = {"seconds": cost["seconds"], "ceiling": ceiling,
+                "pct": (cost["seconds"] - ceiling) / ceiling * 100.0}
+    hook = hook_per_commit_mode(root)
+    # No hook installed and no per-commit mode the project declared: the declaration is the
+    # shipped default and nothing was ever set against it, so there is nothing to reconcile. A
+    # hook that EXISTS but could not be read (non-UTF-8, empty, or under `core.hooksPath`)
+    # still runs, so it stays UNRECONCILED.
+    defaulted = sdlc_md.project_override(root, "test_execution.per_commit") is None
+    if hook["mode"] == "unknown" and defaulted and not _hook_installed(root):
+        divergence = None
+    elif hook["mode"] == "unknown":
+        divergence = (f"the policy declares per-commit `{declared['per_commit']}` and the "
+                      f"hook could not be read ({hook['why']}), so the two are UNRECONCILED")
+    elif hook["mode"] != declared["per_commit"]:
+        divergence = (f"the policy declares per-commit `{declared['per_commit']}` but the "
+                      f"hook runs `{hook['mode']}` ({hook['why']}) - the two cannot silently "
+                      f"disagree about the most expensive decision in the sprint")
+    else:
+        divergence = None
+    return {"declared": declared, "cost_s": cost_s, "cost_basis": cost["basis"],
+            "cost_why": cost["why"], "measured": cost["seconds"] is not None,
+            "hook": hook, "divergence": divergence, "over_budget": over}
+
+
+#: The plan record. One spelling, written by `plan --write` and read back by the close.
+PLAN_REL = "sdlc-studio/.local/sprint-plan.json"
+
+#: Where every test-execution event is appended. One spelling, written here and read by the
+#: sprint report, so the actuals the close reports are the events that happened rather than a
+#: reconstruction. Under `.local/`, so recording a run never dirties the tree being judged.
+EXECUTION_LEDGER_REL = "sdlc-studio/.local/test-execution.json"
+
+#: How many events are kept. Long enough to span several sprints, bounded so the file cannot
+#: grow without limit on a repo that commits all day.
+EXECUTION_LEDGER_MAX = 500
+
+
+def read_execution_ledger(root) -> list[dict]:
+    """Every recorded test-execution event, oldest first.
+
+    `[]` covers absent, unreadable and malformed alike: the caller must treat all three as
+    "no measurement", and it must never treat them as "no cost".
+    """
+    data = sdlc_md.read_json(Path(root) / EXECUTION_LEDGER_REL, {})
+    runs = data.get("runs") if isinstance(data, dict) else None
+    return [r for r in runs if isinstance(r, dict)] if isinstance(runs, list) else []
+
+
+def record_execution_run(root, *, moment: str, mode: str, seconds: float | None,
+                         verdict: str, surface: str | None = None,
+                         run_id: str | None = None, reused_from: str | None = None) -> dict:
+    """Append one test-execution event. Returns the row, or a row carrying `error`.
+
+    Never raises into a close: a ledger that cannot be written costs the retro its cost
+    figure, which is a reporting loss, not a correctness one. It is REPORTED though - a
+    silently unwritten ledger is indistinguishable from a sprint that ran no tests, and that
+    is the exact misreading this ledger exists to end.
+    """
+    row = {"at": sdlc_md.now_iso8601(), "moment": moment, "mode": mode,
+           "seconds": None if seconds is None else round(float(seconds), 1),
+           "verdict": verdict, "surface": surface, "run_id": run_id,
+           "reused_from": reused_from}
+    path = Path(root) / EXECUTION_LEDGER_REL
+    try:
+        runs = read_execution_ledger(root)
+        runs.append(row)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"runs": runs[-EXECUTION_LEDGER_MAX:]}, indent=2),
+                        encoding="utf-8")
+    except OSError as exc:
+        sdlc_md.debug("sprint.record_execution_run", exc)
+        print(f"warning: the test-execution event could NOT be recorded ({exc}) - this "
+              f"sprint's retro will report its test cost as UNCAPTURED, not as zero",
+              file=sys.stderr)
+        return {**row, "error": str(exc)}
+    return row
+
+
+def close_cost(root, run_id: str | None = None) -> dict:
+    """What THIS run's close cost, read from the execution ledger rather than recalled.
+
+    `{"gate_seconds", "gate_runs", "measured_runs", "reused_runs", "reused_seconds",
+    "elapsed_seconds", "unmeasured"}`.
+
+    Every figure is a measurement or it is absent. A row whose `seconds` is null is counted in
+    `unmeasured` and contributes nothing to the total - reading it as zero would let a close
+    that never recorded its cost report the cheapest close on file, which is the direction a
+    cost report must never fail in.
+
+    `reused_runs` is counted separately and its seconds are the seconds of the run whose
+    verdict it reused, so a saving reads as a saving. A reuse that cannot be traced back to a
+    measured run adds to `unmeasured` rather than to zero.
+
+    `elapsed_seconds` spans the first close event to the last, which is what a close costs an
+    operator waiting on it. A close with a single event has no span to measure and reports
+    None, never 0.0."""
+    ledger = read_execution_ledger(root)
+    close_rows = [r for r in ledger if r.get("moment") == "close"]
+    if run_id is None:
+        # `run_id is None` short-circuited the filter and summed EVERY close ever recorded as
+        # this one's cost - over-reporting by 6x on seconds and 143x on elapsed. A run with no
+        # id has no cost of its own to report; saying so is the only honest answer, and it is
+        # the direction a cost report must fail in.
+        return {"gate_seconds": None, "gate_runs": 0, "measured_runs": 0, "reused_runs": 0,
+                "reused_seconds": None, "elapsed_seconds": None,
+                "unmeasured": ["this run carries no run id, so no close row can be attributed "
+                               "to it - the cost is NOT ATTRIBUTABLE, which is not zero and is "
+                               "not the whole ledger"]}
+    rows = [r for r in close_rows if r.get("run_id") == run_id]
+    # The reuse lookup spans the WHOLE ledger, not this run's rows: a reuse saves seconds a
+    # PREVIOUS run paid for, so resolving it against rows already filtered to this run could
+    # only ever fail. A measured saving was reported as unknown with its source two lines above.
+    by_at = {r.get("at"): r for r in close_rows if r.get("at")}
+    gate_seconds = 0.0
+    reused_seconds = 0.0
+    unmeasured: list[str] = []
+    measured_runs = reused_runs = 0
+    for row in rows:
+        seconds = row.get("seconds")
+        if row.get("mode") == "reuse":
+            reused_runs += 1
+            source = by_at.get(row.get("reused_from")) or {}
+            if isinstance(source.get("seconds"), (int, float)):
+                reused_seconds += float(source["seconds"])
+            else:
+                unmeasured.append(f"a reuse at {row.get('at')} whose source run is not on the "
+                                  f"ledger, so the seconds it saved are unknown")
+            continue
+        if isinstance(seconds, (int, float)):
+            gate_seconds += float(seconds)
+            measured_runs += 1
+        else:
+            unmeasured.append(f"a gate run at {row.get('at')} recorded no seconds")
+    stamps = sorted(r["at"] for r in rows if r.get("at"))
+    # The shared strict parser rather than a fifth hand-rolled one - it returns None for a
+    # timestamp it cannot read, which is the answer a cost report needs (unmeasured, not zero).
+    elapsed = (run_state._elapsed_seconds(stamps[0], stamps[-1])  # noqa: SLF001
+               if len(stamps) > 1 else None)
+    return {"gate_seconds": round(gate_seconds, 1) if measured_runs else None,
+            "gate_runs": len(rows) - reused_runs, "measured_runs": measured_runs,
+            "reused_runs": reused_runs,
+            "reused_seconds": round(reused_seconds, 1) if reused_seconds else None,
+            "elapsed_seconds": elapsed, "unmeasured": unmeasured}
+
+
+def close_cost_line(cost: dict) -> str:
+    """One line an operator reads at the close, or a stated absence of measurement."""
+    if not cost.get("gate_runs") and not cost.get("reused_runs"):
+        return "close cost: no gate event recorded for this run - UNMEASURED, not zero"
+    parts = []
+    if cost.get("gate_seconds") is not None:
+        parts.append(f"{cost['gate_seconds']:.0f}s of gate over "
+                     f"{cost['measured_runs']} run(s)")
+    if cost.get("reused_runs"):
+        saved = (f", saving about {cost['reused_seconds']:.0f}s"
+                 if cost.get("reused_seconds") else "")
+        parts.append(f"{cost['reused_runs']} verdict(s) reused{saved}")
+    if cost.get("elapsed_seconds") is not None:
+        parts.append(f"{cost['elapsed_seconds'] // 60}m{cost['elapsed_seconds'] % 60:02d}s elapsed")
+    line = "close cost: " + ("; ".join(parts) if parts else "no measured component")
+    if cost.get("unmeasured"):
+        line += (f" ({len(cost['unmeasured'])} component(s) UNMEASURED: "
+                 f"{cost['unmeasured'][0]})")
+    return line
+
+
+def recorded_test_strategy(root) -> dict | None:
+    """The strategy the PLAN recorded, or None when the plan carries none.
+
+    None covers absent, unreadable and malformed alike, because the caller must treat all
+    three the same way: as a strategy it does not have, and must therefore say it re-derived.
+    """
+    data = sdlc_md.read_json(Path(root) / PLAN_REL, {})
+    strat = data.get("test_strategy") if isinstance(data, dict) else None
+    return strat if isinstance(strat, dict) and strat else None
+
+
+def close_test_strategy(root, batch) -> dict:
+    """The strategy the CLOSE judges against: `{strategy, source, why}`.
+
+    The RECORDED one whenever the plan wrote it. What is judged at the close has to be what
+    was agreed at the plan, or the close marks its own homework against a strategy re-derived
+    from a config that may have moved since - and a policy that changes between the agreement
+    and the verdict is one nobody actually approved.
+
+    A run planned before the plan carried a strategy still gets an answer, and that answer is
+    NAMED as a re-derivation rather than presented as the plan's own.
+    """
+    rec = recorded_test_strategy(root)
+    if rec is not None:
+        return {"strategy": rec, "source": "recorded",
+                "why": f"read back from {PLAN_REL}, as agreed at plan time"}
+    ids = [b.get("id") if isinstance(b, dict) else b for b in (batch or [])]
+    return {"strategy": test_strategy(root, [i for i in ids if i]), "source": "re-derived",
+            "why": (f"no strategy is recorded in {PLAN_REL} (the run was planned before the "
+                    f"plan carried one, or no plan was written), so this was RE-DERIVED now "
+                    f"and is not what was agreed at plan time")}
+
+
+def render_execution_policy(pol: dict) -> list[str]:
+    """The execution block of the plan. Priced per moment, with an unmeasured cost NAMED as
+    unmeasured rather than rendered as a tidy zero."""
+    if not pol:
+        return []
+    # Read DEFENSIVELY. This renders a record that may have been written by an older plan,
+    # and a close must not die on reading its own paperwork - but a missing field is reported
+    # as unknown, never filled in with a plausible-looking default.
+    declared = pol.get("declared") or {}
+    cost_s = pol.get("cost_s") or {}
+    parts = []
+    for moment in EXECUTION_MOMENTS:
+        secs = cost_s.get(moment)
+        price = f"~{secs:.0f}s" if isinstance(secs, (int, float)) else "cost NOT MEASURED"
+        mode = str(declared.get(moment) or "unrecorded").upper()
+        parts.append(f"{_MOMENT_LABELS[moment]} {mode} ({price})")
+    lines = ["  execution policy: " + "; ".join(parts)]
+    if pol.get("measured"):
+        lines.append(f"  execution cost basis: {pol.get('cost_basis')} - the per-commit figure "
+                     f"is paid once per commit that pays it, so this sprint's largest cost is "
+                     f"that number times the commits, not once")
+    else:
+        lines.append(f"  execution cost: NOT MEASURED - "
+                     f"{pol.get('cost_why') or 'the record states no cost'}")
+    over = pol.get("over_budget")
+    if over:
+        lines.append(
+            f"  execution cost is OVER the declared ceiling: {over['seconds']:.0f}s measured "
+            f"against a {over['ceiling']:.0f}s budget ({over['pct']:+.0f}%). This is the point "
+            f"at which that cost can still be traded against scope - cut the batch, bring the "
+            f"gate back under, or re-derive the ceiling against the evidence and record why")
+    if pol.get("divergence"):
+        lines.append(f"  execution policy DIVERGES: {pol['divergence']}")
+    return lines
+
+
+def tsd_staleness(root) -> dict:
+    """Whether the TSD predates the code it describes.
+
+    A strategy review against a rotted document produces confident wrong answers - the class
+    EP0071 spent a sprint repairing - so the comparison is made and REPORTED before the document
+    is used. The verdict is a comparison of commit times, not a freshness marker anyone can
+    write: a stamp asserts currency, it does not establish it.
+
+    The code is the skill's scripts where the tree holds their history (the skill's own
+    repository), else every path outside `sdlc-studio/` - a consuming project's code, never its
+    backlog, whose commits would mark the TSD stale on every grooming change.
+    """
+    import subprocess  # noqa: PLC0415
+    def _last(*paths: str) -> str:
+        try:
+            r = subprocess.run(["git", "log", "-1", "--format=%cI", "--", *paths],
+                               cwd=str(root), capture_output=True, text=True,
+                               timeout=10)  # nosec B603 B607
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return r.stdout.strip() if r.returncode == 0 else ""
+    tsd = _last("sdlc-studio/tsd.md")
+    code, what = _last(".claude/skills/sdlc-studio/scripts"), "the scripts"
+    if not code:
+        code, what = _last(".", ":(exclude)sdlc-studio"), "the code outside sdlc-studio/"
+    if not tsd or not code:
+        return {"known": False, "stale": False,
+                "why": f"no commit history for "
+                       f"{'sdlc-studio/tsd.md' if not tsd else what} - staleness unknown, "
+                       f"which is not the same as fresh"}
+    # Compared as INSTANTS: `%cI` keeps each commit's own offset, so `11:00+01:00` (10:00Z)
+    # compares later than `10:30Z` as a string while being earlier in time.
+    from datetime import datetime  # noqa: PLC0415
+    try:
+        def _at(s: str) -> datetime:   # 3.10 reads no `Z` suffix; it is +00:00
+            return datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith("Z") else s)
+        stale = _at(code) > _at(tsd)
+    except ValueError:
+        return {"known": False, "stale": False,
+                "why": f"a commit time could not be read ({code!r}, {tsd!r}) - staleness "
+                       f"unknown, which is not the same as fresh"}
+    return {"known": True, "stale": stale, "tsd_at": tsd, "code_at": code,
+            "why": (f"{what} changed at {code} and the TSD was last revised at {tsd}"
+                    if stale else "")}
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

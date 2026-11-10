@@ -1,0 +1,197 @@
+<!--
+Template: User Story (Streamlined)
+File: sdlc-studio/stories/US{NNNN}-{slug}.md
+Status values: See reference-outputs.md
+Related: help/story.md, reference-story.md
+-->
+# US{{story_id}}: {{story_title}}
+
+> **Status:** {{status}}
+> **Epic:** [EP{{epic_id}}: {{epic_title}}](../epics/EP{{epic_id}}-{{epic_slug}}.md)
+> **Persona:** {{persona_name}}
+> **Serves:** {{optional - design personas whose End Goals this story serves; names must resolve to persona files (validate serves)}}
+> **Owner:** {{owner}}
+> **Reviewer:** {{reviewer}}
+> **Estimated-by:** {{who made the size call - so the report can tell you your own hit rate}}
+> **Delivered-by:** {{the model that delivered it - written at close, not at filing}}
+> **Created:** {{created_date}}
+> **GitHub Issue:** {{github_issue}}
+> **Affects:** {{source files this story touches, comma-separated}}
+
+<!-- Affects: the source files this story changes. Declaring it lets the engagement floor
+     confirm a single-file change is genuinely small; a multi-file change without an acceptance
+     criterion is refused. See reference-config.md#engagement-floor. -->
+
+## User Story
+
+**As a** {{persona_name}}
+**I want** {{capability}}
+**So that** {{benefit}}
+
+## Context
+
+### Persona Reference
+
+**{{persona_name}}** - {{persona_summary}}
+[Full persona details](../personas.md#{{persona_anchor}})
+
+### Background
+
+{{background}}
+
+---
+
+## Inherited Constraints
+
+> See Epic for full constraint chain. Key constraints for this story:
+
+| Source | Type | Constraint | AC Implication |
+| --- | --- | --- | --- |
+| Epic | {{epic_constraint_type}} | {{epic_constraint}} | {{constraint_ac}} |
+| PRD | Performance | {{performance_constraint}} | {{performance_ac}} |
+| PRD | Security | {{security_constraint}} | {{security_ac}} |
+
+---
+
+## Acceptance Criteria
+
+### AC1: {{ac1_name}}
+
+- **Given** {{ac1_given}}
+- **When** {{ac1_when}}
+- **Then** {{ac1_then}}
+- **Verify:** {{ac1_verify}}
+- **Caller:** {{ac1_caller}}
+- **Verified:** no
+
+### AC2: {{ac2_name}}
+
+- **Given** {{ac2_given}}
+- **When** {{ac2_when}}
+- **Then** {{ac2_then}}
+- **Verify:** {{ac2_verify}}
+- **Caller:** {{ac2_caller}}
+- **Verified:** no
+
+### AC3: {{ac3_name}}
+
+- **Given** {{ac3_given}}
+- **When** {{ac3_when}}
+- **Then** {{ac3_then}}
+- **Verify:** {{ac3_verify}}
+- **Caller:** {{ac3_caller}}
+- **Verified:** no
+
+> **Caller** names what CONSUMES the thing this criterion is about - the hook, lane, command or
+> call site that will reach it - as a path or a command, so the name can be resolved: `the commit
+> gate (tools/hooks/pre-commit)`, `sprint plan --export-lanes`. A mechanism nothing calls is inert
+> however green its tests, and a criterion describing only a function's own behaviour cannot tell
+> the two apart; four such mechanisms shipped in one sprint, each with a passing suite. Answer it
+> while the criterion is being written, when the answer is a sentence. Leave `n/a` only for a
+> criterion whose subject IS the call site (a hook, a CLI verb, a page). Check a written unit with
+> `critic.py caller-check --unit US{{story_id}}`: it reports a unit that adds a mechanism and names
+> no consumer, and a named consumer that resolves to nothing in the tree.
+
+---
+
+## Scope
+
+### In Scope
+
+- {{in_scope_item}}
+
+### Out of Scope
+
+- {{out_of_scope_item}}
+
+---
+
+## Technical Notes
+
+{{technical_notes}}
+
+### API Contracts
+
+{{api_contracts}}
+
+### Data Requirements
+
+{{data_requirements}}
+
+---
+
+## Edge Cases & Error Handling
+
+| Scenario | Expected Behaviour |
+| --- | --- |
+| {{edge_case}} | {{expected_behaviour}} |
+
+> **Minimum edge cases:** {{config.story_quality.edge_cases.api}} for API stories, {{config.story_quality.edge_cases.other}} for others
+
+---
+
+## Test Scenarios
+
+- [ ] {{test_scenario}}
+
+> **Minimum test scenarios:** {{config.story_quality.test_scenarios.api}} for API stories, {{config.story_quality.test_scenarios.ui}} for UI
+
+---
+
+## Dependencies
+
+### Story Dependencies
+
+| Story | Type | What's Needed | Status |
+| --- | --- | --- | --- |
+| [US{{dep_story_id}}](US{{dep_story_id}}-{{dep_slug}}.md) | {{type}} | {{what_needed}} | {{status}} |
+
+### External Dependencies
+
+| Dependency | Type | Status |
+| --- | --- | --- |
+| {{dependency}} | {{dependency_type}} | {{dependency_status}} |
+
+---
+
+## Estimation
+
+**Points:** {{1|2|3|5|8|13|20}}
+**Complexity:** {{complexity}}
+
+> **Points** are a RELATIVE size on the modified Fibonacci scale (1, 2, 3, 5, 8, 13, 20) - not
+> "how long will this take" but "is this bigger than that one", sized against stories already
+> delivered. The gaps widen deliberately, because uncertainty grows with size: it is much harder
+> to argue a story is a 7 rather than an 8 than to choose between a 5 and an 8. A value off the
+> scale is REFUSED, never rounded - the scale IS the estimate. Above 8, SPLIT the story;
+> estimator consistency collapses beyond it, so a bigger number is a triage failure rather than
+> a harder estimate. This is the one size vocabulary: the planner, the forecast and the measured
+> velocity all read this field.
+
+---
+
+## Rollback Envelope
+
+> Required when `affects_production_runtime: true`; optional otherwise. See `reference-story.md#rollback-envelope`.
+
+**Affects production runtime:** {{affects_production_runtime}}
+
+| Component | Reversal | Expected time |
+| --- | --- | --- |
+| {{component}} | {{reversal_command_or_steps}} | {{reversal_eta}} |
+
+If `affects_production_runtime: false`, replace with: *Not applicable – story does not change runtime behaviour.*
+
+---
+
+## Open Questions
+
+- [ ] {{question}} - Owner: {{question_owner}}
+
+---
+
+## Revision History
+
+| Date | Author | Change |
+| --- | --- | --- |
+| {{revision_date}} | {{revision_author}} | {{revision_change}} |
