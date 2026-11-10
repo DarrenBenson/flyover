@@ -2,8 +2,8 @@
   "schema": 1,
   "run_id": "RUN-01M73KN7",
   "started_at": "2026-11-10T20:47:50Z",
-  "ended_at": null,
-  "outcome": "running",
+  "ended_at": "2026-11-10T21:31:38Z",
+  "outcome": "goal-reached",
   "goal": "done",
   "batch": [
     "US01M73F8A",
@@ -197,5 +197,13 @@
   "report_discharged": [],
   "report": "RPT0001",
   "report_fingerprint": "03c24828f37b3083",
-  "report_window_end": "2026-11-10T21:28:39Z"
+  "report_window_end": "2026-11-10T21:28:39Z",
+  "unanswered": [],
+  "unanswered_rulings_from": "RETRO0001",
+  "signature": {
+    "principal": "Darren Benson (delegated to Juno)",
+    "signed_at": "2026-11-10T21:31:38Z",
+    "report": "RPT0001",
+    "fingerprint": "03c24828f37b3083"
+  }
 }

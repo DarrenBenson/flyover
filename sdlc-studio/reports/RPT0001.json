@@ -5,7 +5,12 @@
   "retro_id": "RETRO0001",
   "generated_at": "2026-11-10T21:28:39Z",
   "window_end": "2026-11-10T21:28:39Z",
-  "signature": null,
+  "signature": {
+    "principal": "Darren Benson (delegated to Juno)",
+    "signed_at": "2026-11-10T21:31:38Z",
+    "report": "RPT0001",
+    "fingerprint": "03c24828f37b3083"
+  },
   "sections": [
     {
       "key": "goal",

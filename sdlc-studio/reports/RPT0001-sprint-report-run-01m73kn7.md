@@ -75,7 +75,7 @@ No open finding, close gap or carried unit is recorded.
 
 | Signed by | Date | Fingerprint signed |
 | --- | --- | --- |
-| not yet signed | not yet signed | not yet signed |
+| Darren Benson (delegated to Juno) | 2026-11-10T21:31:38Z | 03c24828f37b3083 |
 
 Signing records the principal, the date and this report's fingerprint against RUN-01M73KN7.
 
