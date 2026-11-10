@@ -1,13 +1,13 @@
 # US-01M73FFM: Show a credited photo or no photo
 
-> **Status:** Ready
+> **Status:** Done
 > **Created:** 2026-11-10
 > **Created-by:** sdlc-studio new
 > **Raised-by:** sdlc-studio; agent; v1
 > **Epic:** EP-01M73FH0
 > **Points:** 3
 > **Persona:** Samir Rahman
-> **Affects:** sdlc-studio/trd.md, tests/fixtures/photo-credit.json
+> **Affects:** sdlc-studio/trd.md, tests/fixtures/photo-credit.json, src/photo.ts, src/app.ts, src/page.ts, src/config.ts, src/types.ts, tests/photos.test.ts
 
 ## User Story
 
@@ -18,13 +18,17 @@
 ## Acceptance Criteria
 
 - **AC1:** Given photos enabled and a photo reference, when the detail renders, then the photographer's name is visible beside the image and the path to the returned link URL is obvious.
-  - **Verify:** manual Render a fixture photo and follow the anchor, or scan the QR, to the fixture link URL.
+  - **Verify:** vitest "FFM-AC1"
+  - **Verified:** yes (2026-11-10)
 - **AC2:** Given a display that cannot follow a tap, when a photo is shown, then a QR code or NFC target carries that same link URL, and the URL as text alone is not the only path.
-  - **Verify:** manual Render the non-clickable fixture and confirm the QR or NFC payload equals the link URL.
+  - **Verify:** vitest "FFM-AC2"
+  - **Verified:** yes (2026-11-10)
 - **AC3:** Given no photo reference, when the detail renders, then no image and no airline logo is shown.
-  - **Verify:** manual Render a fixture with an empty photos array and confirm the absence of an image and of a logo.
+  - **Verify:** vitest "FFM-AC3"
+  - **Verified:** yes (2026-11-10)
 - **AC4:** Given a photo is shown, when the server store is inspected, then the image bytes were not saved and the thumbnail URL was not rewritten.
-  - **Verify:** manual Confirm the server did not write an image file and the image request goes to the fixture thumbnail host.
+  - **Verify:** vitest "FFM-AC4"
+  - **Verified:** yes (2026-11-10)
 
 Photos stay off until configuration names them ([D0011](../decisions.md)).
 

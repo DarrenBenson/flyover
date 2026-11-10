@@ -7,6 +7,7 @@ export type AppConfig = {
   positionProvider: string | null;
   maptilerKey: string | null;
   routeLookup: boolean;
+  photos: boolean;
   databasePath: string;
 };
 
@@ -29,6 +30,7 @@ export function readConfig(env: Record<string, string | undefined>): AppConfig {
     positionProvider: provider || null,
     maptilerKey: (env.MAPTILER_API_KEY ?? "").trim() || null,
     routeLookup: (env.ROUTE_LOOKUP ?? "").trim().toLowerCase() === "adsbdb",
+    photos: (env.PHOTOS ?? "").trim().toLowerCase() === "planespotters",
     databasePath: (env.FLYOVER_DB ?? "").trim() || "data/flyover.sqlite",
   };
 }

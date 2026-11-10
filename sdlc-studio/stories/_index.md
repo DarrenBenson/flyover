@@ -8,11 +8,11 @@
 | Status | Count |
 | --- | --- |
 | Draft | 0 |
-| Ready | 4 |
+| Ready | 3 |
 | Planned | 0 |
 | In Progress | 0 |
 | Review | 0 |
-| Done | 8 |
+| Done | 9 |
 | **Total** | **12** |
 
 ## Stories by Epic
@@ -38,7 +38,7 @@
 | ID | Title | Status | Points | Owner |
 | --- | --- | --- | --- | --- |
 | [US-01M73F8A](US-01M73F8A-poll-only-a-position-provider-the-configuration-has.md) | Poll only a position provider the configuration has enabled | Done | 5 | -- |
-| [US-01M73FFM](US-01M73FFM-show-a-credited-photo-or-no-photo.md) | Show a credited photo or no photo | Ready | 3 | -- |
+| [US-01M73FFM](US-01M73FFM-show-a-credited-photo-or-no-photo.md) | Show a credited photo or no photo | Done | 3 | -- |
 | [US-01M73FSQ](US-01M73FSQ-show-route-and-airline-facts-without-storing-a.md) | Show route and airline facts without storing a route database | Done | 5 | -- |
 
 ### [EP-01M73FVS: Run the display as a kiosk on the owner's servers](../epics/EP-01M73FVS-run-the-display-as-a-kiosk-on-the.md)
@@ -61,7 +61,7 @@
 | [US-01M73F6W](US-01M73F6W-keep-the-map-and-the-list-on-the.md) | Keep the map and the list on the same aircraft | EP-01M73FGP | Ready | 3 | Samir Rahman |
 | [US-01M73F8A](US-01M73F8A-poll-only-a-position-provider-the-configuration-has.md) | Poll only a position provider the configuration has enabled | EP-01M73FH0 | Done | 5 | Alex Brennan |
 | [US-01M73FSQ](US-01M73FSQ-show-route-and-airline-facts-without-storing-a.md) | Show route and airline facts without storing a route database | EP-01M73FH0 | Done | 5 | Samir Rahman |
-| [US-01M73FFM](US-01M73FFM-show-a-credited-photo-or-no-photo.md) | Show a credited photo or no photo | EP-01M73FH0 | Ready | 3 | Samir Rahman |
+| [US-01M73FFM](US-01M73FFM-show-a-credited-photo-or-no-photo.md) | Show a credited photo or no photo | EP-01M73FH0 | Done | 3 | Samir Rahman |
 | [US-01M73FSE](US-01M73FSE-leave-the-live-view-running-full-screen.md) | Leave the live view running full screen | EP-01M73FVS | Done | 3 | Ruth Okonkwo |
 | [US-01M73F39](US-01M73F39-keep-the-last-good-picture-when-the-provider.md) | Keep the last good picture when the provider fails | EP-01M73FVS | Done | 5 | Ruth Okonkwo |
 | [US-01M73F7A](US-01M73F7A-promote-one-build-across-the-owner-s-servers.md) | Promote one build across the owner's servers | EP-01M73FVS | Ready | 5 | Alex Brennan |

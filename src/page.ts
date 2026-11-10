@@ -77,5 +77,15 @@ function renderDetail(snapshot: PublicSnapshot): string {
     ${field("speed", detail.speed)}
     ${field("distance", detail.distance)}
     ${field("direction", detail.direction)}
-  </dl>`;
+  </dl>${renderPhoto(detail)}`;
+}
+
+function renderPhoto(detail: Detail): string {
+  const photo = detail.photo;
+  if (!photo) return "";
+  return `<figure class="photo">
+    <img src="${escapeHtml(photo.thumbnail)}" alt="Aircraft photographed by ${escapeHtml(photo.photographer)}">
+    <figcaption>${escapeHtml(photo.photographer)} <a href="${escapeHtml(photo.link)}">Open the original</a></figcaption>
+    <div class="qr">${photo.qrSvg}</div>
+  </figure>`;
 }

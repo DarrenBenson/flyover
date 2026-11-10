@@ -1,0 +1,13 @@
+{
+  "hit": {
+    "photos": [
+      {
+        "id": "fixture-photo",
+        "thumbnail": { "src": "https://cdn.example.test/photos/fixture-thumb.jpg" },
+        "link": "https://photos.example.test/fixture-photo",
+        "photographer": "Ada Example"
+      }
+    ]
+  },
+  "empty": { "photos": [] }
+}

@@ -4,6 +4,7 @@ import { ADSB_CREDIT, NAVIGATION, POSTCODE_CREDITS, ROUTE_CREDIT } from "./credi
 import { providerKind, readConfig, type AppConfig } from "./config.ts";
 import { clientAllowed } from "./lan.ts";
 import { adsbUrl, postcodeUrl, readAircraft } from "./poll.ts";
+import { photoUrl, qrSvg, readPhoto } from "./photo.ts";
 import { readRoute, routeUrl } from "./route.ts";
 import { renderPage } from "./page.ts";
 import { Store } from "./store.ts";
@@ -89,19 +90,37 @@ export function createApp(deps: AppDeps): FlyoverApp {
       distance: `${chosen.distanceMiles.toFixed(1)} mi`,
       direction: `${Math.round(chosen.bearingDeg)}°`,
       routeShown: false,
+      photo: null,
     };
-    if (!config.routeLookup || !chosen.callsign) return unknown;
-    try {
-      const response = await deps.fetch(routeUrl(chosen.callsign), {
-        headers: { accept: "application/json", "user-agent": USER_AGENT },
-      });
-      if (!response.ok) return unknown;
-      const route = readRoute(await response.json());
-      if (!route) return unknown;
-      return { ...unknown, ...route, routeShown: true };
-    } catch {
-      return unknown;
+    if (config.routeLookup && chosen.callsign) {
+      try {
+        const response = await deps.fetch(routeUrl(chosen.callsign), {
+          headers: { accept: "application/json", "user-agent": USER_AGENT },
+        });
+        if (response.ok) {
+          const route = readRoute(await response.json());
+          if (route) Object.assign(unknown, route, { routeShown: true });
+        }
+      } catch {
+        // A missed route stays unknown. The aircraft itself remains.
+      }
     }
+    if (config.photos) {
+      try {
+        const response = await deps.fetch(photoUrl(chosen.id), {
+          headers: { accept: "application/json", "user-agent": USER_AGENT },
+        });
+        if (response.ok) {
+          const photo = readPhoto(await response.json());
+          if (photo) {
+            unknown.photo = { ...photo, qrSvg: await qrSvg(photo.link) };
+          }
+        }
+      } catch {
+        // No credited photo is the honest result of a failed lookup.
+      }
+    }
+    return unknown;
   }
 
   async function present(selectedId: string | null): Promise<PublicSnapshot> {

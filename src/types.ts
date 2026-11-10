@@ -22,6 +22,14 @@ export type Detail = {
   distance: string;
   direction: string;
   routeShown: boolean;
+  photo: PhotoCredit | null;
+};
+
+export type PhotoCredit = {
+  photographer: string;
+  link: string;
+  thumbnail: string;
+  qrSvg: string;
 };
 
 export type FeedState =
